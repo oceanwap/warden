@@ -1,8 +1,10 @@
 {
   "name": "warden-bench",
   "private": true,
-  "description": "Benchmark harness dependencies (PM2 for scenario B). The load generator is oha.",
+  "description": "Benchmark harness dependencies: the process managers compared with Warden. The load generator is oha.",
   "devDependencies": {
-    "pm2": "^6.0.0"
+    "@platformatic/node": "3.71.0",
+    "pm2": "6.0.14",
+    "wattpm": "3.71.0"
   }
 }

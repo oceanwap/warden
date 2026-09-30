@@ -19,6 +19,7 @@ class BenchController {
   @Get("cpu") cpu() { return String(fib(27)); }
   @Get("health") health() { return "ok"; }
   @Get("whoami") whoami() { return who; }
+  @Get("crash") crash() { setTimeout(() => process.exit(1), 10); return "bye"; }
 }
 
 @Module({ controllers: [BenchController] })

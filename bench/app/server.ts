@@ -5,6 +5,7 @@
 //   GET /cpu        fixed CPU work (worker parallelism)
 //   GET /health     supervision
 //   GET /whoami     which worker answered (pid:thread)
+//   GET /crash      exit this worker (process, or thread in worker mode)
 import { threadId } from "node:worker_threads";
 
 const who = `${process.pid}:${threadId}`;
@@ -30,6 +31,9 @@ const server = Bun.serve({
         return new Response("ok");
       case "/whoami":
         return new Response(who);
+      case "/crash":
+        setTimeout(() => process.exit(1), 10);
+        return new Response("bye");
       default:
         return new Response("not found", { status: 404 });
     }

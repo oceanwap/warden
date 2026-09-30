@@ -2,3 +2,4 @@
 node_modules/
 bench/.run/
 *.sock
+bench/nest/dist/
