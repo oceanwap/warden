@@ -1,0 +1,329 @@
+# Release builds. Two products, published side by side:
+#   warden-<version>-<os>-<arch>.tar.gz      the CLI: warden, README.md, contrib/
+#   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI (once gui/ exists)
+# plus install.sh and SHA256SUMS covering every file.
+#
+# A tag v<version> (matching Cargo.toml) publishes a GitHub Release. Pushes to
+# ci-portability and manual runs are dry runs: everything is built, packaged,
+# checksummed and install-tested, and uploaded as workflow artifacts only.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [ci-portability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+  # Linux binaries link glibc 2.28 symbols at most (RHEL 8, Debian 10+), so
+  # they keep glibc's malloc and the preadv2 fast path (glibc 2.26+) that CI
+  # tests and the benchmarks measure; musl would lose both.
+  GLIBC: "2.28"
+  ZIG_VERSION: "0.14.1"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      gui: ${{ steps.gui.outputs.present == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Version (the tag must match Cargo.toml)
+        run: |
+          cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error title=Version mismatch::tag $GITHUB_REF_NAME is version $tag_version but Cargo.toml says $cargo_version. Nothing was built or published. Set [package] version = \"$tag_version\" in Cargo.toml (cargo updates Cargo.lock), commit, and move the tag to that commit; or tag v$cargo_version instead."
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Release v$cargo_version"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Dry run for version $cargo_version: artifacts only, no release"
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+      - id: gui
+        name: GUI crate present?
+        if: hashFiles('gui/Cargo.toml') != ''
+        run: echo "present=true" >> "$GITHUB_OUTPUT"
+
+  cli:
+    needs: meta
+    name: cli ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: true }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: true }
+          - { os: macos, arch: arm64, runner: macos-latest, target: aarch64-apple-darwin, zig: false }
+          - { os: macos, arch: x86_64, runner: macos-latest, target: x86_64-apple-darwin, zig: false }
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      NAME: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
+      BIN: target/${{ matrix.target }}/release/warden
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+      - if: matrix.zig
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: matrix.zig
+        name: Install zig and cargo-zigbuild
+        run: python -m pip install --disable-pip-version-check "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+      - name: Build (release profile, stripped)
+        run: |
+          if [ "${{ matrix.zig }}" = true ]; then
+            cargo zigbuild --release --locked --bin warden --target "${{ matrix.target }}.$GLIBC"
+          else
+            cargo build --release --locked --bin warden --target "${{ matrix.target }}"
+          fi
+          file "$BIN"
+          ls -l "$BIN"
+      - name: Check the binary
+        run: |
+          if [ "${{ matrix.os }}" = linux ]; then
+            file "$BIN" | grep -q ', stripped' || { echo "::error::$BIN is not stripped"; exit 1; }
+            newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "newest glibc symbol version: $newest"
+            if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC" | sort -V | tail -1)" != "$GLIBC" ]; then
+              echo "::error::$BIN needs glibc $newest, newer than the $GLIBC baseline"; exit 1
+            fi
+            objdump -T "$BIN" | grep -qw preadv2 || { echo "::error::$BIN lost the preadv2 (RWF_NOWAIT) static-file fast path"; exit 1; }
+          fi
+          run="$BIN"
+          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then run="arch -x86_64 $BIN"; else
+              echo "::notice::no Rosetta on this runner: the x86_64 macOS binary was built but not run"; exit 0
+            fi
+          fi
+          got=$($run --version)
+          echo "$got"
+          [ "$got" = "warden $VERSION" ] || { echo "::error::$BIN --version says '$got', expected 'warden $VERSION'"; exit 1; }
+      - name: Package
+        run: |
+          mkdir -p "dist/$NAME/contrib"
+          cp "$BIN" README.md "dist/$NAME/"
+          cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf "dist/$NAME/contrib/"
+          # No AppleDouble (._*) files from macOS tar.
+          COPYFILE_DISABLE=1 tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          tar -tzvf "$NAME.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # The GUI and the CLI in one download. Skipped until gui/ (a workspace
+  # member) exists; its binary name is read from gui/Cargo.toml.
+  gui:
+    needs: [meta, cli]
+    if: needs.meta.outputs.gui == 'true'
+    name: gui ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GUI toolkits link system libraries, so no zig here: an older
+          # distro keeps the glibc baseline low (2.35).
+          - { os: linux, arch: x86_64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: linux, arch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos, arch: arm64, runner: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos, arch: x86_64, runner: macos-latest, target: x86_64-apple-darwin }
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      NAME: warden-gui-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
+      CLI: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          cache: false
+          rustflags: ""
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-${{ matrix.os }}-${{ matrix.arch }}
+      - name: The CLI from the cli job
+        run: tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version || true
+      # TODO(gui): install the toolkit's build dependencies on Linux here
+      # (e.g. apt-get install libgtk-3-dev / libwebkit2gtk-4.1-dev).
+      - name: Build the GUI
+        id: build
+        run: |
+          pkg=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.manifest_path | endswith("/gui/Cargo.toml")) | .name')
+          bin=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.manifest_path | endswith("/gui/Cargo.toml")) | .targets[] | select(.kind | index("bin")) | .name' | head -1)
+          [ -n "$pkg" ] && [ -n "$bin" ] || { echo "::error::gui/Cargo.toml has no binary target"; exit 1; }
+          cargo build --release --locked -p "$pkg" --bin "$bin" --target "${{ matrix.target }}"
+          echo "bin=$bin" >> "$GITHUB_OUTPUT"
+      - name: Package (Linux, .tar.gz)
+        if: matrix.os == 'linux'
+        run: |
+          bin=${{ steps.build.outputs.bin }}
+          mkdir -p "dist/$NAME"
+          cp "target/${{ matrix.target }}/release/$bin" "$CLI/warden" "$CLI/README.md" "dist/$NAME/"
+          cp -R "$CLI/contrib" "dist/$NAME/"
+          tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          echo "FILE=$NAME.tar.gz" >> "$GITHUB_ENV"
+      - name: Package (macOS, Warden.app zipped)
+        if: matrix.os == 'macos'
+        run: |
+          bin=${{ steps.build.outputs.bin }}
+          app=dist/Warden.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/$bin" "$app/Contents/MacOS/"
+          cp "$CLI/warden" "$app/Contents/MacOS/warden"
+          cp -R "$CLI/contrib" "$CLI/README.md" "$app/Contents/Resources/"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Warden</string>
+            <key>CFBundleDisplayName</key><string>Warden</string>
+            <key>CFBundleIdentifier</key><string>io.github.oceanwap.warden</string>
+            <key>CFBundleExecutable</key><string>$bin</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint "$app/Contents/Info.plist"
+          # TODO(signing): unsigned for now, so Gatekeeper warns on first open.
+          # Needs the owner's Apple Developer ID (repository secrets): import
+          # the certificate into a temporary keychain, then
+          #   codesign --force --deep --options runtime --timestamp --sign "Developer ID Application: <name> (<team>)" "$app"
+          #   xcrun notarytool submit <zip> --apple-id … --team-id … --password … --wait
+          #   xcrun stapler staple "$app"   (and zip again after stapling)
+          ditto -c -k --keepParent "$app" "$NAME.zip"
+          echo "FILE=$NAME.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.FILE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  checksums:
+    needs: [meta, cli, gui]
+    # The gui job is skipped until gui/ exists.
+    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{cli,gui}-*"
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cp install.sh dist/
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.meta.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # install.sh against these very files, served locally: user and root
+  # installs, pinned and latest, and a tampered archive that must be refused.
+  install-test:
+    needs: [meta, checksums]
+    if: ${{ !cancelled() && needs.checksums.result == 'success' }}
+    name: install.sh on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      URL: http://127.0.0.1:8765
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.meta.outputs.version }}
+          path: dist
+      - name: Serve the release files
+        run: |
+          cp -R dist tampered
+          for f in tampered/*.tar.gz; do printf 'x' >> "$f"; done
+          (python3 -m http.server 8765 --bind 127.0.0.1 --directory dist > /dev/null 2>&1 &)
+          (python3 -m http.server 8766 --bind 127.0.0.1 --directory tampered > /dev/null 2>&1 &)
+          for _ in $(seq 50); do curl -fs "$URL/SHA256SUMS" > /dev/null && curl -fs http://127.0.0.1:8766/SHA256SUMS > /dev/null && exit 0; sleep 0.2; done
+          exit 1
+      - name: Latest release, as a user (~/.local/bin)
+        run: |
+          WARDEN_DOWNLOAD_URL="$URL" sh install.sh
+          test "$("$HOME/.local/bin/warden" --version)" = "warden $VERSION"
+      - name: Pinned version, as root (/usr/local/bin)
+        run: |
+          sudo env WARDEN_DOWNLOAD_URL="$URL" WARDEN_VERSION="v$VERSION" sh install.sh
+          test "$(/usr/local/bin/warden --version)" = "warden $VERSION"
+          ls -l /usr/local/bin/warden
+      - name: A tampered archive is refused
+        run: |
+          if WARDEN_DOWNLOAD_URL=http://127.0.0.1:8766 WARDEN_INSTALL_DIR="$RUNNER_TEMP/tampered" sh install.sh; then
+            echo "::error::install.sh installed an archive whose checksum does not match"; exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/tampered/warden"
+
+  publish:
+    needs: [meta, checksums, install-test]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.meta.outputs.version }}
+          path: dist
+      - name: GitHub Release
+        run: |
+          flags=()
+          [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Warden $VERSION" --generate-notes "${flags[@]}"
