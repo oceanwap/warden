@@ -311,7 +311,9 @@ pub async fn act(args: &Args, action: &Action) -> i32 {
         Action::Describe => describe(&sels, args).await,
         Action::Env { show_secrets } => env(&sels, *show_secrets).await,
         Action::Config { show_secrets } => show_config(&sels, *show_secrets).await,
-        Action::Logs { lines, follow, events, stream } => logs(&ctx, &sels, *lines, *follow, *events, stream).await,
+        Action::Logs { lines, follow, history, query } => {
+            logs(&ctx, &sels, *lines, *follow, *history, query, args.json).await
+        }
         Action::Scale(s) => scale(&ctx, &sels, s, args).await,
         _ => ops(&ctx, &sels, action, args).await,
     }
@@ -540,80 +542,238 @@ async fn ops(ctx: &Ctx, sels: &[Sel], action: &Action, args: &Args) -> i32 {
 async fn logs(
     ctx: &Ctx,
     sels: &[Sel],
-    lines: usize,
+    lines: Option<usize>,
     follow: Option<bool>,
-    events: bool,
-    stream: &Option<String>,
+    history: bool,
+    query: &crate::logview::Query,
+    json: bool,
 ) -> i32 {
+    if history {
+        return logs_history(sels, lines, query, json).await;
+    }
     // Like PM2: stream by default on a terminal; print and exit when piped.
     // SAFETY: isatty has no preconditions.
     let follow = follow.unwrap_or_else(|| unsafe { libc::isatty(1) == 1 });
-    let req = |w: Option<usize>, lines: usize, follow: bool| Request::Logs {
-        lines,
+    let lines = lines.unwrap_or(15);
+    // Text / time / level filters run here; ask for more so N survive them.
+    let fetch = if query.is_filtering() { 4000 } else { lines };
+    let req = |w: Option<usize>, n: usize, follow: bool| Request::Logs {
+        lines: n,
         follow,
-        worker: w.map(|n| n.to_string()),
-        events,
-        stream: stream.clone(),
+        worker: w.map(|n| n.to_string()).or_else(|| query.worker.clone()),
+        events: query.events || query.level.is_some(),
+        stream: query.stream.clone(),
     };
-    if sels.len() == 1 {
-        let s = &sels[0];
-        let mut out = std::io::stdout();
-        return match control::call(&s.app.socket, &req(s.worker, lines, follow), &mut out).await {
-            Ok(_) => 0,
-            Err(e) => {
-                eprintln!("warden: {}{e}", if ctx.single { String::new() } else { format!("{}: ", s.app.name) });
-                2
-            }
-        };
-    }
-    // Several apps: each line prefixed with its app, recent lines merged by time.
+    let multi = sels.len() > 1;
     let width = sels.iter().map(|s| s.app.name.len()).max().unwrap_or(0);
-    let mut merged: Vec<(String, String)> = Vec::new();
+    let format = |app: &str, l: &str| -> String {
+        if json {
+            crate::logview::to_json(app, l)
+        } else if multi {
+            format!("{app:<width$} | {l}")
+        } else {
+            l.to_string()
+        }
+    };
+    let mut out = crate::logview::PipeOut::new();
+    let mut recent: Vec<(String, String)> = Vec::new();
     let mut live = Vec::new();
+    let mut worst = 0;
     for s in sels {
-        if !s.app.socket.exists() {
+        if multi && !s.app.socket.exists() {
             continue;
         }
         let mut buf: Vec<u8> = Vec::new();
-        if control::call(&s.app.socket, &req(s.worker, lines, false), &mut buf).await.is_ok() {
-            for l in String::from_utf8_lossy(&buf).lines() {
-                merged.push((l.get(..24).unwrap_or("").to_string(), format!("{:<width$} | {l}", s.app.name)));
+        match control::call(&s.app.socket, &req(s.worker, fetch, false), &mut buf).await {
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let kept: Vec<&str> = text.lines().filter(|l| query.matches(l)).collect();
+                for l in &kept[kept.len().saturating_sub(lines)..] {
+                    recent.push((l.get(..24).unwrap_or("").to_string(), format(&s.app.name, l)));
+                }
+                live.push(s.clone());
             }
-            live.push(s.clone());
+            Err(e) => {
+                let prefix = if ctx.single { String::new() } else { format!("{}: ", s.app.name) };
+                eprintln!("warden: {prefix}{e}");
+                worst = 2;
+            }
         }
     }
-    merged.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_, l) in &merged {
-        println!("{l}");
+    recent.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, l) in &recent {
+        if !out.line(l) {
+            return 0;
+        }
     }
-    if !follow {
-        return 0;
+    out.flush();
+    if !follow || live.is_empty() {
+        return worst;
     }
     let mut set = tokio::task::JoinSet::new();
     for s in live {
         let r = req(s.worker, 0, true);
+        let (q, app) = (query.clone(), s.app.name.clone());
+        let prefix = if multi { format!("{app:<width$} | ") } else { String::new() };
         set.spawn(async move {
-            let mut out = Prefixed { prefix: format!("{:<width$} | ", s.app.name), buf: Vec::new() };
-            let _ = control::call(&s.app.socket, &r, &mut out).await;
+            let mut w = Filtered { prefix, app, json, query: q, buf: Vec::new(), out: crate::logview::PipeOut::new() };
+            let _ = control::call(&s.app.socket, &r, &mut w).await;
         });
     }
     while set.join_next().await.is_some() {}
-    0
+    worst
 }
 
-/// Writes whole lines to stdout with a prefix (one `println!` per line keeps
-/// lines from different apps from interleaving).
-struct Prefixed {
+/// `warden logs --history` / `warden search`: the app's log files (rotated
+/// and gzipped ones too, oldest first) or journald.
+async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview::Query, json: bool) -> i32 {
+    use crate::logview::{file_chain, for_each_line, journal_lines};
+    let multi = sels.len() > 1;
+    let width = sels.iter().map(|s| s.app.name.len()).max().unwrap_or(0);
+    let mut out = crate::logview::PipeOut::new();
+    let mut worst = 0;
+    for s in sels {
+        let app = &s.app;
+        let mut q = query.clone();
+        if let Some(w) = s.worker {
+            q.worker = Some(w.to_string());
+        }
+        // Where this app logs: from the running supervisor, else its config.
+        let (cfg, unit) = match call_with(app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await {
+            Ok(r) => {
+                let info = r.info.unwrap_or_default();
+                let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
+                let unit = info["unit"].as_str().map(String::from);
+                let bg = info["log_file"].as_str().map(PathBuf::from);
+                (cfg.map(|c| (c, bg)), unit)
+            }
+            Err(_) => {
+                (app.config.as_ref().and_then(|p| Config::load(p).ok()).map(|c| (c, None)), systemd_unit_for(app))
+            }
+        };
+        let Some((cfg, running_log)) = cfg else {
+            eprintln!("warden: {}: cannot read its config to find its log files", app.name);
+            worst = 2;
+            continue;
+        };
+        let l = &cfg.logging;
+        let background = Some(log_path(&app.name)).filter(|p| p.exists());
+        // (path, raw): raw = the app's own lines (out/err files), not Warden-framed.
+        let mut sources: Vec<(PathBuf, bool)> = Vec::new();
+        match q.stream.as_deref() {
+            Some("stderr") if l.err_file.is_some() => sources.push((l.err_file.clone().unwrap_or_default(), true)),
+            Some("stdout") if l.out_file.is_some() => sources.push((l.out_file.clone().unwrap_or_default(), true)),
+            _ => {
+                if let Some(f) = l.file.clone().or(running_log).or(background) {
+                    sources.push((f, false));
+                } else {
+                    for f in [l.out_file.clone(), l.err_file.clone()].into_iter().flatten() {
+                        sources.push((f, true));
+                    }
+                }
+            }
+        }
+        let emit_prefix = |line: &str| -> String {
+            if json {
+                crate::logview::to_json(&app.name, line)
+            } else if multi {
+                format!("{:<width$} | {line}", app.name)
+            } else {
+                line.to_string()
+            }
+        };
+        // Keep only the last N when asked; otherwise stream everything.
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut push = |line: String, out: &mut crate::logview::PipeOut| -> bool {
+            match lines {
+                Some(n) => {
+                    tail.push_back(line);
+                    if tail.len() > n {
+                        tail.pop_front();
+                    }
+                    true
+                }
+                None => out.line(&line),
+            }
+        };
+        if sources.is_empty() {
+            match unit.as_deref() {
+                Some(u) => {
+                    let res = journal_lines(u, &q, &mut |line| {
+                        if q.matches(line) { push(emit_prefix(line), &mut out) } else { true }
+                    });
+                    if let Err(e) = res {
+                        eprintln!("warden: {}: {e}", app.name);
+                        worst = 2;
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "warden: {}: no log files to read. Set [logging] file (or out_file / err_file) to keep \
+                         history; `warden logs {}` shows the recent lines in memory",
+                        app.name, app.name
+                    );
+                    worst = worst.max(1);
+                    continue;
+                }
+            }
+        }
+        for (path, raw) in &sources {
+            let chain = file_chain(path);
+            if chain.is_empty() {
+                eprintln!("warden: {}: {} does not exist yet", app.name, path.display());
+                worst = worst.max(1);
+            }
+            for f in chain {
+                let res = for_each_line(&f, &mut |line| {
+                    let keep = if *raw { q.matches_raw(line) } else { q.matches(line) };
+                    if keep { push(emit_prefix(line), &mut out) } else { true }
+                });
+                match res {
+                    Ok(true) => {}
+                    Ok(false) => return 0, // the reader went away (| head)
+                    Err(e) => {
+                        eprintln!("warden: {}: {e}", app.name);
+                        worst = worst.max(1);
+                    }
+                }
+            }
+        }
+        for line in tail {
+            if !out.line(&line) {
+                return 0;
+            }
+        }
+    }
+    out.flush();
+    worst
+}
+
+/// Follow mode: filter each line, prefix it, and stop when stdout closes.
+struct Filtered {
     prefix: String,
+    app: String,
+    json: bool,
+    query: crate::logview::Query,
     buf: Vec<u8>,
+    out: crate::logview::PipeOut,
 }
 
-impl std::io::Write for Prefixed {
+impl std::io::Write for Filtered {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         self.buf.extend_from_slice(data);
         while let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=i).collect();
-            println!("{}{}", self.prefix, String::from_utf8_lossy(&line[..line.len() - 1]));
+            let raw: Vec<u8> = self.buf.drain(..=i).collect();
+            let line = String::from_utf8_lossy(&raw[..raw.len() - 1]).to_string();
+            if !self.query.matches(&line) {
+                continue;
+            }
+            let text =
+                if self.json { crate::logview::to_json(&self.app, &line) } else { format!("{}{line}", self.prefix) };
+            if !self.out.line(&text) {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdout closed"));
+            }
+            self.out.flush();
         }
         Ok(data.len())
     }
@@ -621,8 +781,6 @@ impl std::io::Write for Prefixed {
         Ok(())
     }
 }
-
-// -------------------------------------------------------- start and friends
 
 fn systemctl() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("WARDEN_SYSTEMCTL").filter(|v| !v.is_empty()) {

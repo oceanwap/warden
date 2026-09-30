@@ -459,8 +459,10 @@ pub async fn call(
             match reader.read_line(&mut line).await {
                 Ok(0) | Err(_) => return Ok(None),
                 Ok(_) => {
-                    let _ = out.write_all(line.as_bytes());
-                    let _ = out.flush();
+                    // The reader went away (`| head`, Ctrl-C): stop following.
+                    if out.write_all(line.as_bytes()).and_then(|_| out.flush()).is_err() {
+                        return Ok(None);
+                    }
                 }
             }
         }

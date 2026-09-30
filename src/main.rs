@@ -8,6 +8,7 @@ mod fleet;
 mod guard;
 mod health;
 mod logging;
+mod logview;
 mod metrics;
 mod networking;
 mod process;

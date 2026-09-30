@@ -216,8 +216,10 @@ static LOGGER: OnceLock<Logger> = OnceLock::new();
 /// when it runs a supervisor in the background).
 pub fn init(level: Level, timestamps: Option<bool>, mut files: Files) {
     let journald = std::env::var_os("JOURNAL_STREAM").is_some();
-    if let Some(p) = std::env::var_os("WARDEN_LOG_FILE").filter(|p| !p.is_empty()) {
-        files.file = Some(PathBuf::from(p));
+    // A background supervisor (`warden start <app>`) logs to a file of its
+    // own, unless the config already names one.
+    if files.file.is_none() {
+        files.file = std::env::var_os("WARDEN_LOG_FILE").filter(|p| !p.is_empty()).map(PathBuf::from);
     }
     let sinks = Sinks {
         stdout: std::env::var("WARDEN_LOG_STDOUT").map(|v| v != "0").unwrap_or(true),

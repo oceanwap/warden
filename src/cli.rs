@@ -33,6 +33,10 @@ APPS (familiar from PM2):
     scale <app> <N>  Set the number of workers (N, +N or -N)
     logs [target]    Recent lines, then follow on a terminal
                      [--lines N] [--err|--out] [--events] [--nostream] [-f]
+                     --history: from the log files (rotated and .gz too) or journald
+                     --grep TEXT --exclude TEXT --ignore-case --since 2h --until
+                     2026-09-30T12:00 --level warn --json (one object per line)
+    search <text> [target]   Search all of an app's logs (= logs --history --grep)
     flush [target]   Empty the log buffer and truncate log files
     env <app>        The app's environment (values hidden unless --show-secrets)
     reset <target>   Zero restart counters and retry FAILED workers now
@@ -110,15 +114,30 @@ pub enum Action {
     Describe,
     Stop,
     Shutdown,
-    Restart { hard: bool },
-    Reload { safe: bool },
+    Restart {
+        hard: bool,
+    },
+    Reload {
+        safe: bool,
+    },
     Reset,
     Flush,
     Scale(ScaleArg),
-    Logs { lines: usize, follow: Option<bool>, events: bool, stream: Option<String> },
+    Logs {
+        /// Last N lines; `None`: 15 from memory, everything from history.
+        lines: Option<usize>,
+        follow: Option<bool>,
+        /// Read log files / journald instead of the in-memory buffer.
+        history: bool,
+        query: crate::logview::Query,
+    },
     LogLevel(Option<Level>),
-    Env { show_secrets: bool },
-    Config { show_secrets: bool },
+    Env {
+        show_secrets: bool,
+    },
+    Config {
+        show_secrets: bool,
+    },
     Signal(String),
 }
 
@@ -205,8 +224,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut lines: Option<usize> = None;
     let mut follow: Option<bool> = None;
     let mut worker: Option<String> = None;
-    let mut events = false;
-    let mut stream: Option<String> = None;
+    let mut q = crate::logview::Query::default();
+    let mut history = false;
     let mut so = StartOpts::default();
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -223,9 +242,19 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "-f" | "--follow" => follow = Some(true),
             "--nostream" | "--no-stream" => follow = Some(false),
             "-w" | "--worker" => worker = Some(value(a)?),
-            "--events" => events = true,
-            "--err" => stream = Some("stderr".into()),
-            "--out" => stream = Some("stdout".into()),
+            "--events" => q.events = true,
+            "--err" => q.stream = Some("stderr".into()),
+            "--out" => q.stream = Some("stdout".into()),
+            "--grep" | "--search" => q.grep.push(value(a)?),
+            "--exclude" | "--grep-v" => q.exclude.push(value(a)?),
+            "--ignore-case" => q.ignore_case = true,
+            "--since" => q.since = Some(crate::logview::parse_time(&value(a)?)?),
+            "--until" => q.until = Some(crate::logview::parse_time(&value(a)?)?),
+            "--level" => {
+                let l = value(a)?;
+                q.level = Some(parse_level(&l).ok_or_else(|| format!("--level {l:?}: debug, info, warn or error"))?);
+            }
+            "--history" | "--files" | "--all" => history = true,
             "--json" => json = true,
             "--no-wait" => no_wait = true,
             "-y" | "--yes" => yes = true,
@@ -406,7 +435,15 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         "logs" | "log" => {
             too_many(1)?;
             target = one(&rest);
-            Command::Act(Action::Logs { lines: lines.unwrap_or(15), follow, events, stream: stream.clone() })
+            Command::Act(Action::Logs { lines, follow, history, query: q.clone() })
+        }
+        "search" | "grep" => {
+            too_many(2)?;
+            let text = rest.first().cloned().ok_or("search needs the text to find: `warden search timeout api`")?;
+            target = rest.get(1).cloned();
+            let mut query = q.clone();
+            query.grep.insert(0, text);
+            Command::Act(Action::Logs { lines, follow: Some(false), history: true, query })
         }
         "log-level" => {
             too_many(2)?;
@@ -805,16 +842,29 @@ mod tests {
         assert_eq!(act("scale api -1"), (Action::Scale(ScaleArg::By(-1)), Some("api".into())));
         assert_eq!(
             act("logs -n 5 -f"),
-            (Action::Logs { lines: 5, follow: Some(true), events: false, stream: None }, None)
+            (Action::Logs { lines: Some(5), follow: Some(true), history: false, query: Default::default() }, None)
         );
         assert_eq!(
             act("logs --worker 2 --events --nostream"),
-            (Action::Logs { lines: 15, follow: Some(false), events: true, stream: None }, Some(":2".into()))
+            (
+                Action::Logs {
+                    lines: None,
+                    follow: Some(false),
+                    history: false,
+                    query: crate::logview::Query { events: true, ..Default::default() }
+                },
+                Some(":2".into())
+            )
         );
         assert_eq!(
             act("logs api --lines 100 --err"),
             (
-                Action::Logs { lines: 100, follow: None, events: false, stream: Some("stderr".into()) },
+                Action::Logs {
+                    lines: Some(100),
+                    follow: None,
+                    history: false,
+                    query: crate::logview::Query { stream: Some("stderr".into()), ..Default::default() }
+                },
                 Some("api".into())
             )
         );
@@ -838,6 +888,21 @@ mod tests {
         assert_eq!(p("delete api").unwrap().command, Command::Delete { target: "api".into() });
         assert!(p("delete").is_err());
         assert!(p("start app.js --watch").is_err());
+    }
+
+    #[test]
+    fn log_search() {
+        let (a, t) = act("search ECONNREFUSED api --since 2026-09-30 --ignore-case");
+        let Action::Logs { history, follow, query, .. } = a else { panic!() };
+        assert!(history && follow == Some(false));
+        assert_eq!(t.as_deref(), Some("api"));
+        assert_eq!(query.grep, vec!["ECONNREFUSED".to_string()]);
+        assert!(query.ignore_case);
+        assert_eq!(query.since.as_deref(), Some("2026-09-30T00:00:00.000Z"));
+        let (a, _) = act("logs api --history --grep a --grep b --exclude health --level warn");
+        let Action::Logs { query, .. } = a else { panic!() };
+        assert_eq!((query.grep.len(), query.exclude.len(), query.level), (2, 1, Some(Level::Warn)));
+        assert!(p("logs --since yesterday").is_err());
     }
 
     #[test]

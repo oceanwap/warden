@@ -1424,3 +1424,77 @@ fn start_runs_any_command() {
     assert_eq!(code, 2);
     assert!(out.contains("quote it"), "{out}");
 }
+
+/// Old logs: rotated + gzipped files read back in order, searched, filtered,
+/// as JSON, and safe to pipe into `head`.
+#[test]
+fn log_history_search_and_pipes() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("logs");
+    let log = f.home.join("logs/chatty.log");
+    let cfg = format!(
+        "[app]\nname = \"chatty\"\ncommand = \"sh\"\n\
+         args = [\"-c\", \"for i in $(seq 1 400); do echo \\\"line $i padding padding padding\\\"; done; echo oops >&2; exec sleep 300\"]\n\
+         [workers]\nmin_uptime = 300\n[logging]\nfile = \"{}\"\n[logging.rotate]\nmax_size = \"8K\"\nkeep = 3\ncompress = true\n",
+        log.display()
+    );
+    std::fs::write(f.home.join("chatty.toml"), cfg).unwrap();
+    f.ok(&["start", "chatty"]);
+    f.wait("line 400 in the log", |f| {
+        f.cli(&["logs", "chatty", "--nostream", "--lines", "5"]).1.contains("line 400 padding")
+    });
+    f.wait("rotated and gzipped", |f| f.home.join("logs/chatty.log.1.gz").exists());
+
+    // History: every retained line, oldest first, across .gz and current.
+    let out = f.ok(&["logs", "chatty", "--history"]);
+    let nums: Vec<u32> =
+        out.lines().filter_map(|l| l.split("stdout: line ").nth(1)?.split(' ').next()?.parse().ok()).collect();
+    assert!(nums.len() > 50, "{} lines", nums.len());
+    assert!(nums.windows(2).all(|w| w[1] == w[0] + 1), "in order, no gaps");
+    assert_eq!(nums.last(), Some(&400));
+
+    // search = history + grep; filters combine.
+    let out = f.ok(&["search", "line 399 ", "chatty"]);
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let out = f.ok(&["logs", "chatty", "--history", "--grep", "OOPS", "--ignore-case", "--err"]);
+    assert!(out.contains("stderr: oops") && out.lines().count() == 1, "{out}");
+    let out = f.ok(&["logs", "chatty", "--history", "--level", "info"]);
+    assert!(out.contains("INFO  worker ready") && !out.contains(" OUT "), "{out}");
+    let out = f.ok(&["logs", "chatty", "--history", "--since", "1h", "--lines", "3"]);
+    assert_eq!(out.lines().count(), 3);
+    let out = f.ok(&["logs", "chatty", "--history", "--until", "2000-01-01"]);
+    assert!(out.is_empty(), "{out}");
+
+    // JSON lines for jq.
+    let out = f.ok(&["logs", "chatty", "--history", "--json", "--grep", "worker ready"]);
+    let v: Value = serde_json::from_str(out.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        (v["app"].as_str(), v["kind"].as_str(), v["level"].as_str()),
+        (Some("chatty"), Some("event"), Some("info"))
+    );
+    assert_eq!(v["fields"]["worker"], "1");
+
+    // Piping into `head`: stops quietly.
+    let mut child = Command::new(BIN)
+        .args(["logs", "chatty", "--history"])
+        .env("WARDEN_HOME", &f.home)
+        .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = [0u8; 16];
+    child.stdout.as_mut().unwrap().read_exact(&mut first).unwrap();
+    drop(child.stdout.take());
+    let status = child.wait().unwrap();
+    let mut err = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(status.success(), "exit {status:?}: {err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // Works while the app is stopped too (reads the config).
+    f.ok(&["kill", "--yes"]);
+    assert!(f.ok(&["search", "line 400 ", "chatty"]).contains("line 400 padding"));
+}
