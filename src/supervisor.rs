@@ -752,7 +752,11 @@ impl Supervisor {
                     in_ms = d.as_millis(),
                     attempt = s.tracker.restarts_in_window()
                 );
-                self.send_later(d, Event::RestartDue { slot, token });
+                if d.is_zero() {
+                    self.on_restart_due(slot, token);
+                } else {
+                    self.send_later(d, Event::RestartDue { slot, token });
+                }
             }
             Decision::GiveUp => {
                 s.state = State::Failed;

@@ -144,8 +144,10 @@ are retried after `failed_cooldown` (default 300 s).
 
 ### 4.5 Restart protection
 
-Per worker: every unexpected exit is a crash. Delay =
-`min(backoff_initial × 2^(consecutive−1), backoff_max)`. The consecutive counter
+Per worker: every unexpected exit is a crash. The first crash after a healthy
+run restarts at once (a one-off crash costs only the app's startup time, as in
+PM2); crash n ≥ 2 in a row waits
+`min(backoff_initial × 2^(n−2), backoff_max)`. The consecutive counter
 resets after a worker stays up for `restart_window` seconds. More than
 `max_restarts` restarts inside `restart_window` → `FAILED`; retried after
 `failed_cooldown` (if restarts are enabled), or cleared by `warden restart <id>`

@@ -1,4 +1,8 @@
 //! Crash-loop protection: exponential backoff plus a cap on restarts per window.
+//!
+//! The first crash after a healthy run restarts at once (a one-off crash
+//! should cost only the app's startup time); each further crash in a row
+//! waits `backoff_initial`, doubling up to `backoff_max`.
 
 use crate::config;
 use std::collections::VecDeque;
@@ -56,7 +60,10 @@ impl Tracker {
         }
         self.consecutive += 1;
         self.history.push_back(now);
-        Decision::RestartAfter(backoff(p, self.consecutive))
+        if self.consecutive == 1 {
+            return Decision::RestartAfter(Duration::ZERO);
+        }
+        Decision::RestartAfter(backoff(p, self.consecutive - 1))
     }
 
     pub fn reset(&mut self) {
@@ -135,11 +142,11 @@ mod tests {
         let mut t = Tracker::default();
         let t0 = Instant::now();
         let short = Duration::from_millis(10);
-        t.on_crash(&p, t0, short);
-        t.on_crash(&p, t0, short);
-        assert_eq!(t.on_crash(&p, t0, short), Decision::RestartAfter(Duration::from_millis(400)));
+        assert_eq!(t.on_crash(&p, t0, short), Decision::RestartAfter(Duration::ZERO), "first crash: at once");
+        assert_eq!(t.on_crash(&p, t0, short), Decision::RestartAfter(Duration::from_millis(100)));
+        assert_eq!(t.on_crash(&p, t0, short), Decision::RestartAfter(Duration::from_millis(200)));
         let later = t0 + Duration::from_secs(200);
-        assert_eq!(t.on_crash(&p, later, Duration::from_secs(120)), Decision::RestartAfter(Duration::from_millis(100)));
+        assert_eq!(t.on_crash(&p, later, Duration::from_secs(120)), Decision::RestartAfter(Duration::ZERO));
     }
 
     #[test]

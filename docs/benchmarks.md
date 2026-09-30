@@ -49,6 +49,13 @@ then `bun bench/run.ts` and `bun bench/run.ts --app nest`. Needs [`oha`](https:/
 | /cpu p50 / p95 / p99 (ms) | 49.8 / 82.1 / 103.6 | 54.8 / 68.6 / 108.2 | 54.9 / 74.7 / 115.4 | 55.8 / 73.6 / 113.3 |
 | errors (all endpoints) | 0 | 0 | 0 | 0 |
 
+**Respawn update (2026-09-30):** the first crash after a healthy run now
+restarts with no backoff. Release build, 4 × `bench/app`, SIGKILL of one
+worker to `RUNNING` again as seen over the control socket: 31–45 ms (was
+142 ms; PM2 101 ms). A second crash of the same worker inside
+`restart_window` still waits `backoff_initial` (135–150 ms). The control
+socket round trip for `status` was 0.3–0.5 ms.
+
 An earlier run of the same code minus the per-worker health socket gave
 plaintext 97 k / 84 k / 98 k / 99 k req/s and the same memory figures —
 the throughput ordering between A, C and D is within noise.

@@ -22,7 +22,8 @@ ready_timeout = 30                           # s to start listening, else killed
 enabled = true
 max_restarts = 10                            # restarts allowed in restart_window...
 restart_window = 60                          # ...seconds, then the worker is FAILED
-backoff_initial = 100                        # ms, doubles per consecutive crash
+backoff_initial = 100                        # ms before the 2nd crash-in-a-row restart (the 1st is
+                                             # immediate), doubling per further crash
 backoff_max = 10000                          # ms
 failed_cooldown = 300                        # s before a FAILED worker is retried (0 = never)
 
