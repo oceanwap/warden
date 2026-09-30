@@ -107,10 +107,12 @@ warden-gui --ssh deploy@web-1 --remote-warden '~/.local/bin/warden'   # for Add 
 ## How it works
 
 - `client.rs` keeps **one** `subscribe` connection to wardend
-  (`interval_ms: 1000`) for the whole window. It reads continuously and
-  hands the UI one batch per 50 ms at most, with each app's newest status and
-  the newest host metrics only; it never waits for the UI, so wardend never
-  waits for (or drops) it. While the Logs tab shows an app, a second
+  (`interval_ms: 1000`) for the whole window. A tokio task of its own reads
+  it continuously and hands the UI one batch per 50 ms at most, with each
+  app's newest status and the newest host metrics only. When the window is
+  behind, the batch keeps growing up to its bounds (2,000 log lines, 5,000
+  events; the rest is counted as skipped) instead of the reader waiting, so
+  wardend never waits for the GUI and never has to disconnect it. While the Logs tab shows an app, a second
   `subscribe` with `logs: true, apps: [<app>]` runs for it (a filter on the
   main stream would also filter out the other apps' statuses). Actions are
   one short connection each.
@@ -130,16 +132,16 @@ shown, after 15 s, then 60 s idle:
 
 | Build | RSS | PSS | Private | Threads | Idle CPU |
 |---|---|---|---|---|---|
-| default (tiny-skia, CPU) | 20.4 MB | 16.0 MB | 13.5 MB | 4 | 0.18% |
+| default (tiny-skia, CPU) | 20.7 MB | 16.3 MB | 13.8 MB | 4 | 0.14% |
 | `--features wgpu` (GPU renderer; here Mesa's llvmpipe through OpenGL, no GPU) | 143.6 MB | 120.6 MB | 99.6 MB | 9 | 1.9% |
 
 The target was under 60 MB. The default build is the CPU renderer: loading
 a GPU driver costs more memory than drawing this window on the CPU (a real
 GPU driver weighs less than llvmpipe, but still tens of MB), and iced's
 tiny-skia backend redraws only what changed. The binary is 7.7 MB (12.2 MB
-with wgpu). `cargo build -p
-warden-gui --features wgpu` adds the GPU renderer (used first when a GPU is
-found; `ICED_BACKEND=tiny-skia` forces the CPU one).
+with wgpu; about 5 MB in the release tarball). `cargo build -p warden-gui
+--features wgpu` adds the GPU renderer (used first when a GPU is found;
+`ICED_BACKEND=tiny-skia` forces the CPU one).
 
 To measure again: start 10 apps (`warden start "sleep 100000" --name appN -i
 2 --no-wait`), `warden daemon`, then read `Rss`/`Pss` in
@@ -157,7 +159,8 @@ cargo build --bin warden && cargo test -p warden-gui
   quoted command lines are run through `sh` and must come back unchanged).
 - `tests/render.rs`: headless rendering with `iced_test` (tiny-skia): the
   main screen with fake wardend data, an app that gave up, the logs tab, a
-  confirmation and the "wardend is not running" screen. Each is searched for
+  confirmation, the Add app, Edit config and Connection dialogs, and the
+  "wardend is not running" screen. Each is searched for
   what it must show, clicked, and saved as a PNG in
   `$WARDEN_GUI_SNAPSHOT_DIR` (default `target/tmp/snapshots`; CI uploads
   them as the `gui-snapshots` artifact).
@@ -165,6 +168,9 @@ cargo build --bin warden && cargo test -p warden-gui
   workspace's `target/debug/warden`, with a private `WARDEN_HOME`): apps,
   statuses and host metrics arrive, a reload is followed to `rollout_done`,
   errors come back with words, log lines stream, and the feed reconnects
-  after wardend restarts. It stops everything it started.
+  after wardend restarts; a `yes` log flood read by a slow window stays
+  connected with bounded batches and the loss counted; Add app with an env
+  file and Edit config's check and save run the real CLI. It stops
+  everything it started.
 - The SSH tunnel is covered by its command line and error tests; it is not
   run end to end in CI (no sshd there).

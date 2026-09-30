@@ -315,7 +315,7 @@ warden-gui                                   # this machine's wardend (`Start wa
 warden-gui --ssh deploy@web-1                # a remote host, through an SSH tunnel (your agent and keys)
 ```
 
-It idles at about 20 MB of memory and no CPU with 10 apps. Details, the SSH
+It idles at about 21 MB resident and 0.1% CPU with 10 apps. Details, the SSH
 setup and the measurements: [`gui/README.md`](gui/README.md).
 
 ## Benchmarks
