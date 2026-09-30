@@ -210,6 +210,7 @@ mod tests {
             namespace: "default".into(),
             mode: "process".into(),
             config_path: None,
+            launched: "terminal".into(),
             unit: None,
             stopped: false,
             log_file: None,

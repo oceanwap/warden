@@ -9,6 +9,7 @@ mod cli;
 mod config;
 mod control;
 mod doctor;
+mod events;
 mod fleet;
 mod guard;
 mod health;

@@ -105,6 +105,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         cmd.env(k, v);
     }
     cmd.env("WARDEN_IPC_FD", IPC_FD.to_string());
+    // How the supervisor was launched is not the workers' business (a
+    // worker running `warden` itself would misreport).
+    cmd.env_remove(crate::events::LAUNCH_ENV);
     // SAFETY: the closure only calls the async-signal-safe helpers in
     // `sys` (dup2, fcntl, prctl): no allocation or locking after fork.
     #[allow(unsafe_code)]

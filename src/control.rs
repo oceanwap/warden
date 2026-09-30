@@ -74,6 +74,15 @@ pub enum Request {
         #[serde(default)]
         level: Option<crate::config::Level>,
     },
+    /// Stream live events (docs/protocol.md): a status snapshot, worker and
+    /// rollout events as they happen, a status every `interval_ms`.
+    Subscribe {
+        #[serde(default)]
+        interval_ms: Option<u64>,
+        /// Also every log line, as `log` events.
+        #[serde(default)]
+        logs: bool,
+    },
 }
 
 /// Most control connections served at once; more are refused with a message.
@@ -108,7 +117,7 @@ impl Response {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Status {
     pub app: String,
     #[serde(default)]
@@ -120,6 +129,10 @@ pub struct Status {
     /// systemd unit running this supervisor (`warden@api.service`), if any.
     #[serde(default)]
     pub unit: Option<String>,
+    /// How this supervisor was started: `systemd`, `background` (`warden
+    /// start` or `wardend`: `wardend` restarts it if it dies) or `terminal`.
+    #[serde(default)]
+    pub launched: String,
     /// `warden stop`: workers stopped on request, supervisor idle.
     #[serde(default)]
     pub stopped: bool,
@@ -151,7 +164,7 @@ pub struct Status {
     pub workers: Vec<WorkerStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RolloutStatus {
     pub seq: u64,
     pub kind: String,
@@ -161,7 +174,7 @@ pub struct RolloutStatus {
     pub elapsed_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RolloutOutcome {
     pub seq: u64,
     pub kind: String,
@@ -170,7 +183,7 @@ pub struct RolloutOutcome {
     pub duration_secs: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HostStatus {
     pub pid: u32,
     pub uptime_secs: u64,
@@ -179,7 +192,7 @@ pub struct HostStatus {
     pub restarts: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerStatus {
     pub id: usize,
     pub state: String,
@@ -346,6 +359,11 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
                     Err(_) => return Ok(()),
                 }
             }
+        }
+        Request::Subscribe { .. } => {
+            // Implemented by the event stream work (docs/protocol.md); until
+            // then clients fall back to polling `status`.
+            reply(&mut w, &Response::err("subscribe is not supported by this Warden version")).await
         }
         Request::Flush => {
             crate::logging::clear();

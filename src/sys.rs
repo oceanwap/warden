@@ -255,6 +255,28 @@ pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: 
     Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
 }
 
+/// pidfd_open(2): a descriptor that becomes readable when process `pid`
+/// exits, for watching a process that is not our child (`wardend` watching
+/// supervisors) without polling and without pid-reuse races. ENOSYS before
+/// Linux 5.3 (callers fall back to `kill(pid, 0)`), ESRCH if it is gone.
+#[allow(dead_code)] // used by wardend
+pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("pid {pid} out of range")));
+    };
+    if p <= 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("refusing pidfd_open({p})")));
+    }
+    // SAFETY: plain syscall on integers; no memory is passed.
+    let rc = unsafe { libc::syscall(libc::SYS_pidfd_open, p as libc::c_long, 0 as libc::c_long) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_open returned a new descriptor (close-on-exec by
+    // definition) that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
 /// pread that never waits for the disk: preadv2(RWF_NOWAIT) returns
 /// EAGAIN (`ErrorKind::WouldBlock`) when the data is not in the page cache,
 /// so a server can read cached files inline and hand the rest to a thread.
@@ -942,6 +964,46 @@ mod tests {
     }
 
     // --------------------------------------------------------------- send
+
+    /// Readable (the process exited) within `ms`?
+    fn readable_within(fd: &OwnedFd, ms: i32) -> bool {
+        let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one live pollfd, count 1.
+        let n = unsafe { libc::poll(&mut p, 1, ms) };
+        n == 1 && p.revents & libc::POLLIN != 0
+    }
+
+    #[test]
+    fn pidfd_signals_exit_of_a_process() {
+        let mut child = std::process::Command::new("sleep").arg("0.2").spawn().unwrap();
+        let fd = pidfd_open(child.id()).unwrap();
+        assert!(fd_flags(fd.as_raw_fd()).0, "pidfd must be close-on-exec");
+        assert!(!readable_within(&fd, 0), "readable while the process runs");
+        assert!(readable_within(&fd, 5000), "not readable after the process exited");
+        child.wait().unwrap();
+        // Refused and failing targets are errors, never a descriptor.
+        assert_eq!(pidfd_open(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(pidfd_open(u32::MAX).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let reaped = child.id();
+        // (Ok is legal too: the pid may already belong to another process.)
+        if let Err(e) = pidfd_open(reaped) {
+            assert_eq!(e.raw_os_error(), Some(libc::ESRCH));
+        }
+        run_isolated("pidfd_leak_probe");
+    }
+
+    #[test]
+    fn pidfd_leak_probe() {
+        if !in_probe() {
+            return;
+        }
+        let before = open_fds();
+        for _ in 0..1000 {
+            drop(pidfd_open(std::process::id()).unwrap());
+            assert!(pidfd_open(0).is_err());
+        }
+        assert_eq!(open_fds(), before, "pidfd_open leaks descriptors");
+    }
 
     #[test]
     fn send_with_more_delivers_everything_in_order() {

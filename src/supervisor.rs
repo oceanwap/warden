@@ -1276,7 +1276,7 @@ impl Supervisor {
                 }
             }
             Request::Scale { count } => self.scale(count),
-            Request::Logs { .. } | Request::LogLevel { .. } | Request::Flush => {
+            Request::Logs { .. } | Request::LogLevel { .. } | Request::Flush | Request::Subscribe { .. } => {
                 Response::err("internal: this request is answered by the control socket")
             }
         }
@@ -1525,6 +1525,7 @@ impl Supervisor {
             namespace: self.cfg.app.namespace.clone().unwrap_or_else(|| "default".into()),
             mode: mode_name(self.cfg.workers.mode).into(),
             config_path: self.cfg_path.as_ref().map(|p| p.display().to_string()),
+            launched: launched_by(),
             unit: systemd::own_unit(),
             stopped: self.stopped,
             log_file: crate::logging::file_path().map(|p| p.display().to_string()),
@@ -1551,6 +1552,17 @@ impl Supervisor {
             last_rollout: self.last_rollout.clone(),
             workers,
         }
+    }
+}
+
+/// `systemd`, `background` or `terminal` (see `Status.launched`).
+fn launched_by() -> String {
+    if systemd::own_unit().is_some() {
+        "systemd".into()
+    } else if std::env::var_os(crate::events::LAUNCH_ENV).is_some_and(|v| v == "background") {
+        "background".into()
+    } else {
+        "terminal".into()
     }
 }
 

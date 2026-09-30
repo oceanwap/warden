@@ -1175,6 +1175,7 @@ fn spawn_background(name: &str, cfg: &Path) -> Result<std::process::Child, Strin
         .arg(&cfg)
         .env("WARDEN_LOG_FILE", &log)
         .env("WARDEN_LOG_STDOUT", "0")
+        .env(crate::events::LAUNCH_ENV, "background")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(err);
