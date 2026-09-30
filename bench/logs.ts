@@ -176,7 +176,7 @@ const steady = results.filter((r) => r.mode === "steady");
 const flood = results.filter((r) => r.mode === "flood");
 console.log(
   [
-    `**log capture**: ${meta.cpus} CPUs (${meta.cpu_model}), node ${meta.node}, pm2 ${meta.pm2}, ${meta.warden}`,
+    `node ${meta.node} · pm2 ${meta.pm2} · ${meta.warden}`,
     "",
     `Steady: ${WORKERS} workers × ${RATE} lines/s × ${SECONDS} s`,
     "",

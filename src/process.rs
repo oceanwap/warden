@@ -136,7 +136,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             let _ = ctl.send((libc::SIGKILL, true));
         }
     };
-    if let Some(out) = child.stdout.take() {
+    if let Some(out) = child.stdout.take().and_then(|o| output_receiver(o.into_owned_fd(), &label, "stdout")) {
         let on_fail = reader_failed("stdout", ctl_tx.clone(), label.clone());
         let fut = pump_output(out, label.clone(), "stdout", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
@@ -145,7 +145,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             }
         });
     }
-    if let Some(err) = child.stderr.take() {
+    if let Some(err) = child.stderr.take().and_then(|e| output_receiver(e.into_owned_fd(), &label, "stderr")) {
         let on_fail = reader_failed("stderr", ctl_tx.clone(), label.clone());
         let fut = pump_output(err, label.clone(), "stderr", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
@@ -234,6 +234,29 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     Ok(Handle { pid, ctl: ctl_tx })
 }
 
+/// A worker's stdout/stderr pipe as a non-blocking receiver. If that fails
+/// (it can't for a pipe we created), the pipe is closed: the worker gets
+/// EPIPE on output instead of blocking forever on a pipe nobody reads.
+fn output_receiver(
+    fd: std::io::Result<OwnedFd>,
+    label: &str,
+    stream: &str,
+) -> Option<tokio::net::unix::pipe::Receiver> {
+    match fd.and_then(tokio::net::unix::pipe::Receiver::from_owned_fd) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            crate::error!(
+                "cannot read the worker's output; it is discarded",
+                worker = label,
+                stream = stream,
+                error = e,
+                hint = "this is a Warden bug: please report it",
+            );
+            None
+        }
+    }
+}
+
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     crate::sys::pipe_cloexec()
 }
@@ -302,29 +325,49 @@ impl RateLimit {
     }
 }
 
+thread_local! {
+    /// One read buffer for every output reader on this thread: readers
+    /// borrow it only between `readable()` and the end of the synchronous
+    /// read-and-split (never across an await), so 16 workers × stdout and
+    /// stderr share 64 KB instead of holding 2 MB.
+    static READ_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; READ_CHUNK]);
+}
+
 /// Forward a child stream line by line to the log, capping line length and rate.
-async fn pump_output<R: tokio::io::AsyncRead + Unpin>(mut r: R, label: String, stream: &'static str, limit: u32) {
+async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream: &'static str, limit: u32) {
     crate::guard::fault(stream);
-    // On the heap: a 64 KB array would make every reader task's future 64 KB.
-    let mut chunk = vec![0u8; READ_CHUNK];
-    let mut line: Vec<u8> = Vec::with_capacity(256);
+    let mut line: Vec<u8> = Vec::new();
     let mut rate = RateLimit::new(if limit == 0 { u32::MAX } else { limit });
     loop {
-        let n = match r.read(&mut chunk).await {
+        if let Err(e) = rx.readable().await {
+            crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
+            break;
+        }
+        // Everything this read produced goes to the log as one batch.
+        let mut batch = crate::logging::OutputBatch::new(&label, stream);
+        let read = READ_BUF.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let n = rx.try_read(&mut buf)?;
+            split_lines(&buf[..n], &mut line, &mut |l: &mut Vec<u8>| keep(&mut batch, l, &mut rate));
+            Ok::<usize, std::io::Error>(n)
+        });
+        match read {
             Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
                 break;
             }
-            Ok(n) => n,
-        };
-        // Everything this read produced goes to the log as one batch.
-        let mut batch = crate::logging::OutputBatch::new(&label, stream);
-        split_lines(&chunk[..n], &mut line, &mut |l: &mut Vec<u8>| keep(&mut batch, l, &mut rate));
+        }
         if limit == 0 {
             crate::logging::room_for(batch.len(), batch.bytes(), KEEP_ALL_MAX_WAIT).await;
         }
         crate::logging::worker_output_batch(batch);
+        if line.capacity() > 4 * MAX_LINE {
+            line.shrink_to(MAX_LINE); // after an unusually long partial line
+        }
         if let Some(n) = rate.report() {
             crate::warn!(
                 "worker writes too much output; lines dropped",

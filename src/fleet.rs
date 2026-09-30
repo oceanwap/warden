@@ -33,6 +33,9 @@ pub struct Ctx {
     pub apps: Vec<App>,
     /// `-c` / `--socket` / `$WARDEN_CONFIG`: one app, as in single-app use.
     pub single: bool,
+    /// `--no-wait`: `start` returns once the supervisor answers, without
+    /// waiting for the workers to be ready.
+    pub no_wait: bool,
 }
 
 // ------------------------------------------------------------------ places
@@ -160,17 +163,17 @@ pub fn context(args: &Args) -> Ctx {
             problem: None,
         });
         app.socket = sock.clone();
-        return Ctx { apps: vec![app], single: true };
+        return Ctx { apps: vec![app], single: true, no_wait: args.no_wait };
     }
     if let Some(c) = &args.config {
-        return Ctx { apps: vec![app_from_config(c)], single: true };
+        return Ctx { apps: vec![app_from_config(c)], single: true, no_wait: args.no_wait };
     }
     let apps = discover();
     let local = Path::new("warden.toml");
     if apps.is_empty() && local.is_file() {
-        return Ctx { apps: vec![app_from_config(local)], single: true };
+        return Ctx { apps: vec![app_from_config(local)], single: true, no_wait: args.no_wait };
     }
-    Ctx { apps, single: false }
+    Ctx { apps, single: false, no_wait: args.no_wait }
 }
 
 // ------------------------------------------------------------------ targets
@@ -1045,7 +1048,7 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         return match call_with(app, &Request::Start, REQUEST_TIMEOUT).await {
             Ok(r) if r.ok => {
                 println!("{prefix}{}", r.message.unwrap_or_default());
-                wait_ready(app, Duration::from_secs(30)).await
+                ready_or_not(ctx, app, Duration::from_secs(30)).await
             }
             Ok(r) => {
                 eprintln!("warden: {prefix}{}", r.message.unwrap_or_default());
@@ -1065,14 +1068,13 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         eprintln!("warden: {prefix}not running and no config file is known for it");
         return 2;
     };
-    let _ = ctx;
     if let Some(unit) = systemd_unit_for(app) {
         if let Err(e) = run_systemctl(&["start", &unit]) {
             eprintln!("warden: {prefix}{e}\n  see `journalctl -u {unit} -n 50`");
             return 1;
         }
         println!("{prefix}started {unit}");
-        return wait_ready(app, Duration::from_secs(60)).await;
+        return ready_or_not(ctx, app, Duration::from_secs(60)).await;
     }
     match spawn_background(&app.name, &cfg) {
         Ok(mut child) => {
@@ -1089,7 +1091,7 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
                     return 1;
                 }
                 if reachable(app) {
-                    return wait_ready(app, Duration::from_secs(60)).await;
+                    return ready_or_not(ctx, app, Duration::from_secs(60)).await;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1104,6 +1106,16 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
             1
         }
     }
+}
+
+/// `wait_ready`, unless `--no-wait` asked to return as soon as the supervisor
+/// answers (starting many apps at once; `warden list` shows how they came up).
+async fn ready_or_not(ctx: &Ctx, app: &App, limit: Duration) -> i32 {
+    if ctx.no_wait {
+        println!("{}: starting (not waiting for readiness: `warden list` shows it)", app.name);
+        return 0;
+    }
+    wait_ready(app, limit).await
 }
 
 /// Wait until every worker is ready (or the app is stopped), then print one line.
@@ -1731,7 +1743,11 @@ mod tests {
     }
 
     fn ctx() -> Ctx {
-        Ctx { apps: vec![app("api", "backend"), app("web", "backend"), app("queue", "default")], single: false }
+        Ctx {
+            apps: vec![app("api", "backend"), app("web", "backend"), app("queue", "default")],
+            single: false,
+            no_wait: false,
+        }
     }
 
     #[test]
@@ -1752,7 +1768,7 @@ mod tests {
 
     #[test]
     fn single_app_targets() {
-        let c = Ctx { apps: vec![app("api", "default")], single: true };
+        let c = Ctx { apps: vec![app("api", "default")], single: true, no_wait: false };
         let one = |t: Option<&str>| resolve(&c, t, true).map(|v| v[0].worker);
         assert_eq!(one(None), Ok(None));
         assert_eq!(one(Some("2")), Ok(Some(2)));

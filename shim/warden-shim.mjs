@@ -23,9 +23,15 @@
 //     new connections.
 
 import fs from "node:fs";
-import net from "node:net";
-import http from "node:http";
+import { createRequire } from "node:module";
 import { isMainThread } from "node:worker_threads";
+
+// node:http and node:net are loaded only when the app uses them: in Bun,
+// importing node:http costs ~6 MB per worker, wasted on a Bun.serve app.
+// By the time the shim needs them, the app has loaded them (free).
+const require = createRequire(import.meta.url);
+let httpModule = null;
+const http = () => (httpModule ??= require("node:http"));
 
 const env = process.env;
 const isBun = typeof Bun !== "undefined";
@@ -63,6 +69,9 @@ let appHandlerNoPromise = false;
 // Node: requests in flight, and every open connection with its state.
 let nodeInflight = 0;
 const nodeConns = new Set();
+// The app has a node:http server (Bun: one went through Bun.serve), so
+// node:http is loaded and its responses need `Connection: close` in a drain.
+let appUsesNodeHttp = false;
 
 function report(msg) {
   msg.worker = workerId;
@@ -112,6 +121,7 @@ function wardenServe(options, ...rest) {
     }
     opts = o;
   }
+  if (options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function") appUsesNodeHttp = true;
   const server = originalServe.call(this, opts, ...rest);
   servers.add(server);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
@@ -171,10 +181,15 @@ function withReusePort(args) {
   return args;
 }
 
+// An http(s).Server, told apart without loading node:http for a plain TCP
+// server: every http.Server has `maxHeadersCount` (null by default).
+const isHttpServer = (server) => "maxHeadersCount" in server && typeof server.setTimeout === "function";
+
 function trackNodeServer(server) {
   if (servers.has(server)) return;
   servers.add(server);
-  if (server instanceof http.Server) {
+  if (isHttpServer(server)) {
+    appUsesNodeHttp = true;
     server.on("connection", (sock) => {
       sock.__warden = { served: false, busy: false };
       nodeConns.add(sock);
@@ -203,7 +218,7 @@ function trackNodeServer(server) {
     if (!addr || typeof addr !== "object") return; // a Unix socket
     const isApp = appPort == null || addr.port === appPort;
     if (!isApp) return;
-    if (!privateServer && server instanceof http.Server) {
+    if (!privateServer && isHttpServer(server)) {
       openPrivateNode(server, (socket) =>
         report(socket ? { ev: "listening", port: addr.port, socket } : { ev: "listening", port: addr.port }),
       );
@@ -218,7 +233,7 @@ function openPrivateNode(appServer, done) {
   if (!path) return done(null);
   try {
     fs.rmSync(path, { force: true });
-    const p = http.createServer((req, res) => appServer.emit("request", req, res));
+    const p = http().createServer((req, res) => appServer.emit("request", req, res));
     privateServer = p;
     p.once("error", () => done(null));
     p.listen(path, () => {
@@ -231,6 +246,7 @@ function openPrivateNode(appServer, done) {
 }
 
 if (!isBun) {
+  const net = require("node:net");
   const origListen = net.Server.prototype.listen;
   net.Server.prototype.listen = function (...args) {
     if (this !== privateServer) {
@@ -283,9 +299,12 @@ function pending() {
 
 async function markNodeResponsesClose() {
   // node:http responses (Bun's node:http included) don't go through a fetch
-  // handler; add the header there.
+  // handler; add the header there. Nothing to do if the app has no
+  // node:http server.
+  if (!appUsesNodeHttp) return;
   try {
-    const proto = http.ServerResponse && http.ServerResponse.prototype;
+    const mod = http();
+    const proto = mod.ServerResponse && mod.ServerResponse.prototype;
     if (!proto || proto.__wardenPatched) return;
     const set = (res) => {
       try {

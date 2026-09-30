@@ -413,7 +413,9 @@ impl Supervisor {
         add("WARDEN_WORKER_COUNT", self.count.to_string());
         add("WARDEN_DRAIN_MS", self.cfg.shutdown.drain_ms.to_string());
         add("WARDEN_INSTANCE", inst_id.to_string());
-        add("WARDEN_HEALTH_DIR", self.runtime_dir.display().to_string());
+        if self.cfg.private_sockets() {
+            add("WARDEN_HEALTH_DIR", self.runtime_dir.display().to_string());
+        }
         add("WARDEN_STOP_SIGNAL", crate::signals::name(self.cfg.stop_signal()));
         if self.cfg.workers.wait_ready {
             add("WARDEN_WAIT_READY", "1".into());

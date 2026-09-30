@@ -61,6 +61,18 @@ export function rss(pid: number): number {
   }
 }
 
+/** Proportional set size: shared pages (the same binary or libraries in
+ *  several processes) split between the processes that map them. The fair
+ *  "memory used" for a group of processes; RSS counts shared pages in each. */
+export function pss(pid: number): number {
+  try {
+    const m = readFileSync(`/proc/${pid}/smaps_rollup`, "utf8").match(/^Pss:\s+(\d+) kB/m);
+    return m ? Number(m[1]) * 1024 : 0;
+  } catch {
+    return 0;
+  }
+}
+
 export function cpuSeconds(pid: number): number {
   try {
     const s = readFileSync(`/proc/${pid}/stat`, "utf8");

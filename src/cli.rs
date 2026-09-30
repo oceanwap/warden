@@ -65,7 +65,8 @@ OPTIONS:
                           $WARDEN_HOME, /etc/warden (root) or ~/.config/warden]
     -s, --socket <PATH>   One app's control socket
         --json            JSON output for list / status / describe
-        --no-wait         Return as soon as a reload/restart has started
+        --no-wait         Return as soon as a start/reload/restart has begun, without
+                          waiting for workers to be ready
     -h, --help            Show this help
 
 START OPTIONS (a script, a program or a command line, as with PM2):

@@ -19,7 +19,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import {
   BIN, TMP, WARDEN, baseEnv, childrenOf, listenersOnPort, machine, mb, oha, parseArgs, pkgVersion,
-  rss, saveResults, sleep, sum, table, uniq, version, waitFor, type LoadResult,
+  pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor, type LoadResult,
 } from "./lib.ts";
 
 const args = parseArgs();
@@ -206,6 +206,7 @@ async function runScenario(name: string) {
     }
     await sleep(1000);
     const idle_mb = mb(sum(run.pids(), rss));
+    const idle_pss_mb = mb(sum(run.pids(), pss));
     const manager_mb = mb(sum(run.managerPids(), rss));
     const loads: Record<string, LoadResult> = {};
     for (const path of Object.keys(FILES)) {
@@ -215,7 +216,8 @@ async function runScenario(name: string) {
     }
     loads["/index.html (new connection each)"] = oha(`http://127.0.0.1:${PORT}/index.html`, DURATION, CONNECTIONS, { keepalive: false });
     const loaded_mb = mb(sum(run.pids(), rss));
-    return { name, processes: uniq(run.pids()).length, startup_ms, idle_mb, loaded_mb, manager_mb, loads };
+    const loaded_pss_mb = mb(sum(run.pids(), pss));
+    return { name, processes: uniq(run.pids()).length, startup_ms, idle_mb, idle_pss_mb, loaded_mb, loaded_pss_mb, manager_mb, loads };
   } finally {
     await run.stop();
     await waitFor(() => listenersOnPort(PORT) === 0, 15_000).catch(() => {});
@@ -254,12 +256,12 @@ const out = saveResults("static", { meta, results });
 const paths = Object.keys(results[0]?.loads ?? {});
 console.log(
   [
-    `**static files**: ${WORKERS} workers, ${meta.cpus} CPUs (${meta.cpu_model}), nginx ${meta.nginx}, pm2 ${meta.pm2}, serve ${meta.serve}, node ${meta.node}, ${meta.warden}`,
+    `${WORKERS} workers · ${meta.nginx} · pm2 ${meta.pm2} · serve ${meta.serve} · node ${meta.node} · ${meta.warden}`,
     "",
     table(results, (r) => (r.name === "serve" ? "serve (1 process)" : r.name), [
       ["processes", (r) => r.processes],
-      ["total RAM idle (MB)", (r) => r.idle_mb],
-      ["total RAM after load (MB)", (r) => r.loaded_mb],
+      ["total RAM idle: RSS / PSS (MB)", (r) => `${r.idle_mb} / ${r.idle_pss_mb}`],
+      ["total RAM after load: RSS / PSS (MB)", (r) => `${r.loaded_mb} / ${r.loaded_pss_mb}`],
       ["startup (ms)", (r) => r.startup_ms],
       ...paths.flatMap((p): [string, (r: any) => string | number][] => [
         [`${p} req/s`, (r) => r.loads[p].rps],

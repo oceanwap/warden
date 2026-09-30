@@ -230,6 +230,14 @@ fn process_mode_lifecycle() {
     let s = w.wait_for("3 ready workers", T, ready(3));
     let pids: HashSet<u64> = Warden::pids(&s).into_iter().collect();
     assert_eq!(pids.len(), 3);
+    // No health path: workers open no private health socket (it would cost
+    // each worker a second server).
+    let socks: Vec<String> = std::fs::read_dir(&w.dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+        .filter(|n| n.contains(".h") && n.ends_with(".sock"))
+        .collect();
+    assert!(socks.is_empty(), "unexpected health sockets: {socks:?}");
 
     // The kernel spreads fresh connections over every worker.
     let mut seen = HashSet::new();

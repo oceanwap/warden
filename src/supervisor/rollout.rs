@@ -595,7 +595,7 @@ impl Supervisor {
         let path = self.cfg.ready_path().unwrap_or_else(|| "/".into());
         let timeout = Duration::from_secs(self.cfg.health.timeout);
         let url = crate::health::parse_url(&self.cfg.health.url).ok();
-        let expected = if self.cfg.health_sockets() { self.expected_listeners() } else { 0 };
+        let expected = if self.cfg.private_sockets() { self.expected_listeners() } else { 0 };
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
             let check = async move {

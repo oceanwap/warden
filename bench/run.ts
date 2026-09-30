@@ -27,7 +27,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync
 import { join } from "node:path";
 import {
   BIN, ROOT, SHIM, TMP, WARDEN, baseEnv, cpuSeconds, listenersOnPort, machine, mb, oha as ohaRaw,
-  parseArgs, pkgVersion, rss, saveResults, sleep, sum, table, uniq, version, waitFor,
+  parseArgs, pkgVersion, pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor,
 } from "./lib.ts";
 
 const args = parseArgs();
@@ -338,7 +338,7 @@ async function runScenario(name: string) {
   const appPids = await run.appPids();
   const mgrPids = await run.managerPids();
   const all = uniq([...appPids, ...mgrPids]);
-  const idle = { total_rss_mb: mb(sum(all, rss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
+  const idle = { total_rss_mb: mb(sum(all, rss)), total_pss_mb: mb(sum(all, pss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
 
   const endpoints: Record<string, any> = {};
   for (const path of PATHS) {
@@ -347,7 +347,7 @@ async function runScenario(name: string) {
     const r = oha(path, DURATION);
     endpoints[path] = { ...r, cpu_s: +(sum(all, cpuSeconds) - a0).toFixed(2) };
   }
-  const loaded = { total_rss_mb: mb(sum(all, rss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
+  const loaded = { total_rss_mb: mb(sum(all, rss)), total_pss_mb: mb(sum(all, pss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
 
   // Manager idle CPU over 5 s (for Watt the manager is the whole process).
   const m1 = sum(mgrPids, cpuSeconds);
@@ -457,11 +457,11 @@ for (const s of SCENARIOS) {
 const out = saveResults(APP, { meta, results });
 
 const lines = [
-  `**${APP}**: ${WORKERS} workers, ${meta.cpus} CPUs (${meta.cpu_model}), bun ${meta.bun}, node ${meta.node}, pm2 ${meta.pm2}, wattpm ${meta.wattpm}, ${meta.warden}`,
+  `${WORKERS} workers · bun ${meta.bun} · node ${meta.node} · pm2 ${meta.pm2} · wattpm ${meta.wattpm} · ${meta.warden}`,
   "",
   table(results, (r) => r.name, [
-    ["total RAM idle (MB)", (r) => r.idle.total_rss_mb],
-    ["total RAM after load (MB)", (r) => r.loaded.total_rss_mb],
+    ["total RAM idle: RSS / PSS (MB)", (r) => `${r.idle.total_rss_mb} / ${r.idle.total_pss_mb}`],
+    ["total RAM after load: RSS / PSS (MB)", (r) => `${r.loaded.total_rss_mb} / ${r.loaded.total_pss_mb}`],
     ["manager RAM (MB)", (r) => (r.name === "watt" ? "(in total)" : r.loaded.manager_rss_mb)],
     ["manager idle CPU (%)", (r) => r.manager_idle_cpu_pct],
     [`startup to ${WORKERS} serving (ms)`, (r) => r.startup_ms],

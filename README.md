@@ -13,7 +13,7 @@ systemd → warden  (spawn · watch · restart · drain · gate · report)
 
 It replaces "4 systemd units / PM2 + an nginx upstream list" with one service,
 one config file and one port. It is inspired by [Platformatic Watt](https://github.com/platformatic/platformatic)'s
-worker model, but it is a single 1.5 MB binary that embeds no JavaScript runtime.
+worker model, but it is a single ~3 MB binary that embeds no JavaScript runtime.
 
 - **Process mode** (default, production): N Bun processes. One crash affects one worker.
 - **Worker mode** (experimental): one Bun process running N `Worker` threads, about half the memory.
@@ -182,29 +182,38 @@ owns it, it is not a symlink, and no other user can write to it.
   added). Use `journalctl -u warden@api`.
 - Metrics: set `[metrics] listen = "127.0.0.1:9464"` to get Prometheus text at `/metrics`.
 
-## Benchmarks (summary)
+## Benchmarks
 
-2 vCPU container with the load generator on the same cores; full tables in
-[`docs/benchmarks.md`](docs/benchmarks.md).
+The same apps under PM2, Platformatic Watt, nginx, `serve` and Warden, on one
+machine. Everything in the tables below is produced by one command, and anyone
+can re-run it:
 
-| 4 workers | bare Bun ×4 | PM2 | Warden process | Warden worker |
-|---|---|---|---|---|
-| NestJS app RSS idle | 334 MB | 340 MB | 338 MB | **174 MB** |
-| NestJS /json req/s | 28.0k | 26.7k | 28.7k | 26.9k |
-| NestJS /plaintext p99 | 12.3 ms | 13.4 ms | 11.6 ms | 18.2 ms |
-| Supervisor RSS | – | 65 MB | 4 MB | 4 MB |
-| One worker SIGKILLed | stays down | back in 375 ms | back in 433 ms | **all 4 down**, 906 ms |
+```sh
+cargo xtask bench            # all suites (~25 min on 2 CPUs); rewrites the tables below
+cargo xtask bench --quick    # a 5-minute smoke test
+```
 
-Throughput is the same across modes. Worker mode halves memory but costs fault
-isolation and, for NestJS, p99 latency. **Use process mode in production.**
+What each suite does, what each number means and the fairness rules are in
+[`bench/README.md`](bench/README.md); findings, caveats and the before/after
+log of every optimisation are in [`docs/benchmarks.md`](docs/benchmarks.md).
+The machine is small (2 CPUs shared with the load generator), so compare
+columns, not absolute numbers.
+
+<!-- bench:start -->
+<!-- bench:end -->
 
 ## Development
 
 ```sh
-cargo test                  # unit + integration tests (integration tests need `bun` on PATH)
+cargo test                  # unit + integration tests (integration tests need `bun` and `node` on PATH)
 cargo clippy --all-targets
-bun bench/run.ts            # benchmark harness (needs oha, bench/node_modules)
+cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
 ```
+
+All `unsafe` code is in [`src/sys.rs`](src/sys.rs): system calls the standard
+library doesn't expose, and the few that measurably pay on a hot path (the
+static server and log capture), each with a SAFETY note and tests. The rest
+of the crate is `#![deny(unsafe_code)]`.
 
 Layout: `src/supervisor.rs` (event loop), `src/supervisor/rollout.rs` (gates,
 canary, rollback), `src/supervisor/upkeep.rs` (watchdog, recycling),
@@ -216,9 +225,14 @@ Limitations:
 - Linux is authoritative. macOS works for development, but has no `/proc`
   readiness or per-connection balancing.
 - Worker mode needs Bun and the shim.
-- Node apps must pass `reusePort: true` themselves (Node ≥ 22.12) or use
-  `port_strategy = "offset"`, and they get app-level health checks (`health.url`) only.
+- Node apps share the port through Warden's shim (`--import`, Node ≥ 22.12
+  for `reusePort`); older Node needs `port_strategy = "offset"`.
 - If Warden is SIGKILLed, workers are signalled via `PR_SET_PDEATHSIG` (direct
   children only). Under systemd the cgroup takes care of the rest.
 - Don't run Warden as PID 1 in a container; use `tini`, or `docker run --init`, to reap orphans.
-- Logging writes to stdout synchronously. A stalled log consumer slows supervision.
+- A log consumer that can't keep up (a stuck journald, a full disk) costs
+  log lines, never supervision: lines past the queue bounds are dropped,
+  reported in the log and counted (`log_lines_dropped` in `status --json`,
+  `warden_log_lines_dropped_total` in the metrics). With
+  `[logging] max_lines_per_sec = 0` Warden keeps every line by slowing a
+  flooding app down instead (for at most a second per read).

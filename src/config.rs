@@ -843,6 +843,14 @@ impl Config {
         self.live_path().is_some() || self.ready_path().is_some()
     }
 
+    /// Workers open a private health socket only when something uses it: a
+    /// per-worker health path, or a verify_command (it gets the socket as
+    /// WARDEN_WORKER_SOCKET). A second server per worker costs memory
+    /// (measured: ~6 MB per Bun worker), so none without a reason.
+    pub fn private_sockets(&self) -> bool {
+        self.health_sockets() && (self.any_worker_path() || self.reload.verify_command.is_some())
+    }
+
     pub fn socket_path(&self) -> PathBuf {
         match &self.control.socket {
             Some(p) => p.clone(),
@@ -1013,6 +1021,20 @@ mod tests {
         assert!(Config::parse(&format!("{MIN}[health]\nenabled = true\n")).is_err());
         assert!(Config::parse(&format!("{MIN}[health]\npath = \"health\"\n")).is_err());
         assert!(Config::parse(&format!("{MIN}[reload]\nverify_command = \" \"\n")).is_err());
+    }
+
+    #[test]
+    fn private_sockets_only_when_something_uses_them() {
+        let c = Config::parse(MIN).unwrap();
+        assert!(c.health_sockets() && !c.private_sockets(), "no health path, no verify_command: no socket");
+        let c = Config::parse(&format!("{MIN}[health]\npath = \"/health\"\n")).unwrap();
+        assert!(c.private_sockets());
+        let c = Config::parse(&format!("{MIN}[health]\nenabled = true\nurl = \"http://127.0.0.1:3000/hz\"\n")).unwrap();
+        assert!(c.private_sockets(), "an app-level URL's path is checked per worker too");
+        let c =
+            Config::parse(&format!("{MIN}[reload]\nverify_command = \"curl --unix-socket $WARDEN_WORKER_SOCKET x\"\n"))
+                .unwrap();
+        assert!(c.private_sockets(), "verify_command gets WARDEN_WORKER_SOCKET");
     }
 
     #[test]

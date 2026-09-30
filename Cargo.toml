@@ -5,6 +5,11 @@ edition = "2024"
 description = "A small, boring supervisor for Bun/Node HTTP workers: SO_REUSEPORT, graceful drain, rolling reload."
 rust-version = "1.85"
 
+[workspace]
+# xtask: `cargo xtask bench` (see .cargo/config.toml). Plain `cargo build`,
+# `cargo test` and `cargo install` in this directory still mean Warden only.
+members = ["xtask"]
+
 [dependencies]
 libc = "0.2.189"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
