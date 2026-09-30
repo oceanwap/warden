@@ -46,6 +46,7 @@ jobs:
         working-directory: bench
         run: npm ci --no-audit --no-fund
       - run: cargo fmt --check
+      - run: shellcheck install.sh
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --bin warden
       # The runner's own systemd service leaks INVOCATION_ID into every step,

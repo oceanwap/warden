@@ -131,6 +131,7 @@ mod tests {
         assert_eq!(parse_loadavg("0.52\n"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[cfg(target_os = "linux")] // /proc
     fn samples_this_host() {

@@ -1870,6 +1870,7 @@ mod tests {
         assert!(resolve(&c, Some("api:x"), true).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[cfg(target_os = "linux")] // /proc
     fn origin_is_read_from_proc() {

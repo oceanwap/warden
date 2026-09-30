@@ -37,6 +37,30 @@ are in [`docs/architecture.md`](docs/architecture.md) (findings F1–F14) and
 - **Health checks through a shared port hit a random worker.** The shim gives
   each worker a private Unix socket, so Warden can check *that* worker.
 
+## Install
+
+Every release on [GitHub Releases](https://github.com/oceanwap/warden/releases)
+has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
+
+- **CLI only**: `warden-<version>-<os>-<arch>.tar.gz` with the `warden`
+  binary, this README and `contrib/` (systemd units, sysctl file). The Linux
+  binaries need glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10+).
+- **GUI + CLI**: `warden-gui-<version>-<os>-<arch>` (`.tar.gz` on Linux, a
+  zipped `Warden.app` on macOS), once the GUI ships.
+
+`install.sh` installs the CLI: it picks the archive for your OS and CPU,
+checks it against the release's `SHA256SUMS`, and puts `warden` in
+`/usr/local/bin` (as root) or `~/.local/bin`:
+
+```sh
+curl -fsSLO https://github.com/oceanwap/warden/releases/latest/download/install.sh
+sh install.sh                        # or: WARDEN_VERSION=0.1.0 sh install.sh
+```
+
+By hand: download the archive and `SHA256SUMS`, check that
+`sha256sum <archive>` (macOS: `shasum -a 256 <archive>`) prints the hash on
+the archive's line in `SHA256SUMS`, then copy `warden` onto your PATH.
+
 ## Quick start
 
 ```sh
