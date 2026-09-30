@@ -113,6 +113,24 @@ Requests are `events::DaemonRequest`, tagged by `cmd`; replies are one
 | `{"cmd":"app","app":"api","request":{"cmd":"reload","safe":true}}` | forwards any app request and returns its `control::Response` in `response` (`logs` streams lines) |
 | `{"cmd":"shutdown"}` | `wardend` exits; every app keeps running |
 
+On `wardend`'s `subscribe` stream:
+
+- Supervisors' event lines are forwarded as they were sent, except their
+  `hello` and `bye`: `wardend` reports those as `supervisor` events (`found`,
+  `exited`), so the only `hello` and `bye` on this stream are its own (no
+  `app`).
+- `apps` filters the events about an app; `apps` and `host` events always
+  go out.
+- Supervisors report a status every second: a longer `interval_ms` thins
+  `status` and `host` events out for that client, a shorter one does not
+  make them more frequent.
+- `lagged` without `app`: this client fell behind. With `app`: `wardend`
+  fell behind that supervisor's stream.
+- A supervisor that refuses `subscribe` is polled: its `status` events still
+  come, but no `worker`, `rollout` or `log` events and no `bye`. Its exit
+  then counts as on purpose when it removed its control socket (a crashed
+  supervisor leaves the socket behind).
+
 ### `AppEntry`
 
 `name`, `namespace`, `config`, `socket`, `state` (`running`, `stopped`,
@@ -144,9 +162,15 @@ else would:
   stops them (parent-death signal). `wardend` logs `unresponsive` with the
   pid and how to get a stack (`gdb -p` / `cat /proc/<pid>/stack`).
 - **`wardend` itself** runs under systemd (`contrib/wardend.service`,
-  `Restart=always`) or detached (`warden daemon --background`). When it
-  starts it finds every running supervisor (`found`); nothing is lost
-  across its restarts because it holds no state an app needs.
+  `Restart=always`, `KillMode=process`) or detached (`warden daemon
+  --background`; `warden start` does this when it launches a supervisor in
+  the background, unless `WARDEN_NO_DAEMON=1`, and `warden kill` stops it
+  after the apps). When it starts it finds every running supervisor
+  (`found`); nothing is lost across its restarts because it holds no state
+  an app needs. A supervisor it restarts is started as `warden start`
+  started it: the same environment and working directory (read from
+  `/proc/<pid>` when `wardend` found it), never `wardend`'s own, and without
+  systemd's variables (`INVOCATION_ID`, ...).
 
 ## Clients
 

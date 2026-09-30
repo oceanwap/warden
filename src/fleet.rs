@@ -1,10 +1,12 @@
 //! Many apps on one host, PM2-style (`warden list`, `warden restart api`).
 //!
-//! There is no daemon: each app has its own supervisor (run by systemd as
-//! `warden@<app>`, or started in the background by `warden start`). The CLI
-//! finds apps through their configs in the config directory and their
-//! control sockets in the runtime directory, and talks to each one directly.
-//! Nothing here runs on the request path or is needed by a running app.
+//! Each app has its own supervisor (run by systemd as `warden@<app>`, or
+//! started in the background by `warden start`). The CLI finds apps through
+//! their configs in the config directory and their control sockets in the
+//! runtime directory, and talks to each one directly. The optional wardend
+//! (`src/daemon`) only restarts background supervisors that die and serves
+//! live events; nothing here depends on it, runs on the request path, or is
+//! needed by a running app.
 
 use crate::cli::{self, Action, Args, ScaleArg, StartOpts};
 use crate::config::{self, Config};
@@ -78,7 +80,8 @@ fn dump_path() -> PathBuf {
     state_dir().join("dump.json")
 }
 
-fn log_path(name: &str) -> PathBuf {
+/// A background supervisor's log file (`warden start` and wardend).
+pub(crate) fn log_path(name: &str) -> PathBuf {
     state_dir().join("logs").join(format!("{name}.log"))
 }
 
@@ -1080,6 +1083,8 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         Ok(mut child) => {
             let log = log_path(&app.name);
             println!("{prefix}supervisor started in the background (pid {}), log {}", child.id(), log.display());
+            // wardend restarts it if it dies (not needed under systemd).
+            crate::daemon::client::autostart().await;
             // Wait for the control socket, watching for an early exit.
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_secs(15) {
@@ -1157,41 +1162,149 @@ async fn wait_ready(app: &App, limit: Duration) -> i32 {
 }
 
 /// Run a supervisor detached from this terminal, logging to a rotated file.
-fn spawn_background(name: &str, cfg: &Path) -> Result<std::process::Child, String> {
+pub(crate) fn spawn_background(name: &str, cfg: &Path) -> Result<std::process::Child, String> {
+    spawn_background_as(name, cfg, None)
+}
+
+/// The environment and working directory a supervisor was started with.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Origin {
+    pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    pub cwd: Option<PathBuf>,
+}
+
+impl Origin {
+    /// Read from /proc: what `pid` was started with (same user, or root).
+    pub(crate) fn of(pid: u32) -> Option<Origin> {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+        let env: Vec<_> = raw
+            .split(|b| *b == 0)
+            .filter_map(|kv| {
+                let i = kv.iter().position(|b| *b == b'=')?;
+                let (k, v) = (std::ffi::OsStr::from_bytes(&kv[..i]), std::ffi::OsStr::from_bytes(&kv[i + 1..]));
+                Some((k.to_os_string(), v.to_os_string()))
+            })
+            .collect();
+        // A zombie shows an empty environment: better ours than none.
+        if env.is_empty() {
+            return None;
+        }
+        Some(Origin { env, cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok() })
+    }
+}
+
+/// `spawn_background`, but with `origin`'s environment and working
+/// directory instead of ours: wardend restarts a supervisor exactly as
+/// `warden start` started it (the same PATH to bun or node, the same
+/// variables), not with wardend's own.
+pub(crate) fn spawn_background_as(
+    name: &str,
+    cfg: &Path,
+    origin: Option<&Origin>,
+) -> Result<std::process::Child, String> {
+    let cfg = std::fs::canonicalize(cfg).unwrap_or_else(|_| cfg.to_path_buf());
+    let args = [std::ffi::OsStr::new("start"), std::ffi::OsStr::new("-c"), cfg.as_os_str()];
+    spawn_detached(&args, &log_path(name), Some((crate::events::LAUNCH_ENV, "background")), origin)
+        .map_err(|e| format!("starting the supervisor: {e}"))
+}
+
+/// `warden daemon` (wardend) in the background, logging to
+/// `<state dir>/logs/wardend.log`.
+pub(crate) fn spawn_daemon() -> Result<std::process::Child, String> {
+    spawn_detached(&[std::ffi::OsStr::new("daemon")], &crate::daemon::log_path(), None, None)
+}
+
+/// What systemd sets for the unit it runs. A process we start in the
+/// background is not that unit: with `INVOCATION_ID` it would report the
+/// unit as its own (and `warden kill` would stop the unit), with
+/// `JOURNAL_STREAM` it would log for journald into a file.
+const SYSTEMD_ENV: [&str; 8] = [
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+];
+
+/// This binary. After an in-place upgrade Linux reports the old inode as
+/// "<path> (deleted)"; the path itself now holds the new binary.
+fn own_exe() -> Result<PathBuf, String> {
+    let p = std::env::current_exe().map_err(|e| format!("cannot find the warden binary: {e}"))?;
+    Ok(match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    })
+}
+
+/// Run `warden <args>` in its own session (no terminal, own process
+/// group: Ctrl-C here or closing the shell does not reach it), stdout and
+/// stderr to `log`. No parent-death signal: it outlives us. With `origin`:
+/// its environment and working directory instead of ours.
+fn spawn_detached(
+    args: &[&std::ffi::OsStr],
+    log: &Path,
+    env: Option<(&str, &str)>,
+    origin: Option<&Origin>,
+) -> Result<std::process::Child, String> {
     use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| format!("cannot find the warden binary: {e}"))?;
-    let log = log_path(name);
+    let exe = own_exe()?;
     if let Some(d) = log.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
     }
     let err = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log)
+        .open(log)
         .map_err(|e| format!("opening {}: {e}", log.display()))?;
-    let cfg = std::fs::canonicalize(cfg).unwrap_or_else(|_| cfg.to_path_buf());
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["start", "-c"])
-        .arg(&cfg)
-        .env("WARDEN_LOG_FILE", &log)
+    if let Some(o) = origin {
+        cmd.env_clear().envs(o.env.iter().map(|(k, v)| (k, v)));
+        if let Some(cwd) = o.cwd.as_ref().filter(|d| d.is_dir()) {
+            cmd.current_dir(cwd);
+        }
+    }
+    cmd.args(args)
+        .env("WARDEN_LOG_FILE", log)
         .env("WARDEN_LOG_STDOUT", "0")
-        .env(crate::events::LAUNCH_ENV, "background")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(err);
+    for k in SYSTEMD_ENV {
+        cmd.env_remove(k);
+    }
+    if let Some((k, v)) = env {
+        cmd.env(k, v);
+    }
     // SAFETY: the closure only calls setsid (async-signal-safe): it detaches
     // from our terminal and process group, so Ctrl-C here or closing the
-    // shell does not reach the supervisor.
+    // shell does not reach the child.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(crate::sys::child_new_session);
     }
-    cmd.spawn().map_err(|e| format!("starting the supervisor: {e}"))
+    cmd.spawn().map_err(|e| e.to_string())
 }
 
-fn tail(path: &Path, n: usize) -> Vec<String> {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
+/// The last `n` lines of a file (read from its last 64 KB only).
+pub(crate) fn tail(path: &Path, n: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = len.saturating_sub(WINDOW);
+    let mut buf = Vec::new();
+    if f.seek(SeekFrom::Start(from)).is_err() || f.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if from > 0 && !lines.is_empty() {
+        lines.remove(0); // probably cut in the middle
+    }
     lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
 }
 
@@ -1432,8 +1545,11 @@ pub async fn delete(args: &Args, target: &str) -> i32 {
 
 pub async fn kill(args: &Args) -> i32 {
     let ctx = context(args);
+    // Everything (no target, or `all`): the apps, then wardend.
+    let everything = !ctx.single && args.target.as_deref().is_none_or(|t| t == "all");
     let sels = match resolve(&ctx, args.target.as_deref().or(Some("all")), false) {
         Ok(s) => s,
+        Err(_) if everything && ctx.apps.is_empty() => Vec::new(),
         Err(e) => {
             eprintln!("warden: {e}");
             return 2;
@@ -1442,7 +1558,7 @@ pub async fn kill(args: &Args) -> i32 {
     let running: Vec<&Sel> = sels.iter().filter(|s| s.app.socket.exists()).collect();
     if running.is_empty() {
         println!("no app is running");
-        return 0;
+        return if everything { stop_wardend().await } else { 0 };
     }
     if !args.yes && crate::sys::isatty(0) {
         let names: Vec<&str> = running.iter().map(|s| s.app.name.as_str()).collect();
@@ -1465,7 +1581,25 @@ pub async fn kill(args: &Args) -> i32 {
             }
         }
     }
+    if everything {
+        worst = worst.max(stop_wardend().await);
+    }
     worst
+}
+
+/// `warden kill` (everything): wardend goes last, once the apps are down.
+async fn stop_wardend() -> i32 {
+    match crate::daemon::client::stop_daemon().await {
+        Ok(Some(pid)) => {
+            println!("wardend: stopped (pid {pid})");
+            0
+        }
+        Ok(None) => 0,
+        Err(e) => {
+            eprintln!("warden: wardend: {e}");
+            1
+        }
+    }
 }
 
 // ------------------------------------------------------- save / resurrect
@@ -1770,6 +1904,26 @@ mod tests {
         assert!(resolve(&c, Some("nope"), true).unwrap_err().contains("no app or namespace"));
         assert!(resolve(&c, Some("backend:1"), true).unwrap_err().contains("needs an app"));
         assert!(resolve(&c, Some("api:x"), true).is_err());
+    }
+
+    #[test]
+    fn origin_is_read_from_proc() {
+        let me = Origin::of(std::process::id()).expect("our own environment");
+        let path = me.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
+        assert_eq!(path, std::env::var_os("PATH"));
+        assert_eq!(me.cwd, std::env::current_dir().ok());
+        assert_eq!(Origin::of(u32::MAX / 2), None, "no such process");
+    }
+
+    #[test]
+    fn tail_reads_the_last_lines() {
+        let f = std::env::temp_dir().join(format!("warden-tail-{}", std::process::id()));
+        let text: String = (0..20_000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&f, text).unwrap();
+        assert_eq!(tail(&f, 2), vec!["line 19998".to_string(), "line 19999".to_string()]);
+        assert_eq!(tail(&f, 100_000).len(), 64 * 1024 / 11, "only the last 64 KB, first partial line dropped");
+        let _ = std::fs::remove_file(&f);
+        assert!(tail(&f, 3).is_empty());
     }
 
     #[test]

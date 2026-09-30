@@ -8,6 +8,7 @@
 mod cli;
 mod config;
 mod control;
+mod daemon;
 mod doctor;
 mod events;
 mod fleet;
@@ -99,6 +100,13 @@ fn main() {
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
+        Command::Daemon(cli::DaemonCmd::Run { background: false }) => daemon::main(&rt),
+        Command::Daemon(cli::DaemonCmd::Run { background: true }) => rt.block_on(daemon::client::start_background()),
+        Command::Daemon(cli::DaemonCmd::Status) => rt.block_on(daemon::client::status(args.json)),
+        Command::Daemon(cli::DaemonCmd::Stop) => rt.block_on(daemon::client::stop()),
+        Command::Events { logs, interval_ms } => {
+            daemon::client::events(&rt, args.target.clone(), args.json, logs, interval_ms)
+        }
     };
     std::process::exit(code);
 }

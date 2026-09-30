@@ -1108,16 +1108,7 @@ impl Fleet {
     }
 
     fn cli(&self, args: &[&str]) -> (i32, String) {
-        let out = Command::new(BIN)
-            .args(args)
-            .env("WARDEN_HOME", &self.home)
-            .env("WARDEN_RUNTIME_DIR", self.home.join("run"))
-            .env_remove("WARDEN_CONFIG")
-            .current_dir(&self.home)
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-        (out.status.code().unwrap_or(-1), text)
+        self.cli_env(args, &[])
     }
 
     fn cli_env(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
@@ -1126,6 +1117,8 @@ impl Fleet {
             .env("WARDEN_HOME", &self.home)
             .env("WARDEN_RUNTIME_DIR", self.home.join("run"))
             .env_remove("WARDEN_CONFIG")
+            // No test leaves a wardend behind unless it asks for one.
+            .env("WARDEN_NO_DAEMON", "1")
             .envs(env.iter().copied())
             .current_dir(&self.home)
             .output()
@@ -1957,4 +1950,456 @@ fn serve_static_files() {
     let mode =
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(f.home.join("private.toml")).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o600, "config with credentials is owner-only");
+}
+
+// ---- wardend
+
+/// A wardend of one Fleet, run in the foreground as our child (stdout and
+/// stderr to `wardend.out` in the fleet's home). Dropping it stops it:
+/// SIGTERM, then SIGKILL.
+struct Wardend {
+    child: Child,
+    out: PathBuf,
+    sock: PathBuf,
+}
+
+impl Wardend {
+    fn start(f: &Fleet, env: &[(&str, &str)]) -> Wardend {
+        let out = f.home.join("wardend.out");
+        let file = std::fs::File::create(&out).unwrap();
+        let child = Command::new(BIN)
+            .arg("daemon")
+            .env("WARDEN_HOME", &f.home)
+            .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
+            .env_remove("WARDEN_CONFIG")
+            .envs(env.iter().copied())
+            .current_dir(&f.home)
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        let w = Wardend { child, out, sock: f.home.join("run/wardend.sock") };
+        let t0 = Instant::now();
+        while w.try_request(r#"{"cmd":"hello"}"#).is_none() {
+            assert!(t0.elapsed() < T, "wardend did not answer:\n{}", w.log());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        w
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.out).unwrap_or_default()
+    }
+
+    fn connect(&self, req: &str) -> Option<std::io::BufReader<std::os::unix::net::UnixStream>> {
+        let mut s = std::os::unix::net::UnixStream::connect(&self.sock).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        writeln!(s, "{req}").ok()?;
+        Some(std::io::BufReader::new(s))
+    }
+
+    fn try_request(&self, req: &str) -> Option<Value> {
+        use std::io::BufRead;
+        let mut line = String::new();
+        self.connect(req)?.read_line(&mut line).ok()?;
+        serde_json::from_str(&line).ok()
+    }
+
+    fn request(&self, req: &str) -> Value {
+        self.try_request(req).unwrap_or_else(|| panic!("no answer to {req}:\n{}", self.log()))
+    }
+
+    fn subscribe(&self, req: &str) -> EventStream {
+        let r = self.connect(req).unwrap_or_else(|| panic!("cannot subscribe:\n{}", self.log()));
+        EventStream { r, line: String::new(), seen: Vec::new() }
+    }
+
+    /// The entry of `app` in `apps`.
+    fn app(&self, app: &str) -> Value {
+        let v = self.request(r#"{"cmd":"apps"}"#);
+        v["apps"].as_array().unwrap().iter().find(|a| a["name"] == app).cloned().unwrap_or(Value::Null)
+    }
+
+    fn wait_app(&self, what: &str, app: &str, f: impl Fn(&Value) -> bool) -> Value {
+        let t0 = Instant::now();
+        loop {
+            let a = self.app(app);
+            if f(&a) {
+                return a;
+            }
+            assert!(t0.elapsed() < T, "timed out waiting for {what}; last: {a:#}\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Wardend {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(5) {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A `subscribe` stream from wardend.
+struct EventStream {
+    r: std::io::BufReader<std::os::unix::net::UnixStream>,
+    line: String,
+    seen: Vec<Value>,
+}
+
+impl EventStream {
+    fn next(&mut self) -> Option<Value> {
+        use std::io::BufRead;
+        // A read timeout may leave half a line in `line`: keep it for the next call.
+        match self.r.read_line(&mut self.line) {
+            Ok(n) if n > 0 && self.line.ends_with('\n') => {
+                let v: Value = serde_json::from_str(&self.line).unwrap();
+                self.line.clear();
+                self.seen.push(v.clone());
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// The next event matching `f` (within `T`).
+    fn wait(&mut self, what: &str, f: impl Fn(&Value) -> bool) -> Value {
+        let t0 = Instant::now();
+        while t0.elapsed() < T {
+            if let Some(v) = self.next() {
+                if f(&v) {
+                    return v;
+                }
+            }
+        }
+        let seen: Vec<String> = self.seen.iter().map(|v| v.to_string().chars().take(200).collect()).collect();
+        panic!("no event {what} within {T:?}; seen:\n{}", seen.join("\n"));
+    }
+}
+
+fn sup_event(app: &str, event: &str) -> impl Fn(&Value) -> bool {
+    let (app, event) = (app.to_string(), event.to_string());
+    move |v| v["type"] == "supervisor" && v["app"] == app.as_str() && v["event"] == event.as_str()
+}
+
+fn supervisor_pid(f: &Fleet, app: &str) -> u64 {
+    f.app(app)["status"]["pid"].as_u64().unwrap_or_else(|| panic!("{app} is not running:\n{}", f.cli(&["list"]).1))
+}
+
+/// A `warden` child whose stdout lines arrive on a channel.
+fn spawn_lines(f: &Fleet, args: &[&str]) -> (Child, std::sync::mpsc::Receiver<String>) {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env("WARDEN_HOME", &f.home)
+        .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
+        .env_remove("WARDEN_CONFIG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    (child, rx)
+}
+
+fn stop_child(mut c: Child) {
+    unsafe { libc::kill(c.id() as i32, libc::SIGINT) };
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        if let Ok(Some(st)) = c.try_wait() {
+            assert!(st.success(), "Ctrl-C ends it cleanly: {st:?}");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    panic!("did not stop on SIGINT");
+}
+
+/// A wardend we did not spawn ourselves (`--background`, or started by
+/// `warden start`): SIGTERM, then SIGKILL, on drop, whatever happened.
+struct DetachedWardend(Option<i32>);
+
+impl DetachedWardend {
+    /// From output that says "wardend started in the background (pid N)".
+    fn from_output(out: &str) -> DetachedWardend {
+        let pid = out.split("wardend started in the background (pid ").nth(1).and_then(|s| s.split(')').next());
+        DetachedWardend(pid.and_then(|p| p.parse().ok()))
+    }
+}
+
+impl Drop for DetachedWardend {
+    fn drop(&mut self) {
+        let Some(pid) = self.0 else { return };
+        // Only if that pid is still our `warden daemon` (not a reused pid).
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        if cmdline != format!("{BIN}\0daemon\0").as_bytes() {
+            return;
+        }
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let t0 = Instant::now();
+        while alive(pid as u64) && t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive(pid as u64) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[test]
+fn wardend_runs_reports_and_stops() {
+    let f = Fleet::new("wd-life");
+    let (code, out) = f.cli(&["daemon", "status"]);
+    assert_eq!(code, 1, "not running yet: {out}");
+    assert!(out.contains("not running"), "{out}");
+
+    // --background detaches it; status answers; a second one is refused.
+    let out = f.ok(&["daemon", "--background"]);
+    let bg = DetachedWardend::from_output(&out);
+    assert!(bg.0.is_some(), "{out}");
+    let out = f.ok(&["daemon", "status"]);
+    assert!(out.contains("wardend: pid") && out.contains("protocol 1"), "{out}");
+    let (code, out) = f.cli(&["daemon"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("already running"), "{out}");
+    let out = f.ok(&["daemon", "--background"]);
+    assert!(out.contains("already running"), "{out}");
+    let out = f.ok(&["daemon", "stop"]);
+    assert!(out.contains("wardend stopped"), "{out}");
+    let (code, _) = f.cli(&["daemon", "status"]);
+    assert_eq!(code, 1);
+    assert!(!f.home.join("run/wardend.sock").exists(), "socket removed");
+    assert!(f.ok(&["daemon", "stop"]).contains("was not running"));
+
+    // Like PM2: `warden start` starts wardend too (without WARDEN_NO_DAEMON),
+    // and `warden kill` stops it after the apps.
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let (code, out) = f.cli_env(
+        &["start", &fixture("app.ts"), "--name", "api", "--port", &port.to_string()],
+        &[("WARDEN_NO_DAEMON", "0")],
+    );
+    let autostarted = DetachedWardend::from_output(&out);
+    assert_eq!(code, 0, "{out}");
+    assert!(autostarted.0.is_some() && out.contains("api: online"), "{out}");
+    let out = f.ok(&["daemon", "status"]);
+    assert!(out.lines().any(|l| l.starts_with("api ") && l.contains("running") && l.contains("wardend")), "{out}");
+    let out = f.ok(&["kill", "--yes"]);
+    assert!(out.contains("api: stopped") && out.contains("wardend: stopped"), "{out}");
+    assert_eq!(f.cli(&["daemon", "status"]).0, 1);
+}
+
+#[test]
+fn wardend_watches_apps_streams_events_and_forwards_requests() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-watch");
+    let (p1, p2) = (free_port(), free_port());
+    f.ok(&["start", &fixture("app.ts"), "--name", "api", "--port", &p1.to_string()]);
+    let d = Wardend::start(&f, &[]);
+
+    // A running app: watched, `supervised_by` wardend (started in the background).
+    let a = d.wait_app("api running", "api", |a| a["state"] == "running");
+    assert_eq!(a["supervised_by"], "wardend", "{a:#}");
+    assert_eq!(a["supervisor_pid"].as_u64(), Some(supervisor_pid(&f, "api")));
+    assert_eq!(a["status"]["workers_ready"], 1);
+    let hello = d.request(r#"{"cmd":"hello"}"#);
+    assert_eq!((hello["ok"].as_bool(), hello["hello"]["protocol"].as_u64()), (Some(true), Some(1)), "{hello}");
+
+    // subscribe: hello, apps, a status per running app, then events.
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe","interval_ms":500}"#);
+    let first = ev.next().unwrap();
+    assert!(first["type"] == "hello" && first.get("app").is_none(), "{first}");
+    let apps = ev.next().unwrap();
+    assert_eq!(apps["type"], "apps", "{apps}");
+    let st = ev.next().unwrap();
+    assert!(st["type"] == "status" && st["app"] == "api", "{st}");
+    ev.wait("a host event", |v| v["type"] == "host" && v["mem_total_bytes"].as_u64() > Some(0));
+
+    // An app started later is found.
+    f.ok(&["start", &fixture("app.ts"), "--name", "web", "--port", &p2.to_string()]);
+    let found = ev.wait("web found", sup_event("web", "found"));
+    assert_eq!(found["pid"].as_u64(), Some(supervisor_pid(&f, "web")));
+
+    // Requests forwarded to an app: a reload (its rollout is followed with status).
+    let r = d.request(r#"{"cmd":"app","app":"api","request":{"cmd":"reload"}}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["response"]["seq"].as_u64().is_some(), "{r}");
+    f.wait("reload finished", |f| f.app("api")["status"]["last_rollout"]["ok"] == true);
+    // logs stream through.
+    let mut logs =
+        d.connect(r#"{"cmd":"app","app":"api","request":{"cmd":"logs","lines":50,"follow":false}}"#).unwrap();
+    let mut text = String::new();
+    logs.read_to_string(&mut text).unwrap();
+    assert!(text.contains("worker ready"), "{text}");
+    let r = d.request(r#"{"cmd":"app","app":"nope","request":{"cmd":"status"}}"#);
+    assert_eq!(r["ok"], false, "{r}");
+
+    // `warden events --json`: NDJSON from wardend; plain text without --json.
+    let (child, lines) = spawn_lines(&f, &["events", "--json"]);
+    let got: Vec<Value> =
+        (0..3).map(|_| serde_json::from_str(&lines.recv_timeout(T).expect("an event line")).unwrap()).collect();
+    assert_eq!((got[0]["type"].as_str(), got[1]["type"].as_str()), (Some("hello"), Some("apps")), "{got:?}");
+    assert_eq!(got[2]["type"], "status", "{got:?}");
+    stop_child(child);
+    let (child, lines) = spawn_lines(&f, &["events", "api"]);
+    let first = lines.recv_timeout(T).unwrap();
+    assert!(first.contains("wardend pid="), "{first}");
+    let mut text = String::new();
+    while let Ok(l) = lines.recv_timeout(Duration::from_secs(3)) {
+        text += &l;
+        text += "\n";
+        if l.contains("workers ready") {
+            break;
+        }
+    }
+    assert!(text.contains("api running (supervised by wardend"), "{text}");
+    assert!(text.contains("api 1/1 workers ready"), "{text}");
+    stop_child(child);
+
+    // `warden delete`: the supervisor exits on purpose; not restarted; forgotten.
+    f.ok(&["delete", "web"]);
+    ev.wait("web exited", sup_event("web", "exited"));
+    d.wait_app("web forgotten", "web", |a| a.is_null());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!ev.seen.iter().any(|v| sup_event("web", "restarting")(v) || sup_event("web", "died")(v)));
+    assert!(get(p2, "/whoami").is_none(), "web stays down");
+}
+
+#[test]
+fn wardend_restarts_a_killed_supervisor_and_apps_outlive_it() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-restart");
+    let port = free_port();
+    // A variable only the supervisor's environment has (not wardend's).
+    let (code, out) = f.cli_env(
+        &["start", &fixture("app.ts"), "--name", "api", "--port", &port.to_string()],
+        &[("WD_ORIGIN_MARK", "kept")],
+    );
+    assert_eq!(code, 0, "{out}");
+    let mut d = Wardend::start(&f, &[]);
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+    ev.wait("api status", |v| v["type"] == "status" && v["app"] == "api");
+
+    // kill -9: died, restarting (after 1 s), started; the app serves again.
+    let pid = supervisor_pid(&f, "api");
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let died = ev.wait("died", sup_event("api", "died"));
+    assert_eq!(died["pid"].as_u64(), Some(pid));
+    let restarting = ev.wait("restarting", sup_event("api", "restarting"));
+    assert_eq!(restarting["detail"], "after 1000 ms", "{restarting}");
+    let started = ev.wait("started", sup_event("api", "started"));
+    let new_pid = started["pid"].as_u64().unwrap();
+    assert_ne!(new_pid, pid);
+    f.wait("api serving again", |_| get(port, "/whoami").is_some());
+    let a = d.wait_app("api running again", "api", |a| a["state"] == "running");
+    assert_eq!(a["supervisor_restarts"], 1, "{a:#}");
+    assert_eq!(a["supervisor_pid"].as_u64(), Some(new_pid));
+    assert_eq!(supervisor_pid(&f, "api"), new_pid);
+    assert!(d.log().contains("supervisor died; restarting it app=api"), "{}", d.log());
+    // Restarted with the environment it was started with, not wardend's.
+    let env = std::fs::read(format!("/proc/{new_pid}/environ")).unwrap();
+    assert!(env.split(|b| *b == 0).any(|kv| kv == b"WD_ORIGIN_MARK=kept"));
+    assert!(env.split(|b| *b == 0).any(|kv| kv == b"WARDEN_LAUNCH=background"));
+
+    // A hung supervisor is reported, never killed: its workers keep serving.
+    unsafe { libc::kill(new_pid as i32, libc::SIGSTOP) };
+    let unresponsive = ev.wait("unresponsive", sup_event("api", "unresponsive"));
+    assert_eq!(unresponsive["pid"].as_u64(), Some(new_pid));
+    let a = d.app("api");
+    assert_eq!(a["state"], "unreachable", "{a:#}");
+    assert!(a["problem"].as_str().unwrap().contains(&format!("gdb -p {new_pid}")), "{a:#}");
+    assert!(get(port, "/whoami").is_some(), "workers still serve");
+    assert!(alive(new_pid));
+    unsafe { libc::kill(new_pid as i32, libc::SIGCONT) };
+    ev.wait("responsive", sup_event("api", "responsive"));
+    assert!(d.log().contains("supervisor is unresponsive; not killing it"), "{}", d.log());
+
+    // Shut down on request: exited, and not restarted.
+    f.ok(&["shutdown", "api"]);
+    ev.wait("exited", sup_event("api", "exited"));
+    d.wait_app("api stopped", "api", |a| a["state"] == "stopped");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(d.app("api")["state"], "stopped", "not restarted");
+    assert!(get(port, "/whoami").is_none());
+
+    // wardend's own `start`.
+    let r = d.request(r#"{"cmd":"start","app":"api"}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("started in the background"), "{r}");
+    f.wait("api serving", |_| get(port, "/whoami").is_some());
+    let r = d.request(r#"{"cmd":"start","app":"api"}"#);
+    assert!(r["message"].as_str().unwrap().starts_with("already"), "{r}");
+
+    // SIGKILL wardend: every app keeps serving.
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGKILL) };
+    d.child.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(get(port, "/whoami").is_some(), "the app outlives wardend");
+    assert!(f.app("api")["status"]["pid"].is_u64());
+}
+
+#[test]
+fn wardend_gives_up_on_a_supervisor_that_keeps_dying() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-giveup");
+    let port = free_port();
+    f.ok(&["start", &fixture("app.ts"), "--name", "api", "--port", &port.to_string()]);
+    let policy = "initial_ms=100,max_ms=200,deaths=3,window_ms=60000";
+    let d = Wardend::start(&f, &[("WARDEN_DAEMON_POLICY", policy)]);
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+    ev.wait("api status", |v| v["type"] == "status" && v["app"] == "api");
+
+    // Three deaths within the window: restarted twice, then given up.
+    let mut pid = supervisor_pid(&f, "api");
+    for death in 1..=3 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let died = ev.wait("died", sup_event("api", "died"));
+        assert_eq!(died["pid"].as_u64(), Some(pid));
+        if death < 3 {
+            pid = ev.wait("started", sup_event("api", "started"))["pid"].as_u64().unwrap();
+        }
+    }
+    let gave_up = ev.wait("gave up", sup_event("api", "gave_up"));
+    assert_eq!(gave_up["detail"], "3 deaths in 60 s", "{gave_up}");
+    let a = d.wait_app("api gave up", "api", |a| a["state"] == "gave_up");
+    assert!(a["problem"].as_str().unwrap().contains("warden start api"), "{a:#}");
+    assert_eq!(a["supervisor_restarts"], 2);
+    let log = d.log();
+    assert!(log.contains("ERROR wardend gave up restarting it") || log.contains("gave up restarting it"), "{log}");
+    assert!(log.contains("last_lines=") && log.contains("then run `warden start api`"), "{log}");
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(f.app("api")["status"].is_null(), "not restarted after giving up");
+
+    // `warden start api` clears it.
+    f.ok(&["start", "api"]);
+    let a = d.wait_app("api running", "api", |a| a["state"] == "running");
+    assert!(a["problem"].is_null(), "{a:#}");
 }
