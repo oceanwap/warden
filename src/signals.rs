@@ -59,6 +59,7 @@ pub fn parse(name: &str) -> Option<i32> {
         "PIPE" => libc::SIGPIPE,
         "TTIN" => libc::SIGTTIN,
         "TTOU" => libc::SIGTTOU,
+        #[cfg(target_os = "linux")]
         "PWR" => libc::SIGPWR,
         _ => return None,
     })
@@ -75,6 +76,7 @@ pub fn name(sig: i32) -> String {
         (libc::SIGTERM, "SIGTERM"),
         (libc::SIGKILL, "SIGKILL"),
         (libc::SIGWINCH, "SIGWINCH"),
+        #[cfg(target_os = "linux")] // no SIGPWR on macOS
         (libc::SIGPWR, "SIGPWR"),
     ];
     known.iter().find(|(n, _)| *n == sig).map(|(_, s)| s.to_string()).unwrap_or_else(|| format!("SIG{sig}"))

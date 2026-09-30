@@ -81,8 +81,16 @@ fn kernel() -> Vec<Finding> {
         v.push(f(
             Level::Warn,
             "kernel",
-            "not Linux: fine for development, but no SO_REUSEPORT balancing or /proc readiness",
+            "not Linux: fine for development, but SO_REUSEPORT does not balance connections across workers \
+             (use count = 1), no parent-death signal (workers outlive a SIGKILLed supervisor), \
+             no /proc readiness or CPU/RSS metrics",
             Some("run production on Linux"),
+        ));
+        v.push(f(
+            Level::Info,
+            "openat2",
+            "not Linux: unavailable; `warden serve` checks paths with realpath instead (slower, same safety)",
+            None,
         ));
         return v;
     }
@@ -124,7 +132,7 @@ fn kernel() -> Vec<Finding> {
     v.push(
         match root.map_err(|e| e.to_string()).and_then(|d| {
             use std::os::fd::AsFd;
-            crate::sys::openat2(d.as_fd(), c".", libc::O_RDONLY, libc::RESOLVE_BENEATH).map_err(|e| e.to_string())
+            crate::sys::openat2(d.as_fd(), c".", libc::O_RDONLY, crate::sys::RESOLVE_BENEATH).map_err(|e| e.to_string())
         }) {
             Ok(_) => {
                 f(Level::Ok, "openat2", "available: `warden serve` opens files in one syscall, kernel-confined", None)

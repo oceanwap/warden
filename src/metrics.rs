@@ -30,6 +30,7 @@ pub fn proc_stats(pid: u32) -> Option<ProcStats> {
 
 /// utime + stime (clock ticks) from the contents of /proc/<pid>/stat.
 /// The command name may contain spaces and parens, so split after the last ')'.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `proc_stats`, Linux only
 pub fn parse_stat_cpu_ticks(stat: &str) -> Option<u64> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let f: Vec<&str> = rest.split_whitespace().collect();
