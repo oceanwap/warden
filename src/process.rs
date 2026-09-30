@@ -23,11 +23,40 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
     /// Prefix for this process's output lines (`worker=<label>`).
     pub label: String,
-    /// Let the worker write straight to Warden's stdout/stderr (no prefix,
-    /// no copying through Warden; `warden logs` won't show its output).
-    pub inherit_output: bool,
-    /// Output lines kept per second per stream (0 = no limit).
+    /// Where the worker's stdout and stderr go (`[logging] worker_output`).
+    pub output: Output,
+    /// Output lines kept per second per stream (0 = no limit; capture only).
     pub max_lines_per_sec: u32,
+}
+
+/// `[logging] worker_output`.
+#[derive(Debug, Clone)]
+pub enum Output {
+    /// Pipes read by Warden: lines prefixed, rate-limited, kept for
+    /// `warden logs`, copied to stdout/journald and the log files.
+    Capture,
+    /// Straight to Warden's stdout/stderr (no prefix, no copy through
+    /// Warden; `warden logs` won't show it).
+    Inherit,
+    /// Pipes spliced byte for byte into files, rotated at line boundaries.
+    Direct(crate::logging::DirectFiles),
+}
+
+impl Output {
+    pub fn from_config(l: &crate::config::Logging) -> Output {
+        use crate::config::WorkerOutput;
+        match (l.worker_output, &l.out_file) {
+            (WorkerOutput::Inherit, _) => Output::Inherit,
+            (WorkerOutput::Direct, Some(out)) => Output::Direct(crate::logging::DirectFiles {
+                out: out.clone(),
+                err: l.err_file.clone(),
+                per_worker: l.per_worker_files,
+                policy: crate::logging::RotatePolicy::from(&l.rotate),
+            }),
+            // Direct without out_file is refused by config validation.
+            (WorkerOutput::Direct, None) | (WorkerOutput::Capture, _) => Output::Capture,
+        }
+    }
 }
 
 /// Message written by the shim / worker-mode host on fd 3, one JSON object per line.
@@ -89,11 +118,33 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     let write_fd = std::os::fd::AsRawFd::as_raw_fd(&ipc_write);
 
     let mut cmd = Command::new(&spec.program);
-    let out = || if spec.inherit_output { Stdio::inherit() } else { Stdio::piped() };
+    // Direct mode: our own pipes (read end, file, stream), spliced into
+    // the files on the output thread.
+    let mut direct: Vec<(OwnedFd, PathBuf, &'static str)> = Vec::new();
+    let (stdout, stderr) = match &spec.output {
+        Output::Capture => (Stdio::piped(), Stdio::piped()),
+        Output::Inherit => (Stdio::inherit(), Stdio::inherit()),
+        Output::Direct(files) => {
+            let (out_path, err_path) = files.paths(&spec.label);
+            let (out_r, out_w) = pipe()?;
+            direct.push((out_r, out_path, "stdout"));
+            let stderr = match err_path {
+                Some(err_path) => {
+                    let (err_r, err_w) = pipe()?;
+                    direct.push((err_r, err_path, "stderr"));
+                    Stdio::from(err_w)
+                }
+                // No separate err_file: stderr shares stdout's pipe, like
+                // `>out.log 2>&1`, so both keep the order they were written in.
+                None => Stdio::from(out_w.try_clone()?),
+            };
+            (Stdio::from(out_w), stderr)
+        }
+    };
     cmd.args(&spec.args)
         .stdin(Stdio::null())
-        .stdout(out())
-        .stderr(out())
+        .stdout(stdout)
+        .stderr(stderr)
         // Own process group: a terminal Ctrl-C reaches Warden only, and Warden
         // orchestrates the drain. SIGKILL goes to the group to catch grandchildren.
         .process_group(0)
@@ -119,6 +170,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         });
     }
     let mut child = cmd.spawn()?;
+    // Our copies of the pipes' write ends (in `cmd`): only the worker's
+    // remain, so its exit is EOF.
+    drop(cmd);
     drop(ipc_write);
     let pid = child.id().unwrap_or(0);
     let label = spec.label.clone();
@@ -156,6 +210,12 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                 on_fail(m);
             }
         });
+    }
+    if let Output::Direct(files) = &spec.output {
+        for (fd, path, stream) in direct {
+            let on_fail = reader_failed(stream, ctl_tx.clone(), label.clone());
+            start_direct(fd, path, files.policy.clone(), label.clone(), stream, on_fail);
+        }
     }
     match tokio::net::unix::pipe::Receiver::from_owned_fd(ipc_read) {
         Ok(rx) => {
@@ -389,6 +449,114 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream
     }
 }
 
+/// `worker_output = "direct"`: pump one of the worker's pipes into its file
+/// on the output thread. If the pump panics, the worker is killed so it
+/// restarts (its writes would otherwise block on a pipe nobody reads).
+fn start_direct(
+    pipe: OwnedFd,
+    path: PathBuf,
+    policy: crate::logging::RotatePolicy,
+    label: String,
+    stream: &'static str,
+    on_fail: impl FnOnce(String) + Send + 'static,
+) {
+    let active = crate::logging::DirectActive::begin();
+    crate::logging::on_output_thread(Box::new(move || {
+        tokio::task::spawn_local(async move {
+            let _active = active;
+            if let Err(m) = crate::guard::catch_unwind(pump_direct(pipe, path, policy, label, stream)).await {
+                on_fail(m);
+            }
+        });
+    }));
+}
+
+/// Move the pipe's bytes into the file as they arrive (splice: no parsing,
+/// no copy through Warden) until EOF, i.e. until the worker and everything
+/// that inherited its stdout are gone, so its last lines are drained.
+async fn pump_direct(
+    pipe: OwnedFd,
+    path: PathBuf,
+    policy: crate::logging::RotatePolicy,
+    label: String,
+    stream: &'static str,
+) {
+    use crate::logging::Step;
+    crate::guard::fault(stream);
+    let pipe = match tokio::net::unix::pipe::Receiver::from_owned_fd(pipe)
+        .and_then(|rx| rx.into_nonblocking_fd())
+        .and_then(|fd| tokio::io::unix::AsyncFd::new(std::fs::File::from(fd)))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            crate::error!(
+                "cannot read the worker's output; it is discarded",
+                worker = label,
+                stream = stream,
+                error = e,
+                hint = "this is a Warden bug: please report it",
+            );
+            return;
+        }
+    };
+    let file = crate::logging::DirectWriter::open(path, policy, &label, stream);
+    // `warden logs -f`: the unfinished line so far (only while someone follows).
+    let mut partial: Vec<u8> = Vec::new();
+    loop {
+        let mut ready = match pipe.readable().await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
+                break;
+            }
+        };
+        let following = crate::logging::following();
+        if !following {
+            partial.clear();
+        }
+        let mut follow = |b: &[u8]| follow_direct(b, &mut partial, &label, stream);
+        let echo: crate::logging::Echo = if following { Some(&mut follow) } else { None };
+        match ready.try_io(|p| file.step(p.get_ref(), echo)) {
+            // Empty for now: readiness cleared, wait for more.
+            Err(_would_block) => {}
+            Ok(Ok(Step::Moved(_))) => {}
+            Ok(Ok(Step::Eof)) => break,
+            Ok(Ok(Step::Wait(d))) => {
+                drop(ready);
+                tokio::time::sleep(d).await;
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(Err(e)) => {
+                crate::warn!(
+                    "stopped reading worker output",
+                    worker = label,
+                    stream = stream,
+                    error = e,
+                    hint = "the worker gets EPIPE on further output; restart it to reconnect",
+                );
+                break;
+            }
+        }
+    }
+    if !partial.is_empty() {
+        follow_direct(b"\n", &mut partial, &label, stream); // the last line had no newline
+    }
+}
+
+/// `warden logs -f` in direct mode: the bytes just written, cut into lines
+/// as captured output is (they are shown, not kept or written again).
+fn follow_direct(bytes: &[u8], partial: &mut Vec<u8>, label: &str, stream: &'static str) {
+    let mut batch = crate::logging::OutputBatch::new(label, stream);
+    split_lines(bytes, partial, &mut |l: &mut Vec<u8>| {
+        if l.last() == Some(&b'\r') {
+            l.pop();
+        }
+        batch.push(&String::from_utf8_lossy(l));
+        l.clear();
+    });
+    crate::logging::follow_only(batch);
+}
+
 /// Keep-all mode: longest a read waits for room in the log queue.
 const KEEP_ALL_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -620,7 +788,7 @@ mod tests {
                     cwd: None,
                     env: vec![],
                     label: "t".into(),
-                    inherit_output: false,
+                    output: Output::Capture,
                     max_lines_per_sec: 0,
                 };
                 spawn(spec, 42, tx).unwrap();
@@ -655,7 +823,7 @@ mod tests {
                     cwd: None,
                     env: vec![],
                     label: "t".into(),
-                    inherit_output: false,
+                    output: Output::Capture,
                     max_lines_per_sec: 0,
                 };
                 let h = spawn(spec, 1, tx).unwrap();

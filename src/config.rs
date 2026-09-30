@@ -298,7 +298,9 @@ pub struct Logging {
     pub timestamps: Option<bool>,
     /// "capture" (default): worker lines go through Warden with a `worker=N`
     /// prefix and into `warden logs`. "inherit": workers write straight to
-    /// Warden's stdout — for very chatty apps.
+    /// Warden's stdout — for very chatty apps. "direct": worker bytes go
+    /// unchanged to `out_file`/`err_file`, moved by the kernel (splice),
+    /// still rotated — for apps that log heavily and only need the files.
     pub worker_output: WorkerOutput,
     /// Also write the log to this file, rotated by size (for people who
     /// `tail -f` log files, as with PM2). Default: stdout only (journald).
@@ -384,6 +386,9 @@ pub fn parse_size(t: &str) -> Result<u64, String> {
 pub enum WorkerOutput {
     Capture,
     Inherit,
+    /// Byte for byte into `out_file` / `err_file`: no prefix, no ring, no
+    /// line budget, no copy to stdout; the kernel moves the bytes.
+    Direct,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
@@ -626,9 +631,12 @@ impl Config {
         if (self.logging.out_file.is_some() || self.logging.err_file.is_some())
             && self.logging.worker_output == WorkerOutput::Inherit
         {
-            return Err("logging.out_file / err_file need worker_output = \"capture\" (with \"inherit\", \
-                        worker output bypasses Warden)"
+            return Err("logging.out_file / err_file need worker_output = \"capture\" or \"direct\" (with \
+                        \"inherit\", worker output bypasses Warden)"
                 .into());
+        }
+        if self.logging.worker_output == WorkerOutput::Direct {
+            self.check_direct_output()?;
         }
         if let Some(expr) = &self.logging.rotate.interval {
             crate::schedule::Cron::parse(expr).map_err(|e| format!("logging.rotate.interval = {expr:?}: {e}"))?;
@@ -735,6 +743,41 @@ impl Config {
         Ok(())
     }
 
+    /// `worker_output = "direct"`: the files Warden hands the bytes to.
+    /// stdout needs `out_file`; stderr goes to `err_file`, or with it unset
+    /// (or the same path) into `out_file` too, like `>out.log 2>&1`.
+    /// Several worker processes can't share a file: nothing splits their
+    /// writes into lines, so a partial line of one could meet another's.
+    fn check_direct_output(&self) -> Result<(), String> {
+        let l = &self.logging;
+        if l.out_file.is_none() {
+            return Err(if l.err_file.is_some() {
+                "logging.worker_output = \"direct\" needs logging.out_file for stdout (stderr goes to err_file, \
+                 or into out_file when err_file is unset)"
+                    .into()
+            } else {
+                "logging.worker_output = \"direct\" writes worker output straight to files: set logging.out_file \
+                 (and err_file for a separate stderr file), or use worker_output = \"capture\""
+                    .into()
+            });
+        }
+        if self.workers.mode == Mode::Process && self.workers.count > 1 && !l.per_worker_files {
+            return Err(format!(
+                "logging.worker_output = \"direct\" with workers.count = {} needs logging.per_worker_files = true: \
+                 each worker writes its own bytes unparsed, so in one shared file a partial line of one worker \
+                 could meet another's. Fix: add per_worker_files = true under [logging] (files out-1.log, \
+                 out-2.log…), or use worker_output = \"capture\"",
+                self.workers.count
+            ));
+        }
+        if l.file_timestamps {
+            return Err("logging.file_timestamps needs worker_output = \"capture\": \"direct\" writes the app's \
+                        bytes unchanged (let the app's logger add timestamps)"
+                .into());
+        }
+        Ok(())
+    }
+
     /// Upper bounds on every number, so no value can overflow time arithmetic
     /// (`Instant + Duration`) or counters at runtime. Generous: they only
     /// exclude values that are certainly mistakes.
@@ -792,13 +835,16 @@ impl Config {
         }
     }
 
-    /// Log files as the writer thread needs them.
+    /// Log files as the writer thread needs them. With `worker_output =
+    /// "direct"` the out/err files are written by the workers' pumps
+    /// instead (`process::Output::from_config`), not by the writer thread.
     pub fn log_files(&self) -> crate::logging::Files {
         let l = &self.logging;
+        let direct = l.worker_output == WorkerOutput::Direct;
         crate::logging::Files {
             file: l.file.clone(),
-            out_file: l.out_file.clone(),
-            err_file: l.err_file.clone(),
+            out_file: l.out_file.clone().filter(|_| !direct),
+            err_file: l.err_file.clone().filter(|_| !direct),
             per_worker: l.per_worker_files,
             timestamps: l.file_timestamps,
             rotate: crate::logging::RotatePolicy::from(&l.rotate),
@@ -1209,6 +1255,36 @@ level = "info"
         assert!(Config::parse("[app]\nname = \"a b\"\n").is_err());
         assert!(Config::parse(&format!("{MIN}[health]\nenabled = true\nurl = \"https://x\"\n")).is_err());
         assert!(Config::parse(&format!("{MIN}[restart]\nbackoff_initial = 500\nbackoff_max = 100\n")).is_err());
+    }
+
+    #[test]
+    fn direct_output_rules() {
+        let direct = |extra: &str| Config::parse(&format!("{MIN}{extra}"));
+        let l = "[logging]\nworker_output = \"direct\"\n";
+        let err = direct(l).unwrap_err();
+        assert!(err.contains("set logging.out_file"), "{err}");
+        let err = direct(&format!("{l}err_file = \"/tmp/e.log\"\n")).unwrap_err();
+        assert!(err.contains("needs logging.out_file for stdout"), "{err}");
+        let c = direct(&format!("{l}out_file = \"/tmp/o.log\"\n")).unwrap();
+        let files = c.log_files();
+        assert!(files.out_file.is_none() && files.err_file.is_none(), "the writer thread leaves them alone");
+        // Several processes need a file each.
+        let many = format!("[workers]\ncount = 3\n{l}out_file = \"/tmp/o.log\"\n");
+        let err = direct(&many).unwrap_err();
+        assert!(err.contains("workers.count = 3") && err.contains("per_worker_files = true"), "{err}");
+        assert!(direct(&format!("{many}per_worker_files = true\n")).is_ok());
+        // Worker mode is one process, whatever the count.
+        let w = format!(
+            "[app]\nname = \"a\"\nentry = \"main.js\"\n[workers]\nmode = \"worker\"\ncount = 4\n{l}out_file = \"/tmp/o.log\"\n"
+        );
+        assert!(Config::parse(&w).is_ok());
+        let err = direct(&format!("{l}out_file = \"/tmp/o.log\"\nfile_timestamps = true\n")).unwrap_err();
+        assert!(err.contains("file_timestamps"), "{err}");
+        // capture keeps its files for the writer thread; inherit can't have any.
+        let c = direct("[logging]\nout_file = \"/tmp/o.log\"\n").unwrap();
+        assert!(c.log_files().out_file.is_some());
+        let err = direct("[logging]\nworker_output = \"inherit\"\nout_file = \"/tmp/o.log\"\n").unwrap_err();
+        assert!(err.contains("\"capture\" or \"direct\""), "{err}");
     }
 
     #[test]

@@ -1958,3 +1958,215 @@ fn serve_static_files() {
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(f.home.join("private.toml")).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o600, "config with credentials is owner-only");
 }
+
+// ---- worker_output = "direct"
+
+/// A scratch directory next to (not inside) a Warden's, which `start` wipes.
+fn direct_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("warden-it-{name}-direct-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Output of every shape: empty lines, CRLF, bytes that aren't UTF-8,
+/// a line far longer than a pipe (300 KB), and a last line without `\n`.
+fn awkward_output(lines: usize) -> Vec<u8> {
+    let mut data = Vec::new();
+    for i in 0..lines {
+        match i % 11 {
+            0 => {}
+            1 => data.extend_from_slice(b"crlf line\r"),
+            2 => data.extend_from_slice(&[0xff, 0xfe, b' ', 0xc3]),
+            _ => data.extend(format!("line {i} {}", "ab".repeat(i % 97)).bytes()),
+        }
+        if i == lines / 2 {
+            data.extend(std::iter::repeat_n(b'x', 300_000));
+        }
+        data.push(b'\n');
+    }
+    data.extend_from_slice(b"final line without newline");
+    data
+}
+
+fn direct_config(name: &str, script: &str, logging: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+         [workers]\nmin_uptime = 100\n[logging]\nworker_output = \"direct\"\n{logging}"
+    )
+}
+
+/// Wait until `f` holds; panic with `what` and the Warden log otherwise.
+fn eventually(w: &Warden, what: &str, f: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        if t0.elapsed() > T {
+            panic!("timed out waiting for {what}\nlog:\n{}", w.log());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn direct_output_is_written_byte_for_byte() {
+    let dir = direct_dir("direct-bytes");
+    let (input, out, err) = (dir.join("input.bin"), dir.join("logs/out.log"), dir.join("logs/err.log"));
+    let data = awkward_output(3000);
+    std::fs::write(&input, &data).unwrap();
+    let script = format!("cat {}; echo oops >&2; exec sleep 300", input.display());
+    let logging = format!("out_file = \"{}\"\nerr_file = \"{}\"\n", out.display(), err.display());
+    let w = Warden::start("direct-bytes", 0, &direct_config("direct-bytes", &script, &logging));
+    eventually(&w, "the whole output in out.log", || std::fs::read(&out).is_ok_and(|b| b.len() >= data.len()));
+    assert!(std::fs::read(&out).unwrap() == data, "out.log differs from what the worker wrote");
+    eventually(&w, "stderr in err.log", || std::fs::read(&err).is_ok_and(|b| b == b"oops\n"));
+    // Nothing went through Warden's own output.
+    let log = w.log();
+    assert!(!log.contains("final line without newline") && !log.contains(" OUT "), "{log}");
+    drop(w);
+
+    // Only out_file: stderr joins it through the same pipe, in the order written.
+    let merged = dir.join("merged.log");
+    let script = "echo one; echo two >&2; echo three; exec sleep 300";
+    let logging = format!("out_file = \"{}\"\n", merged.display());
+    let w = Warden::start("direct-merged", 0, &direct_config("direct-merged", script, &logging));
+    eventually(&w, "stdout and stderr in one file", || {
+        std::fs::read_to_string(&merged).is_ok_and(|t| t == "one\ntwo\nthree\n")
+    });
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_output_rotates_losslessly_at_line_boundaries() {
+    let dir = direct_dir("direct-rotate");
+    let (input, out) = (dir.join("input.bin"), dir.join("logs/out.log"));
+    let data = awkward_output(8000);
+    std::fs::write(&input, &data).unwrap();
+    let script = format!("cat {}; exec sleep 300", input.display());
+    let logging = format!("out_file = \"{}\"\n[logging.rotate]\nmax_size = \"4K\"\nkeep = 1000\n", out.display());
+    let w = Warden::start("direct-rotate", 0, &direct_config("direct-rotate", &script, &logging));
+    // Rotated files oldest first (out.log.N … out.log.1), then out.log.
+    let chain = || -> Vec<PathBuf> {
+        let mut rotated: Vec<(u32, PathBuf)> = std::fs::read_dir(dir.join("logs"))
+            .map(|rd| {
+                rd.filter_map(|e| {
+                    let p = e.ok()?.path();
+                    let n = p.file_name()?.to_str()?.strip_prefix("out.log.")?.parse().ok()?;
+                    Some((n, p))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        rotated.sort_by_key(|r| std::cmp::Reverse(r.0));
+        rotated.into_iter().map(|r| r.1).chain([out.clone()]).collect()
+    };
+    let total = || chain().iter().map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum::<u64>();
+    eventually(&w, "every byte in the rotated files", || total() >= data.len() as u64);
+    let files = chain();
+    assert!(files.len() > 100, "{} files", files.len());
+    let mut all = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let bytes = std::fs::read(f).unwrap();
+        if i + 1 < files.len() {
+            assert!(bytes.ends_with(b"\n"), "{} does not end with a newline", f.display());
+            assert!(bytes.len() >= 4096, "{} rotated before max_size: {} bytes", f.display(), bytes.len());
+            // Late by no more than the line that reached the limit.
+            let last_line = bytes[..bytes.len() - 1].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+            assert!(last_line < 4096, "{} rotated late: {last_line} bytes before its last line", f.display());
+        }
+        all.extend(bytes);
+    }
+    assert_eq!(all.len(), data.len());
+    assert!(all == data, "the rotated files together differ from what the worker wrote");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The pumps run on Warden's output thread: a panic there still kills the
+/// worker so it restarts with a working pump (its output would block).
+#[test]
+fn direct_output_pump_failure_restarts_the_worker() {
+    let dir = direct_dir("direct-fault");
+    let out = dir.join("out.log");
+    let script = "echo started; exec sleep 300";
+    let cfg = direct_config("direct-fault", script, &format!("out_file = \"{}\"\n", out.display()));
+    let w = Warden::start_env("direct-fault", 0, &cfg, &[("WARDEN_FAULT", "stdout:1")]);
+    w.wait_for("a restarted worker", T, |s| s["workers_ready"] == 1 && s["workers"][0]["crashes"] == 1);
+    assert!(w.log().contains("output reader failed"), "{}", w.log());
+    eventually(&w, "output from the restarted worker", || {
+        std::fs::read_to_string(&out).is_ok_and(|t| t.contains("started\n"))
+    });
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_output_needs_a_file_per_worker_process() {
+    let dir = direct_dir("direct-check");
+    let cfg = dir.join("warden.toml");
+    let base = "[app]\nname = \"dc\"\ncommand = \"sh\"\n[workers]\ncount = 2\n[logging]\nworker_output = \"direct\"\n\
+                out_file = \"/tmp/dc-out.log\"\n";
+    std::fs::write(&cfg, base).unwrap();
+    let out = Command::new(BIN).arg("check").arg("-c").arg(&cfg).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("workers.count = 2") && text.contains("per_worker_files = true"), "{text}");
+    std::fs::write(&cfg, format!("{base}per_worker_files = true\n")).unwrap();
+    let out = Command::new(BIN).arg("check").arg("-c").arg(&cfg).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn direct_output_flush_and_logs() {
+    let dir = direct_dir("direct-logs");
+    let out = dir.join("logs/out.log");
+    let script = "i=0; while :; do i=$((i+1)); echo tick $i; sleep 0.05; done";
+    let logging = format!("out_file = \"{}\"\nerr_file = \"{}\"\n", out.display(), dir.join("logs/err.log").display());
+    let w = Warden::start("direct-logs", 0, &direct_config("direct-logs", script, &logging));
+    let ticks = || -> Vec<u64> {
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        assert!(!text.contains('\0'), "a hole in the file: {text:?}");
+        text.lines().filter_map(|l| l.strip_prefix("tick ")?.parse().ok()).collect()
+    };
+    eventually(&w, "ticks in out.log", || ticks().len() >= 5);
+
+    // `warden logs`: the file's last lines, as worker output, next to Warden's events.
+    let (code, text) = w.cli(&["logs", "--nostream", "-n", "5"]);
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(text.lines().count(), 5, "{text}");
+    assert!(text.lines().all(|l| l.contains(" OUT   worker=1 stdout: tick ")), "{text}");
+    let (_, text) = w.cli(&["logs", "--nostream", "-n", "200"]);
+    assert!(text.contains("INFO  worker ready") && text.contains("stdout: tick "), "{text}");
+    let (_, text) = w.cli(&["logs", "--nostream", "--events", "-n", "200"]);
+    assert!(!text.contains(" OUT "), "{text}");
+
+    // `-f` shows new lines as they are written.
+    let before = *ticks().last().unwrap();
+    let mut follow =
+        Command::new(BIN).args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
+    let mut reader = std::io::BufReader::new(follow.stdout.take().unwrap());
+    let mut newer = None;
+    let t0 = Instant::now();
+    while newer.is_none() && t0.elapsed() < T {
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let n: Option<u64> = line.trim_end().rsplit_once("stdout: tick ").and_then(|(_, n)| n.parse().ok());
+        newer = n.filter(|n| *n > before + 2);
+    }
+    let _ = follow.kill();
+    let _ = follow.wait();
+    assert!(newer.is_some(), "`warden logs -f` showed no new line after tick {before}");
+
+    // `warden flush` empties the file; writing goes on from its start.
+    let before = *ticks().last().unwrap();
+    let (code, text) = w.cli(&["flush"]);
+    assert_eq!(code, 0, "{text}");
+    let after = ticks();
+    assert!(after.first().is_none_or(|n| *n > before), "old lines survived the flush: {after:?}");
+    eventually(&w, "new ticks after the flush", || ticks().len() >= 3);
+    let after = ticks();
+    assert!(after[0] > before && after.windows(2).all(|p| p[1] == p[0] + 1), "{after:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

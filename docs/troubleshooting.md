@@ -49,6 +49,15 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `log lines dropped because stdout could not keep up` | Warden's stdout (journald, a pipe) is slower than the apps' output | Check journald (`journalctl --disk-usage`, rate limits: `RateLimitBurst=`); write to files instead (`[logging] file`/`out_file`) |
 | `cannot write the log file` | The directory doesn't exist or isn't writable, or the disk is full | Fix the path or permissions; lines still go to stdout and memory |
 | `warden logs --history` finds nothing | No log files are configured and journald isn't in use | Set `[logging] out_file`/`err_file`/`file`, or run under systemd |
+| `worker_output = "direct" with workers.count = N needs logging.per_worker_files = true` (at start or `warden check`) | Direct mode writes each worker's bytes unparsed; in one shared file a partial line of one worker could meet another's | Add `per_worker_files = true` under `[logging]` (files `out-1.log`, `out-2.log`…), or use `worker_output = "capture"` |
+| `worker_output = "direct" writes worker output straight to files: set logging.out_file` / `needs logging.out_file for stdout` | Direct mode has nowhere else to put output | Set `out_file`; add `err_file` for a separate stderr file (without it stderr goes into `out_file`, like `2>&1`) |
+| `logging.file_timestamps needs worker_output = "capture"` | Direct mode writes the app's bytes unchanged | Let the app's logger add timestamps, or use `"capture"` |
+| `cannot splice into the worker output file; copying through Warden instead` | The file's filesystem has no splice support (some FUSE or network filesystems), or a seccomp profile blocks `splice` | Nothing is lost, it is only slower; put the files on ext4, xfs or tmpfs, or allow `splice` |
+| `cannot open the worker output file; the worker's output is discarded until it can` | Direct mode: the directory is missing and can't be created, or isn't writable | Fix the path or permissions; Warden retries every second and `worker output file is writable again` reports what was lost |
+| `cannot write the worker output file; its output is discarded until writes work again` | Direct mode: disk full, quota, I/O error. The worker keeps running (its output is read and dropped, never left to block it) | Free space (`df -h`); writing resumes by itself |
+| `cannot rotate the worker output file; it keeps growing` | Warden can't rename or create files in the log directory | Fix the directory's permissions; retried every minute |
+| Direct mode: `warden logs` shows worker lines all with the same time | The files carry no timestamps; lines read from them are stamped with the file's last write | Intended. `warden logs -f` stamps new lines as they arrive; for per-line times let the app's logger write them |
+| `worker output not shown: its file is not in memory right now` | Direct mode: `warden logs` reads the files' tails only from the page cache, so it never waits for a disk | Read the file itself (`tail`, `less`) |
 
 ## Static files (`warden serve`)
 

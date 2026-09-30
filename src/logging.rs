@@ -19,12 +19,19 @@
 //! Cost per line on the event loop: one formatted allocation shared (`Arc`)
 //! by the queue, the in-memory ring and `logs -f` followers; sink formatting
 //! and writes happen on the writer thread, batched.
+//!
+//! `worker_output = "direct"` bypasses all of that for worker output: the
+//! bytes go from each worker's pipe into its out/err file with splice(2) on
+//! an output thread, rotated here at line boundaries (see the section
+//! "worker_output = direct" below). Warden's own events are unchanged.
 
 use crate::config::Level;
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -74,8 +81,14 @@ pub struct OutputBatch {
 impl OutputBatch {
     /// Lines `worker` wrote to `stream` ("stdout"/"stderr") just now.
     pub fn new(worker: &str, stream: &'static str) -> Self {
+        Self::at(worker, stream, SystemTime::now())
+    }
+
+    /// Lines `worker` wrote to `stream`, stamped with `time`.
+    pub fn at(worker: &str, stream: &'static str, time: SystemTime) -> Self {
         let mut prefix = String::with_capacity(TS_LEN + 24 + worker.len());
-        push_timestamp_now(&mut prefix);
+        let d = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+        push_rfc3339(&mut prefix, d.as_secs() as i64, d.subsec_millis());
         for part in [" OUT   worker=", worker, " ", stream, ": "] {
             prefix.push_str(part);
         }
@@ -186,34 +199,34 @@ pub struct StreamFiles {
     base: PathBuf,
     per_worker: bool,
     policy: RotatePolicy,
-    files: std::collections::HashMap<String, FileSink>,
+    files: HashMap<String, FileSink>,
 }
 
 impl StreamFiles {
     fn new(base: PathBuf, per_worker: bool, policy: RotatePolicy) -> Self {
-        StreamFiles { base, per_worker, policy, files: std::collections::HashMap::new() }
-    }
-
-    /// `out.log` → `out-2.log` for worker 2.
-    fn path_for(&self, worker: &str) -> PathBuf {
-        if !self.per_worker {
-            return self.base.clone();
-        }
-        let stem = self.base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let name = match self.base.extension() {
-            Some(e) => format!("{stem}-{worker}.{}", e.to_string_lossy()),
-            None => format!("{stem}-{worker}"),
-        };
-        self.base.with_file_name(name)
+        StreamFiles { base, per_worker, policy, files: HashMap::new() }
     }
 
     /// The file for `worker`'s lines (the shared one unless per-worker).
     fn sink(&mut self, worker: &str) -> &mut FileSink {
         let key = if self.per_worker { worker } else { "" };
-        let path = self.path_for(worker);
+        let path = worker_file(&self.base, self.per_worker, worker);
         let policy = &self.policy;
         self.files.entry(key.to_string()).or_insert_with(|| FileSink::new(path, policy.clone()))
     }
+}
+
+/// `out.log` → `out-2.log` for worker 2 when `per_worker`, else `base`.
+pub fn worker_file(base: &std::path::Path, per_worker: bool, worker: &str) -> PathBuf {
+    if !per_worker {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let name = match base.extension() {
+        Some(e) => format!("{stem}-{worker}.{}", e.to_string_lossy()),
+        None => format!("{stem}-{worker}"),
+    };
+    base.with_file_name(name)
 }
 
 /// `<ts> OUT   worker=<w> <stream>: <text>` → (w, stream, text). The
@@ -377,6 +390,11 @@ pub fn event(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)])
     if level < current_level(l) {
         return;
     }
+    emit(l, format_event(level, msg, fields).into(), Some(level));
+}
+
+/// `<ts> LEVEL msg key=value…`, as stored and written.
+fn format_event(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)]) -> String {
     let mut line = String::with_capacity(TS_LEN + 96);
     push_timestamp_now(&mut line);
     let _ = write!(line, " {:<5} {msg}", level_name(level));
@@ -388,7 +406,7 @@ pub fn event(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)])
             let _ = write!(line, " {k}={v}");
         }
     }
-    emit(l, line.into(), Some(level));
+    line
 }
 
 /// Worker output lines: into memory (for `warden logs`), to followers,
@@ -510,52 +528,36 @@ pub fn clear() {
             crate::warn!("could not truncate the log file", path = p.display(), error = e);
         }
     }
+    truncate_direct_files();
 }
 
-/// A log file rotated by size and/or on a schedule. Numbered
-/// (`app.log.1` newest … `app.log.N`) or dated (`app.log.2026-09-30T00-00-00`),
-/// optionally gzipped; old ones are pruned by count and age.
-pub struct FileSink {
+/// Moves a full log file out of the way: numbered (`app.log.1` newest …
+/// `app.log.N`) or dated (`app.log.2026-09-30T00-00-00`), optionally
+/// gzipped in the background; old ones are pruned by count and age. Shared
+/// by the writer thread's files ([`FileSink`]) and the files workers write
+/// directly ([`DirectFile`]), so both name, keep and compress alike.
+struct Rotator {
     path: PathBuf,
-    file: Option<std::fs::File>,
-    /// Lines not yet written: one write(2) per batch instead of two per
-    /// line. `flush` empties it; the writer thread flushes after every
-    /// batch, and rotation and drop flush first.
-    buf: Vec<u8>,
-    /// Bytes in the file plus those in `buf`.
-    size: u64,
     policy: RotatePolicy,
     next_rotation: Option<SystemTime>,
-    /// Last time an error was reported (at most once a minute).
-    last_error: Option<Instant>,
     /// The previous rotation's compression, finished before names shift again.
     compressing: Option<std::thread::JoinHandle<()>>,
 }
 
-impl FileSink {
-    pub fn new(path: PathBuf, policy: RotatePolicy) -> Self {
+impl Rotator {
+    fn new(path: PathBuf, policy: RotatePolicy) -> Self {
         let next_rotation = policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
-        FileSink {
-            path,
-            file: None,
-            buf: Vec::new(),
-            size: 0,
-            policy,
-            next_rotation,
-            last_error: None,
-            compressing: None,
-        }
+        Rotator { path, policy, next_rotation, compressing: None }
     }
 
-    fn open(&mut self) -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+    /// The schedule (`interval`) says rotate now; the next time is set.
+    /// No clock read without a schedule.
+    fn schedule_due(&mut self) -> bool {
+        let due = self.next_rotation.is_some_and(|t| SystemTime::now() >= t);
+        if due {
+            self.next_rotation = self.policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
         }
-        let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o640).open(&self.path)?;
-        self.size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        self.file = Some(f);
-        Ok(())
+        due
     }
 
     fn sibling(&self, suffix: &str) -> PathBuf {
@@ -564,9 +566,10 @@ impl FileSink {
         PathBuf::from(s)
     }
 
+    /// Rename (or delete, with `keep = 0`) the file at `path`; whoever
+    /// writes it opens a new one at `path` afterwards. A descriptor still
+    /// open on the old file keeps pointing at it under its new name.
     fn rotate(&mut self) -> std::io::Result<()> {
-        self.write_buf()?;
-        self.file = None;
         if let Some(h) = self.compressing.take() {
             let _ = h.join();
         }
@@ -598,7 +601,7 @@ impl FileSink {
         };
         self.prune();
         if let (Some(done), true) = (rotated, self.policy.compress) {
-            // Off the writer thread: a 10 MB file takes ~100 ms to compress.
+            // Off the writing thread: a 10 MB file takes ~100 ms to compress.
             self.compressing = std::thread::Builder::new()
                 .name("warden-gzip".into())
                 .spawn(move || {
@@ -612,7 +615,7 @@ impl FileSink {
                 })
                 .ok();
         }
-        self.open()
+        Ok(())
     }
 
     /// Rotated files beyond `keep`, or older than `max_age`, are deleted.
@@ -636,6 +639,45 @@ impl FileSink {
             }
         }
     }
+}
+
+/// A log file rotated by size and/or on a schedule (see [`Rotator`]),
+/// written line by line by the writer thread.
+pub struct FileSink {
+    rot: Rotator,
+    file: Option<std::fs::File>,
+    /// Lines not yet written: one write(2) per batch instead of two per
+    /// line. `flush` empties it; the writer thread flushes after every
+    /// batch, and rotation and drop flush first.
+    buf: Vec<u8>,
+    /// Bytes in the file plus those in `buf`.
+    size: u64,
+    /// Last time an error was reported (at most once a minute).
+    last_error: Option<Instant>,
+}
+
+impl FileSink {
+    pub fn new(path: PathBuf, policy: RotatePolicy) -> Self {
+        FileSink { rot: Rotator::new(path, policy), file: None, buf: Vec::new(), size: 0, last_error: None }
+    }
+
+    fn open(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(dir) = self.rot.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let f = std::fs::OpenOptions::new().create(true).append(true).mode(0o640).open(&self.rot.path)?;
+        self.size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        self.file = Some(f);
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.write_buf()?;
+        self.file = None;
+        self.rot.rotate()?;
+        self.open()
+    }
 
     /// Append one line; rotates first when the size or the schedule says so.
     pub fn write(&mut self, line: &[u8]) -> Result<(), String> {
@@ -649,17 +691,16 @@ impl FileSink {
             if self.file.is_none() {
                 self.open()?;
             }
-            let due = self.next_rotation.is_some_and(|t| SystemTime::now() >= t);
-            if due {
-                self.next_rotation = self.policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
+            let max = self.rot.policy.max_size;
+            if self.rot.schedule_due() {
                 if self.size > 0 {
                     self.rotate()?;
                 }
-            } else if self.policy.max_size > 0 && self.size > 0 && self.size + needed > self.policy.max_size {
+            } else if max > 0 && self.size > 0 && self.size + needed > max {
                 // `warden flush` may have truncated it: trust the file, not the count.
                 self.write_buf()?;
                 self.size = self.file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(self.size);
-                if self.size > 0 && self.size + needed > self.policy.max_size {
+                if self.size > 0 && self.size + needed > max {
                     self.rotate()?;
                 }
             }
@@ -677,7 +718,7 @@ impl FileSink {
         })();
         res.map_err(|e| {
             self.file = None;
-            format!("{}: {e}", self.path.display())
+            format!("{}: {e}", self.rot.path.display())
         })
     }
 
@@ -685,7 +726,7 @@ impl FileSink {
     pub fn flush(&mut self) -> Result<(), String> {
         self.write_buf().map_err(|e| {
             self.file = None;
-            format!("{}: {e}", self.path.display())
+            format!("{}: {e}", self.rot.path.display())
         })
     }
 
@@ -745,6 +786,706 @@ fn gzip_file(path: &std::path::Path) -> std::io::Result<()> {
 
 fn ignore_missing(e: std::io::Error) -> std::io::Result<()> {
     if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+}
+
+// ------------------------------------------------ worker_output = "direct"
+//
+// Worker bytes go from the worker's pipe to its out/err file with
+// splice(2): no parsing and no copy through Warden's memory. The pipes are
+// pumped on one output thread (`warden-output`, started on first use), so
+// a slow or stalled disk holds up worker output (the worker's writes block,
+// as if it wrote the file itself) but never supervision.
+//
+// splice can't write to O_APPEND files, so each file tracks its write
+// offset, re-read from the file's size before every write: a truncation by
+// someone else (`copytruncate`, `: > file`) or another appender is followed
+// like O_APPEND would, never overwritten or turned into a hole. Rotation
+// happens at a line boundary: splices stop at the size limit; then one
+// chunk is read (not spliced), the line that reached the limit (or was
+// open when the schedule fired) ends the old file and the rest begins the
+// new one. Every stream writing one path
+// shares one `DirectFile` (offset, rotation), and a stream only writes
+// after the file's last line is finished (or its writer is gone, or had
+// LINE_GRACE to finish it): two workers' partial lines never meet.
+
+/// Where direct-mode worker output goes (`[logging] out_file`/`err_file`).
+#[derive(Debug, Clone)]
+pub struct DirectFiles {
+    pub out: PathBuf,
+    /// None: stderr goes into `out` too, through the same pipe (`2>&1`).
+    pub err: Option<PathBuf>,
+    pub per_worker: bool,
+    pub policy: RotatePolicy,
+}
+
+impl DirectFiles {
+    /// `worker`'s stdout file and, when separate, its stderr file.
+    pub fn paths(&self, worker: &str) -> (PathBuf, Option<PathBuf>) {
+        let out = worker_file(&self.out, self.per_worker, worker);
+        let err = self.err.as_deref().map(|e| worker_file(e, self.per_worker, worker)).filter(|e| *e != out);
+        (out, err)
+    }
+}
+
+/// Most bytes one splice moves (a pipe holds 64 KB unless enlarged).
+const DIRECT_CHUNK: usize = 1 << 20;
+/// Userspace buffer for the read/write fallback, rotation and `logs -f`.
+const DIRECT_BUF: usize = 64 * 1024;
+/// How long a writer waits for another writer of the same file to finish
+/// the line it is in the middle of.
+const LINE_GRACE: Duration = Duration::from_millis(100);
+/// A failed rotation is retried after this (the file grows meanwhile).
+const ROTATE_RETRY: Duration = Duration::from_secs(60);
+
+/// Gets a copy of the bytes a step moved, for `warden logs -f` (None when
+/// nobody follows: then nothing is read back).
+pub type Echo<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+
+/// What one [`DirectWriter::step`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Bytes taken from the pipe.
+    Moved(usize),
+    /// The pipe is empty and closed: the worker (and whatever it started) is gone.
+    Eof,
+    /// Another writer of the file is in the middle of a line: try again after this.
+    Wait(Duration),
+}
+
+thread_local! {
+    /// Direct files open on this thread by path; every writer of a path
+    /// shares one (offset, rotation, whose turn it is).
+    static DIRECT_OPEN: RefCell<HashMap<PathBuf, Weak<RefCell<DirectFile>>>> =
+        RefCell::new(HashMap::new());
+    /// Buffer for the fallback copy, rotation and `logs -f`; allocated on first use.
+    static DIRECT_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A direct file `warden logs` shows the tail of: (path, worker, stream).
+/// `worker` is "*" once several workers have written the same path.
+type Known = (PathBuf, String, &'static str);
+/// Every direct file opened so far (it stays listed after its worker exits).
+static DIRECT_KNOWN: Mutex<Vec<Known>> = Mutex::new(Vec::new());
+/// Paths whose filesystem refused splice: warned once, then copied.
+static DIRECT_NO_SPLICE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Direct streams still being pumped (`flush` waits for them at exit, so
+/// the last lines of exited workers are drained into their files).
+static DIRECT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn with_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
+    DIRECT_SCRATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.len() < DIRECT_BUF {
+            b.resize(DIRECT_BUF, 0);
+        }
+        f(&mut b)
+    })
+}
+
+/// Read one chunk from `pipe` and drop it (the file can't take it).
+fn discard_chunk(pipe: &std::fs::File) -> std::io::Result<usize> {
+    use std::io::Read;
+    with_scratch(|buf| {
+        let mut r = pipe;
+        r.read(buf)
+    })
+}
+
+/// Counts one direct stream as active until dropped.
+pub struct DirectActive(());
+
+impl DirectActive {
+    pub fn begin() -> Self {
+        DIRECT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        DirectActive(())
+    }
+}
+
+impl Drop for DirectActive {
+    fn drop(&mut self) {
+        DIRECT_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// One stream's handle on its direct file.
+pub struct DirectWriter {
+    file: Rc<RefCell<DirectFile>>,
+    id: u64,
+}
+
+impl DirectWriter {
+    /// The file at `path` for `worker`'s `stream`, shared with every other
+    /// writer of that path on this thread. If it can't be opened, that is
+    /// logged, and output is discarded until it can (retried every second).
+    pub fn open(path: PathBuf, policy: RotatePolicy, worker: &str, stream: &'static str) -> DirectWriter {
+        {
+            let mut known = DIRECT_KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+            match known.iter_mut().find(|k| k.0 == path) {
+                Some(k) if k.1 != worker => k.1 = "*".into(),
+                Some(_) => {}
+                None => known.push((path.clone(), worker.to_string(), stream)),
+            }
+        }
+        let file = DIRECT_OPEN.with(|open| {
+            let mut open = open.borrow_mut();
+            open.retain(|_, f| f.strong_count() > 0);
+            if let Some(f) = open.get(&path).and_then(Weak::upgrade) {
+                return f;
+            }
+            let f = Rc::new(RefCell::new(DirectFile::new(path.clone(), policy, worker, stream)));
+            open.insert(path, Rc::downgrade(&f));
+            f
+        });
+        DirectWriter { file, id: DIRECT_WRITER_ID.fetch_add(1, Ordering::Relaxed) }
+    }
+
+    /// Move the next chunk of `pipe` (non-blocking) into the file.
+    /// `WouldBlock`: the pipe is empty. `echo` gets a copy of the bytes
+    /// (pass it only while someone follows `warden logs -f`).
+    pub fn step(&self, pipe: &std::fs::File, echo: Echo<'_>) -> std::io::Result<Step> {
+        self.file.borrow_mut().step(self.id, pipe, echo)
+    }
+}
+
+impl Drop for DirectWriter {
+    fn drop(&mut self) {
+        if let Ok(mut f) = self.file.try_borrow_mut() {
+            if f.last_writer == Some(self.id) {
+                f.last_writer_gone = true;
+            }
+        }
+    }
+}
+
+/// One direct-mode file: descriptor, write offset and rotation, shared by
+/// every stream that writes it.
+pub struct DirectFile {
+    rot: Rotator,
+    file: Option<std::fs::File>,
+    /// Opened read-write: its last byte and `logs -f` can be read back.
+    readable: bool,
+    /// A regular file: offsets, splice and rotation apply. Otherwise (a
+    /// FIFO, a terminal, /dev/null) plain writes, never rotated.
+    regular: bool,
+    /// Where the next byte goes: the file's size, re-read before each write.
+    offset: u64,
+    /// splice works here; false after EINVAL/ENOSYS/EPERM, and off Linux.
+    splice: bool,
+    /// The schedule asked for a rotation: done at the next line boundary.
+    rotate_due: bool,
+    /// A rotation failed: none before this.
+    rotate_retry: Option<Instant>,
+    /// The file could not be opened: next attempt.
+    next_open: Option<Instant>,
+    last_writer: Option<u64>,
+    last_writer_gone: bool,
+    last_write: Instant,
+    /// Writes are failing: bytes are being discarded.
+    failing: bool,
+    /// Bytes discarded since the last report.
+    discarded: u64,
+    last_report: Option<Instant>,
+    worker: String,
+    stream: &'static str,
+}
+
+impl DirectFile {
+    fn new(path: PathBuf, policy: RotatePolicy, worker: &str, stream: &'static str) -> Self {
+        let no_splice = DIRECT_NO_SPLICE.lock().unwrap_or_else(|e| e.into_inner()).contains(&path);
+        let mut f = DirectFile {
+            rot: Rotator::new(path, policy),
+            file: None,
+            readable: false,
+            regular: false,
+            offset: 0,
+            splice: cfg!(target_os = "linux") && !no_splice,
+            rotate_due: false,
+            rotate_retry: None,
+            next_open: None,
+            last_writer: None,
+            last_writer_gone: false,
+            last_write: Instant::now(),
+            failing: false,
+            discarded: 0,
+            last_report: None,
+            worker: worker.to_string(),
+            stream,
+        };
+        f.reopen();
+        f
+    }
+
+    /// O_CREAT, never O_APPEND (splice refuses it), close-on-exec (std),
+    /// read-write when allowed (for the last byte and `logs -f`).
+    fn open(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = &self.rot.path;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).mode(0o640);
+        let (f, readable) = match opts.clone().read(true).open(path) {
+            Ok(f) => (f, true),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => (opts.open(path)?, false),
+            Err(e) => return Err(e),
+        };
+        let m = f.metadata()?;
+        self.regular = m.is_file();
+        self.offset = if self.regular { m.len() } else { 0 };
+        self.file = Some(f);
+        self.readable = readable;
+        Ok(())
+    }
+
+    /// Open the file unless the last attempt failed less than a second ago.
+    fn reopen(&mut self) -> bool {
+        if self.next_open.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        match self.open() {
+            Ok(()) => {
+                self.next_open = None;
+                true
+            }
+            Err(e) => {
+                self.next_open = Some(Instant::now() + Duration::from_secs(1));
+                self.failing = true;
+                if self.should_report() {
+                    crate::error!(
+                        "cannot open the worker output file; the worker's output is discarded until it can",
+                        file = self.rot.path.display(),
+                        worker = self.worker,
+                        stream = self.stream,
+                        error = e,
+                        discarded_bytes = std::mem::take(&mut self.discarded),
+                        hint = "make sure the directory exists (or can be created) and is writable by the user Warden runs as; Warden retries every second",
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn step(&mut self, me: u64, pipe: &std::fs::File, echo: Echo<'_>) -> std::io::Result<Step> {
+        self.sync_offset();
+        if self.file.is_none() && !self.reopen() {
+            let n = discard_chunk(pipe)?;
+            self.discarded += n as u64;
+            return Ok(if n == 0 { Step::Eof } else { Step::Moved(n) });
+        }
+        if self.last_writer != Some(me) {
+            if let Some(wait) = self.take_turn() {
+                return Ok(Step::Wait(wait));
+            }
+            self.last_writer = Some(me);
+            self.last_writer_gone = false;
+        }
+        let n = if self.rotation_due() { self.rotate_at_line(pipe, echo)? } else { self.transfer(pipe, echo)? };
+        self.last_write = Instant::now();
+        if !self.failing && self.discarded > 0 {
+            crate::info!(
+                "worker output file is writable again",
+                file = self.rot.path.display(),
+                worker = self.worker,
+                discarded_bytes = std::mem::take(&mut self.discarded),
+            );
+        }
+        Ok(if n == 0 { Step::Eof } else { Step::Moved(n) })
+    }
+
+    /// Follow the file's real size: truncated elsewhere (`copytruncate`,
+    /// `warden flush` from another process) or appended to by someone
+    /// else, the next write goes to its end. Deleted: a new file.
+    fn sync_offset(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let (Some(f), true) = (&self.file, self.regular) else { return };
+        match f.metadata() {
+            Ok(m) if m.nlink() == 0 => {
+                self.file = None;
+                self.next_open = None;
+            }
+            Ok(m) => self.offset = m.len(),
+            Err(_) => {}
+        }
+    }
+
+    /// Another writer wrote last. If the file ends inside its line, it gets
+    /// LINE_GRACE from its last write to finish; after that, or if it is
+    /// gone, the line is ended here, so two writers never share a line.
+    fn take_turn(&mut self) -> Option<Duration> {
+        if !self.regular || self.offset == 0 || !self.ends_mid_line() {
+            return None;
+        }
+        let since = self.last_write.elapsed();
+        if self.last_writer.is_some() && !self.last_writer_gone && since < LINE_GRACE {
+            return Some((LINE_GRACE - since).min(Duration::from_millis(5)));
+        }
+        let _ = self.write_bytes(b"\n");
+        None
+    }
+
+    fn ends_mid_line(&self) -> bool {
+        use std::os::unix::fs::FileExt;
+        let (Some(f), true) = (&self.file, self.readable) else { return false };
+        let mut b = [0u8; 1];
+        matches!(f.read_at(&mut b, self.offset - 1), Ok(1)) && b[0] != b'\n'
+    }
+
+    fn rotation_due(&mut self) -> bool {
+        if !self.regular {
+            return false;
+        }
+        if self.rot.schedule_due() && self.offset > 0 {
+            self.rotate_due = true;
+        }
+        if let Some(t) = self.rotate_retry {
+            if Instant::now() < t {
+                return false;
+            }
+            self.rotate_retry = None;
+        }
+        if self.offset == 0 {
+            return false;
+        }
+        let max = self.rot.policy.max_size;
+        self.rotate_due || (max > 0 && self.offset >= max)
+    }
+
+    /// The fast path: splice up to the size limit (or a chunk).
+    fn transfer(&mut self, pipe: &std::fs::File, echo: Echo<'_>) -> std::io::Result<usize> {
+        let max = self.rot.policy.max_size;
+        let room = match self.regular && max > 0 && self.offset < max {
+            true => (max - self.offset).min(DIRECT_CHUNK as u64) as usize,
+            false => DIRECT_CHUNK,
+        };
+        // Off Linux `splice` is always false: the copy below.
+        #[cfg(target_os = "linux")]
+        if self.splice && self.regular {
+            use std::os::fd::AsFd;
+            let start = self.offset;
+            let Some(f) = self.file.as_ref() else { return discard_chunk(pipe) };
+            match crate::sys::splice(pipe.as_fd(), f.as_fd(), Some(&mut self.offset), room) {
+                Ok(n) => {
+                    self.failing = false;
+                    if let (Some(echo), true) = (echo, n > 0) {
+                        self.echo_back(start, n, echo);
+                    }
+                    return Ok(n);
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {
+                    return Err(e);
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EPERM)) => {
+                    self.splice = false;
+                    DIRECT_NO_SPLICE.lock().unwrap_or_else(|e| e.into_inner()).push(self.rot.path.clone());
+                    crate::warn!(
+                        "cannot splice into the worker output file; copying through Warden instead",
+                        file = self.rot.path.display(),
+                        reason = e,
+                        hint = "output still works, only slower (one copy through Warden); a local filesystem such as ext4, xfs or tmpfs takes splice",
+                    );
+                }
+                // The data is still in the pipe: drop one chunk so the
+                // worker never blocks on a file that can't take it.
+                Err(e) => {
+                    let n = discard_chunk(pipe)?;
+                    self.write_failed(&e, n);
+                    return Ok(n);
+                }
+            }
+        }
+        self.copy(pipe, room, echo)
+    }
+
+    /// The fallback: read(2) into a buffer, write it out.
+    fn copy(&mut self, pipe: &std::fs::File, room: usize, echo: Echo<'_>) -> std::io::Result<usize> {
+        use std::io::Read;
+        with_scratch(|buf| {
+            let mut r = pipe;
+            let n = r.read(&mut buf[..room.clamp(1, DIRECT_BUF)])?;
+            if n > 0 {
+                match self.write_bytes(&buf[..n]) {
+                    Ok(()) => {
+                        if let Some(echo) = echo {
+                            echo(&buf[..n]);
+                        }
+                    }
+                    Err(e) => self.write_failed(&e, n),
+                }
+            }
+            Ok(n)
+        })
+    }
+
+    /// Rotation, exact and at a line boundary: one chunk is read (not
+    /// spliced) and cut where the line that reaches the limit ends; that
+    /// much ends the old file and the rest begins the new one (cut again if
+    /// it fills that one too). Without such a newline all of it goes to the
+    /// current file and the rotation waits for the next chunk.
+    fn rotate_at_line(&mut self, pipe: &std::fs::File, echo: Echo<'_>) -> std::io::Result<usize> {
+        use std::io::Read;
+        with_scratch(|buf| {
+            let mut r = pipe;
+            let n = r.read(buf)?;
+            let mut rest = &buf[..n];
+            while !rest.is_empty() {
+                // What this file still takes: nothing once due (limit or schedule).
+                let max = self.rot.policy.max_size;
+                let room = match (self.rotate_due, max) {
+                    (true, _) => 0,
+                    (false, 0) => usize::MAX,
+                    (false, max) => max.saturating_sub(self.offset).try_into().unwrap_or(usize::MAX),
+                };
+                // The line that reaches the limit is the file's last.
+                let from = room.saturating_sub(1);
+                let end = match rest.get(from..).and_then(|r| r.iter().position(|&b| b == b'\n')) {
+                    Some(i) if room <= rest.len() && self.rotate_retry.is_none() => from + i + 1,
+                    // Room for all of it, or the line goes on: rotate once it ends.
+                    _ => {
+                        self.write_or_drop(rest);
+                        break;
+                    }
+                };
+                let (head, tail) = rest.split_at(end);
+                self.write_or_drop(head);
+                if let Err(e) = self.rotate_now() {
+                    self.rotate_retry = Some(Instant::now() + ROTATE_RETRY);
+                    crate::error!(
+                        "cannot rotate the worker output file; it keeps growing",
+                        file = self.rot.path.display(),
+                        error = e,
+                        hint = "Warden must be able to rename and create files in that directory; retried in a minute",
+                    );
+                }
+                rest = tail;
+            }
+            if let (Some(echo), true) = (echo, n > 0) {
+                echo(&buf[..n]);
+            }
+            Ok(n)
+        })
+    }
+
+    fn rotate_now(&mut self) -> std::io::Result<()> {
+        self.rotate_due = false;
+        self.rot.rotate()?;
+        // The descriptor still points at the rotated file; the new one
+        // starts empty. The turn stays with this writer: the rest of its
+        // chunk (maybe a partial line) begins the new file.
+        self.file = None;
+        self.rotate_retry = None;
+        self.open()
+    }
+
+    fn write_or_drop(&mut self, b: &[u8]) {
+        if let Err(e) = self.write_bytes(b) {
+            self.write_failed(&e, b.len());
+        }
+    }
+
+    fn write_bytes(&mut self, b: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let Some(f) = self.file.as_ref() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "the file is not open"));
+        };
+        if self.regular {
+            f.write_all_at(b, self.offset)?;
+            self.offset += b.len() as u64;
+        } else {
+            let mut w = f;
+            w.write_all(b)?;
+        }
+        self.failing = false;
+        Ok(())
+    }
+
+    fn write_failed(&mut self, e: &std::io::Error, lost: usize) {
+        self.failing = true;
+        self.discarded += lost as u64;
+        if self.should_report() {
+            crate::error!(
+                "cannot write the worker output file; its output is discarded until writes work again",
+                file = self.rot.path.display(),
+                worker = self.worker,
+                stream = self.stream,
+                error = e,
+                discarded_bytes = std::mem::take(&mut self.discarded),
+                hint = "free disk space (`df -h`) or fix the file's permissions; the worker keeps running and writing resumes by itself",
+            );
+        }
+    }
+
+    /// `logs -f`: the bytes just spliced, read back from the page cache.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn echo_back(&self, start: u64, n: usize, echo: &mut dyn FnMut(&[u8])) {
+        use std::os::unix::fs::FileExt;
+        let (Some(f), true) = (&self.file, self.readable) else { return };
+        let skip = n.saturating_sub(DIRECT_BUF);
+        with_scratch(|buf| {
+            if let Ok(k) = f.read_at(&mut buf[..n - skip], start + skip as u64) {
+                echo(&buf[..k]);
+            }
+        });
+    }
+
+    /// `warden flush`: empty the file; the next byte goes to offset 0.
+    fn truncate(&mut self) {
+        let (Some(f), true) = (&self.file, self.regular) else { return };
+        match f.set_len(0) {
+            Ok(()) => {
+                self.offset = 0;
+                self.rotate_due = false;
+                self.last_writer = None;
+            }
+            Err(e) => crate::warn!(
+                "could not truncate the worker output file; it keeps its content",
+                file = self.rot.path.display(),
+                error = e,
+                hint = "check the file's permissions",
+            ),
+        }
+    }
+
+    fn should_report(&mut self) -> bool {
+        let due = self.last_report.is_none_or(|t| t.elapsed() >= Duration::from_secs(60));
+        if due {
+            self.last_report = Some(Instant::now());
+        }
+        due
+    }
+}
+
+/// Work for the output thread.
+enum DirectMsg {
+    /// Called on the thread, inside its LocalSet: spawns a pump.
+    Run(Box<dyn FnOnce() + Send>),
+    /// `warden flush`: truncate every open direct file, then say so.
+    Truncate(Sender<()>),
+}
+
+static DIRECT_THREAD: OnceLock<Option<tokio::sync::mpsc::UnboundedSender<DirectMsg>>> = OnceLock::new();
+
+/// Run `start` on the output thread, where direct-mode files are written
+/// (`start` spawns its task with `spawn_local`). If that thread can't run,
+/// `start` runs here, on the caller's LocalSet.
+pub fn on_output_thread(start: Box<dyn FnOnce() + Send>) {
+    let start = match output_thread() {
+        Some(tx) => match tx.send(DirectMsg::Run(start)) {
+            Ok(()) => return,
+            Err(tokio::sync::mpsc::error::SendError(DirectMsg::Run(start))) => start,
+            Err(_) => return,
+        },
+        None => start,
+    };
+    start();
+}
+
+fn output_thread() -> Option<&'static tokio::sync::mpsc::UnboundedSender<DirectMsg>> {
+    DIRECT_THREAD
+        .get_or_init(|| {
+            let started = tokio::runtime::Builder::new_current_thread().enable_all().build().and_then(|rt| {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DirectMsg>();
+                std::thread::Builder::new().name("warden-output".into()).spawn(move || {
+                    let local = tokio::task::LocalSet::new();
+                    local.block_on(&rt, async move {
+                        while let Some(msg) = rx.recv().await {
+                            match msg {
+                                DirectMsg::Run(start) => start(),
+                                DirectMsg::Truncate(done) => {
+                                    truncate_direct_here();
+                                    let _ = done.send(());
+                                }
+                            }
+                        }
+                    });
+                })?;
+                Ok(tx)
+            });
+            match started {
+                Ok(tx) => Some(tx),
+                Err(e) => {
+                    crate::error!(
+                        "cannot start the thread that writes worker output files; writing them on the main thread",
+                        error = e,
+                        hint = "a slow disk can now delay supervision; check the process and memory limits (ulimit -u)",
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn truncate_direct_here() {
+    let files: Vec<_> = DIRECT_OPEN.with(|open| open.borrow().values().filter_map(Weak::upgrade).collect());
+    for f in files {
+        if let Ok(mut f) = f.try_borrow_mut() {
+            f.truncate();
+        }
+    }
+}
+
+/// `warden flush` for direct files: truncated on the thread that writes
+/// them, between two writes, so no write lands past the new end. Waits a
+/// moment so the command returns after the fact.
+fn truncate_direct_files() {
+    truncate_direct_here();
+    if let Some(Some(tx)) = DIRECT_THREAD.get() {
+        let (done, wait) = channel();
+        if tx.send(DirectMsg::Truncate(done)).is_ok() && wait.recv_timeout(Duration::from_millis(250)).is_err() {
+            crate::warn!(
+                "worker output files are still being truncated",
+                hint = "the disk is slow; the truncation finishes in the background",
+            );
+        }
+    }
+}
+
+/// Someone is reading `warden logs` (and may follow it).
+pub fn following() -> bool {
+    logger().tx.receiver_count() > 0
+}
+
+/// Direct-mode output for `warden logs -f` only: not kept, not written
+/// (it is in the file already).
+pub fn follow_only(b: OutputBatch) {
+    let l = logger();
+    for line in b.batch.lines {
+        let _ = l.tx.send(line);
+    }
+}
+
+/// Bytes read from the end of each direct file for `warden logs`.
+const DIRECT_TAIL_MIN: u64 = 64 * 1024;
+const DIRECT_TAIL_MAX: u64 = 256 * 1024;
+
+/// The last `n` lines of a direct file as `warden logs` shows worker
+/// output, stamped with the file's last write (lines carry no time of
+/// their own). Only the page cache is read, so the event loop never waits
+/// for the disk; otherwise one line says where the output is.
+fn direct_tail(k: &Known, n: usize) -> Vec<Line> {
+    let (path, worker, stream) = k;
+    let bytes = (n as u64).saturating_mul(1024).clamp(DIRECT_TAIL_MIN, DIRECT_TAIL_MAX);
+    match crate::logview::tail_lines(path, n, bytes) {
+        Ok((mtime, text)) => {
+            let mut b = OutputBatch::at(worker, stream, mtime);
+            for t in &text {
+                b.push(t);
+            }
+            b.batch.lines
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => vec![
+            format_event(
+                Level::Info,
+                "worker output not shown: its file is not in memory right now",
+                &[("file", &path.display()), ("reason", &e), ("hint", &"read the file itself (tail, less)")],
+            )
+            .into(),
+        ],
+    }
 }
 
 /// Format for stdout: journald gets `<priority>` and no timestamp.
@@ -899,19 +1640,38 @@ fn write_loop(rx: Receiver<Queued>, sinks: Sinks) {
     }
 }
 
-/// Wait (up to `timeout`) for queued lines to be written. Called before exit.
+/// Wait (up to `timeout`) for queued lines to be written, and for direct
+/// worker output to be drained from the pipes of workers that have exited.
+/// Called before exit.
 pub fn flush(timeout: Duration) {
     let l = logger();
     let t0 = Instant::now();
-    while l.pending.load(Ordering::Relaxed) > 0 && t0.elapsed() < timeout {
+    while (l.pending.load(Ordering::Relaxed) > 0 || DIRECT_ACTIVE.load(Ordering::Relaxed) > 0) && t0.elapsed() < timeout
+    {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// The last `n` lines kept in memory that pass `keep` (oldest first).
+/// The last `n` lines kept in memory that pass `keep` (oldest first). With
+/// `worker_output = "direct"`, worker output is not in memory: the tails
+/// of its files are read instead and merged in by time.
 pub fn recent_matching(n: usize, keep: &dyn Fn(&str) -> bool) -> Vec<Line> {
-    let rings = logger().rings.lock().unwrap_or_else(|e| e.into_inner());
-    merge_newest(&rings.events, &rings.output, n, keep)
+    let mut lines = {
+        let rings = logger().rings.lock().unwrap_or_else(|e| e.into_inner());
+        merge_newest(&rings.events, &rings.output, n, keep)
+    };
+    let known = DIRECT_KNOWN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if known.is_empty() || n == 0 {
+        return lines;
+    }
+    for k in &known {
+        lines.extend(direct_tail(k, n).into_iter().filter(|l| keep(l)));
+    }
+    // Stable: events keep their order, and so do each file's lines.
+    lines.sort_by(|a, b| a.get(..TS_LEN).cmp(&b.get(..TS_LEN)));
+    let cut = lines.len().saturating_sub(n);
+    lines.drain(..cut);
+    lines
 }
 
 /// The newest `n` lines of both rings that pass `keep`, oldest first.
@@ -1168,6 +1928,247 @@ mod tests {
         assert_eq!(merged.files.len(), 1, "one shared file");
         merged.files.values_mut().for_each(|f| f.flush().unwrap());
         assert_eq!(std::fs::read_to_string(dir.join("all.log")).unwrap(), "a\nb\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------- worker_output = "direct"
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("warden-direct-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A pipe whose read end is non-blocking, as the output thread has it.
+    fn nb_pipe() -> (std::fs::File, std::fs::File) {
+        let (r, w) = crate::sys::pipe_cloexec().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
+        let _in_rt = rt.enter();
+        let r = tokio::net::unix::pipe::Receiver::from_owned_fd(r).unwrap().into_nonblocking_fd().unwrap();
+        (std::fs::File::from(r), std::fs::File::from(w))
+    }
+
+    /// A pipe whose write end a thread fills with `data`, then closes.
+    fn feed(data: Vec<u8>) -> (std::fs::File, std::thread::JoinHandle<()>) {
+        let (r, mut w) = nb_pipe();
+        let t = std::thread::spawn(move || w.write_all(&data).unwrap());
+        (r, t)
+    }
+
+    /// Step until the pipe is empty (`Ok(None)`: EOF) or the file says wait.
+    fn pump(w: &DirectWriter, pipe: &std::fs::File, until_eof: bool) -> Option<Step> {
+        loop {
+            match w.step(pipe, None) {
+                Ok(Step::Moved(_)) => {}
+                Ok(Step::Eof) => return None,
+                Ok(wait @ Step::Wait(_)) => return Some(wait),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && until_eof => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Some(Step::Moved(0)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+    }
+
+    /// Lines of every length (empty, short, CRLF, over a pipe's 64 KB),
+    /// ending with one that has no newline.
+    fn varied_output(lines: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut seed = 99u64;
+        for i in 0..lines {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let len = match (seed >> 33) % 10 {
+                0 => 0,
+                1 => 70_000 + (seed >> 40) as usize % 5000,
+                _ => (seed >> 40) as usize % 300,
+            };
+            data.extend(format!("{i} ").bytes());
+            data.extend((0..len).map(|j| b'a' + (j % 26) as u8));
+            data.extend_from_slice(if i % 7 == 0 { b"\r\n" } else { b"\n" });
+        }
+        data.extend_from_slice(b"last line, no newline");
+        data
+    }
+
+    /// Rotated files oldest first, then the current one.
+    fn chain(path: &std::path::Path) -> Vec<PathBuf> {
+        let mut rotated: Vec<(u32, PathBuf)> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.unwrap().path();
+                let n = p.file_name()?.to_str()?.strip_prefix("out.log.")?.parse().ok()?;
+                Some((n, p))
+            })
+            .collect();
+        rotated.sort_by_key(|r| std::cmp::Reverse(r.0));
+        rotated.into_iter().map(|r| r.1).chain([path.to_path_buf()]).collect()
+    }
+
+    #[test]
+    fn direct_files_rotate_exactly_at_line_boundaries() {
+        // Spliced, then the read/write fallback: the same bytes either way.
+        for splice in [true, false] {
+            let dir = scratch_dir(&format!("rotate-{splice}"));
+            let path = dir.join("out.log");
+            let policy = RotatePolicy { max_size: 4096, keep: 1000, ..RotatePolicy::default() };
+            let w = DirectWriter::open(path.clone(), policy, "1", "stdout");
+            w.file.borrow_mut().splice &= splice;
+            let data = varied_output(600);
+            let (pipe, t) = feed(data.clone());
+            assert_eq!(pump(&w, &pipe, true), None);
+            t.join().unwrap();
+            let files = chain(&path);
+            assert!(files.len() > 20, "{} files", files.len());
+            let mut all = Vec::new();
+            for (i, f) in files.iter().enumerate() {
+                let bytes = std::fs::read(f).unwrap();
+                if i + 1 < files.len() {
+                    assert!(bytes.ends_with(b"\n"), "{} does not end a line", f.display());
+                    assert!(bytes.len() >= 4096, "{} rotated early: {} bytes", f.display(), bytes.len());
+                    // ...and late by no more than the line that reached the limit.
+                    let last_line = bytes[..bytes.len() - 1].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+                    assert!(last_line < 4096, "{} rotated late: {last_line} bytes before its last line", f.display());
+                }
+                all.extend(bytes);
+            }
+            assert!(all == data, "splice={splice}: the files together are not what was written");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn direct_files_follow_truncation_and_flush() {
+        let dir = scratch_dir("truncate");
+        let path = dir.join("out.log");
+        let policy = RotatePolicy { max_size: 0, ..RotatePolicy::default() };
+        let w = DirectWriter::open(path.clone(), policy, "1", "stdout");
+        let (pipe, t) = feed(b"first\n".to_vec());
+        pump(&w, &pipe, true);
+        t.join().unwrap();
+        // Truncated by someone else (copytruncate): no hole of zeros.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        let (pipe, t) = feed(b"second\n".to_vec());
+        pump(&w, &pipe, true);
+        t.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second\n");
+        // `warden flush`.
+        truncate_direct_here();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let (pipe, t) = feed(b"third\n".to_vec());
+        pump(&w, &pipe, true);
+        t.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        // Deleted: a new file at the path.
+        std::fs::remove_file(&path).unwrap();
+        let (pipe, t) = feed(b"fourth\n".to_vec());
+        pump(&w, &pipe, true);
+        t.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fourth\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_files_rotate_on_schedule_at_a_line_boundary() {
+        let dir = scratch_dir("schedule");
+        let path = dir.join("out.log");
+        let policy = RotatePolicy { max_size: 0, keep: 3, ..RotatePolicy::default() };
+        let w = DirectWriter::open(path.clone(), policy, "1", "stdout");
+        let (r, mut wr) = nb_pipe();
+        wr.write_all(b"abc\ndef").unwrap();
+        pump(&w, &r, false);
+        // The schedule fires while a line is unfinished: it waits for its end.
+        w.file.borrow_mut().rot.next_rotation = Some(UNIX_EPOCH);
+        wr.write_all(b"gh").unwrap();
+        pump(&w, &r, false);
+        assert!(!dir.join("out.log.1").exists(), "no newline yet: no rotation");
+        wr.write_all(b"i\njk\n").unwrap();
+        pump(&w, &r, false);
+        assert_eq!(std::fs::read_to_string(dir.join("out.log.1")).unwrap(), "abc\ndefghi\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "jk\n");
+        // Once: the next writes stay in the new file.
+        wr.write_all(b"lm\n").unwrap();
+        pump(&w, &r, false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "jk\nlm\n");
+        assert!(!dir.join("out.log.2").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_writers_of_one_file_never_share_a_line() {
+        let dir = scratch_dir("turns");
+        let path = dir.join("out.log");
+        let policy = RotatePolicy { max_size: 0, ..RotatePolicy::default() };
+        let a = DirectWriter::open(path.clone(), policy.clone(), "1", "stdout");
+        let b = DirectWriter::open(path.clone(), policy, "1", "stdout");
+        assert!(Rc::ptr_eq(&a.file, &b.file), "one shared file");
+        let ((ar, mut aw), (br, mut bw)) = (nb_pipe(), nb_pipe());
+        // A is mid-line: B waits for it to finish.
+        aw.write_all(b"a starts").unwrap();
+        pump(&a, &ar, false);
+        bw.write_all(b"b line\n").unwrap();
+        assert!(matches!(pump(&b, &br, false), Some(Step::Wait(_))));
+        aw.write_all(b" and ends\n").unwrap();
+        pump(&a, &ar, false);
+        pump(&b, &br, false);
+        // A stays mid-line past the grace period: B ends the line itself.
+        aw.write_all(b"a stalls").unwrap();
+        pump(&a, &ar, false);
+        bw.write_all(b"b again\n").unwrap();
+        let t0 = Instant::now();
+        while let Some(Step::Wait(d)) = pump(&b, &br, false) {
+            std::thread::sleep(d);
+        }
+        assert!(t0.elapsed() >= LINE_GRACE - Duration::from_millis(10));
+        // A goes away mid-line: B doesn't wait at all.
+        pump(&a, &ar, false); // nothing new
+        aw.write_all(b"a dies").unwrap();
+        pump(&a, &ar, false);
+        drop(a);
+        bw.write_all(b"b last\n").unwrap();
+        assert_eq!(pump(&b, &br, false), Some(Step::Moved(0)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, "a starts and ends\nb line\na stalls\nb again\na dies\nb last\n");
+        drop((aw, bw));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_output_is_drained_even_when_the_file_is_unusable() {
+        let dir = scratch_dir("unusable");
+        // A directory where the file should be: open fails, bytes are discarded, never blocking.
+        let path = dir.join("taken");
+        std::fs::create_dir_all(&path).unwrap();
+        let w = DirectWriter::open(path.clone(), RotatePolicy::default(), "1", "stdout");
+        let (pipe, t) = feed(vec![b'x'; 300_000]);
+        assert_eq!(pump(&w, &pipe, true), None, "EOF reached: everything was read");
+        t.join().unwrap();
+        assert_eq!(w.file.borrow().discarded, 300_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn direct_paths_and_tails() {
+        let files = DirectFiles {
+            out: "/l/out.log".into(),
+            err: Some("/l/err.log".into()),
+            per_worker: true,
+            policy: RotatePolicy::default(),
+        };
+        assert_eq!(files.paths("2"), ("/l/out-2.log".into(), Some("/l/err-2.log".into())));
+        let merged = DirectFiles { err: None, per_worker: false, ..files.clone() };
+        assert_eq!(merged.paths("2"), ("/l/out.log".into(), None));
+        let same = DirectFiles { err: Some("/l/out.log".into()), ..files };
+        assert_eq!(same.paths("3"), ("/l/out-3.log".into(), None), "same file: one pipe");
+        // `warden logs`: the file's last lines, framed like captured output.
+        let dir = scratch_dir("tail");
+        let path = dir.join("out.log");
+        std::fs::write(&path, "one\ntwo\nthree").unwrap();
+        let lines = direct_tail(&(path.clone(), "1".into(), "stdout"), 2);
+        let shown: Vec<_> = lines.iter().map(|l| split_output(l)).collect();
+        assert_eq!(shown, vec![Some(("1", "stdout", "two")), Some(("1", "stdout", "three"))]);
+        assert!(direct_tail(&(dir.join("missing"), "1".into(), "stdout"), 2).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
