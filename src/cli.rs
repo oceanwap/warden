@@ -56,6 +56,18 @@ APPS (familiar from PM2):
                      --overwrite  --cutover overlap|same-port|new-port:<port>
                      (switch with rollback)  --finalize (remove them from PM2)
 
+WARDEND (optional daemon: restarts background supervisors that die, one socket
+for live events; apps never depend on it and keep running without it):
+    daemon           Run wardend in the foreground; --background detaches it (log in
+                     the state directory: logs/wardend.log). `warden start` starts it
+                     in the background for you unless WARDEN_NO_DAEMON=1
+    daemon status    wardend's pid and every app it watches  [--json]; exit 1 when
+                     it is not running
+    daemon stop      Stop wardend; every app keeps running (`warden kill` stops it too)
+    events [target]  Live events, one line each: workers, rollouts, supervisors
+                     [--json] (NDJSON)  [--logs] (log lines too)  [--interval MS]
+                     From wardend when it runs, else from the apps' sockets
+
 SUPERVISOR:
     start            With no app: run the supervisor in the foreground for -c
                      (what systemd runs; also: run)
@@ -125,6 +137,23 @@ pub enum Command {
     Top,
     Doctor,
     Pm2Migrate(Box<crate::migrate::MigrateOpts>),
+    /// wardend: run it, or ask the running one.
+    Daemon(DaemonCmd),
+    /// `warden events [target]`: live events.
+    Events {
+        logs: bool,
+        interval_ms: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DaemonCmd {
+    /// `warden daemon [--background]`.
+    Run {
+        background: bool,
+    },
+    Status,
+    Stop,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -253,6 +282,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut worker: Option<String> = None;
     let mut q = crate::logview::Query::default();
     let mut history = false;
+    let (mut background, mut with_logs) = (false, false);
+    let mut interval_ms: Option<u64> = None;
     let mut so = StartOpts::default();
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -282,6 +313,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 q.level = Some(parse_level(&l).ok_or_else(|| format!("--level {l:?}: debug, info, warn or error"))?);
             }
             "--history" | "--files" | "--all" => history = true,
+            "--background" => background = true,
+            "--logs" => with_logs = true,
+            "--interval" => interval_ms = Some(num(a, &value(a)?)?),
             "--json" => json = true,
             "--no-wait" => no_wait = true,
             "-y" | "--yes" => yes = true,
@@ -543,8 +577,27 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             target = one(&rest);
             Command::Top
         }
+        "daemon" | "wardend" => {
+            too_many(1)?;
+            Command::Daemon(match one(&rest).as_deref() {
+                None | Some("start") | Some("run") => DaemonCmd::Run { background },
+                Some("status") => DaemonCmd::Status,
+                Some("stop") => DaemonCmd::Stop,
+                Some(other) => return Err(format!("daemon {other:?}: expected `status`, `stop` or nothing")),
+            })
+        }
+        "events" => {
+            too_many(1)?;
+            target = one(&rest);
+            Command::Events { logs: with_logs, interval_ms }
+        }
         other => return Err(format!("unknown command {other:?} (see `warden --help`)")),
     };
+    if background && !matches!(command, Command::Daemon(DaemonCmd::Run { .. })) {
+        return Err("--background only applies to `warden daemon` (`warden start` already runs apps in the \
+                    background)"
+            .into());
+    }
     if let Some(w) = worker {
         target = Some(format!("{}:{w}", target.unwrap_or_default()));
     }
@@ -702,7 +755,7 @@ fn health_word(h: Option<bool>) -> &'static str {
 }
 
 /// Aligned columns; the last column is not padded.
-fn table(rows: &[Vec<String>]) -> String {
+pub(crate) fn table(rows: &[Vec<String>]) -> String {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> =
         (0..cols).map(|c| rows.iter().filter_map(|r| r.get(c)).map(|s| s.chars().count()).max().unwrap_or(0)).collect();
@@ -986,6 +1039,23 @@ mod tests {
         assert_eq!(p("delete api").unwrap().command, Command::Delete { target: "api".into() });
         assert!(p("delete").is_err());
         assert!(p("start app.js --watch").is_err());
+    }
+
+    #[test]
+    fn daemon_and_events_commands() {
+        assert_eq!(p("daemon").unwrap().command, Command::Daemon(DaemonCmd::Run { background: false }));
+        assert_eq!(p("daemon --background").unwrap().command, Command::Daemon(DaemonCmd::Run { background: true }));
+        assert_eq!(p("daemon status").unwrap().command, Command::Daemon(DaemonCmd::Status));
+        assert!(p("daemon status --json").unwrap().json);
+        assert_eq!(p("daemon stop").unwrap().command, Command::Daemon(DaemonCmd::Stop));
+        assert!(p("daemon frobnicate").is_err());
+        assert!(p("daemon stop now").is_err());
+        assert!(p("start app.js --background").is_err(), "only for the daemon");
+        let a = p("events api --json --logs --interval 500").unwrap();
+        assert_eq!(a.command, Command::Events { logs: true, interval_ms: Some(500) });
+        assert_eq!((a.target.as_deref(), a.json), (Some("api"), true));
+        assert_eq!(p("events").unwrap().command, Command::Events { logs: false, interval_ms: None });
+        assert!(p("events --interval soon").is_err());
     }
 
     #[test]

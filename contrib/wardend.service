@@ -1,0 +1,50 @@
+# systemd unit for wardend, Warden's optional daemon (docs/protocol.md):
+# it restarts the supervisors `warden start` launched in the background when
+# they die, and serves live events (`warden events`, the GUI) on
+# /run/warden/wardend.sock. Apps never depend on it: stopping, restarting or
+# killing it stops no app.
+#   cp contrib/wardend.service /etc/systemd/system/
+#   systemctl enable --now wardend
+
+[Unit]
+Description=wardend: Warden's second-level supervision and live events
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# READY=1 once its socket is bound.
+Type=notify
+NotifyAccess=main
+# Root, like `sudo warden start` and `warden startup`: it must reach every
+# app's control socket (/run/warden/<app>/control.sock, /etc/warden configs)
+# and restart a background supervisor as the user that started it.
+ExecStart=/usr/local/bin/warden daemon
+Restart=always
+RestartSec=1s
+# wardend pings every 2 s while its loop keeps up; a hung wardend is
+# restarted (apps are not affected).
+WatchdogSec=30
+
+# The supervisors wardend restarts are its children and land in this unit's
+# cgroup: stopping the unit must stop wardend alone, never them.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# /run/warden holds every app's runtime directory: create it (readable, so
+# warden@<app> units running as another user can reach theirs) and never
+# remove it when wardend stops.
+RuntimeDirectory=warden
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+# Inherited by the supervisors it restarts, as under warden@.service.
+NoNewPrivileges=true
+LimitNOFILE=65536
+# Deliberately no filesystem sandboxing (ProtectSystem=, ProtectHome=,
+# PrivateTmp=, ...) and no MemoryMax= / CPUQuota=: a supervisor wardend
+# restarts inherits this unit's namespaces and cgroup limits, and an app must
+# see the same host as when `warden start` launched it.
+
+[Install]
+WantedBy=multi-user.target
