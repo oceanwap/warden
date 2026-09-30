@@ -42,6 +42,9 @@ APPS (familiar from PM2):
     reset <target>   Zero restart counters and retry FAILED workers now
     signal <SIG> <target>   Send a signal to the workers (SIGUSR2, USR2, 12)
     top              Live view of every app (also: monit)
+    serve [dir] [port]   Serve static files (default: . on 8080) with Warden's built-in
+                     server, like `pm2 serve`: --name --spa --listing -i N
+                     --basic-auth user:pass (or --basic-auth-username/-password)
     save             Remember the running apps, worker counts and stopped state
     resurrect        Start what `save` remembered
     startup          Install the systemd unit and enable saved apps at boot (root)
@@ -95,6 +98,12 @@ pub enum Command {
     Act(Action),
     Start {
         what: String,
+        opts: Box<StartOpts>,
+    },
+    /// `warden serve <dir> [port]`, like `pm2 serve`.
+    Serve {
+        dir: PathBuf,
+        port: u16,
         opts: Box<StartOpts>,
     },
     Delete {
@@ -174,6 +183,10 @@ pub struct StartOpts {
     pub log_file: Option<PathBuf>,
     pub merge_logs: bool,
     pub shim: Option<bool>,
+    /// `serve`: single-page app fallback, directory listing, Basic auth.
+    pub spa: bool,
+    pub listing: bool,
+    pub basic_auth: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -295,6 +308,19 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--error-file" | "--err-file" => so.err_file = Some(value(a)?.into()),
             "-l" | "--log" => so.log_file = Some(value(a)?.into()),
             "--merge-logs" => so.merge_logs = true,
+            "--spa" => so.spa = true,
+            "--listing" => so.listing = true,
+            "--basic-auth" => so.basic_auth = Some(value(a)?),
+            "--basic-auth-username" => {
+                let u = value(a)?;
+                let pass = so.basic_auth.take().and_then(|x| x.split_once(':').map(|(_, p)| p.to_string()));
+                so.basic_auth = Some(format!("{u}:{}", pass.unwrap_or_default()));
+            }
+            "--basic-auth-password" => {
+                let pw = value(a)?;
+                let user = so.basic_auth.take().and_then(|x| x.split_once(':').map(|(u, _)| u.to_string()));
+                so.basic_auth = Some(format!("{}:{pw}", user.unwrap_or_default()));
+            }
             "--shim" => so.shim = Some(true),
             "--no-shim" => so.shim = Some(false),
             "--shutdown-with-message" => {
@@ -341,6 +367,15 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 None => Command::Run,
                 Some(what) => Command::Start { what, opts: Box::new(so.clone()) },
             }
+        }
+        "serve" => {
+            too_many(2)?;
+            let dir = PathBuf::from(rest.first().cloned().unwrap_or_else(|| ".".into()));
+            let port = match rest.get(1) {
+                Some(p) => p.parse().map_err(|_| format!("serve: {p:?} is not a port"))?,
+                None => so.port.unwrap_or(8080),
+            };
+            Command::Serve { dir, port, opts: Box::new(so.clone()) }
         }
         "run" => {
             too_many(0)?;
@@ -888,6 +923,19 @@ mod tests {
         assert_eq!(p("delete api").unwrap().command, Command::Delete { target: "api".into() });
         assert!(p("delete").is_err());
         assert!(p("start app.js --watch").is_err());
+    }
+
+    #[test]
+    fn serve_command() {
+        let a = p("serve ./dist 3000 --spa --name site --basic-auth-username u --basic-auth-password p").unwrap();
+        let Command::Serve { dir, port, opts } = a.command else { panic!() };
+        assert_eq!((dir, port), (PathBuf::from("./dist"), 3000));
+        assert!(opts.spa);
+        assert_eq!(opts.name.as_deref(), Some("site"));
+        assert_eq!(opts.basic_auth.as_deref(), Some("u:p"));
+        let Command::Serve { dir, port, .. } = p("serve").unwrap().command else { panic!() };
+        assert_eq!((dir, port), (PathBuf::from("."), 8080));
+        assert!(p("serve dist notaport").is_err());
     }
 
     #[test]

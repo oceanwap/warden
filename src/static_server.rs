@@ -1,0 +1,912 @@
+//! Warden's built-in static file server (`warden serve <dir> <port>`, like
+//! `pm2 serve` or `npx serve`). It runs as the worker process of an app with
+//! a `[static]` section, so it is supervised like any app: several workers
+//! share the port with SO_REUSEPORT, each reports readiness and a heartbeat
+//! on Warden's IPC pipe and serves a private health socket, and it drains on
+//! the stop signal, so rolling restarts drop no requests.
+//!
+//! HTTP/1.1 with keep-alive; GET and HEAD; ETag / Last-Modified with 304s;
+//! single byte ranges (206); precompressed `.br` / `.gz` siblings; SPA
+//! fallback; `404.html`; Basic auth; extra headers. Paths can't leave the
+//! root (`..`, symlinks pointing outside, NUL), dotfiles are hidden by
+//! default, request heads are capped at 16 KB and must arrive within 10 s.
+
+use crate::config::Static;
+use std::os::fd::FromRawFd;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+const MAX_HEAD: usize = 16 * 1024;
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CONNECTIONS: usize = 10_000;
+
+struct Site {
+    root: PathBuf,
+    cfg: Static,
+    auth: Option<String>,
+    draining: AtomicBool,
+    active: AtomicUsize,
+}
+
+/// Entry point of `warden serve-static` (started by the supervisor).
+pub fn main() -> i32 {
+    let cfg: Static = match std::env::var("WARDEN_STATIC")
+        .map_err(|e| e.to_string())
+        .and_then(|j| serde_json::from_str(&j).map_err(|e| e.to_string()))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warden serve-static: WARDEN_STATIC is missing or invalid ({e}); this command is run by Warden");
+            return 78;
+        }
+    };
+    let port: u16 = match std::env::var("PORT").ok().and_then(|p| p.parse().ok()) {
+        Some(p) => p,
+        None => {
+            eprintln!("warden serve-static: PORT is not set; set app.port in the config");
+            return 78;
+        }
+    };
+    // Resolve `current` symlinks once: this worker serves one release.
+    let root = match std::fs::canonicalize(&cfg.root) {
+        Ok(r) if r.is_dir() => r,
+        Ok(r) => {
+            eprintln!("warden serve-static: {} is not a directory", r.display());
+            return 78;
+        }
+        Err(e) => {
+            eprintln!("warden serve-static: static.root {}: {e}", cfg.root.display());
+            return 78;
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("warden serve-static: cannot start the runtime: {e}");
+            return 1;
+        }
+    };
+    let auth = cfg.basic_auth.as_deref().map(|a| format!("Basic {}", base64(a.as_bytes())));
+    let site = Arc::new(Site { root, cfg, auth, draining: AtomicBool::new(false), active: AtomicUsize::new(0) });
+    match rt.block_on(serve(site, port)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("warden serve-static: {e}");
+            1
+        }
+    }
+}
+
+/// A TCP listener with SO_REUSEPORT (std can't set it before bind).
+fn reuseport_listener(host: &str, port: u16, reuse_port: bool) -> Result<std::net::TcpListener, String> {
+    let ip: std::net::IpAddr = host.parse().map_err(|_| format!("static.host {host:?} is not an IP address"))?;
+    let addr = std::net::SocketAddr::new(ip, port);
+    let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    // SAFETY: plain socket syscalls on a descriptor we own; closed on error.
+    unsafe {
+        let fd = libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0);
+        if fd < 0 {
+            return Err(format!("socket: {}", std::io::Error::last_os_error()));
+        }
+        let one: libc::c_int = 1;
+        let set = |opt| libc::setsockopt(fd, libc::SOL_SOCKET, opt, &one as *const _ as *const libc::c_void, 4);
+        set(libc::SO_REUSEADDR);
+        if reuse_port {
+            set(libc::SO_REUSEPORT);
+        }
+        let (sa, len) = sockaddr(&addr);
+        if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len) != 0 || libc::listen(fd, 1024) != 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(format!("cannot listen on {addr}: {e}"));
+        }
+        Ok(std::net::TcpListener::from_raw_fd(fd))
+    }
+}
+
+fn sockaddr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: zeroed sockaddr_storage is a valid value; we fill the variant we use.
+    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let len = match addr {
+        std::net::SocketAddr::V4(a) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
+                sin_zero: [0; 8],
+            };
+            // SAFETY: sockaddr_in fits in sockaddr_storage.
+            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in, sin) };
+            std::mem::size_of::<libc::sockaddr_in>()
+        }
+        std::net::SocketAddr::V6(a) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: 0,
+                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                sin6_scope_id: 0,
+            };
+            // SAFETY: sockaddr_in6 fits in sockaddr_storage.
+            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in6, sin6) };
+            std::mem::size_of::<libc::sockaddr_in6>()
+        }
+    };
+    (ss, len as libc::socklen_t)
+}
+
+/// One JSON line to Warden on the IPC pipe (fd from WARDEN_IPC_FD).
+fn report(msg: serde_json::Value) {
+    let Some(fd) = std::env::var("WARDEN_IPC_FD").ok().and_then(|v| v.parse::<i32>().ok()) else { return };
+    let mut line = msg.to_string();
+    line.push('\n');
+    // SAFETY: write(2) on the inherited pipe; a failure only loses the message.
+    unsafe {
+        libc::write(fd, line.as_ptr() as *const libc::c_void, line.len());
+    }
+}
+
+async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
+    let reuse = std::env::var("WARDEN_REUSE_PORT").is_ok_and(|v| v == "1");
+    let std_listener = reuseport_listener(&site.cfg.host, port, reuse)?;
+    let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| e.to_string())?;
+    let worker: u64 = std::env::var("WARDEN_WORKER_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+    // Private socket for this worker's health checks.
+    let mut unix = None;
+    if let Ok(dir) = std::env::var("WARDEN_HEALTH_DIR") {
+        let app = std::env::var("WARDEN_APP").unwrap_or_else(|_| "app".into());
+        let inst = std::env::var("WARDEN_INSTANCE").unwrap_or_else(|_| std::process::id().to_string());
+        let path = PathBuf::from(dir).join(format!("{app}.h{inst}-{worker}.sock"));
+        if path.as_os_str().len() <= 100 {
+            let _ = std::fs::remove_file(&path);
+            if let Ok(l) = tokio::net::UnixListener::bind(&path) {
+                unix = Some((l, path));
+            }
+        }
+    }
+    let mut msg = serde_json::json!({"ev": "listening", "port": port, "worker": worker});
+    if let Some((_, p)) = &unix {
+        msg["socket"] = p.display().to_string().into();
+    }
+    report(msg);
+    println!("serving {} on {}:{port}", site.root.display(), site.cfg.host);
+
+    let beat_ms: u64 = std::env::var("WARDEN_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    if beat_ms > 0 {
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_millis(beat_ms));
+            loop {
+                t.tick().await;
+                report(serde_json::json!({"ev": "heartbeat", "worker": worker}));
+            }
+        });
+    }
+
+    let stop_name = std::env::var("WARDEN_STOP_SIGNAL").unwrap_or_else(|_| "SIGTERM".into());
+    let stop_sig = crate::signals::parse(&stop_name).unwrap_or(libc::SIGTERM);
+    let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(stop_sig))
+        .map_err(|e| format!("installing the {stop_name} handler: {e}"))?;
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+
+    let unix_listener = unix.as_ref().map(|(l, _)| l);
+    loop {
+        tokio::select! {
+            _ = stop.recv() => break,
+            acc = listener.accept() => {
+                let Ok((stream, _)) = acc else { continue };
+                let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+                let _ = stream.set_nodelay(true);
+                let (site, drain) = (site.clone(), drain_rx.clone());
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let (r, w) = stream.into_split();
+                    connection(r, Conn::Tcp(w), site, drain).await;
+                });
+            }
+            acc = async { match unix_listener { Some(l) => l.accept().await.map(|(s, _)| s), None => std::future::pending().await } } => {
+                let Ok(stream) = acc else { continue };
+                let (site, drain) = (site.clone(), drain_rx.clone());
+                tokio::spawn(async move {
+                    let (r, w) = stream.into_split();
+                    connection(r, Conn::Unix(w), site, drain).await;
+                });
+            }
+        }
+    }
+
+    // Drain: stop accepting, tell idle keep-alive connections to close, let
+    // requests in flight finish (at least WARDEN_DRAIN_MS, at most ~grace).
+    drop(listener);
+    site.draining.store(true, Ordering::SeqCst);
+    let _ = drain_tx.send(true);
+    report(serde_json::json!({"ev": "draining", "worker": worker}));
+    let drain_ms: u64 = std::env::var("WARDEN_DRAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(drain_ms) || site.active.load(Ordering::SeqCst) > 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Some((_, p)) = unix {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
+}
+
+/// The writing half of a client connection. TCP bodies go out with
+/// sendfile(2); the Unix health socket uses a plain copy.
+enum Conn {
+    Tcp(tokio::net::tcp::OwnedWriteHalf),
+    Unix(tokio::net::unix::OwnedWriteHalf),
+}
+
+impl Conn {
+    async fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(w) => w.write_all(b).await,
+            Conn::Unix(w) => w.write_all(b).await,
+        }
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(w) => w.flush().await,
+            Conn::Unix(w) => w.flush().await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(w) => w.shutdown().await,
+            Conn::Unix(w) => w.shutdown().await,
+        }
+    }
+
+    /// Send `count` bytes of `file` from `offset`.
+    async fn send_file(&mut self, file: std::fs::File, offset: u64, count: u64) -> std::io::Result<u64> {
+        match self {
+            Conn::Tcp(w) => sendfile_all(w.as_ref(), &file, offset, count).await,
+            Conn::Unix(w) => {
+                let mut f = tokio::fs::File::from_std(file);
+                if offset > 0 {
+                    use tokio::io::AsyncSeekExt;
+                    f.seek(std::io::SeekFrom::Start(offset)).await?;
+                }
+                tokio::io::copy(&mut f.take(count), w).await
+            }
+        }
+    }
+}
+
+/// Zero-copy body: the kernel moves file pages to the socket, no userspace
+/// buffer. Loops on partial sends and waits for writability on EAGAIN.
+async fn sendfile_all(
+    sock: &tokio::net::TcpStream,
+    file: &std::fs::File,
+    offset: u64,
+    count: u64,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let (out_fd, in_fd) = (sock.as_raw_fd(), file.as_raw_fd());
+    let mut off: libc::off_t = offset as libc::off_t;
+    let mut left = count;
+    while left > 0 {
+        sock.writable().await?;
+        let chunk = left.min(1 << 30) as usize;
+        let res = sock.try_io(tokio::io::Interest::WRITABLE, || {
+            // SAFETY: both fds are open for the whole call (`sock` and `file`
+            // are borrowed, so neither can be closed or reused meanwhile);
+            // `off` is a valid, exclusively borrowed off_t. sendfile only
+            // reads the file and writes the socket; it touches no Rust memory
+            // besides `off`.
+            let n = unsafe { libc::sendfile(out_fd, in_fd, &mut off, chunk) };
+            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as u64) }
+        });
+        match res {
+            Ok(0) => {
+                // The file shrank under us: the promised Content-Length can't
+                // be met, so the connection must close.
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file truncated while sending"));
+            }
+            Ok(n) => left -= n.min(left),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(count)
+}
+
+/// Files up to this size are sent with the headers in one write (fewer
+/// syscalls and packets than headers + sendfile).
+const SMALL_FILE: u64 = 64 * 1024;
+
+struct Request {
+    method: String,
+    path: String,
+    keep_alive: bool,
+    headers: Vec<(String, String)>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+}
+
+async fn read_head<R: tokio::io::AsyncRead + Unpin>(r: &mut BufReader<R>) -> Result<Option<Request>, u16> {
+    let mut head = Vec::with_capacity(512);
+    loop {
+        let before = head.len();
+        let n = r.read_until(b'\n', &mut head).await.map_err(|_| 400u16)?;
+        if n == 0 {
+            return if head.is_empty() { Ok(None) } else { Err(400) };
+        }
+        if head.len() > MAX_HEAD {
+            return Err(431);
+        }
+        let line = &head[before..];
+        if line == b"\r\n" || line == b"\n" {
+            if before == 0 {
+                head.clear(); // tolerate a stray empty line between requests
+                continue;
+            }
+            break;
+        }
+    }
+    let text = std::str::from_utf8(&head).map_err(|_| 400u16)?;
+    let mut lines = text.split("\r\n").flat_map(|l| l.split('\n')).filter(|l| !l.is_empty());
+    let first = lines.next().ok_or(400u16)?;
+    let mut parts = first.split(' ');
+    let (method, target, version) =
+        (parts.next().ok_or(400u16)?, parts.next().ok_or(400u16)?, parts.next().unwrap_or(""));
+    let headers: Vec<(String, String)> =
+        lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect();
+    let conn = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.to_ascii_lowercase());
+    let keep_alive = match version {
+        "HTTP/1.1" => conn.as_deref() != Some("close"),
+        _ => conn.as_deref() == Some("keep-alive"),
+    };
+    Ok(Some(Request { method: method.to_string(), path: target.to_string(), keep_alive, headers }))
+}
+
+async fn connection<R>(r: R, mut w: Conn, site: Arc<Site>, mut drain: tokio::sync::watch::Receiver<bool>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut r = BufReader::new(r);
+    let mut first = true;
+    loop {
+        // A new connection always gets its first request served (a client
+        // that connected just before the drain began must not see an empty
+        // reply); only idle keep-alive connections are closed by the drain.
+        let head = if first {
+            first = false;
+            tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut r)).await
+        } else {
+            tokio::select! {
+                biased;
+                h = tokio::time::timeout(IDLE_TIMEOUT, read_head(&mut r)) => h,
+                _ = drain.wait_for(|d| *d) => return,
+            }
+        };
+        let req = match head {
+            Ok(Ok(Some(req))) => req,
+            Ok(Ok(None)) | Err(_) => return,
+            Ok(Err(code)) => {
+                let _ = respond_error(&mut w, code, false).await;
+                return;
+            }
+        };
+        site.active.fetch_add(1, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let keep = req.keep_alive && !site.draining.load(Ordering::SeqCst);
+        let result = handle(&req, &site, &mut w, keep).await;
+        site.active.fetch_sub(1, Ordering::SeqCst);
+        if site.cfg.access_log {
+            let (status, bytes) = result.as_ref().map(|x| *x).unwrap_or((0, 0));
+            println!("{} {} {status} {bytes}B {:.1}ms", req.method, req.path, t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        if result.is_err() || !keep || site.draining.load(Ordering::SeqCst) {
+            let _ = w.shutdown().await;
+            return;
+        }
+    }
+}
+
+async fn respond_error(w: &mut Conn, code: u16, keep: bool) -> std::io::Result<(u16, u64)> {
+    let body = format!("{code} {}\n", reason(code));
+    let mut head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: {}\r\n",
+        reason(code),
+        body.len(),
+        if keep { "keep-alive" } else { "close" }
+    );
+    if code == 405 {
+        head += "Allow: GET, HEAD\r\n";
+    }
+    head += "\r\n";
+    w.write_all(head.as_bytes()).await?;
+    w.write_all(body.as_bytes()).await?;
+    w.flush().await?;
+    Ok((code, body.len() as u64))
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        416 => "Range Not Satisfiable",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    }
+}
+
+/// URL path → a file under root, or why not. Never leaves root.
+pub fn resolve(root: &Path, url_path: &str, dotfiles: bool) -> Result<PathBuf, u16> {
+    let path = url_path.split(['?', '#']).next().unwrap_or("/");
+    let decoded = percent_decode(path).ok_or(400u16)?;
+    if decoded.contains('\0') || !decoded.starts_with('/') {
+        return Err(400);
+    }
+    let mut out = root.to_path_buf();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => return Err(403),
+            s if s.starts_with('.') && !dotfiles && s != ".well-known" => return Err(404),
+            s => {
+                if Path::new(s).components().any(|c| !matches!(c, Component::Normal(_))) {
+                    return Err(400);
+                }
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A resolved path is only served if, after following symlinks, it is still
+/// inside root.
+fn inside(root: &Path, p: &Path) -> bool {
+    std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(root))
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+async fn handle(req: &Request, site: &Site, w: &mut Conn, keep: bool) -> std::io::Result<(u16, u64)> {
+    if req.method != "GET" && req.method != "HEAD" {
+        return respond_error(w, 405, keep).await;
+    }
+    if let Some(expected) = &site.auth {
+        if req.header("authorization") != Some(expected.as_str()) {
+            let body = "401 Unauthorized\n";
+            let head = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"warden\"\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                body.len(),
+                if keep { "keep-alive" } else { "close" }
+            );
+            w.write_all(head.as_bytes()).await?;
+            w.write_all(body.as_bytes()).await?;
+            w.flush().await?;
+            return Ok((401, body.len() as u64));
+        }
+    }
+    let cfg = &site.cfg;
+    let path = match resolve(&site.root, &req.path, cfg.dotfiles) {
+        Ok(p) => p,
+        Err(code) => return not_found_or(w, site, req, code, keep).await,
+    };
+    let mut file = path.clone();
+    if file.is_dir() {
+        let url_path = req.path.split(['?', '#']).next().unwrap_or("/");
+        if !url_path.ends_with('/') {
+            let loc = format!("{url_path}/");
+            let head = format!(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                if keep { "keep-alive" } else { "close" }
+            );
+            w.write_all(head.as_bytes()).await?;
+            w.flush().await?;
+            return Ok((301, 0));
+        }
+        let index = file.join(&cfg.index);
+        if index.is_file() {
+            file = index;
+        } else if cfg.listing && inside(&site.root, &file) {
+            return listing(w, &file, url_path, req.method == "HEAD", keep).await;
+        } else {
+            return not_found_or(w, site, req, 404, keep).await;
+        }
+    }
+    if !file.is_file() || !inside(&site.root, &file) {
+        return not_found_or(w, site, req, 404, keep).await;
+    }
+    send_file(w, site, req, &file, 200, keep).await
+}
+
+/// SPA fallback to index.html, then 404.html, then a plain 404.
+async fn not_found_or(w: &mut Conn, site: &Site, req: &Request, code: u16, keep: bool) -> std::io::Result<(u16, u64)> {
+    if code == 404 {
+        let wants_page = req.header("accept").is_none_or(|a| a.contains("text/html") || a.contains("*/*"));
+        let last = req.path.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("");
+        if site.cfg.spa && wants_page && !last.contains('.') {
+            let index = site.root.join(&site.cfg.index);
+            if index.is_file() {
+                return send_file(w, site, req, &index, 200, keep).await;
+            }
+        }
+        let page = site.root.join("404.html");
+        if page.is_file() {
+            return send_file(w, site, req, &page, 404, keep).await;
+        }
+    }
+    respond_error(w, code, keep).await
+}
+
+async fn listing(w: &mut Conn, dir: &Path, url_path: &str, head_only: bool, keep: bool) -> std::io::Result<(u16, u64)> {
+    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    let mut names: Vec<(bool, String)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| (e.path().is_dir(), e.file_name().to_string_lossy().to_string()))
+                .filter(|(_, n)| !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut body = format!("<!doctype html><meta charset=utf-8><title>{0}</title><h1>{0}</h1><ul>", esc(url_path));
+    if url_path != "/" {
+        body += "<li><a href=\"../\">../</a>";
+    }
+    for (is_dir, n) in names {
+        let shown = if is_dir { format!("{n}/") } else { n };
+        body += &format!("<li><a href=\"{0}\">{0}</a>", esc(&shown));
+    }
+    body += "</ul>\n";
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\
+         Connection: {}\r\n\r\n",
+        body.len(),
+        if keep { "keep-alive" } else { "close" }
+    );
+    w.write_all(head.as_bytes()).await?;
+    if !head_only {
+        w.write_all(body.as_bytes()).await?;
+    }
+    w.flush().await?;
+    Ok((200, body.len() as u64))
+}
+
+async fn send_file(
+    w: &mut Conn,
+    site: &Site,
+    req: &Request,
+    file: &Path,
+    status: u16,
+    keep: bool,
+) -> std::io::Result<(u16, u64)> {
+    let cfg = &site.cfg;
+    let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    // Precompressed sibling the client accepts.
+    let accept = req.header("accept-encoding").unwrap_or("");
+    let mut body_path = file.to_path_buf();
+    let mut encoding = None;
+    if cfg.precompressed && status == 200 && req.header("range").is_none() {
+        for (enc, suffix) in [("br", "br"), ("gzip", "gz")] {
+            if accept.split(',').any(|a| a.trim().split(';').next() == Some(enc)) {
+                let mut p = file.as_os_str().to_owned();
+                p.push(format!(".{suffix}"));
+                let p = PathBuf::from(p);
+                if p.is_file() && inside(&site.root, &p) {
+                    body_path = p;
+                    encoding = Some(enc);
+                    break;
+                }
+            }
+        }
+    }
+    let meta = match tokio::fs::metadata(&body_path).await {
+        Ok(m) => m,
+        Err(_) => return respond_error(w, 404, keep).await,
+    };
+    let len = meta.len();
+    let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+    let etag = format!("W/\"{len:x}-{mtime:x}{}\"", encoding.map(|e| format!("-{e}")).unwrap_or_default());
+    let last_modified = http_date(mtime);
+
+    let not_modified = status == 200
+        && match req.header("if-none-match") {
+            Some(tags) => tags.split(',').any(|t| t.trim() == etag || t.trim() == "*"),
+            None => req.header("if-modified-since").and_then(parse_http_date).is_some_and(|since| mtime <= since),
+        };
+
+    let html = matches!(ext.as_str(), "html" | "htm");
+    let cache = if html || status != 200 {
+        "no-cache".to_string()
+    } else if fingerprinted(file) {
+        "public, max-age=31536000, immutable".to_string()
+    } else {
+        format!("public, max-age={}", cfg.cache_max_age)
+    };
+    let mut head = String::with_capacity(256);
+    let conn = if keep { "keep-alive" } else { "close" };
+    let mut extra = String::new();
+    for (k, v) in &cfg.headers {
+        extra += &format!("{k}: {v}\r\n");
+    }
+    let vary = if cfg.precompressed { "Vary: Accept-Encoding\r\n" } else { "" };
+    if not_modified {
+        head += &format!(
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nLast-Modified: {last_modified}\r\nCache-Control: {cache}\r\n\
+             {vary}{extra}Connection: {conn}\r\n\r\n"
+        );
+        w.write_all(head.as_bytes()).await?;
+        w.flush().await?;
+        return Ok((304, 0));
+    }
+    // Single byte range.
+    let mut range = None;
+    if status == 200 && encoding.is_none() {
+        if let Some(r) = req.header("range") {
+            match parse_range(r, len) {
+                Some(Ok(rg)) => range = Some(rg),
+                Some(Err(())) => {
+                    let h = format!(
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\n\
+                         Connection: {conn}\r\n\r\n"
+                    );
+                    w.write_all(h.as_bytes()).await?;
+                    w.flush().await?;
+                    return Ok((416, 0));
+                }
+                None => {}
+            }
+        }
+    }
+    let (code, start, count) = match range {
+        Some((a, b)) => (206, a, b - a + 1),
+        None => (status, 0, len),
+    };
+    head += &format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {}\r\nContent-Length: {count}\r\nETag: {etag}\r\n\
+         Last-Modified: {last_modified}\r\nCache-Control: {cache}\r\nAccept-Ranges: bytes\r\n{vary}{extra}Connection: {conn}\r\n",
+        reason(code),
+        mime(&ext),
+    );
+    if let Some(e) = encoding {
+        head += &format!("Content-Encoding: {e}\r\n");
+    }
+    if code == 206 {
+        head += &format!("Content-Range: bytes {start}-{}/{len}\r\n", start + count - 1);
+    }
+    head += "\r\n";
+    if req.method == "HEAD" {
+        w.write_all(head.as_bytes()).await?;
+        w.flush().await?;
+        return Ok((code, 0));
+    }
+    if count <= SMALL_FILE {
+        // Headers and body in one write.
+        let mut buf = head.into_bytes();
+        let body_start = buf.len();
+        buf.resize(body_start + count as usize, 0);
+        let mut f = tokio::fs::File::open(&body_path).await?;
+        if start > 0 {
+            use tokio::io::AsyncSeekExt;
+            f.seek(std::io::SeekFrom::Start(start)).await?;
+        }
+        f.read_exact(&mut buf[body_start..]).await?;
+        w.write_all(&buf).await?;
+        w.flush().await?;
+        return Ok((code, count));
+    }
+    w.write_all(head.as_bytes()).await?;
+    let file = tokio::fs::File::open(&body_path).await?.into_std().await;
+    let sent = w.send_file(file, start, count).await?;
+    w.flush().await?;
+    Ok((code, sent))
+}
+
+/// `bytes=a-b`, `bytes=a-`, `bytes=-n` against `len`. None: ignore (not a
+/// single bytes range); Some(Err): unsatisfiable.
+pub fn parse_range(h: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = h.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // multiple ranges: send the whole file
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    let r = match (a.is_empty(), b.is_empty()) {
+        (true, false) => {
+            let n: u64 = b.parse().ok()?;
+            if n == 0 || len == 0 {
+                return Some(Err(()));
+            }
+            (len.saturating_sub(n), len - 1)
+        }
+        (false, _) => {
+            let start: u64 = a.parse().ok()?;
+            let end: u64 = if b.is_empty() { len.saturating_sub(1) } else { b.parse().ok()? };
+            if start >= len || end < start {
+                return Some(Err(()));
+            }
+            (start, end.min(len - 1))
+        }
+        _ => return None,
+    };
+    Some(Ok(r))
+}
+
+/// `app.3f9a2c1b.js`, `index-DkS8xW2q.css`: a content hash in the name.
+fn fingerprinted(p: &Path) -> bool {
+    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    name.split(['.', '-', '_']).any(|part| {
+        part.len() >= 8
+            && part.chars().all(|c| c.is_ascii_alphanumeric())
+            && part.chars().any(|c| c.is_ascii_digit())
+            && part.chars().any(|c| c.is_ascii_alphabetic())
+    })
+}
+
+fn mime(ext: &str) -> &'static str {
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "xml" => "application/xml",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "yaml" | "yml" => "application/yaml",
+        _ => "application/octet-stream",
+    }
+}
+
+const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// IMF-fixdate: `Wed, 30 Sep 2026 12:00:01 GMT`.
+pub fn http_date(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, m, d) = crate::logging::civil_from_days(days);
+    format!(
+        "{}, {d:02} {} {y} {:02}:{:02}:{:02} GMT",
+        DAYS[(days.rem_euclid(7)) as usize],
+        MONTHS[(m - 1) as usize],
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+pub fn parse_http_date(s: &str) -> Option<u64> {
+    let p: Vec<&str> = s.split_whitespace().collect();
+    if p.len() != 6 || p[5] != "GMT" {
+        return None;
+    }
+    let d: i64 = p[1].parse().ok()?;
+    let m = MONTHS.iter().position(|x| *x == p[2])? as i64 + 1;
+    let y: i64 = p[3].parse().ok()?;
+    let hms: Vec<i64> = p[4].split(':').filter_map(|x| x.parse().ok()).collect();
+    if hms.len() != 3 {
+        return None;
+    }
+    // Days from civil (Howard Hinnant).
+    let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hms[0] * 3600 + hms[1] * 60 + hms[2];
+    (secs >= 0).then_some(secs as u64)
+}
+
+pub fn base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_stay_inside_root() {
+        let root = Path::new("/srv/site");
+        assert_eq!(resolve(root, "/a/b.js?v=1", false), Ok(PathBuf::from("/srv/site/a/b.js")));
+        assert_eq!(resolve(root, "/a%20b.txt", false), Ok(PathBuf::from("/srv/site/a b.txt")));
+        assert_eq!(resolve(root, "/../etc/passwd", false), Err(403));
+        assert_eq!(resolve(root, "/a/%2e%2e/%2e%2e/etc/passwd", false), Err(403));
+        assert_eq!(resolve(root, "/.env", false), Err(404));
+        assert!(resolve(root, "/.env", true).is_ok());
+        assert!(resolve(root, "/.well-known/security.txt", false).is_ok());
+        assert_eq!(resolve(root, "/a%00b", false), Err(400));
+        assert_eq!(resolve(root, "/%zz", false), Err(400));
+        assert_eq!(resolve(root, "noslash", false), Err(400));
+    }
+
+    #[test]
+    fn ranges() {
+        assert_eq!(parse_range("bytes=0-9", 100), Some(Ok((0, 9))));
+        assert_eq!(parse_range("bytes=90-", 100), Some(Ok((90, 99))));
+        assert_eq!(parse_range("bytes=-10", 100), Some(Ok((90, 99))));
+        assert_eq!(parse_range("bytes=50-500", 100), Some(Ok((50, 99))));
+        assert_eq!(parse_range("bytes=100-", 100), Some(Err(())));
+        assert_eq!(parse_range("bytes=0-1,5-6", 100), None);
+        assert_eq!(parse_range("items=0-1", 100), None);
+    }
+
+    #[test]
+    fn dates_and_misc() {
+        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(http_date(1_790_769_601), "Wed, 30 Sep 2026 12:00:01 GMT");
+        assert_eq!(parse_http_date("Wed, 30 Sep 2026 12:00:01 GMT"), Some(1_790_769_601));
+        assert_eq!(parse_http_date("nonsense"), None);
+        assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64(b"ab"), "YWI=");
+        assert!(fingerprinted(Path::new("app.3f9a2c1b.js")));
+        assert!(fingerprinted(Path::new("index-DkS8xW2q.css")));
+        assert!(!fingerprinted(Path::new("favicon.ico")));
+        assert!(!fingerprinted(Path::new("background.png")));
+        assert_eq!(mime("woff2"), "font/woff2");
+    }
+}

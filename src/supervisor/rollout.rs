@@ -254,6 +254,12 @@ impl Supervisor {
                     return Err(format!("preflight: entry {} not found", e.display()));
                 }
             }
+            Mode::Process if self.cfg.static_files.is_some() => {
+                let root = self.cfg.static_files.as_ref().map(|s| s.root.clone()).unwrap_or_default();
+                if !root.is_dir() {
+                    return Err(format!("preflight: static.root {} is not a directory", root.display()));
+                }
+            }
             Mode::Process => {
                 if !command_exists(&self.cfg.app.command, &self.cfg.app.env) {
                     return Err(format!("preflight: command `{}` not found", self.cfg.app.command));
@@ -589,7 +595,7 @@ impl Supervisor {
         let path = self.cfg.ready_path().unwrap_or_else(|| "/".into());
         let timeout = Duration::from_secs(self.cfg.health.timeout);
         let url = crate::health::parse_url(&self.cfg.health.url).ok();
-        let expected = if self.shim_path.is_some() { self.expected_listeners() } else { 0 };
+        let expected = if self.cfg.health_sockets() { self.expected_listeners() } else { 0 };
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
             let check = async move {

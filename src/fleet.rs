@@ -908,6 +908,73 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     }
 }
 
+/// `warden serve <dir> [port]`: an app whose workers are Warden's static server.
+pub async fn serve(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
+    let ctx = context(args);
+    let root = match std::fs::canonicalize(dir) {
+        Ok(r) if r.is_dir() => r,
+        Ok(r) => {
+            eprintln!("warden: {} is not a directory", r.display());
+            return 2;
+        }
+        Err(e) => {
+            eprintln!("warden: {}: {e}", dir.display());
+            return 2;
+        }
+    };
+    let default_name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "static".into());
+    let name = sanitize_name(&o.name.clone().unwrap_or(default_name));
+    let count = match o.instances.as_deref() {
+        None => "1".to_string(),
+        Some("max") | Some("0") => "\"max\"".into(),
+        Some("-1") | Some("max-1") => "\"max-1\"".into(),
+        Some(n) => match n.parse::<usize>() {
+            Ok(n) => n.to_string(),
+            Err(_) => {
+                eprintln!("warden: -i {n:?}: expected a number or \"max\"");
+                return 2;
+            }
+        },
+    };
+    let mut t = format!(
+        "# Written by `warden serve`. Every setting: warden.example.toml\n\n[app]\nname = {}\nport = {port}\n",
+        toml_str(&name)
+    );
+    if let Some(ns) = &o.namespace {
+        t += &format!("namespace = {}\n", toml_str(ns));
+    }
+    t += &format!("\n[workers]\ncount = {count}\n\n[static]\nroot = {}\n", toml_str(&root.display().to_string()));
+    if o.spa {
+        t += "spa = true\n";
+    }
+    if o.listing {
+        t += "listing = true\n";
+    }
+    if let Some(a) = &o.basic_auth {
+        t += &format!("basic_auth = {}\n", toml_str(a));
+    }
+    if let Err(e) = Config::parse(&t) {
+        eprintln!("warden: the generated config is invalid: {e}");
+        return 2;
+    }
+    let file = config_dir().join(format!("{name}.toml"));
+    if file.exists() {
+        eprintln!(
+            "warden: app {name:?} already exists ({}). Use `warden start {name}`, or `warden delete {name}` first",
+            file.display()
+        );
+        return 1;
+    }
+    // Basic auth credentials live in it: owner-only.
+    let mode = if o.basic_auth.is_some() { 0o600 } else { 0o644 };
+    if let Err(e) = write_private(&file, &t, mode) {
+        eprintln!("warden: {e}");
+        return 1;
+    }
+    println!("{name}: serving {} on port {port} (config {})", root.display(), file.display());
+    start_app(&ctx, &app_from_config(&file)).await
+}
+
 /// What `warden start <what>` runs when `what` is not an app or a config.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Launch {

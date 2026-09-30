@@ -96,6 +96,8 @@ pub struct Supervisor {
     watchdog_enabled: bool,
     /// Invalidates the pending scheduled restart when the schedule changes.
     schedule_token: u64,
+    /// This binary, for `[static]` apps (their workers run `warden serve-static`).
+    exe: PathBuf,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -200,6 +202,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         last_tick: Instant::now(),
         watchdog_enabled: systemd::watchdog_requested(),
         schedule_token: 0,
+        exe: own_exe(),
         cfg,
         cfg_path,
     };
@@ -433,7 +436,13 @@ impl Supervisor {
                 if !a.instance_var.is_empty() {
                     add(&a.instance_var, (slot_id - 1).to_string());
                 }
-                (a.command.clone(), with_preload(&a.command, &a.args, self.shim_path.as_deref()))
+                match &self.cfg.static_files {
+                    Some(st) => {
+                        add("WARDEN_STATIC", serde_json::to_string(st).unwrap_or_default());
+                        (self.exe.display().to_string(), vec!["serve-static".to_string()])
+                    }
+                    None => (a.command.clone(), with_preload(&a.command, &a.args, self.shim_path.as_deref())),
+                }
             }
             Mode::Worker => {
                 add("WARDEN_WORKERS", self.count.to_string());
@@ -1533,6 +1542,17 @@ impl Supervisor {
             last_rollout: self.last_rollout.clone(),
             workers,
         }
+    }
+}
+
+/// This binary's path. After an in-place upgrade Linux reports the old
+/// inode as "<path> (deleted)"; the path itself now holds the new binary.
+fn own_exe() -> PathBuf {
+    let p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("warden"));
+    let s = p.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(orig) => PathBuf::from(orig),
+        None => p,
     }
 }
 

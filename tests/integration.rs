@@ -1498,3 +1498,149 @@ fn log_history_search_and_pipes() {
     f.ok(&["kill", "--yes"]);
     assert!(f.ok(&["search", "line 400 ", "chatty"]).contains("line 400 padding"));
 }
+
+/// One raw HTTP/1.1 exchange: (status, headers lowercased, body).
+fn http_raw(port: u16, req: &str) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("no header end");
+    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+    let body = buf[split + 4..].to_vec();
+    let mut lines = head.lines();
+    let status: u16 = lines.next().unwrap().split(' ').nth(1).unwrap().parse().unwrap();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (status, headers, body)
+}
+
+fn get_close(port: u16, path: &str, extra: &str) -> (u16, std::collections::HashMap<String, String>, Vec<u8>) {
+    http_raw(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{extra}\r\n"))
+}
+
+/// `warden serve`: Warden's own static server, supervised like any app.
+#[test]
+fn serve_static_files() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("serve");
+    let site = f.home.join("site");
+    std::fs::create_dir_all(site.join("assets")).unwrap();
+    std::fs::create_dir_all(site.join("docs")).unwrap();
+    std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
+    std::fs::write(site.join("404.html"), "custom missing").unwrap();
+    std::fs::write(site.join("assets/app.3f9a2c1b.js"), "console.log(1)").unwrap();
+    std::fs::write(site.join("style.css"), "body{}").unwrap();
+    std::fs::write(site.join(".env"), "SECRET=1").unwrap();
+    let big: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("big.bin"), &big).unwrap();
+    // A precompressed sibling.
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, b"body{}").unwrap();
+    std::fs::write(site.join("style.css.gz"), gz.finish().unwrap()).unwrap();
+    // A symlink pointing outside the root must not be served.
+    std::fs::write(f.home.join("outside.txt"), "nope").unwrap();
+    std::os::unix::fs::symlink(f.home.join("outside.txt"), site.join("escape.txt")).unwrap();
+
+    let port = free_port();
+    let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
+    assert!(out.contains("site: online (2/2"), "{out}");
+
+    let (st, h, body) = get_close(port, "/", "");
+    assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));
+    assert_eq!(h["content-type"], "text/html; charset=utf-8");
+    assert_eq!(h["cache-control"], "no-cache");
+    let (st, h, _) = get_close(port, "/assets/app.3f9a2c1b.js", "");
+    assert_eq!(st, 200);
+    assert!(h["cache-control"].contains("immutable"), "{h:?}");
+    // Revalidation.
+    let etag = h["etag"].clone();
+    let (st, _, body) = get_close(port, "/assets/app.3f9a2c1b.js", &format!("If-None-Match: {etag}\r\n"));
+    assert_eq!((st, body.len()), (304, 0));
+    // Ranges on a large file (sent with sendfile) and the whole file.
+    let (st, h, body) = get_close(port, "/big.bin", "Range: bytes=1000-1999\r\n");
+    assert_eq!(st, 206);
+    assert_eq!(h["content-range"], format!("bytes 1000-1999/{}", big.len()));
+    assert_eq!(body, big[1000..2000]);
+    let (st, _, body) = get_close(port, "/big.bin", "Range: bytes=-10\r\n");
+    assert_eq!((st, body.as_slice()), (206, &big[big.len() - 10..]));
+    let (st, _, _) = get_close(port, "/big.bin", "Range: bytes=99999999-\r\n");
+    assert_eq!(st, 416);
+    let (st, h, body) = get_close(port, "/big.bin", "");
+    assert_eq!((st, body.len()), (200, big.len()));
+    assert!(body == big, "large body intact");
+    assert_eq!(h["content-length"], big.len().to_string());
+    // Precompressed.
+    let (st, h, body) = get_close(port, "/style.css", "Accept-Encoding: gzip, deflate\r\n");
+    assert_eq!((st, h.get("content-encoding").map(String::as_str)), (200, Some("gzip")));
+    let mut plain = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut plain).unwrap();
+    assert_eq!(plain, "body{}");
+    let (_, h, body) = get_close(port, "/style.css", "");
+    assert!(!h.contains_key("content-encoding") && body == b"body{}");
+    // SPA fallback, 404 page, hidden and escaping paths.
+    let (st, _, body) = get_close(port, "/app/settings", "Accept: text/html\r\n");
+    assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));
+    let (st, _, body) = get_close(port, "/missing.png", "");
+    assert_eq!((st, body.as_slice()), (404, b"custom missing".as_slice()));
+    assert_eq!(get_close(port, "/.env", "").0, 404);
+    assert_eq!(get_close(port, "/escape.txt", "").0, 404);
+    assert_eq!(get_close(port, "/../../etc/passwd", "").0, 403);
+    assert_eq!(get_close(port, "/%2e%2e/%2e%2e/etc/passwd", "").0, 403);
+    assert_eq!(get_close(port, "/docs", "").0, 301);
+    // Methods and HEAD.
+    assert_eq!(http_raw(port, "POST / HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").0, 405);
+    let (st, h, body) = http_raw(port, "HEAD /big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!((st, body.len(), h["content-length"].clone()), (200, 0, big.len().to_string()));
+    // Keep-alive: two requests on one connection.
+    let (st, _, body) = http_raw(
+        port,
+        "GET /style.css HTTP/1.1\r\nHost: x\r\n\r\nGET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(st, 200);
+    assert!(String::from_utf8_lossy(&body).contains("HTTP/1.1 200"), "second response on the same connection");
+    // Oversized head.
+    let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(20_000));
+    assert_eq!(http_raw(port, &huge).0, 431);
+
+    // Rolling restart under load: no failed request.
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let client = {
+        let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match std::panic::catch_unwind(|| get_close(port, "/style.css", "").0) {
+                    Ok(200) => ok.fetch_add(1, Ordering::Relaxed),
+                    _ => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    f.ok(&["restart", "site"]);
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    eprintln!("static rolling restart: {} ok, {} failed", ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
+    assert!(ok.load(Ordering::Relaxed) > 100);
+    assert_eq!(fail.load(Ordering::Relaxed), 0);
+
+    // Basic auth.
+    let p2 = free_port();
+    std::fs::create_dir_all(f.home.join("private")).unwrap();
+    std::fs::write(f.home.join("private/index.html"), "secret page").unwrap();
+    f.ok(&["serve", f.home.join("private").to_str().unwrap(), &p2.to_string(), "--basic-auth", "u:p"]);
+    let (st, h, _) = get_close(p2, "/", "");
+    assert_eq!(st, 401);
+    assert!(h["www-authenticate"].starts_with("Basic"));
+    assert_eq!(get_close(p2, "/", "Authorization: Basic dTpw\r\n").0, 200);
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(f.home.join("private.toml")).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o600, "config with credentials is owner-only");
+}

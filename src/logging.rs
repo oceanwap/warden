@@ -768,7 +768,7 @@ pub fn format_rfc3339(secs: i64, millis: u32) -> String {
 }
 
 // Howard Hinnant's days-to-civil algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

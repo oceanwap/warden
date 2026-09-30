@@ -15,6 +15,7 @@ mod process;
 mod restart;
 mod schedule;
 mod signals;
+mod static_server;
 mod supervisor;
 mod systemd;
 mod worker;
@@ -24,6 +25,10 @@ use std::path::PathBuf;
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Internal: the worker process of an app with a [static] section.
+    if argv.first().map(String::as_str) == Some("serve-static") {
+        std::process::exit(static_server::main());
+    }
     let mut args = match cli::parse(&argv) {
         Ok(a) => a,
         Err(e) => {
@@ -75,6 +80,7 @@ fn main() {
             None => rt.block_on(fleet::act(&args, &action)),
         },
         Command::Start { what, opts } => rt.block_on(fleet::start(&args, &what, &opts)),
+        Command::Serve { dir, port, opts } => rt.block_on(fleet::serve(&args, &dir, port, &opts)),
         Command::Delete { target } => rt.block_on(fleet::delete(&args, &target)),
         Command::Save => rt.block_on(fleet::save(&args)),
         Command::Resurrect => rt.block_on(fleet::resurrect(&args)),

@@ -30,6 +30,64 @@ pub struct Config {
     pub metrics: Metrics,
     #[serde(default)]
     pub control: Control,
+    /// Serve a directory of static files with Warden's built-in server
+    /// (`warden serve <dir> <port>`, like `pm2 serve`). `app.command` is then
+    /// not used.
+    #[serde(default, rename = "static")]
+    pub static_files: Option<Static>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Static {
+    /// Directory to serve; relative paths are relative to the working
+    /// directory (or the config file). A `current` symlink is resolved when
+    /// each worker starts, so a rolling restart picks up a new release.
+    pub root: PathBuf,
+    /// Address to bind (the port is `app.port`).
+    #[serde(default = "default_static_host")]
+    pub host: String,
+    /// Single-page app: unknown paths get `index.html`.
+    #[serde(default)]
+    pub spa: bool,
+    #[serde(default = "default_index")]
+    pub index: String,
+    /// `Cache-Control: max-age` in seconds for files (HTML is always
+    /// revalidated; fingerprinted names like `app.3f9a2c1b.js` are cached a
+    /// year, immutable).
+    #[serde(default = "default_cache_max_age")]
+    pub cache_max_age: u64,
+    /// HTML listing for directories without an index.
+    #[serde(default)]
+    pub listing: bool,
+    /// Serve dotfiles (except `.well-known`, always served).
+    #[serde(default)]
+    pub dotfiles: bool,
+    /// Serve `file.br` / `file.gz` next to `file` when the client accepts them.
+    #[serde(default = "yes")]
+    pub precompressed: bool,
+    /// `user:password` for HTTP Basic auth.
+    #[serde(default)]
+    pub basic_auth: Option<String>,
+    /// Extra response headers.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// One stdout line per request (method, path, status, bytes, ms).
+    #[serde(default)]
+    pub access_log: bool,
+}
+
+fn default_static_host() -> String {
+    "0.0.0.0".into()
+}
+fn default_index() -> String {
+    "index.html".into()
+}
+fn default_cache_max_age() -> u64 {
+    3600
+}
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -475,6 +533,17 @@ impl Config {
                 cfg.app.working_directory = Some(base.join(wd));
             }
         }
+        // A relative static root: from the working directory, else the config file.
+        if let Some(st) = &mut cfg.static_files {
+            if st.root.is_relative() {
+                let base = cfg
+                    .app
+                    .working_directory
+                    .clone()
+                    .unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")));
+                st.root = base.join(&st.root);
+            }
+        }
         Ok(cfg)
     }
 
@@ -503,6 +572,22 @@ impl Config {
         }
         if a.name == "all" {
             return Err("app.name cannot be \"all\" (that targets every app)".into());
+        }
+        if let Some(st) = &self.static_files {
+            if self.app.port.is_none() {
+                return Err("[static] needs app.port (the port to serve on)".into());
+            }
+            if self.workers.mode == Mode::Worker {
+                return Err("[static] runs Warden's own file server: use workers.mode = \"process\"".into());
+            }
+            if st.root.as_os_str().is_empty() {
+                return Err("static.root must name the directory to serve".into());
+            }
+            if let Some(a) = &st.basic_auth {
+                if !a.contains(':') {
+                    return Err("static.basic_auth must be \"user:password\"".into());
+                }
+            }
         }
         if self.workers.wait_ready && !self.shim_enabled() {
             return Err("workers.wait_ready needs Warden's shim, which loads into bun and node commands \
@@ -591,10 +676,12 @@ impl Config {
         if h.enabled && h.url.is_empty() && !per_worker {
             return Err("health.enabled needs health.path (per-worker) and/or health.url (app-level)".into());
         }
-        if per_worker && h.url.is_empty() && !self.shim_enabled() {
-            return Err("health paths are checked through the Bun shim's private socket; without the shim (non-Bun command or shim = false) set health.url instead".into());
+        if per_worker && h.url.is_empty() && !self.health_sockets() {
+            return Err("health paths are checked through each worker's private socket, which Warden's shim \
+                        (bun and node commands) or its static server opens; for other programs set health.url"
+                .into());
         }
-        if self.any_worker_path() && self.shim_enabled() {
+        if self.any_worker_path() && self.health_sockets() {
             // The shim names each worker's socket <dir>/<name>.h<instance>-<worker>.sock
             // and Unix socket paths are limited to ~104 bytes.
             let dir = self.socket_path().parent().map(|d| d.as_os_str().len()).unwrap_or(0);
@@ -672,6 +759,11 @@ impl Config {
         Ok(())
     }
 
+    /// Workers report a private health socket (the shim, or the static server).
+    pub fn health_sockets(&self) -> bool {
+        self.shim_enabled() || self.static_files.is_some()
+    }
+
     /// Whether to inject the Bun shim.
     pub fn shim_enabled(&self) -> bool {
         match self.workers.mode {
@@ -707,7 +799,10 @@ impl Config {
             Some(v) => v,
             None => {
                 self.workers.port_strategy != PortStrategy::Offset
-                    && (self.app.port.is_none() || self.shim_enabled() || self.workers.mode == Mode::Worker)
+                    && (self.app.port.is_none()
+                        || self.shim_enabled()
+                        || self.static_files.is_some()
+                        || self.workers.mode == Mode::Worker)
             }
         }
     }
