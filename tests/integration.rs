@@ -1958,3 +1958,357 @@ fn serve_static_files() {
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(f.home.join("private.toml")).unwrap().permissions());
     assert_eq!(mode & 0o777, 0o600, "config with credentials is owner-only");
 }
+
+// ---- subscribe (event stream)
+
+use std::io::BufRead;
+
+/// A raw `subscribe` connection speaking NDJSON, as `wardend` or a GUI would.
+struct Events {
+    r: std::io::BufReader<std::os::unix::net::UnixStream>,
+    /// A line cut short by a read timeout, completed by the next read.
+    partial: String,
+    seen: Vec<Value>,
+}
+
+impl Events {
+    fn open(w: &Warden, req: &str) -> Events {
+        let mut s = std::os::unix::net::UnixStream::connect(w.socket()).unwrap();
+        writeln!(s, "{req}").unwrap();
+        Events { r: std::io::BufReader::new(s), partial: String::new(), seen: Vec::new() }
+    }
+
+    /// `Ok(None)` at EOF, `Err(())` when nothing arrived within `timeout`.
+    fn read(&mut self, timeout: Duration) -> Result<Option<Value>, ()> {
+        self.r.get_ref().set_read_timeout(Some(timeout.max(Duration::from_millis(1)))).unwrap();
+        match self.r.read_line(&mut self.partial) {
+            Ok(_) if self.partial.ends_with('\n') => {
+                let v: Value = serde_json::from_str(&self.partial)
+                    .unwrap_or_else(|e| panic!("not an event line ({e}): {:?}", self.partial));
+                self.partial.clear();
+                self.seen.push(v.clone());
+                Ok(Some(v))
+            }
+            Ok(_) => Ok(None),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Err(()),
+            Err(e) => panic!("reading events: {e}"),
+        }
+    }
+
+    fn next(&mut self) -> Value {
+        match self.read(T) {
+            Ok(Some(v)) => v,
+            Ok(None) => panic!("EOF; events so far: {:#?}", self.seen),
+            Err(()) => panic!("no event within {T:?}; events so far: {:#?}", self.seen),
+        }
+    }
+
+    /// Events up to and including the first one matching `f`.
+    fn until(&mut self, what: &str, f: impl Fn(&Value) -> bool) -> Vec<Value> {
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        loop {
+            let left = T.checked_sub(t0.elapsed()).unwrap_or_default();
+            match self.read(left) {
+                Ok(Some(v)) => {
+                    let done = f(&v);
+                    out.push(v);
+                    if done {
+                        return out;
+                    }
+                }
+                Ok(None) => panic!("EOF while waiting for {what}: {out:#?}"),
+                Err(()) => panic!("timed out waiting for {what}: {out:#?}"),
+            }
+        }
+    }
+
+    /// Every event until EOF.
+    fn rest(&mut self) -> Vec<Value> {
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        loop {
+            let left = T.checked_sub(t0.elapsed()).unwrap_or_default();
+            match self.read(left) {
+                Ok(Some(v)) => out.push(v),
+                Ok(None) => return out,
+                Err(()) => panic!("no EOF within {T:?}: {out:#?}"),
+            }
+        }
+    }
+}
+
+fn is_worker(e: &Value, worker: u64, event: &str) -> bool {
+    e["type"] == "worker" && e["worker"] == worker && e["event"] == event
+}
+
+/// The `event` names of one worker's events, in order.
+fn worker_story(events: &[Value], worker: u64) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "worker" && e["worker"] == worker)
+        .map(|e| e["event"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn wait_exit(w: &mut Warden) -> Option<i32> {
+    let t0 = Instant::now();
+    loop {
+        if let Some(st) = w.child.try_wait().unwrap() {
+            return st.code();
+        }
+        assert!(t0.elapsed() < T, "warden did not exit\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn subscribe_streams_worker_rollout_log_and_bye_events() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let mut w = Warden::start("sub-events", port, &simple("sub-events", port, 2, ""));
+    let s = w.wait_for("2 ready workers", T, ready(2));
+
+    // hello, then a status snapshot, at once.
+    let mut ev = Events::open(&w, r#"{"cmd":"subscribe","interval_ms":60000}"#);
+    let mut logs = Events::open(&w, r#"{"cmd":"subscribe","interval_ms":60000,"logs":true}"#);
+    let hello = ev.next();
+    assert_eq!(hello["type"], "hello", "{hello}");
+    assert_eq!(hello["protocol"], 1);
+    assert_eq!(hello["app"], "sub-events");
+    assert_eq!(hello["pid"], w.child.id());
+    assert!(!hello["version"].as_str().unwrap().is_empty());
+    let snap = ev.next();
+    assert_eq!((&snap["type"], &snap["app"]), (&"status".into(), &"sub-events".into()), "{snap}");
+    assert_eq!(snap["status"]["workers_ready"], 2);
+    assert_eq!(logs.next()["type"], "hello");
+    assert_eq!(logs.next()["type"], "status");
+
+    // kill -9 worker 2: crashed, restarting, starting, ready, for worker 2 only.
+    let victim = s["workers"][1]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let got = ev.until("worker 2 ready again", |e| is_worker(e, 2, "ready"));
+    assert_eq!(worker_story(&got, 2), ["crashed", "restarting", "starting", "ready"], "{got:#?}");
+    assert!(worker_story(&got, 1).is_empty(), "{got:#?}");
+    let crashed = got.iter().find(|e| is_worker(e, 2, "crashed")).unwrap();
+    assert_eq!(crashed["pid"], victim);
+    assert!(crashed["detail"].as_str().unwrap().contains("SIGKILL"), "{crashed}");
+    assert!(crashed["at_ms"].as_u64().unwrap() > 1_600_000_000_000, "{crashed}");
+    let restarting = got.iter().find(|e| is_worker(e, 2, "restarting")).unwrap();
+    assert!(restarting["detail"].as_str().unwrap().starts_with("in_ms="), "{restarting}");
+    let back = got.last().unwrap();
+    assert!(back["pid"].as_u64().is_some_and(|p| p != victim), "{back}");
+    assert!(back["detail"].as_str().unwrap().starts_with("startup_ms="), "{back}");
+    assert!(!got.iter().any(|e| e["type"] == "log"), "no log events without `logs`");
+
+    // `logs: true` also streams the log lines.
+    let line = logs.until("the crash log line", |e| {
+        e["type"] == "log" && e["line"].as_str().is_some_and(|l| l.contains("worker crashed"))
+    });
+    assert_eq!(line.last().unwrap()["app"], "sub-events");
+
+    // A reload: `rollout` when it starts (before any worker is touched) and
+    // as its phase changes, then `rollout_done`.
+    let before: Vec<u64> = Warden::pids(&w.status().unwrap());
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let got = ev.until("rollout_done", |e| e["type"] == "rollout_done");
+    let done = got.last().unwrap();
+    assert_eq!(done["app"], "sub-events");
+    assert_eq!(done["outcome"]["ok"], true, "{done}");
+    assert_eq!(done["outcome"]["kind"], "reload");
+    let rollouts: Vec<&Value> = got.iter().filter(|e| e["type"] == "rollout").collect();
+    assert!(rollouts.len() >= 2, "a start and phase changes: {got:#?}");
+    assert!(
+        rollouts.iter().all(|r| r["rollout"]["seq"] == done["outcome"]["seq"] && r["rollout"]["kind"] == "reload"),
+        "{got:#?}"
+    );
+    assert_eq!(got[0]["type"], "rollout", "the rollout is announced first: {got:#?}");
+    assert_eq!(got[0]["rollout"]["phase"], "starting");
+    assert_eq!((&got[0]["rollout"]["done"], &got[0]["rollout"]["total"]), (&0.into(), &2.into()));
+    let phases: HashSet<&str> = rollouts.iter().map(|r| r["rollout"]["phase"].as_str().unwrap()).collect();
+    assert!(phases.iter().any(|p| p.contains("draining old process")), "{phases:?}");
+    for old in &before {
+        let of_old: Vec<&str> = got.iter().filter(|e| e["pid"] == *old).map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(of_old, ["stopping", "stopped"], "old worker {old}: {got:#?}");
+    }
+    for id in [1, 2] {
+        assert_eq!(worker_story(&got, id), ["starting", "ready", "stopping", "stopped"], "worker {id}: {got:#?}");
+    }
+
+    // `shutdown`: every worker stops, then `bye`, then EOF.
+    let (_, out) = w.request(r#"{"cmd":"shutdown"}"#);
+    assert!(out.contains("\"ok\":true"), "{out}");
+    let rest = ev.rest();
+    let bye = rest.last().unwrap_or_else(|| panic!("no events before EOF"));
+    assert_eq!(bye["type"], "bye", "{rest:#?}");
+    assert_eq!(bye["app"], "sub-events");
+    assert_eq!(bye["reason"], "shutdown request");
+    for id in [1, 2] {
+        assert_eq!(worker_story(&rest, id), ["stopping", "stopped"], "worker {id}: {rest:#?}");
+    }
+    // The log stream ends the same way, after Warden's last log line.
+    let rest = logs.rest();
+    assert_eq!(rest.last().unwrap()["type"], "bye", "{rest:#?}");
+    assert!(
+        rest.iter().any(|e| e["type"] == "log" && e["line"].as_str().unwrap().contains("INFO  stopped")),
+        "{rest:#?}"
+    );
+    assert_eq!(wait_exit(&mut w), Some(0));
+}
+
+#[test]
+fn subscribe_sends_status_every_interval_and_bye_on_sigterm() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let mut w = Warden::start("sub-interval", port, &simple("sub-interval", port, 1, ""));
+    w.wait_for("1 ready worker", T, ready(1));
+    let t0 = Instant::now();
+    let mut ev = Events::open(&w, r#"{"cmd":"subscribe","interval_ms":500}"#);
+    assert_eq!(ev.next()["type"], "hello");
+    assert_eq!(ev.next()["type"], "status");
+    let mut periodic = 0;
+    while let Some(left) = Duration::from_millis(1300).checked_sub(t0.elapsed()) {
+        match ev.read(left) {
+            Ok(Some(e)) if e["type"] == "status" => {
+                assert_eq!(e["status"]["workers_ready"], 1);
+                periodic += 1;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("EOF"),
+            Err(()) => break,
+        }
+    }
+    assert!(periodic >= 2, "{periodic} status events after the snapshot in 1.3 s: {:#?}", ev.seen);
+
+    w.signal(libc::SIGTERM);
+    let rest = ev.rest();
+    let bye = rest.last().unwrap_or_else(|| panic!("no events before EOF"));
+    assert_eq!((&bye["type"], &bye["reason"]), (&"bye".into(), &"SIGTERM".into()), "{rest:#?}");
+    assert_eq!(worker_story(&rest, 1), ["stopping", "stopped"], "{rest:#?}");
+    assert_eq!(wait_exit(&mut w), Some(0));
+}
+
+/// Worker mode: `worker` 0 is the host process, 1..=count its Worker threads.
+#[test]
+fn subscribe_in_worker_mode_names_threads_and_the_host() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start(
+        "sub-threads",
+        port,
+        &format!(
+            "[app]\nname = \"sub-threads\"\nentry = \"{}\"\nport = {port}\n[workers]\ncount = 2\nmode = \"worker\"\n[restart]\nbackoff_initial = 50\n[shutdown]\ndrain_ms = 100\n",
+            fixture("app.ts")
+        ),
+    );
+    let s = w.wait_for("2 ready threads", T, ready(2));
+    let host = s["host"]["pid"].as_u64().unwrap();
+    let mut ev = Events::open(&w, r#"{"cmd":"subscribe","interval_ms":60000}"#);
+    assert_eq!(ev.next()["type"], "hello");
+    assert_eq!(ev.next()["type"], "status");
+
+    // One Worker throws: that thread crashed, then the host is replaced.
+    let _ = get(port, "/throw");
+    let got = ev.until("the recovery", |e| e["type"] == "rollout_done");
+    let crashed = got.iter().find(|e| e["type"] == "worker" && e["event"] == "crashed").unwrap();
+    assert!([1, 2].contains(&crashed["worker"].as_u64().unwrap()), "a thread, not the host: {crashed}");
+    assert_eq!(crashed["pid"], host);
+    assert_eq!(got.last().unwrap()["outcome"]["kind"], "recovery", "{got:#?}");
+    assert_eq!(got.last().unwrap()["outcome"]["ok"], true, "{got:#?}");
+    let new_host = got.iter().find(|e| is_worker(e, 0, "starting")).unwrap()["pid"].as_u64().unwrap();
+    assert_ne!(new_host, host);
+    assert_eq!(worker_story(&got, 0), ["restarting", "starting", "ready", "stopping", "stopped"], "{got:#?}");
+    for thread in [1, 2] {
+        assert!(
+            got.iter().any(|e| is_worker(e, thread, "ready") && e["pid"] == new_host),
+            "Worker {thread} of the new host: {got:#?}"
+        );
+    }
+    let old: Vec<&str> =
+        got.iter().filter(|e| e["worker"] == 0 && e["pid"] == host).map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(old, ["stopping", "stopped"], "{got:#?}");
+}
+
+/// A subscriber that never reads (its socket buffer full of log events) must
+/// cost the supervisor nothing but its own events: other requests answer at
+/// once, memory stays flat, and it is dropped after the write timeout.
+#[test]
+fn a_subscriber_that_never_reads_does_not_stall_the_supervisor() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = simple("sub-stuck", port, 1, "[logging]\nlevel = \"debug\"\n");
+    let w = Warden::start_opts("sub-stuck", port, &cfg, &[("FIXTURE_SPAM", "1")], true);
+    w.wait_for("1 ready worker", T, ready(1));
+    let t0 = Instant::now();
+    let mut stuck = std::os::unix::net::UnixStream::connect(w.socket()).unwrap();
+    writeln!(stuck, r#"{{"cmd":"subscribe","interval_ms":250,"logs":true}}"#).unwrap();
+    std::thread::sleep(Duration::from_millis(1500)); // its socket buffer fills up
+
+    let mut lat: Vec<Duration> = (0..20)
+        .map(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            let (d, out) = w.request(r#"{"cmd":"status"}"#);
+            assert!(out.contains("\"ok\":true"), "{out}");
+            d
+        })
+        .collect();
+    lat.sort();
+    eprintln!("status latency with a stuck subscriber: p50 {:?}, max {:?}", lat[10], lat[19]);
+    assert!(lat[10] < Duration::from_millis(100), "p50 {:?}", lat[10]);
+    assert!(lat[19] < Duration::from_millis(500), "max {:?}", lat[19]);
+    let rss = w.rss_kb();
+    eprintln!("warden RSS with a stuck subscriber: {rss} kB");
+    assert!(rss > 0 && rss < 40 * 1024, "RSS {rss} kB");
+
+    // Not read for REQUEST_TIMEOUT (5 s): disconnected. What it had buffered
+    // is still readable, then EOF.
+    std::thread::sleep(Duration::from_secs(7).saturating_sub(t0.elapsed()));
+    stuck.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (mut total, mut buf, t1) = (0usize, vec![0u8; 64 * 1024], Instant::now());
+    let mut first = Vec::new();
+    loop {
+        match stuck.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if first.len() < 4096 {
+                    first.extend_from_slice(&buf[..n]);
+                }
+                total += n;
+            }
+            Err(e) => panic!("no EOF: the stuck subscriber was not disconnected ({e}, {total} bytes read)"),
+        }
+        assert!(t1.elapsed() < Duration::from_secs(10), "still streaming: the stuck subscriber was not disconnected");
+    }
+    let first = String::from_utf8_lossy(&first);
+    assert!(first.starts_with(r#"{"type":"hello""#), "{first}");
+    eprintln!("the stuck subscriber had {total} bytes buffered when it was dropped");
+    assert_eq!(w.status().unwrap()["workers"][0]["state"], "RUNNING");
+    let (_, out) = w.cli(&["logs", "--events", "-n", "500"]);
+    assert!(out.contains("event subscriber stopped reading; disconnected it"), "{out}");
+}
+
+/// EOF without `bye` is how `wardend` tells a crash from an exit on purpose.
+#[test]
+fn a_supervisor_that_dies_says_no_bye() {
+    if !have_bun() {
+        return;
+    }
+    // The event loop panics on its 8th tick.
+    let (mut w, _port) = fault_warden("sub-panic", "tick:8", 1);
+    w.wait_for("1 ready worker", T, ready(1));
+    let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);
+    assert_eq!(ev.next()["type"], "hello");
+    let rest = ev.rest();
+    assert!(!rest.iter().any(|e| e["type"] == "bye"), "{rest:#?}");
+    assert_ne!(wait_exit(&mut w), Some(0));
+    assert!(w.log().contains("warden panicked at"), "{}", w.log());
+}

@@ -105,6 +105,11 @@ impl Supervisor {
                 pid = pid,
                 silent_s = silent.as_secs()
             );
+            // Worker mode: the silent Worker (0: the host's own thread).
+            let wid = if worker_mode { worker } else { slot };
+            emit(&self.cfg.app.name, wid, WorkerEvent::Hung, Some(pid), || {
+                Some(format!("no heartbeat for {}s", silent.as_secs()))
+            });
             if worker_mode && role == Role::Current {
                 // Can't kill one thread: replace the host, then SIGKILL the old one.
                 self.on_thread_crash(slot, true);
@@ -171,6 +176,9 @@ impl Supervisor {
             .collect();
         for id in due {
             info!("retrying failed worker after cooldown", worker = self.label(id), cooldown_s = cooldown.as_secs());
+            self.emit_worker(id, WorkerEvent::Restarting, None, || {
+                Some(format!("FAILED; retrying after failed_cooldown={}s", cooldown.as_secs()))
+            });
             let Some(s) = self.slots.get_mut(&id) else { continue };
             s.tracker.reset();
             s.failed_at = None;
