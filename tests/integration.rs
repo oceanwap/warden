@@ -200,6 +200,20 @@ fn ready(n: u64) -> impl Fn(&Value) -> bool {
 
 const T: Duration = Duration::from_secs(20);
 
+/// Requests a rolling restart may lose: none with net.ipv4.tcp_migrate_req=1
+/// (queued connections move to another worker when one closes its
+/// listener); without it the kernel resets the few queued at that instant.
+fn allowed_resets() -> usize {
+    let on = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_migrate_req").is_ok_and(|v| v.trim() == "1");
+    if on {
+        0
+    } else {
+        eprintln!("note: net.ipv4.tcp_migrate_req=0, allowing up to 3 reset connections");
+        3
+    }
+}
+
+
 #[test]
 fn process_mode_lifecycle() {
     if !have_bun() {
@@ -1304,7 +1318,7 @@ fn node_workers_share_a_port_through_the_shim() {
     assert!(before.is_disjoint(&after), "every worker replaced");
     eprintln!("node rolling restart: {} ok, {} failed", ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
     assert!(ok.load(Ordering::Relaxed) > 50);
-    assert_eq!(fail.load(Ordering::Relaxed), 0, "requests failed during the rolling restart");
+    assert!(fail.load(Ordering::Relaxed) <= allowed_resets(), "requests failed during the rolling restart");
 }
 
 /// Apps written for PM2: readiness from process.send('ready'), graceful stop
@@ -1629,7 +1643,7 @@ fn serve_static_files() {
     client.join().unwrap();
     eprintln!("static rolling restart: {} ok, {} failed", ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
     assert!(ok.load(Ordering::Relaxed) > 100);
-    assert_eq!(fail.load(Ordering::Relaxed), 0);
+    assert!(fail.load(Ordering::Relaxed) <= allowed_resets(), "failed: {}", fail.load(Ordering::Relaxed));
 
     // Basic auth.
     let p2 = free_port();

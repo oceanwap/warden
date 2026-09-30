@@ -60,8 +60,9 @@ const drainPromise = new Promise((r) => (drainFinished = r));
 // and whether any of them was callback-style (returned no promise).
 const appHandlers = new Set();
 let appHandlerNoPromise = false;
-// Node: requests in flight per server.
+// Node: requests in flight, and every open connection with its state.
 let nodeInflight = 0;
+const nodeConns = new Set();
 
 function report(msg) {
   msg.worker = workerId;
@@ -174,9 +175,22 @@ function trackNodeServer(server) {
   if (servers.has(server)) return;
   servers.add(server);
   if (server instanceof http.Server) {
+    server.on("connection", (sock) => {
+      sock.__warden = { served: false, busy: false };
+      nodeConns.add(sock);
+      sock.once("close", () => nodeConns.delete(sock));
+    });
     server.on("request", (req, res) => {
       nodeInflight++;
-      res.once("close", () => nodeInflight--);
+      const st = req.socket && req.socket.__warden;
+      if (st) st.busy = true;
+      res.once("close", () => {
+        nodeInflight--;
+        if (st) {
+          st.busy = false;
+          st.served = true;
+        }
+      });
       if (draining) {
         try {
           if (!res.headersSent) res.setHeader("connection", "close");
@@ -295,11 +309,24 @@ async function markNodeResponsesClose() {
 function stopAccepting(s) {
   try {
     if (isBun) s.stop(false); // stop accepting; keep serving open connections
-    else {
-      s.close();
-      if (typeof s.closeIdleConnections === "function") s.closeIdleConnections();
-    }
+    else s.close();
   } catch {}
+}
+
+// Node: close keep-alive connections that already served a request and sit
+// idle. Not Node's closeIdleConnections(): it also closes connections just
+// accepted whose first request hasn't been parsed yet, and those clients
+// would see an empty reply. New connections get their request answered
+// (with Connection: close) and close after it.
+function closeServedIdle() {
+  for (const sock of nodeConns) {
+    const st = sock.__warden;
+    if (st && st.served && !st.busy) {
+      try {
+        sock.destroy();
+      } catch {}
+    }
+  }
 }
 
 function stopAll(s) {
@@ -318,9 +345,8 @@ async function drain() {
   for (const s of servers) stopAccepting(s);
   const t0 = Date.now();
   while (Date.now() - t0 < drainMs || pending() > 0) {
+    if (!isBun) closeServedIdle();
     await sleep(20);
-    // Node: keep-alive connections that went idle since.
-    if (!isBun) for (const s of servers) if (typeof s.closeIdleConnections === "function") s.closeIdleConnections();
   }
   for (const s of servers) stopAll(s);
   closePrivateSocket();
