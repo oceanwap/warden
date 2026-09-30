@@ -360,7 +360,6 @@ pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: 
 /// supervisors) without polling and without pid-reuse races. ENOSYS before
 /// Linux 5.3 (callers fall back to `kill(pid, 0)`), ESRCH if it is gone.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // used by wardend
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let Ok(p) = libc::pid_t::try_from(pid) else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("pid {pid} out of range")));
@@ -381,7 +380,6 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
 /// Not Linux: no pidfds; always `Unsupported`, and callers fall back to
 /// polling `kill(pid, 0)`.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)] // used by wardend
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let _ = pid;
     Err(io::Error::new(io::ErrorKind::Unsupported, "pidfd_open is Linux-only"))

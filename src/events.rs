@@ -6,9 +6,6 @@
 //! bounded broadcast. With no subscriber it costs one atomic load, so emit
 //! calls can sit on every state change.
 
-// Parts are used only once the subscribe stream and wardend land.
-#![allow(dead_code)]
-
 use crate::control::{Request, RolloutOutcome, RolloutStatus, Status};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;

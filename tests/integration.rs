@@ -2404,7 +2404,6 @@ fn wardend_gives_up_on_a_supervisor_that_keeps_dying() {
     assert!(a["problem"].is_null(), "{a:#}");
 }
 
-
 // ---- subscribe (event stream)
 
 use std::io::BufRead;
@@ -2758,7 +2757,6 @@ fn a_supervisor_that_dies_says_no_bye() {
     assert_ne!(wait_exit(&mut w), Some(0));
     assert!(w.log().contains("warden panicked at"), "{}", w.log());
 }
-
 
 // ---- worker_output = "direct"
 
