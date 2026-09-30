@@ -1514,10 +1514,13 @@ fn log_history_search_and_pipes() {
     }
     let f = Fleet::new("logs");
     let log = f.home.join("logs/chatty.log");
+    // keep = 10 retains all ~40 KB, so `worker ready` (logged after
+    // min_uptime, which on a loaded machine can fall inside the output) is
+    // never rotated out before the `--level info` check below.
     let cfg = format!(
         "[app]\nname = \"chatty\"\ncommand = \"sh\"\n\
          args = [\"-c\", \"for i in $(seq 1 400); do echo \\\"line $i padding padding padding\\\"; done; echo oops >&2; exec sleep 300\"]\n\
-         [workers]\nmin_uptime = 300\n[logging]\nfile = \"{}\"\n[logging.rotate]\nmax_size = \"8K\"\nkeep = 3\ncompress = true\n",
+         [workers]\nmin_uptime = 300\n[logging]\nfile = \"{}\"\n[logging.rotate]\nmax_size = \"8K\"\nkeep = 10\ncompress = true\n",
         log.display()
     );
     std::fs::write(f.home.join("chatty.toml"), cfg).unwrap();

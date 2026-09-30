@@ -49,12 +49,9 @@ jobs:
       - run: shellcheck install.sh
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --bin warden
-      # The runner's own systemd service leaks INVOCATION_ID into every step,
-      # and Warden would take that service for its own unit (`warden kill`
-      # then goes through systemctl). Run as from a terminal.
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: env -u INVOCATION_ID cargo test --test integration
+        run: cargo test --test integration
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
@@ -77,12 +74,9 @@ jobs:
         run: npm ci --no-audit --no-fund
       - run: cargo build --all-targets
       - run: cargo test --bin warden
-      # The runner's own systemd service leaks INVOCATION_ID into every step,
-      # and Warden would take that service for its own unit (`warden kill`
-      # then goes through systemctl). Run as from a terminal.
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: env -u INVOCATION_ID cargo test --test integration
+        run: cargo test --test integration
 
   macos:
     runs-on: macos-latest

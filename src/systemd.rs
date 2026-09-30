@@ -42,12 +42,37 @@ pub fn reloading() {
 }
 
 /// The systemd unit running us (`warden@api.service`), from our cgroup.
-/// Only when systemd started us (`INVOCATION_ID` is set), so a shell inside
-/// some user service is not mistaken for a unit.
+/// Only when systemd started *this* process as the unit's main process:
+/// `INVOCATION_ID` alone is inherited by everything a service starts (a CI
+/// runner, a shell in some service), and taking that service for our own
+/// would make `warden kill` try to stop it.
 pub fn own_unit() -> Option<String> {
     std::env::var_os("INVOCATION_ID")?;
+    let exec_pid = std::env::var("SYSTEMD_EXEC_PID").ok();
+    if !started_by_systemd(exec_pid.as_deref(), std::process::id(), parent_is_systemd) {
+        return None;
+    }
     let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     unit_from_cgroup(&cg)
+}
+
+/// systemd 248+ sets `SYSTEMD_EXEC_PID` to the pid it executed: only that
+/// process is the unit's own. Older systemd doesn't: then our parent must be
+/// a systemd manager (pid 1, or a `systemd --user` instance).
+fn started_by_systemd(exec_pid: Option<&str>, me: u32, parent_is_systemd: impl Fn() -> bool) -> bool {
+    match exec_pid {
+        Some(p) => p.trim().parse::<u32>().ok() == Some(me),
+        None => parent_is_systemd(),
+    }
+}
+
+fn parent_is_systemd() -> bool {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return false };
+    // The fields after the command name, which is in parentheses and may
+    // contain spaces: state, ppid, ...
+    let Some(after) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return false };
+    let Some(ppid) = after.split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok()) else { return false };
+    ppid == 1 || std::fs::read_to_string(format!("/proc/{ppid}/comm")).is_ok_and(|c| c.trim() == "systemd")
 }
 
 fn unit_from_cgroup(cg: &str) -> Option<String> {
@@ -65,5 +90,24 @@ mod tests {
         let cg = "0::/system.slice/system-warden.slice/warden@api.service\n";
         assert_eq!(super::unit_from_cgroup(cg).as_deref(), Some("warden@api.service"));
         assert_eq!(super::unit_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), None);
+    }
+
+    #[test]
+    fn only_the_units_main_process_owns_the_unit() {
+        use super::started_by_systemd;
+        // systemd 248+: SYSTEMD_EXEC_PID names the process it started.
+        assert!(started_by_systemd(Some("42"), 42, || false));
+        assert!(!started_by_systemd(Some("41"), 42, || true), "a child of the unit's process is not the unit");
+        assert!(!started_by_systemd(Some("junk"), 42, || true));
+        // Older systemd: the parent decides.
+        assert!(started_by_systemd(None, 42, || true));
+        assert!(!started_by_systemd(None, 42, || false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_started_by_a_test_runner_is_not_systemds() {
+        // Whatever this test runs under, its parent is cargo or a shell.
+        assert!(!super::parent_is_systemd() || std::os::unix::process::parent_id() == 1);
     }
 }
