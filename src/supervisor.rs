@@ -1,0 +1,1219 @@
+//! The supervisor: one event loop owning all state (no locks). Child exits,
+//! readiness, timers, signals, health results and CLI requests all arrive as
+//! events and are handled in order.
+//!
+//! - `rollout.rs`: gated replacement of workers (reload, safe-reload with a
+//!   canary, restart N, recycling), preflight, rollback.
+//! - `upkeep.rs`: the 1 s maintenance tick (watchdog, per-worker health,
+//!   memory / lifetime recycling, FAILED cooldown).
+
+mod rollout;
+mod upkeep;
+
+use crate::config::{Config, Mode, OnHealthFailure, PortStrategy};
+use crate::control::{self, ControlMsg, HostStatus, Request, Response, Status, WorkerStatus};
+use crate::process::{self, IpcMsg, ProcEvent};
+use crate::restart::{Decision, Policy};
+use crate::signals::Sig;
+use crate::worker::{Instance, Role, Slot, State, ThreadInfo, describe_exit};
+use crate::{debug, error, info, metrics, networking, systemd, warn};
+use rollout::{Kind, Roll};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, oneshot};
+
+const SHIM_JS: &str = include_str!("../shim/warden-shim.mjs");
+const HOST_JS: &str = include_str!("../shim/warden-host.mjs");
+const HEARTBEAT_MS: u64 = 1000;
+
+enum Event {
+    Ready { inst: u64 },
+    ReadyTimeout { inst: u64 },
+    RestartDue { slot: usize, token: u64 },
+    KillDue { inst: u64 },
+    AppHealth(Result<u16, String>),
+    WorkerHealth { inst: u64, result: Result<(), String> },
+    Tick,
+    Gate(rollout::GateEvent),
+    Snapshot(oneshot::Sender<Status>),
+}
+
+struct HealthState {
+    healthy: Option<bool>,
+    failures: u32,
+}
+
+pub struct Supervisor {
+    cfg: Config,
+    cfg_path: Option<PathBuf>,
+    policy: Policy,
+    count: usize,
+    slots: BTreeMap<usize, Slot>,
+    insts: HashMap<u64, Instance>,
+    next_inst: u64,
+    tx: mpsc::UnboundedSender<Event>,
+    proc_tx: mpsc::UnboundedSender<ProcEvent>,
+    roll: Option<Roll>,
+    roll_seq: u64,
+    last_rollout: Option<control::RolloutOutcome>,
+    /// Workers waiting for a graceful replacement (health, memory, lifetime, hang).
+    pending_replace: BTreeMap<usize, (String, bool)>,
+    shutting_down: bool,
+    /// `warden stop`: workers stopped, supervisor idle.
+    stopped: bool,
+    /// `warden restart` (all): start everything again once all have exited.
+    start_after_stop: bool,
+    app_health: HealthState,
+    started: Instant,
+    announced_ready: bool,
+    runtime_dir: PathBuf,
+    shim_path: Option<PathBuf>,
+    host_path: Option<PathBuf>,
+    force_kill: bool,
+    supervisor_cpu_prev: Option<(Instant, f64)>,
+    ticks: u64,
+}
+
+pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(run_local(cfg, cfg_path)).await
+}
+
+async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
+    let socket = cfg.socket_path();
+    let listener = control::bind(&socket).await?;
+    let runtime_dir = socket.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let (shim_path, host_path) = write_js(&cfg, &runtime_dir)?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+    let (proc_tx, mut proc_rx) = mpsc::unbounded_channel::<ProcEvent>();
+    let (sig_tx, mut sig_rx) = mpsc::unbounded_channel::<Sig>();
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+
+    crate::signals::listen(sig_tx).map_err(|e| format!("installing signal handlers: {e}"))?;
+    tokio::task::spawn_local(control::serve(listener, ctl_tx));
+
+    if let Some(addr) = &cfg.metrics.listen {
+        let addr: std::net::SocketAddr = addr.parse().map_err(|e| format!("metrics.listen: {e}"))?;
+        let tx = tx.clone();
+        tokio::task::spawn_local(async move {
+            let snapshot = move || {
+                let tx = tx.clone();
+                async move {
+                    let (s, r) = oneshot::channel();
+                    tx.send(Event::Snapshot(s)).ok()?;
+                    r.await.ok()
+                }
+            };
+            if let Err(e) = metrics::serve(addr, snapshot).await {
+                error!("metrics endpoint failed", addr = addr, error = e);
+            }
+        });
+    }
+
+    if cfg.health.enabled && !cfg.health.url.is_empty() {
+        let target = crate::health::parse_url(&cfg.health.url)?;
+        let interval = Duration::from_secs(cfg.health.interval);
+        let timeout = Duration::from_secs(cfg.health.timeout);
+        let tx = tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let r = crate::health::check(&target, timeout).await;
+                if tx.send(Event::AppHealth(r)).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    {
+        let tx = tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if tx.send(Event::Tick).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    let mut sup = Supervisor {
+        policy: Policy::from(&cfg.restart),
+        count: cfg.workers.count,
+        slots: BTreeMap::new(),
+        insts: HashMap::new(),
+        next_inst: 1,
+        tx,
+        proc_tx,
+        roll: None,
+        roll_seq: 0,
+        last_rollout: None,
+        pending_replace: BTreeMap::new(),
+        shutting_down: false,
+        stopped: false,
+        start_after_stop: false,
+        app_health: HealthState { healthy: None, failures: 0 },
+        started: Instant::now(),
+        announced_ready: false,
+        runtime_dir,
+        shim_path,
+        host_path,
+        force_kill: false,
+        supervisor_cpu_prev: None,
+        ticks: 0,
+        cfg,
+        cfg_path,
+    };
+
+    info!(
+        "starting application",
+        app = sup.cfg.app.name,
+        mode = mode_name(sup.cfg.workers.mode),
+        workers = sup.count,
+        pid = std::process::id(),
+        control = socket.display(),
+    );
+    warn_if_no_migrate_req(&sup.cfg);
+    if sup.cfg.health_path().is_none() {
+        info!("no health path configured: new workers are gated on listening only (set [health] path)");
+    }
+    sup.start_all();
+
+    loop {
+        tokio::select! {
+            Some(ev) = rx.recv() => sup.on_event(ev),
+            Some(pe) = proc_rx.recv() => sup.on_proc(pe),
+            Some(s) = sig_rx.recv() => sup.on_signal(s),
+            Some((req, reply)) = ctl_rx.recv() => {
+                let resp = sup.on_request(req);
+                let _ = reply.send(resp);
+            }
+        }
+        if sup.shutting_down && sup.insts.is_empty() {
+            break;
+        }
+    }
+    info!("stopped", app = sup.cfg.app.name);
+    let _ = std::fs::remove_file(&socket);
+    Ok(())
+}
+
+/// Write the embedded shim / host scripts into the runtime directory.
+fn write_js(cfg: &Config, dir: &Path) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    if !cfg.shim_enabled() {
+        return Ok((None, None));
+    }
+    control::ensure_private_dir(dir)?;
+    let write = |name: String, body: &str| -> Result<PathBuf, String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join(name);
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        // create_new = O_CREAT|O_EXCL: never follows a planted symlink.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&tmp)
+            .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.write_all(body.as_bytes()).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(path)
+    };
+    let shim = write(format!("{}-shim.mjs", cfg.app.name), SHIM_JS)?;
+    let host = match cfg.workers.mode {
+        Mode::Worker => Some(write(format!("{}-host.mjs", cfg.app.name), HOST_JS)?),
+        Mode::Process => None,
+    };
+    Ok((Some(shim), host))
+}
+
+/// With SO_REUSEPORT, connections still queued on a listener that closes are
+/// reset unless the kernel migrates them (Linux ≥ 5.14). Measured: 10-15 resets
+/// per worker-mode reload under load with 0, none with 1.
+fn warn_if_no_migrate_req(cfg: &Config) {
+    if cfg.workers.port_strategy != PortStrategy::Shared || cfg.app.port.is_none() {
+        return;
+    }
+    if let Ok(v) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_migrate_req") {
+        if v.trim() == "0" {
+            warn!(
+                "net.ipv4.tcp_migrate_req is 0: a few queued connections may be reset when a worker stops",
+                fix = "sysctl -w net.ipv4.tcp_migrate_req=1",
+            );
+        }
+    }
+}
+
+fn mode_name(m: Mode) -> &'static str {
+    match m {
+        Mode::Process => "process",
+        Mode::Worker => "worker",
+    }
+}
+
+impl Supervisor {
+    fn is_worker_mode(&self) -> bool {
+        self.cfg.workers.mode == Mode::Worker
+    }
+
+    fn slot_ids(&self) -> Vec<usize> {
+        match self.cfg.workers.mode {
+            Mode::Process => (1..=self.count).collect(),
+            Mode::Worker => vec![1],
+        }
+    }
+
+    fn label(&self, slot: usize) -> String {
+        if self.is_worker_mode() { "host".into() } else { slot.to_string() }
+    }
+
+    fn send_later(&self, after: Duration, ev: Event) {
+        let tx = self.tx.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(after).await;
+            let _ = tx.send(ev);
+        });
+    }
+
+    // ---------------------------------------------------------------- start
+
+    fn start_all(&mut self) {
+        for id in self.slot_ids() {
+            let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
+            slot.tracker.reset();
+            slot.failed_at = None;
+            slot.token += 1;
+            self.spawn_current(id);
+        }
+    }
+
+    /// Spawn the serving instance of a slot. On spawn failure the slot goes
+    /// through normal crash handling (backoff, then FAILED).
+    fn spawn_current(&mut self, slot_id: usize) -> Option<u64> {
+        if self.slots.get(&slot_id).is_none_or(|s| s.removing) {
+            return None;
+        }
+        match self.spawn_instance(slot_id, Role::Current) {
+            Ok(inst) => {
+                let s = self.slots.get_mut(&slot_id)?;
+                s.current = Some(inst);
+                s.state = State::Starting;
+                Some(inst)
+            }
+            Err(e) => {
+                error!(
+                    "failed to start worker",
+                    worker = self.label(slot_id),
+                    command = self.cfg.app.command,
+                    error = e
+                );
+                if let Some(s) = self.slots.get_mut(&slot_id) {
+                    s.last_exit = Some(format!("spawn failed: {e}"));
+                }
+                self.on_slot_crash(slot_id, Duration::ZERO);
+                None
+            }
+        }
+    }
+
+    fn spawn_instance(&mut self, slot_id: usize, role: Role) -> std::io::Result<u64> {
+        if self.slots.get(&slot_id).is_none_or(|s| s.removing) {
+            return Err(std::io::Error::other(format!("worker {slot_id} no longer exists (scaled down)")));
+        }
+        let inst_id = self.next_inst;
+        self.next_inst += 1;
+        let spec = self.spec(slot_id, inst_id);
+        let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
+        let pid = handle.pid;
+        let inst = Instance::new(slot_id, handle, role);
+        self.insts.insert(inst_id, inst);
+        if self.is_worker_mode() {
+            info!("host starting", pid = pid, workers = self.count, role = role_name(role));
+        } else {
+            info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
+        }
+        self.watch_readiness(inst_id, pid, slot_id);
+        Ok(inst_id)
+    }
+
+    fn spec(&self, slot_id: usize, inst_id: u64) -> process::Spec {
+        let a = &self.cfg.app;
+        let mut env: Vec<(String, String)> = a.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut add = |k: &str, v: String| env.push((k.to_string(), v));
+        add("WARDEN_APP", a.name.clone());
+        add("WARDEN_MODE", mode_name(self.cfg.workers.mode).into());
+        add("WARDEN_WORKER_COUNT", self.count.to_string());
+        add("WARDEN_DRAIN_MS", self.cfg.shutdown.drain_ms.to_string());
+        add("WARDEN_INSTANCE", inst_id.to_string());
+        add("WARDEN_HEALTH_DIR", self.runtime_dir.display().to_string());
+        if self.cfg.watchdog.timeout > 0 {
+            add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
+        }
+        if self.cfg.workers.port_strategy == PortStrategy::Shared {
+            add("WARDEN_REUSE_PORT", "1".into());
+        }
+        if let Some(p) = a.port {
+            add("PORT", networking::worker_port(p, self.cfg.workers.port_strategy, slot_id).to_string());
+        }
+        let (program, args) = match self.cfg.workers.mode {
+            Mode::Process => {
+                add("WARDEN_WORKER_ID", slot_id.to_string());
+                (a.command.clone(), with_preload(&a.args, self.shim_path.as_deref()))
+            }
+            Mode::Worker => {
+                add("WARDEN_WORKERS", self.count.to_string());
+                if let Some(shim) = &self.shim_path {
+                    add("WARDEN_SHIM", shim.display().to_string());
+                }
+                add("WARDEN_ENTRY", self.entry_path().display().to_string());
+                let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                (a.command.clone(), vec![host])
+            }
+        };
+        process::Spec { program, args, cwd: a.working_directory.clone(), env, label: self.label(slot_id) }
+    }
+
+    fn entry_path(&self) -> PathBuf {
+        let e = PathBuf::from(self.cfg.app.entry.as_deref().unwrap_or("index.js"));
+        if e.is_absolute() {
+            return e;
+        }
+        let base =
+            self.cfg.app.working_directory.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        base.join(e)
+    }
+
+    /// How many listeners make an instance ready.
+    fn expected_listeners(&self) -> usize {
+        if self.is_worker_mode() { self.count } else { 1 }
+    }
+
+    /// Readiness: shim `listening` reports (handled in `on_ipc`) or, with a
+    /// configured port, the process owning LISTEN sockets on it (Linux /proc).
+    /// Without a port and in process mode, a worker is ready once spawned.
+    fn watch_readiness(&self, inst: u64, pid: u32, slot_id: usize) {
+        let tx = self.tx.clone();
+        let deadline = self.cfg.ready_timeout();
+        let expected = self.expected_listeners();
+        let port = self.cfg.app.port.map(|p| networking::worker_port(p, self.cfg.workers.port_strategy, slot_id));
+        let first_worker = slot_id == 1 && self.insts.len() == 1;
+
+        self.send_later(deadline, Event::ReadyTimeout { inst });
+
+        match port {
+            None if !self.is_worker_mode() => {
+                let _ = tx.send(Event::Ready { inst });
+            }
+            None => {} // worker mode: wait for every Worker's shim report
+            Some(port) => {
+                tokio::task::spawn_local(async move {
+                    let start = Instant::now();
+                    let mut delay = Duration::from_millis(20);
+                    while start.elapsed() < deadline {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_millis(250));
+                        match networking::count_listeners(pid, port) {
+                            Some(n) if n >= expected => break,
+                            Some(_) => continue,
+                            // No /proc: a connect probe is only meaningful for the first worker.
+                            None if first_worker && networking::port_accepts(port) => break,
+                            None => continue,
+                        }
+                    }
+                    if start.elapsed() < deadline {
+                        let _ = tx.send(Event::Ready { inst });
+                    }
+                });
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- events
+
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Ready { inst } => self.mark_ready(inst),
+            Event::ReadyTimeout { inst } => {
+                let timeout = self.cfg.workers.ready_timeout;
+                let label = self.insts.get(&inst).map(|i| self.label(i.slot));
+                if let Some(i) = self.insts.get_mut(&inst) {
+                    if i.ready_at.is_none() && !i.stopping {
+                        error!(
+                            "worker not ready in time; killing",
+                            worker = label.unwrap_or_default(),
+                            pid = i.handle.pid,
+                            ready_timeout_s = timeout,
+                        );
+                        i.timed_out = true;
+                        i.handle.signal(libc::SIGKILL);
+                    }
+                }
+            }
+            Event::RestartDue { slot, token } => self.on_restart_due(slot, token),
+            Event::KillDue { inst } => {
+                if let Some(i) = self.insts.get(&inst) {
+                    warn!(
+                        "worker did not exit within grace period; sending SIGKILL",
+                        worker = self.label(i.slot),
+                        pid = i.handle.pid
+                    );
+                    i.handle.signal(libc::SIGKILL);
+                }
+            }
+            Event::AppHealth(r) => self.on_app_health(r),
+            Event::WorkerHealth { inst, result } => self.on_worker_health(inst, result),
+            Event::Tick => self.on_tick(),
+            Event::Gate(g) => self.on_gate(g),
+            Event::Snapshot(reply) => {
+                let _ = reply.send(self.status());
+            }
+        }
+    }
+
+    fn on_proc(&mut self, ev: ProcEvent) {
+        match ev {
+            ProcEvent::Exited { inst, code, signal } => self.on_exit(inst, code, signal),
+            ProcEvent::Ipc { inst, msg } => self.on_ipc(inst, msg),
+        }
+    }
+
+    fn on_ipc(&mut self, inst_id: u64, msg: IpcMsg) {
+        let worker_mode = self.is_worker_mode();
+        let expected = self.expected_listeners();
+        let (port, strategy) = (self.cfg.app.port, self.cfg.workers.port_strategy);
+        let Some(inst) = self.insts.get_mut(&inst_id) else { return };
+        let expected_port = port.map(|p| networking::worker_port(p, strategy, inst.slot));
+        let worker = msg.worker.unwrap_or(if worker_mode { 0 } else { inst.slot });
+        match msg.ev.as_str() {
+            "heartbeat" => {
+                inst.heartbeats.insert(worker, Instant::now());
+            }
+            "listening" => {
+                // Other servers the app may start (metrics, admin) don't count.
+                if expected_port.is_some() && msg.port.is_some() && msg.port != expected_port {
+                    debug!("ignoring listener on another port", port = msg.port.unwrap_or(0));
+                    return;
+                }
+                if let Some(sock) = &msg.socket {
+                    inst.sockets.insert(worker, PathBuf::from(sock));
+                }
+                let ready = if worker_mode {
+                    inst.threads.entry(worker).or_default().listening = true;
+                    debug!("worker listening", worker = worker, port = msg.port.unwrap_or(0), pid = inst.handle.pid);
+                    inst.threads_listening() >= expected
+                } else {
+                    inst.listening.insert(msg.port.unwrap_or(0));
+                    true
+                };
+                if ready {
+                    self.mark_ready(inst_id);
+                }
+            }
+            "exit" if worker_mode => {
+                let why = describe_exit(msg.code, None);
+                inst.heartbeats.remove(&worker);
+                inst.sockets.remove(&worker);
+                let t = inst.threads.entry(worker).or_insert_with(ThreadInfo::default);
+                t.listening = false;
+                t.last_exit = Some(why.clone());
+                let unexpected = !msg.expected.unwrap_or(false) && !inst.stopping;
+                if unexpected {
+                    t.crashed = true;
+                    t.crashes += 1;
+                    let (slot, role, pid) = (inst.slot, inst.role, inst.handle.pid);
+                    warn!("worker thread crashed", worker = worker, reason = why, host_pid = pid);
+                    if role == Role::Current && !self.shutting_down && !self.stopped {
+                        self.on_thread_crash(slot, false);
+                    } else if role == Role::Replacement && self.rollout_new_instance(slot) == Some(inst_id) {
+                        self.fail_rollout(format!("Worker {worker} of the new host crashed ({why})"));
+                    }
+                }
+            }
+            "error" if worker_mode => {
+                warn!("worker thread error", worker = worker, message = msg.message.unwrap_or_default());
+            }
+            "draining" => debug!("draining", worker = worker),
+            other => debug!("unknown IPC event", ev = other),
+        }
+    }
+
+    fn mark_ready(&mut self, inst_id: u64) {
+        let lifetime = self.cfg.limits.max_lifetime;
+        let Some(inst) = self.insts.get_mut(&inst_id) else { return };
+        if inst.ready_at.is_some() || inst.stopping {
+            return;
+        }
+        let now = Instant::now();
+        inst.ready_at = Some(now);
+        if lifetime > 0 {
+            inst.recycle_at = Some(now + upkeep::jittered(Duration::from_secs(lifetime), inst_id));
+        }
+        let ms = inst.started.elapsed().as_millis();
+        let (slot_id, role, pid) = (inst.slot, inst.role, inst.handle.pid);
+        match role {
+            Role::Current => {
+                if let Some(s) = self.slots.get_mut(&slot_id) {
+                    s.state = State::Running;
+                }
+                if self.is_worker_mode() {
+                    info!("host ready", pid = pid, workers = self.count, startup_ms = ms);
+                } else {
+                    info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
+                }
+            }
+            Role::Replacement => {
+                info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
+            }
+            Role::Retiring => {}
+        }
+        self.rollout_on_ready(inst_id);
+        self.check_all_ready();
+    }
+
+    fn check_all_ready(&mut self) {
+        let all = !self.slots.is_empty() && self.slots.values().all(|s| s.state == State::Running);
+        if all && !self.announced_ready {
+            self.announced_ready = true;
+            info!("all workers ready", workers = self.count, startup_ms = self.started.elapsed().as_millis());
+            systemd::notify("READY=1\nSTATUS=all workers ready");
+        }
+    }
+
+    fn on_exit(&mut self, inst_id: u64, code: Option<i32>, signal: Option<i32>) {
+        let Some(inst) = self.insts.remove(&inst_id) else { return };
+        for sock in inst.sockets.values() {
+            let _ = std::fs::remove_file(sock);
+        }
+        let why = describe_exit(code, signal);
+        let slot_id = inst.slot;
+        let label = self.label(slot_id);
+        let uptime = inst.started.elapsed();
+        let is_current = self.slots.get(&slot_id).is_some_and(|s| s.current == Some(inst_id));
+        let reason = if inst.timed_out {
+            "not ready in time".to_string()
+        } else if inst.hung {
+            format!("hung: no heartbeat for {}s ({why})", self.cfg.watchdog.timeout)
+        } else {
+            why.clone()
+        };
+
+        if inst.restart_on_exit && is_current && !self.shutting_down && !self.stopped {
+            // A bad release, not a crash of this slot: restart right away on the
+            // restored config, without counting it towards the restart limit.
+            warn!("worker that failed its rollout gates stopped; restarting", worker = label, pid = inst.handle.pid);
+            if let Some(s) = self.slots.get_mut(&slot_id) {
+                s.current = None;
+                s.state = State::Restarting;
+                s.last_exit = Some("failed rollout gates".into());
+                s.restarts += 1;
+                s.token += 1;
+            }
+            self.spawn_current(slot_id);
+        } else if inst.stopping || inst.role == Role::Retiring {
+            info!("worker stopped", worker = label, pid = inst.handle.pid, reason = why);
+            if is_current {
+                let mut remove = false;
+                if let Some(s) = self.slots.get_mut(&slot_id) {
+                    s.current = None;
+                    s.state = State::Stopped;
+                    s.last_exit = Some(why);
+                    remove = s.removing;
+                }
+                if remove {
+                    self.slots.remove(&slot_id);
+                }
+            }
+        } else if inst.role == Role::Replacement {
+            error!("replacement exited before taking over", worker = label, pid = inst.handle.pid, reason = reason);
+        } else if is_current {
+            if let Some(s) = self.slots.get_mut(&slot_id) {
+                s.current = None;
+                s.crashes += 1;
+                s.state = if self.shutting_down || self.stopped { State::Stopped } else { State::Crashed };
+                s.last_exit = Some(reason.clone());
+            }
+            if self.shutting_down || self.stopped {
+                info!("worker exited", worker = label, pid = inst.handle.pid, reason = reason);
+            } else {
+                warn!(
+                    "worker crashed",
+                    worker = label,
+                    pid = inst.handle.pid,
+                    reason = reason,
+                    uptime_s = uptime.as_secs()
+                );
+                self.on_slot_crash(slot_id, uptime);
+            }
+        }
+
+        self.rollout_on_exit(inst_id, &reason);
+
+        if self.stopped && self.start_after_stop && !self.shutting_down && self.insts.is_empty() {
+            self.start_after_stop = false;
+            self.stopped = false;
+            info!("starting all workers");
+            self.start_all();
+        }
+    }
+
+    /// Worker mode: a Worker died (or hung) but the host lives on (degraded).
+    /// Replace the host: after backoff for a crash, immediately for a hang
+    /// (a hung Worker's listener black-holes connections until it is gone).
+    fn on_thread_crash(&mut self, slot_id: usize, hung: bool) {
+        if hung {
+            self.request_replace(slot_id, "a Worker thread is hung".into(), true);
+            return;
+        }
+        let pending = self.slots.get(&slot_id).is_some_and(|s| s.state == State::Restarting)
+            || self.roll.as_ref().is_some_and(|r| r.kind == Kind::Recovery);
+        if pending {
+            return;
+        }
+        let uptime = self
+            .slots
+            .get(&slot_id)
+            .and_then(|s| s.current)
+            .and_then(|i| self.insts.get(&i))
+            .map(|i| i.started.elapsed());
+        if let Some(s) = self.slots.get_mut(&slot_id) {
+            s.crashes += 1;
+        }
+        self.on_slot_crash(slot_id, uptime.unwrap_or_default());
+    }
+
+    fn on_slot_crash(&mut self, slot_id: usize, uptime: Duration) {
+        if self.shutting_down || self.stopped {
+            return;
+        }
+        if self.slots.get(&slot_id).is_some_and(|s| s.removing) {
+            self.slots.remove(&slot_id);
+            return;
+        }
+        // A replacement for this slot is already on its way (rollout): it
+        // becomes the slot's worker now; if it then fails its gates it is
+        // stopped and the slot restarted (see `fail_rollout`).
+        let current_gone = self.slots.get(&slot_id).is_some_and(|s| s.current.is_none());
+        if let Some(new) = self.rollout_new_instance(slot_id).filter(|_| current_gone) {
+            let ready = self.insts.get(&new).is_some_and(|i| i.ready_at.is_some());
+            if let Some(i) = self.insts.get_mut(&new) {
+                i.role = Role::Current;
+            }
+            if let Some(s) = self.slots.get_mut(&slot_id) {
+                s.current = Some(new);
+                s.state = if ready { State::Running } else { State::Starting };
+            }
+            info!("old worker gone; its replacement takes over the slot", worker = self.label(slot_id));
+            return;
+        }
+        let label = self.label(slot_id);
+        let policy = self.policy.clone();
+        let cooldown = self.cfg.restart.failed_cooldown;
+        let Some(s) = self.slots.get_mut(&slot_id) else { return };
+        match s.tracker.on_crash(&policy, Instant::now(), uptime) {
+            Decision::RestartAfter(d) => {
+                s.state = State::Restarting;
+                s.token += 1;
+                let (slot, token) = (slot_id, s.token);
+                info!(
+                    "worker restarting",
+                    worker = label,
+                    in_ms = d.as_millis(),
+                    attempt = s.tracker.restarts_in_window()
+                );
+                self.send_later(d, Event::RestartDue { slot, token });
+            }
+            Decision::GiveUp => {
+                s.state = State::Failed;
+                s.failed_at = Some(Instant::now());
+                if policy.enabled {
+                    let retry = if cooldown > 0 { format!("retrying in {cooldown}s") } else { "not retrying".into() };
+                    error!(
+                        "worker failed: too many restarts",
+                        worker = label,
+                        max_restarts = policy.max_restarts,
+                        window_s = policy.window.as_secs(),
+                        next = retry,
+                        hint = if self.cfg.workers.mode == Mode::Worker {
+                            "fix the cause, then run `warden reload`".to_string()
+                        } else {
+                            format!("fix the cause, then run `warden restart {slot_id}`")
+                        },
+                    );
+                } else {
+                    error!("worker exited and restarts are disabled", worker = label);
+                }
+            }
+        }
+    }
+
+    fn on_restart_due(&mut self, slot_id: usize, token: u64) {
+        if self.shutting_down || self.stopped {
+            return;
+        }
+        let Some(s) = self.slots.get_mut(&slot_id) else { return };
+        if s.token != token || s.state != State::Restarting {
+            return;
+        }
+        if s.current.is_some() {
+            // Worker mode, degraded host: bring up a replacement next to it.
+            if self.roll.is_some() {
+                // Busy (e.g. a reload's preflight): try again shortly instead of dropping it.
+                self.send_later(Duration::from_secs(1), Event::RestartDue { slot: slot_id, token });
+            } else if let Err(e) =
+                self.begin_rollout(Kind::Recovery, vec![slot_id], "Worker thread crashed".into(), false)
+            {
+                warn!("recovery could not start; retrying", worker = self.label(slot_id), reason = e);
+                self.send_later(Duration::from_secs(1), Event::RestartDue { slot: slot_id, token });
+            }
+            return;
+        }
+        s.restarts += 1;
+        self.spawn_current(slot_id);
+    }
+
+    // ------------------------------------------------------------- stopping
+
+    fn stop_instance(&mut self, inst_id: u64) {
+        let grace = self.cfg.grace_period();
+        let Some(i) = self.insts.get_mut(&inst_id) else { return };
+        if i.stopping {
+            return;
+        }
+        i.stopping = true;
+        i.handle.signal(libc::SIGTERM);
+        if let Some(s) = self.slots.get_mut(&i.slot) {
+            if s.current == Some(inst_id) {
+                s.state = State::Stopping;
+            }
+        }
+        self.send_later(grace, Event::KillDue { inst: inst_id });
+    }
+
+    fn kill_instance(&mut self, inst_id: u64) {
+        if let Some(i) = self.insts.get_mut(&inst_id) {
+            i.stopping = true;
+            i.handle.signal(libc::SIGKILL);
+        }
+    }
+
+    fn stop_all(&mut self) {
+        self.abort_rollout("workers are being stopped");
+        self.pending_replace.clear();
+        for s in self.slots.values_mut() {
+            s.token += 1;
+            if s.current.is_none() && s.state != State::Failed {
+                s.state = State::Stopped;
+            }
+        }
+        let ids: Vec<u64> = self.insts.keys().copied().collect();
+        for id in ids {
+            self.stop_instance(id);
+        }
+    }
+
+    fn begin_shutdown(&mut self, why: &str) {
+        if self.shutting_down {
+            if !self.force_kill {
+                self.force_kill = true;
+                warn!("second shutdown request: killing workers now");
+                for i in self.insts.values() {
+                    i.handle.signal(libc::SIGKILL);
+                }
+            }
+            return;
+        }
+        info!("shutting down", reason = why, workers = self.insts.len(), grace_s = self.cfg.shutdown.grace_period);
+        systemd::notify("STOPPING=1");
+        self.shutting_down = true;
+        self.start_after_stop = false;
+        self.stop_all();
+    }
+
+    fn on_signal(&mut self, s: Sig) {
+        match s {
+            Sig::Term | Sig::Int => self.begin_shutdown(s.name()),
+            Sig::Hup => {
+                let r = self.request_reload(false);
+                if !r.ok {
+                    warn!("SIGHUP ignored", reason = r.message.unwrap_or_default());
+                }
+            }
+            Sig::Usr1 | Sig::Usr2 => {
+                info!("forwarding signal to workers", signal = s.name());
+                for i in self.insts.values() {
+                    i.handle.signal(s.raw());
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- health
+
+    /// App-level check through the shared port (`health.url`).
+    fn on_app_health(&mut self, r: Result<u16, String>) {
+        if !self.announced_ready || self.shutting_down || self.stopped {
+            return;
+        }
+        let threshold = self.cfg.health.failure_threshold;
+        match r {
+            Ok(code) => {
+                if self.app_health.healthy == Some(false) {
+                    info!("application healthy again", status = code);
+                }
+                self.app_health.healthy = Some(true);
+                self.app_health.failures = 0;
+            }
+            Err(e) => {
+                self.app_health.failures += 1;
+                warn!(
+                    "app health check failed",
+                    url = self.cfg.health.url,
+                    error = e,
+                    consecutive = self.app_health.failures
+                );
+                if self.app_health.failures == threshold {
+                    self.app_health.healthy = Some(false);
+                    error!("application unhealthy", failures = threshold);
+                    if self.cfg.health.on_failure == OnHealthFailure::Reload {
+                        let r = self.request_reload(false);
+                        if !r.ok {
+                            warn!("health-triggered reload skipped", reason = r.message.unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-worker check over the worker's private socket.
+    fn on_worker_health(&mut self, inst_id: u64, result: Result<(), String>) {
+        let threshold = self.cfg.health.failure_threshold;
+        let on_failure = self.cfg.health.on_failure;
+        let Some(inst) = self.insts.get_mut(&inst_id) else { return };
+        inst.health_inflight = false;
+        if inst.stopping || inst.role != Role::Current {
+            return;
+        }
+        let (slot, pid) = (inst.slot, inst.handle.pid);
+        match result {
+            Ok(()) => {
+                if inst.healthy == Some(false) {
+                    info!("worker healthy again", worker = slot, pid = pid);
+                }
+                inst.healthy = Some(true);
+                inst.health_fails = 0;
+            }
+            Err(e) => {
+                inst.health_fails += 1;
+                warn!(
+                    "worker health check failed",
+                    worker = slot,
+                    pid = pid,
+                    error = e,
+                    consecutive = inst.health_fails
+                );
+                // Re-trigger every `threshold` failures in case a replacement failed.
+                if inst.health_fails >= threshold && (inst.health_fails - threshold) % threshold == 0 {
+                    inst.healthy = Some(false);
+                    error!("worker unhealthy", worker = slot, pid = pid, failures = inst.health_fails);
+                    if on_failure != OnHealthFailure::Log {
+                        self.request_replace(slot, format!("failed {threshold} health checks"), false);
+                    }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- control
+
+    fn request_reload(&mut self, safe: bool) -> Response {
+        if self.shutting_down {
+            return Response::err("shutting down");
+        }
+        if self.stopped {
+            return Response::err("workers are stopped; use `warden restart`");
+        }
+        let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+        let kind = if safe { Kind::SafeReload } else { Kind::Reload };
+        match self.begin_rollout(kind, ids, String::new(), false) {
+            Ok(seq) => Response::started(if safe { "safe-reload started" } else { "reload started" }, seq),
+            Err(e) => Response::err(e),
+        }
+    }
+
+    fn on_request(&mut self, req: Request) -> Response {
+        match req {
+            Request::Status => Response { ok: true, message: None, status: Some(self.status()), seq: None },
+            Request::Reload { safe } => self.request_reload(safe),
+            Request::Stop => {
+                if self.shutting_down {
+                    return Response::err("shutting down");
+                }
+                // A pending `restart` (stop, then start) is cancelled either way.
+                self.start_after_stop = false;
+                if self.stopped {
+                    return Response::ok("already stopped");
+                }
+                info!("stopping all workers (supervisor stays up)");
+                self.stopped = true;
+                self.stop_all();
+                Response::ok("stopping workers; `warden restart` starts them again")
+            }
+            Request::Shutdown => {
+                self.begin_shutdown("control request");
+                Response::ok("shutting down")
+            }
+            Request::Restart { worker: None } => {
+                if self.shutting_down {
+                    return Response::err("shutting down");
+                }
+                if self.insts.is_empty() {
+                    self.stopped = false;
+                    self.start_all();
+                } else {
+                    info!("restarting all workers (stop, then start)");
+                    self.stopped = true;
+                    self.start_after_stop = true;
+                    self.stop_all();
+                }
+                Response::ok("restarting all workers; use `warden safe-reload` for zero-downtime")
+            }
+            Request::Restart { worker: Some(id) } => {
+                if self.shutting_down || self.stopped {
+                    return Response::err("workers are stopped or shutting down");
+                }
+                if self.is_worker_mode() {
+                    return Response::err("worker mode restarts the whole host; use `warden safe-reload`");
+                }
+                if !self.slots.contains_key(&id) {
+                    return Response::err(format!("no worker {id}"));
+                }
+                if let Some(s) = self.slots.get_mut(&id) {
+                    s.tracker.reset();
+                    s.failed_at = None;
+                }
+                match self.begin_rollout(Kind::Restart, vec![id], String::new(), false) {
+                    Ok(seq) => Response::started(format!("restarting worker {id}"), seq),
+                    Err(e) => Response::err(e),
+                }
+            }
+            Request::Scale { count } => self.scale(count),
+            Request::Logs { .. } => Response::err("logs are served by the control socket"),
+        }
+    }
+
+    fn scale(&mut self, n: usize) -> Response {
+        if n == 0 || n > 1024 {
+            return Response::err("count must be between 1 and 1024");
+        }
+        if self.shutting_down || self.stopped {
+            return Response::err("workers are stopped or shutting down");
+        }
+        if self.roll.is_some() {
+            return Response::err("a rollout is in progress; try again when it finishes");
+        }
+        if let Some(p) = self.cfg.app.port {
+            if self.cfg.workers.port_strategy == PortStrategy::Offset && p as usize + n - 1 > u16::MAX as usize {
+                return Response::err("port + count exceeds 65535");
+            }
+        }
+        let old = self.count;
+        self.count = n;
+        info!("scaling", from = old, to = n);
+        if self.is_worker_mode() {
+            if n != old {
+                return match self.begin_rollout(Kind::Reload, vec![1], "scale".into(), false) {
+                    Ok(seq) => Response::started(format!("scaling to {n} workers (replacing the host process)"), seq),
+                    Err(e) => {
+                        self.count = old;
+                        Response::err(e)
+                    }
+                };
+            }
+            return Response::ok(format!("already {n} workers"));
+        }
+        for id in (old + 1)..=n {
+            let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
+            slot.removing = false;
+            slot.token += 1;
+            self.spawn_current(id);
+        }
+        let extra: Vec<usize> = self.slots.keys().copied().filter(|id| *id > n).collect();
+        for id in extra {
+            self.pending_replace.remove(&id);
+            let Some(s) = self.slots.get_mut(&id) else { continue };
+            s.removing = true;
+            s.token += 1;
+            let current = s.current;
+            match current {
+                Some(inst) => self.stop_instance(inst),
+                None => {
+                    self.slots.remove(&id);
+                }
+            }
+        }
+        Response::ok(format!("scaled from {old} to {n} workers"))
+    }
+
+    // --------------------------------------------------------------- status
+
+    fn status(&mut self) -> Status {
+        let now = Instant::now();
+        let sample = |pid: u32, prev: &mut Option<(Instant, f64)>, started: Instant| {
+            let st = metrics::proc_stats(pid)?;
+            let pct = match prev {
+                Some((t, c)) if now.duration_since(*t) > Duration::from_millis(100) => {
+                    (st.cpu_seconds - *c) / now.duration_since(*t).as_secs_f64() * 100.0
+                }
+                _ => st.cpu_seconds / now.duration_since(started).as_secs_f64().max(0.001) * 100.0,
+            };
+            *prev = Some((now, st.cpu_seconds));
+            Some((st, (pct * 10.0).round() / 10.0))
+        };
+
+        let mut workers = Vec::new();
+        let mut host = None;
+        let mut ready = 0;
+        if self.is_worker_mode() {
+            let slot = self.slots.get(&1);
+            let cur = slot.and_then(|s| s.current);
+            if let Some(inst) = cur.and_then(|c| self.insts.get_mut(&c)) {
+                let started = inst.started;
+                let pid = inst.handle.pid;
+                let s = sample(pid, &mut inst.cpu_prev, started);
+                host = Some(HostStatus {
+                    pid,
+                    uptime_secs: started.elapsed().as_secs(),
+                    rss_bytes: s.map(|x| x.0.rss_bytes),
+                    cpu_percent: s.map(|x| x.1),
+                    restarts: slot.map(|s| s.restarts).unwrap_or(0),
+                });
+                if inst.ready_at.is_some() {
+                    ready = inst.threads_listening();
+                }
+            }
+            let slot_state = slot.map(|s| s.state).unwrap_or(State::Stopped);
+            let inst = cur.and_then(|c| self.insts.get(&c));
+            for id in 1..=self.count {
+                let t = inst.and_then(|i| i.threads.get(&id));
+                let state = match (slot_state, t) {
+                    (State::Running | State::Restarting, Some(t)) if t.crashed => "CRASHED",
+                    (State::Running | State::Restarting, Some(t)) if t.listening => "RUNNING",
+                    (State::Running | State::Restarting, _) => "STARTING",
+                    (other, _) => other.as_str(),
+                };
+                workers.push(WorkerStatus {
+                    id,
+                    state: state.into(),
+                    pid: inst.map(|i| i.handle.pid),
+                    uptime_secs: inst.and_then(|i| i.ready_at).map(|r| r.elapsed().as_secs()),
+                    restarts: slot.map(|s| s.restarts).unwrap_or(0),
+                    crashes: t.map(|t| t.crashes).unwrap_or(0),
+                    rss_bytes: None,
+                    cpu_seconds: None,
+                    cpu_percent: None,
+                    last_exit: t.and_then(|t| t.last_exit.clone()),
+                    healthy: inst.and_then(|i| i.healthy),
+                });
+            }
+        } else {
+            for s in self.slots.values() {
+                let inst = s.current.and_then(|c| self.insts.get_mut(&c));
+                let (pid, uptime, stats, healthy) = match inst {
+                    Some(i) => {
+                        let started = i.started;
+                        let pid = i.handle.pid;
+                        (Some(pid), Some(started.elapsed().as_secs()), sample(pid, &mut i.cpu_prev, started), i.healthy)
+                    }
+                    None => (None, None, None, None),
+                };
+                if s.state == State::Running {
+                    ready += 1;
+                }
+                workers.push(WorkerStatus {
+                    id: s.id,
+                    state: s.state.as_str().into(),
+                    pid,
+                    uptime_secs: uptime,
+                    restarts: s.restarts,
+                    crashes: s.crashes,
+                    rss_bytes: stats.map(|x| x.0.rss_bytes),
+                    cpu_seconds: stats.map(|x| x.0.cpu_seconds),
+                    cpu_percent: stats.map(|x| x.1),
+                    last_exit: s.last_exit.clone(),
+                    healthy,
+                });
+            }
+        }
+        let me = std::process::id();
+        let started = self.started;
+        let sup = sample(me, &mut self.supervisor_cpu_prev, started);
+        let rollout = self.rollout_status();
+        Status {
+            app: self.cfg.app.name.clone(),
+            mode: mode_name(self.cfg.workers.mode).into(),
+            pid: me,
+            uptime_secs: self.started.elapsed().as_secs(),
+            workers_configured: self.count,
+            workers_ready: ready,
+            healthy: if self.cfg.health.enabled && !self.cfg.health.url.is_empty() {
+                self.app_health.healthy
+            } else {
+                None
+            },
+            supervisor_rss_bytes: sup.map(|x| x.0.rss_bytes),
+            host,
+            reloading: rollout.is_some(),
+            shutting_down: self.shutting_down,
+            rollout,
+            last_rollout: self.last_rollout.clone(),
+            workers,
+        }
+    }
+}
+
+/// Insert `--preload=<shim>` where Bun accepts it: after `run` when the args
+/// start with the `run` subcommand (`bun --preload x run f` prints usage),
+/// otherwise first (`bun --preload x f.ts`).
+fn with_preload(args: &[String], shim: Option<&Path>) -> Vec<String> {
+    let Some(shim) = shim else { return args.to_vec() };
+    let flag = [format!("--preload={}", shim.display())];
+    match args.first().map(String::as_str) {
+        Some("run") => [&args[..1], &flag, &args[1..]].concat(),
+        _ => [&flag[..], args].concat(),
+    }
+}
+
+fn role_name(r: Role) -> &'static str {
+    match r {
+        Role::Current => "current",
+        Role::Replacement => "replacement",
+        Role::Retiring => "retiring",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preload_placement() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let shim = Some(Path::new("/r/shim.mjs"));
+        assert_eq!(
+            with_preload(&s(&["run", "dist/main.js"]), shim),
+            s(&["run", "--preload=/r/shim.mjs", "dist/main.js"])
+        );
+        assert_eq!(with_preload(&s(&["server.ts"]), shim), s(&["--preload=/r/shim.mjs", "server.ts"]));
+        assert_eq!(with_preload(&s(&["server.ts"]), None), s(&["server.ts"]));
+    }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "warden-bench",
+  "private": true,
+  "description": "Benchmark harness dependencies (PM2 for scenario B). The load generator is oha.",
+  "devDependencies": {
+    "pm2": "^6.0.0"
+  }
+}

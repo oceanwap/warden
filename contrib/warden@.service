@@ -1,0 +1,43 @@
+# systemd unit for Warden. One instance per app:
+#   cp contrib/warden@.service /etc/systemd/system/
+#   install -m 644 warden.example.toml /etc/warden/travelerwe-api.toml   # edit it
+#   systemctl enable --now warden@travelerwe-api
+#   systemctl reload warden@travelerwe-api     # safe-reload: canary, gates, rollback
+#
+# Set [control] socket = "/run/warden/<name>/control.sock" in the config
+# (one runtime directory per instance: stopping one must not delete another's).
+
+[Unit]
+Description=Warden: %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# READY=1 is sent once every worker is listening.
+Type=notify
+NotifyAccess=main
+User=www-data
+Group=www-data
+ExecStart=/usr/local/bin/warden start --config /etc/warden/%i.toml
+# Blocks until the rollout finishes; a failed canary makes `systemctl reload` fail.
+ExecReload=/usr/local/bin/warden safe-reload --config /etc/warden/%i.toml
+TimeoutStartSec=120
+TimeoutReloadSec=600
+Restart=always
+RestartSec=2
+
+# Only Warden gets the first SIGTERM and orchestrates the drain; systemd
+# SIGKILLs the whole cgroup if it is still there after TimeoutStopSec.
+KillMode=mixed
+KillSignal=SIGTERM
+# grace_period (30 s) + margin
+TimeoutStopSec=35
+
+RuntimeDirectory=warden/%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
+NoNewPrivileges=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

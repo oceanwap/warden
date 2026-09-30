@@ -1,0 +1,67 @@
+# Warden example config. Every key except [app] name and the command/entry is
+# optional; values shown are the defaults unless marked "example".
+# Validate with: warden check -c warden.toml
+
+[app]
+name = "travelerwe-api"                      # example; [A-Za-z0-9._-]
+command = "bun"                              # process mode: the app; worker mode: the Bun binary
+args = ["run", "dist/main.js"]               # example (process mode)
+# entry = "dist/main.js"                     # worker mode: module each Worker imports
+working_directory = "/srv/apps/travelerwe/api/current"   # example; relative = relative to this file
+port = 3000                                  # example; sets PORT and enables readiness detection
+env = { NODE_ENV = "production" }            # example
+# shim = true                                # default: true when command is bun
+
+[workers]
+count = 4                                    # example (default 1)
+mode = "process"                             # "process" (production) | "worker" (experimental, Bun Workers)
+port_strategy = "shared"                     # "shared" (SO_REUSEPORT) | "offset" (PORT = port + i - 1)
+ready_timeout = 30                           # s to start listening, else killed and counted as a crash
+
+[restart]
+enabled = true
+max_restarts = 10                            # restarts allowed in restart_window...
+restart_window = 60                          # ...seconds, then the worker is FAILED
+backoff_initial = 100                        # ms, doubles per consecutive crash
+backoff_max = 10000                          # ms
+failed_cooldown = 300                        # s before a FAILED worker is retried (0 = never)
+
+[shutdown]
+grace_period = 30                            # s to exit after SIGTERM before SIGKILL
+drain_ms = 500                               # ms the shim keeps answering with Connection: close
+
+[health]
+enabled = true                               # example (default false): periodic per-worker checks
+path = "/health"                             # example; checked on each worker's private socket
+# url = "http://127.0.0.1:3000/health"       # optional app-level check through the shared port
+interval = 5                                 # s
+timeout = 2                                  # s
+failure_threshold = 3                        # consecutive failures
+on_failure = "replace"                       # "replace" the worker gracefully | "log" | "reload" (app-level)
+
+[reload]                                     # gates for every replacement (reload, safe-reload, restart N, recycling)
+health_passes = 3                            # consecutive passes on the new worker's private socket
+health_interval_ms = 500
+# verify_command = "curl -sf --unix-socket \"$WARDEN_WORKER_SOCKET\" http://w/ready"   # example smoke test
+min_ready = 0                                # s each new worker must stay healthy before taking over
+canary_soak = 30                             # s the safe-reload canary runs next to the old worker
+pause = 0                                    # s between workers (safe-reload)
+# preflight = "bun run check:deploy"         # example; runs before anything is touched
+timeout = 120                                # s allowed per worker for all gates
+
+[watchdog]
+timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
+
+[limits]
+max_memory = 0                               # MB per worker process; recycle gracefully above it (0 = off)
+max_lifetime = 0                             # s; recycle each worker after this, ±10% jitter (0 = off)
+
+[logging]
+level = "info"                               # debug | info | warn | error
+# timestamps = true                          # default: off under journald (it adds its own)
+
+[metrics]
+# listen = "127.0.0.1:9464"                  # Prometheus text at /metrics
+
+[control]
+socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory=warden/%i in the unit
