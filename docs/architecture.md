@@ -88,6 +88,16 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   tracks state, restarts with backoff, drains on shutdown, answers the CLI over
   a Unix socket, optionally serves `/metrics`. Never proxies requests.
 - **Workers**: the application. Each binds the shared port itself.
+- **wardend** (`warden daemon`, optional, one per host and user): one socket
+  for every app's live events and commands (the CLI's `warden events`, the
+  planned GUI), and a second level of supervision: it restarts supervisors
+  that `warden start` launched in the background when they die (backoff, give
+  up after 10 deaths in 10 min), and reports hung ones without killing them
+  (their workers die with them). It holds no workers and no state an app
+  needs: killing it stops nothing. Under systemd every app is its own unit and
+  wardend only watches; under launchd, in containers and for background apps
+  it also resurrects the saved apps (once per boot). Protocol:
+  [`protocol.md`](protocol.md).
 
 ### 4.2 Modes
 
@@ -249,7 +259,15 @@ app-level check; their rollout gates fall back to it too.
 - Logs: one line per event on stdout, `ts LEVEL message key=value…`; worker
   stdout/stderr are prefixed `worker=N`. Timestamps are dropped under journald
   (`JOURNAL_STREAM` set), which adds its own. The last 1000 lines are kept in
-  memory for `warden logs`.
+  memory for `warden logs`. Worker output is read in 64 KB batches (one
+  timestamp, one queue message, one lock per read), limited by
+  `max_lines_per_sec`, and written to rotated files. With `worker_output =
+  "direct"` the bytes go from the worker's pipe into its log file with
+  `splice(2)`: no copy through Warden, no parsing, rotation at a line
+  boundary (supervisor CPU per 200 MB: 0.72 s captured, 0.14 s direct).
+- Live events: every worker state change, rollout phase and (on request) log
+  line is pushed to `subscribe` clients as it happens, with a full status
+  every interval; with no subscriber an event costs one atomic load.
 - Metrics (`warden status`, optional Prometheus endpoint): workers configured /
   running, restarts, crashes, uptime, RSS and CPU per worker from `/proc`,
   health status.
@@ -258,10 +276,15 @@ app-level check; their rollout gates fall back to it too.
 
 ### 4.10 Control plane
 
-`warden start` runs in the foreground. Other commands talk to it over a Unix
-socket (mode 0600) with one JSON request / response per line:
-`status`, `workers`, `stop`, `shutdown`, `restart [id]`, `reload`,
-`safe-reload`, `scale N`, `logs [-f]`.
+Each supervisor answers on its own Unix socket (mode 0600, in a private
+runtime directory), one JSON request and response per line: `status`,
+`stop`, `shutdown`, `start`, `restart`, `reload`, `scale`, `reset`,
+`signal`, `config`, `flush`, `logs [-f]`, `log-level`, and `subscribe`
+(a stream of events). The CLI talks to each app directly (`warden list`
+~3 ms for 10 apps), so it never depends on wardend; `wardend.sock` adds
+one place to watch and drive every app. Both are specified in
+[`protocol.md`](protocol.md), with the wire types in `src/control.rs` and
+`src/events.rs`.
 
 ### 4.11 Security
 
@@ -291,5 +314,8 @@ but costs fault isolation and (for NestJS) p99 latency.
   reversible at the cost of 2× memory for a few seconds.
 - Error-rate gates need request metrics Warden doesn't see (it isn't a proxy);
   `verify_command` is the hook for app-specific smoke tests today.
-- A Node shim (patch `net.Server.prototype.listen`) would give Node apps the
-  same `reusePort`, private health socket and drain behaviour without app changes.
+- A native GUI (Rust, iced) as a separate process on `wardend.sock`, locally
+  or through an SSH tunnel; it shares `src/events.rs` with the daemon.
+- wardend features beyond this round: alerts (webhook/command), in-memory
+  resource history, port registry, start order, fleet deploys with release
+  pinning, audit log (peer uid), self-upgrade by re-exec.

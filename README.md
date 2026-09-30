@@ -165,7 +165,8 @@ has everything; the differences are in the right column.
 | `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files, pipe-friendly |
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server on par with nginx (see Benchmarks) |
 | `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](#surviving-reboots-and-crashes) |
-| `pm2 monit` | `warden top` | |
+| `pm2 monit` | `warden top`, `warden events` | `events`: every worker, rollout and supervisor event as it happens (`--json` for scripts, `--logs` for output) |
+| PM2's daemon | `warden daemon` (wardend) | Optional: live events for every app on one socket, and restarts dead supervisors. Apps never depend on it; killing it stops nothing. `warden start` starts it (`WARDEN_NO_DAEMON=1` doesn't) |
 | | `warden doctor` | Environment problems (kernel settings, limits, ports, permissions), each with its fix |
 
 ### Moving from PM2
@@ -266,6 +267,31 @@ crash, with the service manager the host has:
   kill` stops wardend's unit or job too, so it stays down until the next boot.
 - In a container, run `warden daemon --resurrect` under an init
   (`docker run --init`, tini) that reaps orphaned processes.
+- `--resurrect` runs once per boot: when launchd restarts a crashed wardend,
+  apps you stopped since boot stay stopped (`warden resurrect` starts them).
+
+### wardend: one socket for every app
+
+`warden daemon` (started by `warden start`, or by the units above) watches
+every supervisor on the host and pushes what happens to `warden events` and,
+later, the GUI:
+
+```
+$ warden events
+12:00:01 wardend pid=4211 version=0.1.0 (Ctrl-C to stop)
+12:00:01 api running (supervised by wardend, pid 4208)
+12:00:01 api 4/4 workers ready
+12:00:09 api worker 2 crashed pid=4230 exit code 3
+12:00:09 api worker 2 restarting in_ms=0
+12:00:09 api worker 2 starting pid=4262
+12:00:09 api worker 2 ready pid=4262 startup_ms=31
+```
+
+A supervisor that dies (`kill -9`, OOM) is started again with backoff when
+nothing else would (systemd restarts its own units; one run in a terminal is
+yours); a hung one is reported, never killed, because its workers are still
+serving. The protocol, for scripts and other clients:
+[`docs/protocol.md`](docs/protocol.md).
 
 ## Benchmarks
 
