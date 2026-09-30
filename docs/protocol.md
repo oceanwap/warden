@@ -14,8 +14,11 @@ The runtime directory is `$WARDEN_RUNTIME_DIR`, else `/run/warden` for root
 (`/var/run/warden` on macOS), else `$XDG_RUNTIME_DIR/warden`, else
 `/tmp/warden-<uid>`.
 
-The wire types live in `src/control.rs` (requests, `Status`) and
-`src/events.rs` (events, daemon requests). `events::PROTOCOL` is the
+The wire types live in the `warden-protocol` crate (`protocol/`):
+`control.rs` (requests, `Status`), `events.rs` (events, daemon requests) and
+`paths.rs` (where the sockets are). The `warden` binary re-exports them
+from `src/control.rs` and `src/events.rs`, and the GUI builds against the
+same crate, so the two cannot drift apart. `events::PROTOCOL` is the
 version; it goes up only for incompatible changes. New fields are always
 optional (`#[serde(default)]`) so an older CLI or GUI keeps working.
 
@@ -222,6 +225,10 @@ else would:
 
 - `warden events [app] [--json] [--logs]`: live events, from `wardend` when
   it runs, else straight from the apps' sockets.
-- The GUI (separate process, planned) connects to `wardend.sock` locally,
-  or through an SSH tunnel (`ssh -L`) for a remote host: there is no TCP
-  listener to secure.
+- `warden-gui` ([`gui/`](../gui/README.md)), a separate process, connects to
+  `wardend.sock` locally, or through an SSH tunnel (`ssh -N -L <local
+  socket>:<remote wardend.sock> user@host`) for a remote host: there is no
+  TCP listener to secure. It keeps one `subscribe` stream open (reconnecting
+  with backoff), opens a second one with `logs: true` and `apps: [<app>]`
+  only while its logs pane shows that app, and sends every action as a short
+  `app` or `start` request.

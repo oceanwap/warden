@@ -89,8 +89,8 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   a Unix socket, optionally serves `/metrics`. Never proxies requests.
 - **Workers**: the application. Each binds the shared port itself.
 - **wardend** (`warden daemon`, optional, one per host and user): one socket
-  for every app's live events and commands (the CLI's `warden events`, the
-  planned GUI), and a second level of supervision: it restarts supervisors
+  for every app's live events and commands (the CLI's `warden events`,
+  `warden-gui`), and a second level of supervision: it restarts supervisors
   that `warden start` launched in the background when they die (backoff, give
   up after 10 deaths in 10 min), and reports hung ones without killing them
   (their workers die with them). It holds no workers and no state an app
@@ -283,8 +283,8 @@ runtime directory), one JSON request and response per line: `status`,
 (a stream of events). The CLI talks to each app directly (`warden list`
 ~3 ms for 10 apps), so it never depends on wardend; `wardend.sock` adds
 one place to watch and drive every app. Both are specified in
-[`protocol.md`](protocol.md), with the wire types in `src/control.rs` and
-`src/events.rs`.
+[`protocol.md`](protocol.md), with the wire types in the `warden-protocol`
+crate (`protocol/`, re-exported from `src/control.rs` and `src/events.rs`).
 
 ### 4.11 Security
 
@@ -314,8 +314,10 @@ but costs fault isolation and (for NestJS) p99 latency.
   reversible at the cost of 2× memory for a few seconds.
 - Error-rate gates need request metrics Warden doesn't see (it isn't a proxy);
   `verify_command` is the hook for app-specific smoke tests today.
-- A native GUI (Rust, iced) as a separate process on `wardend.sock`, locally
-  or through an SSH tunnel; it shares `src/events.rs` with the daemon.
+- The native GUI ([`gui/`](../gui/README.md), iced) runs as a separate process
+  on `wardend.sock`, locally or through an SSH tunnel, and shares the
+  `warden-protocol` crate with the daemon. Next: a resource history (charts),
+  alerts, several hosts in one window.
 - wardend features beyond this round: alerts (webhook/command), in-memory
   resource history, port registry, start order, fleet deploys with release
   pinning, audit log (peer uid), self-upgrade by re-exec.

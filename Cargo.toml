@@ -7,10 +7,11 @@ rust-version = "1.85"
 
 [workspace]
 # protocol: the wire types (docs/protocol.md), shared by warden and the GUI.
+# gui: the native GUI (warden-gui), a client of wardend.
 # xtask: `cargo xtask bench` (see .cargo/config.toml). Plain `cargo build`,
 # `cargo test` and `cargo install` in this directory still mean Warden only;
-# `--workspace` takes in the rest.
-members = ["protocol", "xtask"]
+# `--workspace` (or `-p warden-gui`) takes in the rest.
+members = ["protocol", "gui", "xtask"]
 
 [dependencies]
 libc = "0.2.189"
