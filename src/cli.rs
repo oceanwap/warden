@@ -50,6 +50,11 @@ APPS (familiar from PM2):
     startup          Install the systemd unit and enable saved apps at boot (root)
     unstartup        Disable them again
     kill [target]    Stop every app's supervisor (asks first on a terminal; --yes)
+    pm2-migrate      Import PM2's apps: a config, a 0600 .env file and a MIGRATION.md
+                     report per app. --from jlist|dump|<ecosystem file>  --env <name>
+                     --apps a,b  --out <dir>  --dry-run  --mode process|worker
+                     --overwrite  --cutover overlap|same-port|new-port:<port>
+                     (switch with rollback)  --finalize (remove them from PM2)
 
 SUPERVISOR:
     start            With no app: run the supervisor in the foreground for -c
@@ -119,6 +124,7 @@ pub enum Command {
     Kill,
     Top,
     Doctor,
+    Pm2Migrate(Box<crate::migrate::MigrateOpts>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,7 +228,7 @@ fn num(flag: &str, v: &str) -> Result<u64, String> {
 }
 
 /// `300M`, `1G`, `512` (MB) → MB.
-fn parse_mb(s: &str) -> Result<u64, String> {
+pub fn parse_mb(s: &str) -> Result<u64, String> {
     let t = s.trim().to_ascii_uppercase();
     let (num, mult) = match t.chars().last() {
         Some('K') => (&t[..t.len() - 1], 1.0 / 1024.0),
@@ -235,6 +241,10 @@ fn parse_mb(s: &str) -> Result<u64, String> {
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
+    // Its options (--env NAME, --out DIR) differ from `start`'s.
+    if argv.first().map(String::as_str) == Some("pm2-migrate") {
+        return parse_migrate(&argv[1..]);
+    }
     let mut config: Option<PathBuf> = None;
     let mut socket = None;
     let (mut json, mut no_wait, mut yes, mut show_secrets, mut hard) = (false, false, false, false, false);
@@ -544,6 +554,51 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         return Err(format!("{cmd} takes no argument"));
     }
     Ok(Args { command, target, config, socket, json, no_wait, yes, table_only })
+}
+
+fn parse_migrate(argv: &[String]) -> Result<Args, String> {
+    let mut o = crate::migrate::MigrateOpts::default();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("pm2-migrate: {a} needs a value"));
+        match a.as_str() {
+            "--from" => o.from = Some(value()?),
+            "--env" => o.env = Some(value()?),
+            "--apps" | "--only" => {
+                o.apps.extend(value()?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from))
+            }
+            "--out" => o.out = Some(value()?.into()),
+            "--dry-run" => o.dry_run = true,
+            "--mode" => o.mode = Some(value()?),
+            "--cutover" => o.cutover = Some(crate::migrate::parse_cutover(&value()?)?),
+            "--finalize" => o.finalize = true,
+            "--overwrite" => o.overwrite = true,
+            "-y" | "--yes" => o.yes = true,
+            "-h" | "--help" => return Ok(Args { command: Command::Help, ..empty_args() }),
+            s if s.starts_with('-') => return Err(format!("pm2-migrate: unknown option {s}")),
+            name => o.apps.push(name.to_string()),
+        }
+    }
+    if o.dry_run && (o.cutover.is_some() || o.finalize) {
+        return Err(
+            "pm2-migrate: --dry-run changes nothing, so it can't be combined with --cutover or --finalize".into()
+        );
+    }
+    let yes = o.yes;
+    Ok(Args { command: Command::Pm2Migrate(Box::new(o)), yes, ..empty_args() })
+}
+
+fn empty_args() -> Args {
+    Args {
+        command: Command::Help,
+        target: None,
+        config: None,
+        socket: None,
+        json: false,
+        no_wait: false,
+        yes: false,
+        table_only: false,
+    }
 }
 
 /// Follow a rollout until it finishes; exit code 0 = succeeded.

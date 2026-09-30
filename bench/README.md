@@ -83,7 +83,9 @@ Common options: `--duration S` (seconds per load test, default 10),
   answered), never with its own CLI: `pm2 jlist` alone takes ~170 ms, and
   polling it would time PM2's CLI instead of its recovery.
 - Requests time out after 2 s and count as failed. PM2's cluster mode can
-  hang a connection it handed to a worker that is exiting.
+  hang a connection it handed to a worker that is exiting. The "which worker
+  answered" probe gives up after 250 ms and asks again, so one such hang
+  doesn't inflate a recovery time.
 - `BUN_OPTIONS` and `NODE_OPTIONS` from your shell are removed, so they can't
   change what is measured.
 - Every static server must return the exact bytes of every file, or its run

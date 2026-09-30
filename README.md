@@ -144,6 +144,25 @@ has everything; the differences are in the right column.
 | `pm2 monit` | `warden top` | |
 | | `warden doctor` | Environment problems (kernel settings, limits, ports, permissions), each with its fix |
 
+### Moving from PM2
+
+```sh
+warden pm2-migrate --dry-run                   # what it would write, from `pm2 jlist`
+warden pm2-migrate                             # <app>.toml + <app>.env (0600) + MIGRATION.md
+warden pm2-migrate --cutover same-port         # PM2 stops each app, Warden starts it; PM2 is restored on failure
+warden pm2-migrate --finalize                  # remove the migrated apps from PM2, `warden save`
+```
+
+It reads the running daemon (`--from dump` for `pm2 save`'s file, or an
+ecosystem file with `--env production`). Env values go to a 0600 file, never
+into the config, and only the variables the app was given: `pm2 jlist` also
+carries the whole shell of whoever ran `pm2 start`, which is left out and
+listed by name in `MIGRATION.md` for review. PM2's defaults carry over where
+apps depend on them (SIGINT to stop, `NODE_APP_INSTANCE`). `--cutover
+overlap` runs both side by side first (apps that share their port with
+`reusePort`); `new-port:<p>` starts Warden on another port for you to switch
+the proxy.
+
 Every problem Warden logs says what happened, why, what it did and how to fix
 it; [`docs/troubleshooting.md`](docs/troubleshooting.md) collects them by symptom.
 
@@ -219,23 +238,23 @@ The same app under each manager: 4 workers, one port. PM2 in cluster mode, Watt 
 
 | | bare | pm2 | watt | warden-process |
 |---|---|---|---|---|
-| total RAM idle: RSS / PSS (MB) | 226 / 91 | 350.8 / 150 | 496.4 / 473.8 | 233.6 / 96.8 |
-| total RAM after load: RSS / PSS (MB) | 282.1 / 129.5 | 388.3 / 186.8 | 530.6 / 508.1 | 289.6 / 135.4 |
-| manager RAM (MB) | 0 | 66.4 | (in total) | 6.4 |
-| manager idle CPU (%) | 0 | 0.2 | 3.4 | 0 |
-| startup to 4 serving (ms) | 188 | 879 | 3143 | 211 |
-| crash recovery (ms) | n/a (nothing restarts it) | 352 | 1532 | 139 |
-| requests failed during a crash | n/a | 2 of 2548 | 1 of 7237 | 0 of 3365 |
-| rolling restart under load: failed | n/a | 0 of 2018 (794 ms) | 0 of 3193 (3594 ms) | 0 of 2896 (533 ms) |
-| status command (ms) | n/a | 168.8 | 509.7 | 2.1 |
-| /plaintext req/s | 65830 | 51625 | 54211 | 64100 |
-| /plaintext p50 / p99 (ms) | 0.9 / 3.44 | 0.58 / 7.97 | 0.73 / 7.3 | 0.89 / 4.05 |
+| total RAM idle: RSS / PSS (MB) | 219.3 / 94.4 | 344.8 / 151.6 | 484.2 / 474.6 | 232.3 / 101.2 |
+| total RAM after load: RSS / PSS (MB) | 275.3 / 133.6 | 378.1 / 184 | 521.9 / 512.4 | 286.9 / 139.4 |
+| manager RAM (MB) | 0 | 64.7 | (in total) | 6.2 |
+| manager idle CPU (%) | 0 | 0.2 | 3.2 | 0.2 |
+| startup to 4 serving (ms) | 233 | 1058 | 3444 | 224 |
+| crash recovery (ms) | n/a (nothing restarts it) | 447 | 1820 | 113 |
+| requests failed during a crash | n/a | 1 of 2063 | 1 of 6885 | 0 of 3639 |
+| rolling restart under load: failed | n/a | 0 of 1607 (857 ms) | 0 of 2986 (3470 ms) | 0 of 3747 (554 ms) |
+| status command (ms) | n/a | 172.3 | 465 | 1.9 |
+| /plaintext req/s | 61405 | 53410 | 51876 | 66497 |
+| /plaintext p50 / p99 (ms) | 0.93 / 4.16 | 0.6 / 8.47 | 1.01 / 4.97 | 0.9 / 2.84 |
 | /plaintext errors | 0 | 0 | 0 | 0 |
-| /json req/s | 65786 | 52856 | 50015 | 65866 |
-| /json p50 / p99 (ms) | 0.91 / 2.98 | 0.61 / 8.13 | 1.01 / 5.32 | 0.92 / 2.79 |
+| /json req/s | 64398 | 50443 | 50946 | 64608 |
+| /json p50 / p99 (ms) | 0.92 / 3.48 | 0.5 / 9 | 1.17 / 4.06 | 0.94 / 2.83 |
 | /json errors | 0 | 0 | 0 | 0 |
-| /cpu req/s | 827 | 847 | 815 | 813 |
-| /cpu p50 / p99 (ms) | 77.11 / 155.74 | 74.4 / 145.4 | 76.12 / 158.27 | 77.78 / 159.31 |
+| /cpu req/s | 800 | 792 | 830 | 826 |
+| /cpu p50 / p99 (ms) | 79.65 / 161.5 | 76.74 / 153.78 | 73.61 / 126.43 | 78.2 / 163.5 |
 | /cpu errors | 0 | 0 | 0 | 0 |
 
 ### NestJS app on Node.js
@@ -246,23 +265,23 @@ A minimal NestJS (Express) app with the same endpoints, 4 workers.
 
 | | bare | pm2 | watt | warden-process |
 |---|---|---|---|---|
-| total RAM idle: RSS / PSS (MB) | 399.5 / 229.4 | 486.6 / 268.6 | 587.3 / 564.8 | 404.4 / 232.3 |
-| total RAM after load: RSS / PSS (MB) | 695.3 / 525.1 | 811.9 / 593.6 | 1130.9 / 1108.4 | 701 / 528.5 |
-| manager RAM (MB) | 0 | 66.5 | (in total) | 6.1 |
+| total RAM idle: RSS / PSS (MB) | 399.8 / 236.3 | 486.4 / 273.9 | 589.4 / 579.8 | 412.8 / 246.9 |
+| total RAM after load: RSS / PSS (MB) | 698.7 / 535.1 | 796.2 / 583.4 | 1120.8 / 1111.2 | 713.3 / 547.1 |
+| manager RAM (MB) | 0 | 66.8 | (in total) | 5.7 |
 | manager idle CPU (%) | 0 | 0.2 | 2.4 | 0 |
-| startup to 4 serving (ms) | 1264 | 1944 | 4897 | 1360 |
-| crash recovery (ms) | n/a (nothing restarts it) | 1636 | 2130 | 729 |
-| requests failed during a crash | n/a | 2 of 3052 | 0 of 4337 | 1 of 2544 |
-| rolling restart under load: failed | n/a | 0 of 1226 (1838 ms) | 0 of 1900 (4666 ms) | 0 of 1691 (1614 ms) |
-| status command (ms) | n/a | 168.2 | 510.8 | 1.7 |
-| /plaintext req/s | 10008 | 8042 | 8683 | 9911 |
-| /plaintext p50 / p99 (ms) | 5.5 / 25.65 | 6.89 / 28.24 | 6.07 / 31.56 | 5.68 / 23.98 |
+| startup to 4 serving (ms) | 1270 | 1991 | 4453 | 1243 |
+| crash recovery (ms) | n/a (nothing restarts it) | 1677 | 1958 | 813 |
+| requests failed during a crash | n/a | 1 of 3003 | 1 of 4163 | 0 of 2662 |
+| rolling restart under load: failed | n/a | 0 of 1233 (1819 ms) | 0 of 1975 (4620 ms) | 0 of 1573 (1835 ms) |
+| status command (ms) | n/a | 156.1 | 446.1 | 1.9 |
+| /plaintext req/s | 9553 | 8372 | 8619 | 9541 |
+| /plaintext p50 / p99 (ms) | 6.03 / 22.89 | 6.6 / 26.03 | 6.12 / 31.98 | 5.64 / 27.32 |
 | /plaintext errors | 0 | 0 | 0 | 0 |
-| /json req/s | 10062 | 9154 | 9321 | 9707 |
-| /json p50 / p99 (ms) | 5.86 / 20.11 | 6.27 / 23.56 | 6.15 / 26.69 | 6.22 / 19.9 |
+| /json req/s | 9899 | 8709 | 9128 | 10024 |
+| /json p50 / p99 (ms) | 5.63 / 22.26 | 6.79 / 19.72 | 6.32 / 28.05 | 5.7 / 21.58 |
 | /json errors | 0 | 0 | 0 | 0 |
-| /cpu req/s | 720 | 730 | 764 | 764 |
-| /cpu p50 / p99 (ms) | 81.12 / 246.25 | 91.37 / 142.56 | 82.64 / 146.01 | 79.64 / 148.88 |
+| /cpu req/s | 757 | 751 | 737 | 737 |
+| /cpu p50 / p99 (ms) | 81.04 / 149.94 | 83.92 / 115.64 | 77.06 / 171.09 | 85.61 / 186.79 |
 | /cpu errors | 0 | 0 | 0 | 0 |
 
 ### Bun app (Bun.serve)
@@ -273,23 +292,23 @@ A minimal NestJS (Express) app with the same endpoints, 4 workers.
 
 | | bare | pm2 | warden-process | warden-worker |
 |---|---|---|---|---|
-| total RAM idle: RSS / PSS (MB) | 153.6 / 53.5 | 287.4 / 147.9 | 176.6 / 68.7 | 74.1 / 55.5 |
-| total RAM after load: RSS / PSS (MB) | 174.9 / 58.1 | 292.2 / 144 | 198.8 / 74.5 | 79.2 / 58.1 |
-| manager RAM (MB) | 0 | 64.8 | 6.8 | 5.1 |
-| manager idle CPU (%) | 0 | 0.2 | 0 | 0 |
-| startup to 4 serving (ms) | 58 | 650 | 81 | 90 |
-| crash recovery (ms) | n/a (nothing restarts it) | 176 | 57 | 114 |
-| requests failed during a crash | n/a | 0 of 11570 | 0 of 11405 | 0 of 11102 |
-| rolling restart under load: failed | n/a | 0 of 12228 (643 ms) | 0 of 10309 (259 ms) | 0 of 11297 (259 ms) |
-| status command (ms) | n/a | 171.3 | 1.8 | 1.7 |
-| /plaintext req/s | 95660 | 83766 | 96353 | 98247 |
-| /plaintext p50 / p99 (ms) | 0.4 / 4.34 | 0.67 / 3.77 | 0.45 / 4.01 | 0.42 / 4.23 |
+| total RAM idle: RSS / PSS (MB) | 150.1 / 52.9 | 282.6 / 159.6 | 174.4 / 68.7 | 77.2 / 58.2 |
+| total RAM after load: RSS / PSS (MB) | 171.9 / 58 | 289.5 / 157.8 | 197.1 / 74.9 | 79.5 / 59.1 |
+| manager RAM (MB) | 0 | 65.2 | 6.7 | 6.9 |
+| manager idle CPU (%) | 0 | 0 | 0 | 0 |
+| startup to 4 serving (ms) | 50 | 650 | 88 | 116 |
+| crash recovery (ms) | n/a (nothing restarts it) | 155 | 47 | 91 |
+| requests failed during a crash | n/a | 0 of 10742 | 0 of 11055 | 0 of 10426 |
+| rolling restart under load: failed | n/a | 0 of 12083 (604 ms) | 0 of 11214 (261 ms) | 0 of 11709 (261 ms) |
+| status command (ms) | n/a | 160.5 | 2.1 | 1.8 |
+| /plaintext req/s | 96949 | 80225 | 96877 | 97607 |
+| /plaintext p50 / p99 (ms) | 0.43 / 3.97 | 0.66 / 4.12 | 0.44 / 4.13 | 0.35 / 4.37 |
 | /plaintext errors | 0 | 0 | 0 | 0 |
-| /json req/s | 87817 | 74886 | 83323 | 82981 |
-| /json p50 / p99 (ms) | 0.6 / 3.3 | 0.78 / 2.8 | 0.56 / 3.96 | 0.59 / 4.86 |
+| /json req/s | 87851 | 76506 | 85531 | 87148 |
+| /json p50 / p99 (ms) | 0.59 / 3.53 | 0.77 / 2.59 | 0.6 / 3.7 | 0.55 / 4.21 |
 | /json errors | 0 | 0 | 0 | 0 |
-| /cpu req/s | 1243 | 1238 | 1252 | 1243 |
-| /cpu p50 / p99 (ms) | 49.51 / 100.72 | 48.57 / 98.22 | 52.61 / 96.84 | 48.48 / 99.18 |
+| /cpu req/s | 1264 | 1203 | 1242 | 1248 |
+| /cpu p50 / p99 (ms) | 44.58 / 95.65 | 52.54 / 118.8 | 50.05 / 122.84 | 49.58 / 102.44 |
 | /cpu errors | 0 | 0 | 0 | 0 |
 
 ### NestJS app on Bun
@@ -300,23 +319,23 @@ The NestJS app on Bun, 4 workers; Warden also in worker (thread) mode.
 
 | | bare | pm2 | warden-process | warden-worker |
 |---|---|---|---|---|
-| total RAM idle: RSS / PSS (MB) | 340 / 197.9 | 421.8 / 261.8 | 347.8 / 203.1 | 179.8 / 157.8 |
-| total RAM after load: RSS / PSS (MB) | 432.4 / 288.3 | 528.5 / 366.6 | 434.2 / 287.4 | 346.1 / 323.9 |
-| manager RAM (MB) | 0 | 65.4 | 6.2 | 5.1 |
+| total RAM idle: RSS / PSS (MB) | 335.6 / 196.6 | 420 / 274.6 | 343.9 / 200.3 | 180.6 / 159.1 |
+| total RAM after load: RSS / PSS (MB) | 460.1 / 317 | 513.6 / 366.3 | 488.8 / 343 | 357.9 / 336.2 |
+| manager RAM (MB) | 0 | 65.2 | 6 | 5 |
 | manager idle CPU (%) | 0 | 0.2 | 0 | 0 |
-| startup to 4 serving (ms) | 757 | 1390 | 771 | 744 |
-| crash recovery (ms) | n/a (nothing restarts it) | 839 | 458 | 920 |
-| requests failed during a crash | n/a | 0 of 5405 | 0 of 4625 | 0 of 2931 |
-| rolling restart under load: failed | n/a | 2406 of 6090 (1387 ms) | 0 of 3654 (1311 ms) | 0 of 3444 (1065 ms) |
-| status command (ms) | n/a | 167.3 | 1.7 | 1.8 |
-| /plaintext req/s | 28624 | 25591 | 28313 | 24612 |
-| /plaintext p50 / p99 (ms) | 1.44 / 11.42 | 1.6 / 15.13 | 1.4 / 12.09 | 1.31 / 19.77 |
+| startup to 4 serving (ms) | 771 | 1482 | 761 | 779 |
+| crash recovery (ms) | n/a (nothing restarts it) | 781 | 474 | 1057 |
+| requests failed during a crash | n/a | 0 of 5631 | 0 of 4686 | 0 of 2842 |
+| rolling restart under load: failed | n/a | 4324 of 8699 (1659 ms) | 0 of 3207 (1323 ms) | 0 of 3512 (1048 ms) |
+| status command (ms) | n/a | 152.7 | 1.9 | 1.8 |
+| /plaintext req/s | 31075 | 26008 | 30474 | 25860 |
+| /plaintext p50 / p99 (ms) | 1.28 / 11.17 | 1.54 / 16.79 | 1.47 / 9.94 | 1.02 / 18.85 |
 | /plaintext errors | 0 | 0 | 0 | 0 |
-| /json req/s | 28880 | 26338 | 28285 | 25560 |
-| /json p50 / p99 (ms) | 1.4 / 10.41 | 1.72 / 12.63 | 1.61 / 10.71 | 1.45 / 17.14 |
+| /json req/s | 29124 | 25657 | 30655 | 27787 |
+| /json p50 / p99 (ms) | 1.42 / 10.75 | 1.62 / 13.49 | 1.33 / 8.95 | 1.3 / 15.35 |
 | /json errors | 0 | 0 | 0 | 0 |
-| /cpu req/s | 1155 | 1101 | 1182 | 1161 |
-| /cpu p50 / p99 (ms) | 56.23 / 105.78 | 52.37 / 104.63 | 49.08 / 93.58 | 49.43 / 94.92 |
+| /cpu req/s | 1185 | 1086 | 1185 | 1154 |
+| /cpu p50 / p99 (ms) | 49.54 / 95.16 | 56.5 / 112.72 | 51.72 / 99.02 | 55.88 / 110.11 |
 | /cpu errors | 0 | 0 | 0 | 0 |
 
 ### Static files
@@ -328,21 +347,21 @@ The NestJS app on Bun, 4 workers; Warden also in worker (thread) mode.
 | | warden | nginx | pm2-serve | serve (1 process) |
 |---|---|---|---|---|
 | processes | 5 | 5 | 5 | 1 |
-| total RAM idle: RSS / PSS (MB) | 23.4 / 6.3 | 24.1 / 12.7 | 320.5 / 131.4 | 97.2 / 81.6 |
-| total RAM after load: RSS / PSS (MB) | 24.8 / 7.6 | 25.6 / 12.9 | 466.9 / 273.7 | 188.8 / 173.2 |
-| startup (ms) | 18 | 16 | 676 | 346 |
-| /index.html req/s | 86994 | 88526 | 16549 | 16439 |
-| /index.html p50 / p99 (ms) | 0.54 / 3.51 | 0.52 / 5.34 | 3.05 / 16.87 | 3.65 / 7.18 |
+| total RAM idle: RSS / PSS (MB) | 21.7 / 6.3 | 24.1 / 12.7 | 316.8 / 133.4 | 99.6 / 97.5 |
+| total RAM after load: RSS / PSS (MB) | 23.4 / 7.6 | 25.6 / 12.9 | 503.6 / 315.8 | 196.8 / 194.7 |
+| startup (ms) | 21 | 12 | 694 | 386 |
+| /index.html req/s | 84959 | 90948 | 12583 | 16577 |
+| /index.html p50 / p99 (ms) | 0.62 / 3.35 | 0.35 / 6.55 | 4.73 / 17.06 | 3.7 / 6.05 |
 | /index.html errors | 0 | 0 | 0 | 0 |
-| /assets/app.3f9a2c1b.js req/s | 67542 | 72738 | 12814 | 1663 |
-| /assets/app.3f9a2c1b.js p50 / p99 (ms) | 0.64 / 6.56 | 0.71 / 4.23 | 4.19 / 18.58 | 37.04 / 75.19 |
+| /assets/app.3f9a2c1b.js req/s | 68389 | 70981 | 10849 | 1758 |
+| /assets/app.3f9a2c1b.js p50 / p99 (ms) | 0.55 / 7.01 | 0.7 / 4.43 | 4.56 / 27.56 | 35.14 / 62.51 |
 | /assets/app.3f9a2c1b.js errors | 0 | 0 | 0 | 0 |
-| /media/video.bin req/s | 4756 | 4431 | 2006 | 1012 |
-| /media/video.bin p50 / p99 (ms) | 13.58 / 27.27 | 13.4 / 33.58 | 30 / 81.53 | 58.61 / 104.92 |
-| /media/video.bin MB/s | 4749.7 | 4424.5 | 2000.1 | 1006.1 |
+| /media/video.bin req/s | 5083 | 4311 | 2064 | 1025 |
+| /media/video.bin p50 / p99 (ms) | 12.21 / 28.32 | 14.89 / 29.5 | 28.66 / 85.25 | 58.18 / 94.1 |
+| /media/video.bin MB/s | 5076.6 | 4305 | 2058.5 | 1018.8 |
 | /media/video.bin errors | 0 | 0 | 0 | 0 |
-| /index.html (new connection each) req/s | 28595 | 27712 | 4476 | 9835 |
-| /index.html (new connection each) p50 / p99 (ms) | 2.15 / 5.11 | 2.2 / 5.66 | 12.9 / 40.82 | 6.17 / 11.93 |
+| /index.html (new connection each) req/s | 29273 | 29299 | 4324 | 9333 |
+| /index.html (new connection each) p50 / p99 (ms) | 2.1 / 4.99 | 2.17 / 4.76 | 13.86 / 35.39 | 6.47 / 12.63 |
 | /index.html (new connection each) errors | 0 | 0 | 0 | 0 |
 
 ### Log-heavy apps
@@ -356,18 +375,18 @@ Steady: 4 workers × 5000 lines/s × 10 s
 | | warden | pm2 |
 |---|---|---|
 | lines written / in the log file | 200000 / 200000 | 200000 / 200000 |
-| manager CPU (s) | 0.34 | 1.43 |
-| manager peak RAM (MB) | 5.5 | 74.8 |
+| manager CPU (s) | 0.36 | 1.42 |
+| manager peak RAM (MB) | 5.5 | 75.6 |
 
 Flood: 1 worker writing 200 MB to stdout as fast as it is read
 
 | | warden | pm2 | warden (keep all) |
 |---|---|---|---|
-| time to write it (ms) | 235 | 1287 | 603 |
-| throughput (MB/s) | 851.1 | 155.4 | 331.7 |
-| manager CPU (s) | 0.18 | 1.59 | 0.72 |
-| manager CPU per GB (s) | 0.92 | 8.14 | 3.69 |
-| manager peak RAM (MB) | 5.6 | 81.9 | 5.7 |
+| time to write it (ms) | 218 | 1304 | 657 |
+| throughput (MB/s) | 917.4 | 153.4 | 304.4 |
+| manager CPU (s) | 0.14 | 1.59 | 0.74 |
+| manager CPU per GB (s) | 0.72 | 8.14 | 3.79 |
+| manager peak RAM (MB) | 5.5 | 91.7 | 5.6 |
 | lines in the log file | 10000 | 2076388 | 2076388 |
 
 ### Many apps on one host
@@ -379,14 +398,14 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 | | warden | pm2 |
 |---|---|---|
 | manager processes | 10 | 1 |
-| manager RAM, all apps: RSS (MB) | 49.1 | 76.9 |
-| manager RAM, all apps: PSS (MB) | 7.3 | 36.1 |
+| manager RAM, all apps: RSS (MB) | 48.2 | 74.9 |
+| manager RAM, all apps: PSS (MB) | 7.3 | 34.9 |
 | manager idle CPU (%) | 0 | 0.7 |
-| start 10 apps (ms) | 579 | 2181 |
-| `list` (ms) | 2.6 | 167.9 |
-| `list --json` (ms) | 2.7 | 160.3 |
-| `describe app3` (ms) | 1.9 | 161.7 |
-| `logs app3 --nostream` (ms) | 1.7 | 169.4 |
+| start 10 apps (ms) | 581 | 2182 |
+| `list` (ms) | 2.7 | 166.5 |
+| `list --json` (ms) | 2.6 | 155.5 |
+| `describe app3` (ms) | 2 | 165.5 |
+| `logs app3 --nostream` (ms) | 1.9 | 156.9 |
 <!-- bench:end -->
 
 ## Development

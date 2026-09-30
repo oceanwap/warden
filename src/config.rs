@@ -108,6 +108,13 @@ pub struct App {
     pub port: Option<u16>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// A file of `KEY=VALUE` lines (secrets kept out of the config, mode
+    /// 0600), relative to the config file. Read when the config is loaded, so
+    /// `warden reload` picks up changes. `env` wins over it.
+    pub env_file: Option<PathBuf>,
+    /// The variables read from `env_file` (filled by `load`).
+    #[serde(skip)]
+    pub env_from_file: BTreeMap<String, String>,
     /// Inject Warden's Bun shim (reusePort, readiness, drain).
     /// Default: on when `command` is `bun`.
     pub shim: Option<bool>,
@@ -538,6 +545,14 @@ impl Config {
                 cfg.app.working_directory = Some(base.join(wd));
             }
         }
+        if let Some(f) = &cfg.app.env_file {
+            let file = if f.is_relative() { path.parent().unwrap_or(Path::new(".")).join(f) } else { f.clone() };
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| format!("{}: app.env_file {}: {e}", path.display(), file.display()))?;
+            cfg.app.env_from_file = parse_env_file(&text)
+                .map_err(|e| format!("{}: app.env_file {}: {e}", path.display(), file.display()))?;
+            cfg.app.env_file = Some(file);
+        }
         // A relative static root: from the working directory, else the config file.
         if let Some(st) = &mut cfg.static_files {
             if st.root.is_relative() {
@@ -859,6 +874,66 @@ impl Config {
     }
 }
 
+/// The worker environment from the config: `env_file`, then `env` on top.
+impl App {
+    pub fn environment(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.env_from_file.iter().filter(|(k, _)| !self.env.contains_key(*k)).chain(self.env.iter())
+    }
+}
+
+/// `KEY=VALUE` lines as in systemd's EnvironmentFile and dotenv: blank lines
+/// and `#` comments skipped, an optional `export `, values optionally in
+/// double quotes (with \n, \t, \", \\ escapes) or single quotes (literal).
+pub fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(format!("line {}: expected KEY=VALUE", i + 1));
+        };
+        let k = k.trim();
+        if k.is_empty()
+            || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || k.starts_with(|c: char| c.is_ascii_digit())
+        {
+            return Err(format!("line {}: {k:?} is not a valid variable name", i + 1));
+        }
+        let v = v.trim();
+        let value = if let Some(inner) = v.strip_prefix('"') {
+            let Some(inner) = inner.strip_suffix('"') else {
+                return Err(format!("line {}: unterminated double quote", i + 1));
+            };
+            let mut s = String::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    s.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('n') => s.push('\n'),
+                    Some('t') => s.push('\t'),
+                    Some('r') => s.push('\r'),
+                    Some(o) => s.push(o),
+                    None => s.push('\\'),
+                }
+            }
+            s
+        } else if let Some(inner) = v.strip_prefix('\'') {
+            inner.strip_suffix('\'').ok_or_else(|| format!("line {}: unterminated single quote", i + 1))?.to_string()
+        } else {
+            // Unquoted: a trailing ` # comment` is not part of the value.
+            v.split(" #").next().unwrap_or("").trim_end().to_string()
+        };
+        out.insert(k.to_string(), value);
+    }
+    Ok(out)
+}
+
 /// Find the control socket even when the file no longer parses (someone is
 /// mid-edit or a deploy broke it): scan for `[app] name` and `[control] socket`
 /// line by line, so `warden safe-reload` can still reach Warden and report the
@@ -1043,6 +1118,35 @@ mod tests {
         let c = Config::parse(&site).unwrap();
         let st = c.static_files.unwrap();
         assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
+    }
+
+    #[test]
+    fn env_files() {
+        let e = parse_env_file(
+            "# secrets\n\nDB_URL=postgres://u:p@h/db\nexport TOKEN = abc # note\nQUOTED=\"a b\\n\\\"c\\\"\"\nLIT='x $y \\n'\nEMPTY=\n",
+        )
+        .unwrap();
+        assert_eq!(e["DB_URL"], "postgres://u:p@h/db");
+        assert_eq!(e["TOKEN"], "abc");
+        assert_eq!(e["QUOTED"], "a b\n\"c\"");
+        assert_eq!(e["LIT"], "x $y \\n");
+        assert_eq!(e["EMPTY"], "");
+        assert!(parse_env_file("NOEQUALS\n").unwrap_err().contains("line 1"));
+        assert!(parse_env_file("1BAD=x\n").unwrap_err().contains("not a valid variable name"));
+        assert!(parse_env_file("A=\"open\n").unwrap_err().contains("unterminated"));
+        // Loaded relative to the config file; `env` wins over the file.
+        let dir = std::env::temp_dir().join(format!("warden-envfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("api.env"), "A=from-file\nB=file-only\n").unwrap();
+        std::fs::write(dir.join("api.toml"), format!("{MIN}env_file = \"api.env\"\nenv = {{ A = \"from-config\" }}\n"))
+            .unwrap();
+        let c = Config::load(&dir.join("api.toml")).unwrap();
+        let env: BTreeMap<&String, &String> = c.app.environment().collect();
+        assert_eq!(env.get(&"A".to_string()).map(|s| s.as_str()), Some("from-config"));
+        assert_eq!(env.get(&"B".to_string()).map(|s| s.as_str()), Some("file-only"));
+        std::fs::remove_file(dir.join("api.env")).unwrap();
+        assert!(Config::load(&dir.join("api.toml")).unwrap_err().contains("env_file"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

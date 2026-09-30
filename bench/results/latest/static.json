@@ -1,0 +1,211 @@
+{
+  "meta": {
+    "date": "2026-09-30T16:29:14.408Z",
+    "kernel": "6.18.44-fc-v50 x86_64",
+    "cpus": 2,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "warden": "warden 0.1.0",
+    "tcp_migrate_req": "1",
+    "workers": 4,
+    "duration_s": 10,
+    "connections": 64,
+    "node": "v22.22.2",
+    "pm2": "6.0.14",
+    "serve": "14.2.6",
+    "nginx": "nginx/1.24.0 (Ubuntu)"
+  },
+  "results": [
+    {
+      "name": "warden",
+      "processes": 5,
+      "startup_ms": 21,
+      "idle_mb": 21.7,
+      "idle_pss_mb": 6.3,
+      "loaded_mb": 23.4,
+      "loaded_pss_mb": 7.6,
+      "manager_mb": 6.3,
+      "loads": {
+        "/index.html": {
+          "rps": 84959,
+          "p50_ms": 0.62,
+          "p95_ms": 2.19,
+          "p99_ms": 3.35,
+          "mb_per_s": 121.5,
+          "ok": 849862,
+          "errors": 0
+        },
+        "/assets/app.3f9a2c1b.js": {
+          "rps": 68389,
+          "p50_ms": 0.55,
+          "p95_ms": 3.6,
+          "p99_ms": 7.01,
+          "mb_per_s": 3205.4,
+          "ok": 684247,
+          "errors": 0
+        },
+        "/media/video.bin": {
+          "rps": 5083,
+          "p50_ms": 12.21,
+          "p95_ms": 21.92,
+          "p99_ms": 28.32,
+          "mb_per_s": 5076.6,
+          "ok": 50807,
+          "errors": 0
+        },
+        "/index.html (new connection each)": {
+          "rps": 29273,
+          "p50_ms": 2.1,
+          "p95_ms": 3.93,
+          "p99_ms": 4.99,
+          "mb_per_s": 41.9,
+          "ok": 292804,
+          "errors": 0
+        }
+      }
+    },
+    {
+      "name": "nginx",
+      "processes": 5,
+      "startup_ms": 12,
+      "idle_mb": 24.1,
+      "idle_pss_mb": 12.7,
+      "loaded_mb": 25.6,
+      "loaded_pss_mb": 12.9,
+      "manager_mb": 6.6,
+      "loads": {
+        "/index.html": {
+          "rps": 90948,
+          "p50_ms": 0.35,
+          "p95_ms": 2.9,
+          "p99_ms": 6.55,
+          "mb_per_s": 130.1,
+          "ok": 909800,
+          "errors": 0
+        },
+        "/assets/app.3f9a2c1b.js": {
+          "rps": 70981,
+          "p50_ms": 0.7,
+          "p95_ms": 2.76,
+          "p99_ms": 4.43,
+          "mb_per_s": 3327,
+          "ok": 710126,
+          "errors": 0
+        },
+        "/media/video.bin": {
+          "rps": 4311,
+          "p50_ms": 14.89,
+          "p95_ms": 23.44,
+          "p99_ms": 29.5,
+          "mb_per_s": 4305,
+          "ok": 43091,
+          "errors": 0
+        },
+        "/index.html (new connection each)": {
+          "rps": 29299,
+          "p50_ms": 2.17,
+          "p95_ms": 3.87,
+          "p99_ms": 4.76,
+          "mb_per_s": 41.9,
+          "ok": 293049,
+          "errors": 0
+        }
+      }
+    },
+    {
+      "name": "pm2-serve",
+      "processes": 5,
+      "startup_ms": 694,
+      "idle_mb": 316.8,
+      "idle_pss_mb": 133.4,
+      "loaded_mb": 503.6,
+      "loaded_pss_mb": 315.8,
+      "manager_mb": 69.9,
+      "loads": {
+        "/index.html": {
+          "rps": 12583,
+          "p50_ms": 4.73,
+          "p95_ms": 9.21,
+          "p99_ms": 17.06,
+          "mb_per_s": 18,
+          "ok": 125865,
+          "errors": 0
+        },
+        "/assets/app.3f9a2c1b.js": {
+          "rps": 10849,
+          "p50_ms": 4.56,
+          "p95_ms": 14.88,
+          "p99_ms": 27.56,
+          "mb_per_s": 508.3,
+          "ok": 108504,
+          "errors": 0
+        },
+        "/media/video.bin": {
+          "rps": 2064,
+          "p50_ms": 28.66,
+          "p95_ms": 55.88,
+          "p99_ms": 85.25,
+          "mb_per_s": 2058.5,
+          "ok": 20617,
+          "errors": 0
+        },
+        "/index.html (new connection each)": {
+          "rps": 4324,
+          "p50_ms": 13.86,
+          "p95_ms": 24.22,
+          "p99_ms": 35.39,
+          "mb_per_s": 6.2,
+          "ok": 43189,
+          "errors": 0
+        }
+      }
+    },
+    {
+      "name": "serve",
+      "processes": 1,
+      "startup_ms": 386,
+      "idle_mb": 99.6,
+      "idle_pss_mb": 97.5,
+      "loaded_mb": 196.8,
+      "loaded_pss_mb": 194.7,
+      "manager_mb": 0,
+      "loads": {
+        "/index.html": {
+          "rps": 16577,
+          "p50_ms": 3.7,
+          "p95_ms": 4.62,
+          "p99_ms": 6.05,
+          "mb_per_s": 0,
+          "ok": 0,
+          "errors": 0
+        },
+        "/assets/app.3f9a2c1b.js": {
+          "rps": 1758,
+          "p50_ms": 35.14,
+          "p95_ms": 51.48,
+          "p99_ms": 62.51,
+          "mb_per_s": 41.4,
+          "ok": 17523,
+          "errors": 0
+        },
+        "/media/video.bin": {
+          "rps": 1025,
+          "p50_ms": 58.18,
+          "p95_ms": 84.51,
+          "p99_ms": 94.1,
+          "mb_per_s": 1018.8,
+          "ok": 10192,
+          "errors": 0
+        },
+        "/index.html (new connection each)": {
+          "rps": 9333,
+          "p50_ms": 6.47,
+          "p95_ms": 9.3,
+          "p99_ms": 12.63,
+          "mb_per_s": 0,
+          "ok": 0,
+          "errors": 0
+        }
+      }
+    }
+  ]
+}

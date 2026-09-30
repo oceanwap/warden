@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "date": "2026-09-30T16:33:05.846Z",
+    "kernel": "6.18.44-fc-v50 x86_64",
+    "cpus": 2,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "warden": "warden 0.1.0",
+    "tcp_migrate_req": "1",
+    "apps": 10,
+    "node": "v22.22.2",
+    "pm2": "6.0.14"
+  },
+  "results": [
+    {
+      "name": "warden",
+      "apps": 10,
+      "manager_processes": 10,
+      "start_all_ms": 581,
+      "manager_rss_mb": 48.2,
+      "manager_pss_mb": 7.3,
+      "manager_idle_cpu_pct": 0,
+      "cmd_ms": {
+        "list": 2.7,
+        "list --json": 2.6,
+        "describe app3": 2,
+        "logs app3 --nostream": 1.9
+      }
+    },
+    {
+      "name": "pm2",
+      "apps": 10,
+      "manager_processes": 1,
+      "start_all_ms": 2182,
+      "manager_rss_mb": 74.9,
+      "manager_pss_mb": 34.9,
+      "manager_idle_cpu_pct": 0.7,
+      "cmd_ms": {
+        "list": 166.5,
+        "list --json": 155.5,
+        "describe app3": 165.5,
+        "logs app3 --nostream": 156.9
+      }
+    }
+  ]
+}

@@ -261,7 +261,9 @@ impl Supervisor {
                 }
             }
             Mode::Process => {
-                if !command_exists(&self.cfg.app.command, &self.cfg.app.env) {
+                let env: std::collections::BTreeMap<String, String> =
+                    self.cfg.app.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
+                if !command_exists(&self.cfg.app.command, &env) {
                     return Err(format!("preflight: command `{}` not found", self.cfg.app.command));
                 }
                 let script = self.cfg.app.args.iter().find(|a| {

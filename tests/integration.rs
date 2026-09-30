@@ -1120,6 +1120,20 @@ impl Fleet {
         (out.status.code().unwrap_or(-1), text)
     }
 
+    fn cli_env(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("WARDEN_HOME", &self.home)
+            .env("WARDEN_RUNTIME_DIR", self.home.join("run"))
+            .env_remove("WARDEN_CONFIG")
+            .envs(env.iter().copied())
+            .current_dir(&self.home)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        (out.status.code().unwrap_or(-1), text)
+    }
+
     fn ok(&self, args: &[&str]) -> String {
         let (code, out) = self.cli(args);
         assert_eq!(code, 0, "warden {} failed:\n{out}", args.join(" "));
@@ -1657,6 +1671,119 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
         drop(w);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `warden pm2-migrate` against a real PM2 (bench/node_modules): configs and
+/// 0600 env files from `pm2 jlist` with the inherited shell left out, a
+/// same-port cutover, a failed cutover rolled back to PM2, and --finalize.
+#[test]
+fn pm2_migrate_imports_cuts_over_and_rolls_back() {
+    let pm2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/node_modules/.bin/pm2");
+    if !pm2.exists() || !have_node() {
+        eprintln!("skipping: needs node and `npm ci` in bench/ (pm2)");
+        return;
+    }
+    let f = Fleet::new("migrate");
+    let pm2_home = f.home.join("pm2home");
+    let env = [("PM2_HOME", pm2_home.to_str().unwrap()), ("WARDEN_PM2", pm2.to_str().unwrap())];
+    let pm2_run = |args: &[&str]| {
+        let out = Command::new(&pm2).args(args).env("PM2_HOME", &pm2_home).output().unwrap();
+        assert!(out.status.success(), "pm2 {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let (p_api, p_bad) = (free_port(), free_port());
+    let app = fixture("node_app.mjs");
+    // `bad` works under PM2 but crashes under Warden (it sees WARDEN_APP).
+    let bad = f.home.join("bad.mjs");
+    std::fs::write(&bad, format!("if (process.env.WARDEN_APP) process.exit(3);\nawait import({:?});\n", app)).unwrap();
+    let idle = f.home.join("queue.mjs");
+    std::fs::write(&idle, "setInterval(() => {}, 1 << 30);\n").unwrap();
+    std::fs::write(
+        f.home.join("eco.config.cjs"),
+        format!(
+            "module.exports = {{ apps: [\n\
+             {{ name: 'api', script: {app:?}, env: {{ PORT: '{p_api}', API_SECRET: 's3cr3t value' }}, kill_timeout: 3000 }},\n\
+             {{ name: 'queue', script: {idle:?}, cron_restart: '0 3 * * *' }},\n\
+             {{ name: 'bad', script: {bad:?}, env: {{ PORT: '{p_bad}' }}, max_restarts: 1 }} ] }};\n"
+        ),
+    )
+    .unwrap();
+    pm2_run(&["start", f.home.join("eco.config.cjs").to_str().unwrap()]);
+    let pm2_pid = |name: &str| -> u64 {
+        let list: Value = serde_json::from_str(&pm2_run(&["jlist"])).unwrap();
+        list.as_array().unwrap().iter().find(|p| p["name"] == name).map(|p| p["pid"].as_u64().unwrap()).unwrap_or(0)
+    };
+    let t0 = Instant::now();
+    while get(p_api, "/").is_none() && t0.elapsed() < T {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Dry run: nothing written, no secret printed.
+    let (code, out) = f.cli_env(&["pm2-migrate", "--dry-run"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("name = \"api\"") && out.contains("name = \"queue\""), "{out}");
+    assert!(!out.contains("s3cr3t"), "dry run must not print env values: {out}");
+    assert!(!f.home.join("api.toml").exists());
+
+    // The real thing: configs, env files, report.
+    let (code, out) = f.cli_env(&["pm2-migrate"], &env);
+    assert_eq!(code, 0, "{out}");
+    let toml = std::fs::read_to_string(f.home.join("api.toml")).unwrap();
+    assert!(toml.contains(&format!("port = {p_api}")) && toml.contains("env_file = \"api.env\""), "{toml}");
+    assert!(toml.contains("signal = \"SIGINT\"") && toml.contains("grace_period = 3"), "{toml}");
+    assert!(!toml.contains("s3cr3t"));
+    let env_file = f.home.join("api.env");
+    let env_text = std::fs::read_to_string(&env_file).unwrap();
+    assert!(env_text.contains("API_SECRET=\"s3cr3t value\""), "{env_text}");
+    assert!(!env_text.contains("CARGO_MANIFEST_DIR"), "the shell that ran `pm2 start` is not copied: {env_text}");
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&env_file).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(std::fs::read_to_string(f.home.join("queue.toml")).unwrap().contains("schedule = \"0 3 * * *\""));
+    let report = std::fs::read_to_string(f.home.join("MIGRATION.md")).unwrap();
+    assert!(report.contains("## api") && report.contains("Environment left out"), "{report}");
+    for app in ["api", "queue", "bad"] {
+        let (code, out) = f.cli(&["check", "-c", f.home.join(format!("{app}.toml")).to_str().unwrap()]);
+        assert_eq!(code, 0, "{out}");
+    }
+    // A second run doesn't overwrite.
+    let (code, out) = f.cli_env(&["pm2-migrate", "--apps", "api"], &env);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("--overwrite"), "{out}");
+
+    // Same-port cutover: PM2 stops it, Warden serves it.
+    let before = pm2_pid("api");
+    let (code, out) = f.cli_env(&["pm2-migrate", "--apps", "api", "--overwrite", "--cutover", "same-port"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("now served by Warden"), "{out}");
+    let who = get(p_api, "/").expect("api answers after the cutover");
+    let pid: u64 = who.split(':').next().unwrap().parse().unwrap();
+    assert!(pid != before && f.pids("api").contains(&pid), "served by a Warden worker: {who}");
+    assert_eq!(pm2_pid("api"), 0, "PM2's copy is stopped");
+    assert!(f.cli(&["env", "api", "--show-secrets"]).1.contains("API_SECRET=s3cr3t value"));
+
+    // A failed cutover rolls back: PM2 serves `bad` again.
+    let (code, out) = f.cli_env(&["pm2-migrate", "--apps", "bad", "--overwrite", "--cutover", "same-port"], &env);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("rolled back"), "{out}");
+    let t0 = Instant::now();
+    while get(p_bad, "/").is_none() && t0.elapsed() < T {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let who = get(p_bad, "/").expect("bad answers again under PM2");
+    assert_eq!(who.split(':').next().unwrap().parse::<u64>().unwrap(), pm2_pid("bad"));
+
+    // Finalize: only the app that runs under Warden leaves PM2.
+    let (code, out) = f.cli_env(&["pm2-migrate", "--finalize"], &env);
+    assert_eq!(code, 0, "{out}");
+    let names: Vec<String> = serde_json::from_str::<Value>(&pm2_run(&["jlist"]))
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!names.contains(&"api".to_string()) && names.contains(&"bad".to_string()), "{names:?}");
+    pm2_run(&["kill"]);
 }
 
 /// `warden doctor` names each problem with a fix, and fails only on real ones.

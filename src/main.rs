@@ -15,6 +15,7 @@ mod health;
 mod logging;
 mod logview;
 mod metrics;
+mod migrate;
 mod networking;
 mod process;
 mod restart;
@@ -96,6 +97,7 @@ fn main() {
         Command::Kill => rt.block_on(fleet::kill(&args)),
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
+        Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
     };
     std::process::exit(code);
 }

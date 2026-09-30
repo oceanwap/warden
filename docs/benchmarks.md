@@ -26,43 +26,43 @@ Numbers from the README run (2 CPUs, 4 workers).
 
 - **Warden adds nothing on the request path.** In process mode the workers
   own the port (SO_REUSEPORT); req/s and latency match the same processes
-  run bare (node:http: 64.1k vs 65.8k req/s, within noise). PM2's cluster
-  mode passes every connection through its daemon: 51.6k req/s and a p99
-  twice as long (8.0 vs 4.1 ms). Watt: 54.2k req/s, p99 7.3 ms.
+  run bare (node:http: 66.5k vs 61.4k req/s, within noise). PM2's cluster
+  mode passes every connection through its daemon: 53.4k req/s and a p99
+  three times as long (8.5 vs 2.8 ms). Watt: 51.9k req/s, p99 5.0 ms.
 - **Manager cost.** Warden's supervisor: ~6 MB RSS, under 1 MB PSS per app
-  (10 apps: 7.3 MB PSS in all), 0 % idle CPU. PM2's daemon: ~66 MB RSS
-  (36 MB PSS), 0.2–0.7 % idle CPU. Watt runs the app inside its own runtime:
-  twice the memory of 4 processes for the Node app (PSS 474 vs 97 MB) and
-  2–3 % idle CPU.
+  (10 apps: 7.3 MB PSS in all), 0 % idle CPU. PM2's daemon: ~65 MB RSS
+  (35 MB PSS), 0.2–0.7 % idle CPU. Watt runs the app inside its own runtime:
+  almost 5× the memory of 4 processes for the Node app (PSS 475 vs 101 MB)
+  and 2–3 % idle CPU.
 - **Startup and CLI.** Warden starts 4 workers as fast as starting them bare;
-  PM2 needs ~0.9 s more (its daemon), Watt 3–5 s. `warden status` answers in
-  ~2 ms, `pm2 jlist` in ~160 ms, `wattpm ps` in ~510 ms. With 10 apps:
-  `warden list` 2.6 ms, `pm2 list` 168 ms; starting 10 apps 0.6 s vs 2.2 s.
-- **Recovery.** A crashed worker answers again 2–3× sooner under Warden than
-  under PM2: node:http 139 vs 352 ms, NestJS on Node 729 vs 1,636 ms, Bun
-  57 vs 176 ms; Watt 1.5–2.1 s. The first crash after a healthy run
-  restarts with no backoff.
+  PM2 needs 0.6–1 s more (its daemon), Watt 3–4.5 s. `warden status` answers
+  in ~2 ms, `pm2 jlist` in ~160 ms, `wattpm ps` in ~450 ms. With 10 apps:
+  `warden list` 2.7 ms, `pm2 list` 167 ms; starting 10 apps 0.6 s vs 2.2 s.
+- **Recovery.** A crashed worker answers again 2–4× sooner under Warden than
+  under PM2: node:http 113 vs 447 ms, NestJS on Node 813 vs 1,677 ms, Bun
+  47 vs 155 ms; Watt 1.8–2 s. The first crash after a healthy run restarts
+  with no backoff.
 - **Rolling restarts.** Warden lost no request in any run, and finished
-  sooner (node:http 533 ms vs PM2 794 ms, Watt 3.6 s). PM2's `reload` is
+  sooner (node:http 554 ms vs PM2 857 ms, Watt 3.5 s). PM2's `reload` is
   graceful only in cluster mode (Node): for Bun apps it runs fork mode,
-  where reload is a restart, and NestJS on Bun lost 2,406 of 6,090
-  requests during it.
+  where reload is a restart, and NestJS on Bun lost 4,324 of 8,699 requests
+  (half) during it.
 - **Worker (thread) mode** (Bun only): by RSS it looks like half the memory
   of 4 processes, but most of that difference is shared pages. By PSS it
-  saves 20–25 % idle (NestJS 158 vs 203 MB) and nothing after load (324 vs
-  287 MB), with a worse p99 for NestJS (19.8 vs 12.1 ms), and one crash
-  takes all workers down. **Use process mode in production.** For Node,
-  threads don't save memory at all: 4 `node:http` processes use 96 MB PSS,
-  one process with 4 worker threads 104 MB; so Warden has no Node thread mode.
-- **Static files.** `warden serve` is within ~7 % of nginx at every size:
-  86,994 vs 88,526 req/s for a 1.5 KB page, 67.5k vs 72.7k for 48 KB, ahead
-  on the 1 MB file (4.75 vs 4.42 GB/s) and on a new connection per request
-  (28.6k vs 27.7k), in 40 % less memory (PSS 7.6 vs 12.9 MB). That is
-  2–40× what `pm2 serve` and `serve` deliver.
-- **Logs.** Warden reads a flooding worker at ~850 MB/s (PM2 155 MB/s) for a
-  ninth of PM2's CPU per GB; with `max_lines_per_sec = 0` it keeps every
-  line at ~2× PM2's throughput. Steady logging (20k lines/s) costs it a
-  quarter of PM2's CPU.
+  saves ~20 % idle (NestJS 159 vs 200 MB) and 2 % after load (336 vs
+  343 MB), with a worse p99 for NestJS (18.9 vs 9.9 ms), and one crash takes
+  all workers down. **Use process mode in production.** For Node, threads
+  don't save memory at all: 4 `node:http` processes use 96 MB PSS, one
+  process with 4 worker threads 104 MB; so Warden has no Node thread mode.
+- **Static files.** `warden serve` is within ~7 % of nginx on small files
+  (1.5 KB page 85.0k vs 90.9k req/s; 48 KB 68.4k vs 71.0k), ties it on a new
+  connection per request (29.3k both), is ahead on a 1 MB file (5.1 vs
+  4.3 GB/s), and uses 40 % less memory (PSS 7.6 vs 12.9 MB). That is 2.5–39×
+  what `pm2 serve` and `serve` deliver.
+- **Logs.** Warden reads a flooding worker at ~920 MB/s (PM2 153 MB/s) for
+  one eleventh of PM2's CPU per GB; with `max_lines_per_sec = 0` it keeps
+  every line at 2× PM2's throughput. Steady logging (20k lines/s) costs it a
+  quarter of PM2's CPU (0.36 vs 1.42 s per 10 s).
 
 ## Findings about the other managers
 

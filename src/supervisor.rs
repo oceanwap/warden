@@ -406,7 +406,7 @@ impl Supervisor {
 
     fn spec(&self, slot_id: usize, inst_id: u64) -> process::Spec {
         let a = &self.cfg.app;
-        let mut env: Vec<(String, String)> = a.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut env: Vec<(String, String)> = a.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut add = |k: &str, v: String| env.push((k.to_string(), v));
         add("WARDEN_APP", a.name.clone());
         add("WARDEN_MODE", mode_name(self.cfg.workers.mode).into());
@@ -1347,6 +1347,12 @@ impl Supervisor {
     /// Effective config and paths for `describe`, `config` and `env`.
     fn info(&self, show_secrets: bool) -> serde_json::Value {
         let mut v = serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null);
+        // What workers get: env_file's variables with `env` on top.
+        if let Some(app) = v.pointer_mut("/app").and_then(|a| a.as_object_mut()) {
+            let merged: serde_json::Map<String, serde_json::Value> =
+                self.cfg.app.environment().map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone()))).collect();
+            app.insert("env".into(), serde_json::Value::Object(merged));
+        }
         if let Some(env) = v.pointer_mut("/app/env").and_then(|e| e.as_object_mut()) {
             for (k, val) in env.iter_mut() {
                 if !show_secrets && !is_plain_env(k) {

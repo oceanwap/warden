@@ -90,6 +90,10 @@ const PATHS = ["/plaintext", "/json", "/cpu"];
 
 /** A request that takes longer than this counts as failed (a hang). */
 const REQUEST_TIMEOUT_MS = 2000;
+/** The "which worker answered" probe gives up sooner: one probe stuck on a
+ *  connection that a manager lost must not delay seeing a worker come back
+ *  (the load clients still count such hangs as failed requests). */
+const PROBE_TIMEOUT_MS = 250;
 async function httpOk(path = "/health"): Promise<boolean> {
   try {
     const r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
@@ -110,7 +114,7 @@ async function whoami(): Promise<string | null> {
     const r = await fetch(`http://127.0.0.1:${PORT}/whoami`, {
       headers: { connection: "close" },
       keepalive: false,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
     const t = await r.text();
     return r.ok ? t : null;
