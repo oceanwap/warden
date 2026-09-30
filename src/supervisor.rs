@@ -28,13 +28,29 @@ const HOST_JS: &str = include_str!("../shim/warden-host.mjs");
 const HEARTBEAT_MS: u64 = 1000;
 
 enum Event {
-    Ready { inst: u64 },
-    ReadyTimeout { inst: u64 },
-    RestartDue { slot: usize, token: u64 },
-    KillDue { inst: u64 },
+    Ready {
+        inst: u64,
+    },
+    ReadyTimeout {
+        inst: u64,
+    },
+    RestartDue {
+        slot: usize,
+        token: u64,
+    },
+    KillDue {
+        inst: u64,
+    },
     AppHealth(Result<u16, String>),
-    WorkerHealth { inst: u64, result: Result<(), String> },
+    WorkerHealth {
+        inst: u64,
+        result: Result<(), String>,
+    },
     Tick,
+    /// `[restart] schedule` fired (stale when `token` changed).
+    Scheduled {
+        token: u64,
+    },
     Gate(rollout::GateEvent),
     Snapshot(oneshot::Sender<Status>),
 }
@@ -78,6 +94,8 @@ pub struct Supervisor {
     last_tick: Instant,
     /// systemd set WATCHDOG_USEC for us (WatchdogSec= in the unit).
     watchdog_enabled: bool,
+    /// Invalidates the pending scheduled restart when the schedule changes.
+    schedule_token: u64,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -181,6 +199,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         outage: false,
         last_tick: Instant::now(),
         watchdog_enabled: systemd::watchdog_requested(),
+        schedule_token: 0,
         cfg,
         cfg_path,
     };
@@ -209,6 +228,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
+    sup.schedule_next();
     if saved.as_ref().is_some_and(|s| s.stopped) {
         info!("workers stay stopped, as saved by `warden save`", hint = "`warden start <app>` starts them");
         sup.stopped = true;
@@ -391,6 +411,13 @@ impl Supervisor {
         add("WARDEN_DRAIN_MS", self.cfg.shutdown.drain_ms.to_string());
         add("WARDEN_INSTANCE", inst_id.to_string());
         add("WARDEN_HEALTH_DIR", self.runtime_dir.display().to_string());
+        add("WARDEN_STOP_SIGNAL", crate::signals::name(self.cfg.stop_signal()));
+        if self.cfg.workers.wait_ready {
+            add("WARDEN_WAIT_READY", "1".into());
+        }
+        if !a.instance_var.is_empty() {
+            add("WARDEN_INSTANCE_VAR", a.instance_var.clone());
+        }
         if self.cfg.watchdog.timeout > 0 {
             add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
         }
@@ -403,7 +430,10 @@ impl Supervisor {
         let (program, args) = match self.cfg.workers.mode {
             Mode::Process => {
                 add("WARDEN_WORKER_ID", slot_id.to_string());
-                (a.command.clone(), with_preload(&a.args, self.shim_path.as_deref()))
+                if !a.instance_var.is_empty() {
+                    add(&a.instance_var, (slot_id - 1).to_string());
+                }
+                (a.command.clone(), with_preload(&a.command, &a.args, self.shim_path.as_deref()))
             }
             Mode::Worker => {
                 add("WARDEN_WORKERS", self.count.to_string());
@@ -452,9 +482,14 @@ impl Supervisor {
 
         self.send_later(deadline, Event::ReadyTimeout { inst });
 
+        // `wait_ready`: only the app's `process.send('ready')` counts (on_ipc).
+        let port = if self.cfg.workers.wait_ready { None } else { port };
         match port {
+            None if self.cfg.workers.wait_ready => {}
+            // No port: ready once it has stayed up `min_uptime` (a crash on
+            // boot then counts as a failed start, not as a running worker).
             None if !self.is_worker_mode() => {
-                let _ = tx.send(Event::Ready { inst });
+                self.send_later(Duration::from_millis(self.cfg.workers.min_uptime), Event::Ready { inst });
             }
             None => {} // worker mode: wait for every Worker's shim report
             Some(port) => {
@@ -484,6 +519,7 @@ impl Supervisor {
 
     fn on_event(&mut self, ev: Event) {
         match ev {
+            Event::Scheduled { token } => self.on_scheduled(token),
             Event::Ready { inst } => self.mark_ready(inst),
             Event::ReadyTimeout { inst } => {
                 let timeout = self.cfg.workers.ready_timeout;
@@ -557,7 +593,13 @@ impl Supervisor {
                     inst.listening.insert(msg.port.unwrap_or(0));
                     true
                 };
-                if ready {
+                if ready && !self.cfg.workers.wait_ready {
+                    self.mark_ready(inst_id);
+                }
+            }
+            "ready" => {
+                if self.cfg.workers.wait_ready {
+                    debug!("app reported ready", worker = worker, pid = inst.handle.pid);
                     self.mark_ready(inst_id);
                 }
             }
@@ -680,6 +722,24 @@ impl Supervisor {
             }
         } else if inst.role == Role::Replacement {
             error!("replacement exited before taking over", worker = label, pid = inst.handle.pid, reason = reason);
+        } else if is_current
+            && signal.is_none()
+            && code.is_some_and(|c| self.cfg.restart.stop_exit_codes.contains(&c))
+            && !self.shutting_down
+        {
+            info!(
+                "worker finished; not restarting",
+                worker = label,
+                pid = inst.handle.pid,
+                reason = why,
+                hint = "this exit code is listed in restart.stop_exit_codes; `warden restart` starts it again",
+            );
+            if let Some(s) = self.slots.get_mut(&slot_id) {
+                s.current = None;
+                s.state = State::Stopped;
+                s.last_exit = Some(format!("{why} (done)"));
+                s.token += 1;
+            }
         } else if is_current {
             if let Some(s) = self.slots.get_mut(&slot_id) {
                 s.current = None;
@@ -834,12 +894,13 @@ impl Supervisor {
 
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
+        let stop_signal = self.cfg.stop_signal();
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
         if i.stopping {
             return;
         }
         i.stopping = true;
-        i.handle.signal(libc::SIGTERM);
+        i.handle.signal_group(stop_signal);
         if let Some(s) = self.slots.get_mut(&i.slot) {
             if s.current == Some(inst_id) {
                 s.state = State::Stopping;
@@ -1042,6 +1103,59 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------- control
+
+    /// Arm the next `[restart] schedule` run (PM2's `cron_restart`).
+    fn schedule_next(&mut self) {
+        self.schedule_token += 1;
+        let Some(expr) = self.cfg.restart.schedule.clone() else { return };
+        let cron = match crate::schedule::Cron::parse(&expr) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("restart.schedule is invalid; scheduled restarts are off", schedule = expr, error = e);
+                return;
+            }
+        };
+        let now = std::time::SystemTime::now();
+        let Some(at) = cron.next_after(now) else { return };
+        let wait = at.duration_since(now).unwrap_or_default();
+        info!(
+            "next scheduled restart",
+            schedule = expr,
+            at = crate::logging::format_rfc3339(
+                at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
+                0
+            ),
+            in_s = wait.as_secs()
+        );
+        self.send_later(wait, Event::Scheduled { token: self.schedule_token });
+    }
+
+    fn on_scheduled(&mut self, token: u64) {
+        if token != self.schedule_token {
+            return;
+        }
+        if self.shutting_down {
+            return;
+        }
+        if self.stopped {
+            info!("scheduled restart skipped: workers are stopped");
+        } else if self.roll.is_some() {
+            // Busy: try again in a minute rather than skipping a day.
+            info!("scheduled restart postponed: a rollout is in progress", retry_s = 60);
+            self.send_later(Duration::from_secs(60), Event::Scheduled { token });
+            return;
+        } else {
+            let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+            match self.begin_rollout(Kind::Restart, ids, "scheduled".into(), false) {
+                Ok(_) => info!(
+                    "scheduled rolling restart started",
+                    schedule = self.cfg.restart.schedule.clone().unwrap_or_default()
+                ),
+                Err(e) => warn!("scheduled restart could not start", reason = e),
+            }
+        }
+        self.schedule_next();
+    }
 
     fn request_reload(&mut self, safe: bool) -> Response {
         if self.shutting_down {
@@ -1429,11 +1543,14 @@ pub fn is_plain_env(key: &str) -> bool {
         || key.starts_with("WARDEN_")
 }
 
-/// Insert `--preload=<shim>` where Bun accepts it: after `run` when the args
-/// start with the `run` subcommand (`bun --preload x run f` prints usage),
-/// otherwise first (`bun --preload x f.ts`).
-fn with_preload(args: &[String], shim: Option<&Path>) -> Vec<String> {
+/// Load the shim before the app: Bun takes `--preload=<shim>` (after `run`
+/// when the args start with the `run` subcommand: `bun --preload x run f`
+/// prints usage), Node takes `--import=<shim>` before the script.
+fn with_preload(command: &str, args: &[String], shim: Option<&Path>) -> Vec<String> {
     let Some(shim) = shim else { return args.to_vec() };
+    if crate::config::is_node(command) {
+        return [&[format!("--import={}", shim.display())][..], args].concat();
+    }
     let flag = [format!("--preload={}", shim.display())];
     match args.first().map(String::as_str) {
         Some("run") => [&args[..1], &flag, &args[1..]].concat(),
@@ -1458,10 +1575,14 @@ mod tests {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let shim = Some(Path::new("/r/shim.mjs"));
         assert_eq!(
-            with_preload(&s(&["run", "dist/main.js"]), shim),
+            with_preload("bun", &s(&["run", "dist/main.js"]), shim),
             s(&["run", "--preload=/r/shim.mjs", "dist/main.js"])
         );
-        assert_eq!(with_preload(&s(&["server.ts"]), shim), s(&["--preload=/r/shim.mjs", "server.ts"]));
-        assert_eq!(with_preload(&s(&["server.ts"]), None), s(&["server.ts"]));
+        assert_eq!(with_preload("bun", &s(&["server.ts"]), shim), s(&["--preload=/r/shim.mjs", "server.ts"]));
+        assert_eq!(with_preload("bun", &s(&["server.ts"]), None), s(&["server.ts"]));
+        assert_eq!(
+            with_preload("/usr/bin/node", &s(&["--max-old-space-size=512", "server.js"]), shim),
+            s(&["--import=/r/shim.mjs", "--max-old-space-size=512", "server.js"])
+        );
     }
 }

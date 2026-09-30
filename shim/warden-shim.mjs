@@ -1,28 +1,34 @@
-// Warden shim for Bun. Injected by Warden; apps don't import it.
+// Warden shim for Bun and Node. Injected by Warden; apps don't import it.
 //
-// Process mode: loaded with `bun --preload <this file>`.
-// Worker mode:  the entry module of every Worker; it installs the hooks and
-//               then imports the app (WARDEN_ENTRY).
+// Process mode: loaded with `bun --preload <this file>` or
+//               `node --import <this file>`.
+// Worker mode:  (Bun) the entry module of every Worker; it installs the hooks
+//               and then imports the app (WARDEN_ENTRY).
 //
 // What it does (see docs/architecture.md, findings F3, F7-F11):
-//  1. Wraps Bun.serve to force `reusePort: true`. Bun's node:http (Express,
-//     NestJS, Fastify on node:http) calls Bun.serve internally, so this also
-//     fixes node:http ignoring `listen({ reusePort })` under Bun.
+//  1. Makes every server on the app's port join the SO_REUSEPORT group, so N
+//     workers share it: Bun.serve gets `reusePort: true` (Bun's node:http goes
+//     through Bun.serve); under Node, net.Server#listen gets `reusePort: true`
+//     (Node 22.12+ / 23.1+).
 //  2. Serves the same app on a private Unix socket for this worker only, so
 //     Warden can health-check *this* worker (the shared port reaches a random one).
-//  3. Reports listening servers (readiness) and a heartbeat from the event
-//     loop (watchdog) to Warden.
-//  4. Drains on SIGTERM (process mode) or on a shutdown message (worker mode):
-//     closes listeners, answers remaining requests with `Connection: close`,
-//     waits WARDEN_DRAIN_MS and for in-flight requests, then exits.
+//  3. Reports listening servers (readiness), `process.send('ready')` (PM2's
+//     wait_ready) and a heartbeat from the event loop (watchdog) to Warden.
+//  4. Drains on the stop signal (WARDEN_STOP_SIGNAL, SIGTERM by default; SIGINT
+//     for apps written for PM2) or on a shutdown message (worker mode): closes
+//     listeners, answers remaining requests with `Connection: close`, waits
+//     WARDEN_DRAIN_MS and for in-flight requests, then exits.
 //  5. In Workers, closes listeners from an exit hook: Bun does not close the
 //     listening socket of a Worker that dies, which would black-hole 1/N of
 //     new connections.
 
 import fs from "node:fs";
+import net from "node:net";
+import http from "node:http";
 import { isMainThread } from "node:worker_threads";
 
 const env = process.env;
+const isBun = typeof Bun !== "undefined";
 const inWorker = !isMainThread;
 const workerId = Number(env.WARDEN_WORKER_ID || 0);
 const ipcFd = env.WARDEN_IPC_FD ? Number(env.WARDEN_IPC_FD) : null;
@@ -31,9 +37,16 @@ const forceReusePort = env.WARDEN_REUSE_PORT === "1";
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);
+const stopSignal = env.WARDEN_STOP_SIGNAL || "SIGTERM";
 // The app's own port. Other servers the app starts (metrics, admin) are
 // neither readiness signals nor health-check targets.
 const appPort = env.PORT ? Number(env.PORT) : null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Worker mode: each Worker gets its instance index (PM2's NODE_APP_INSTANCE).
+if (inWorker && env.WARDEN_INSTANCE_VAR) {
+  process.env[env.WARDEN_INSTANCE_VAR] = String(Math.max(0, workerId - 1));
+}
 
 const servers = new Set();
 let privateServer = null;
@@ -43,10 +56,12 @@ let drainStarted = false;
 let drainDone = false;
 let drainFinished;
 const drainPromise = new Promise((r) => (drainFinished = r));
-// Promises of app SIGTERM handlers we deferred until after the drain, and
-// whether any of them was callback-style (returned no promise).
+// Promises of app stop-signal handlers we deferred until after the drain,
+// and whether any of them was callback-style (returned no promise).
 const appHandlers = new Set();
 let appHandlerNoPromise = false;
+// Node: requests in flight per server.
+let nodeInflight = 0;
 
 function report(msg) {
   msg.worker = workerId;
@@ -62,7 +77,15 @@ function report(msg) {
   } catch {}
 }
 
-const originalServe = Bun.serve;
+function privateSocketPath() {
+  if (!healthDir) return null;
+  const path = `${healthDir}/${env.WARDEN_APP || "app"}.h${instance}-${workerId}.sock`;
+  return path.length > 100 ? null : path; // sun_path limit
+}
+
+// ------------------------------------------------------------------- Bun
+
+let originalServe = null;
 
 function wardenServe(options, ...rest) {
   let opts = options;
@@ -92,17 +115,16 @@ function wardenServe(options, ...rest) {
   servers.add(server);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
   if (isApp) {
-    const socket = privateServer ? null : openPrivateSocket(options);
+    const socket = privateServer ? null : openPrivateBun(options);
     report(socket ? { ev: "listening", port: server.port, socket } : { ev: "listening", port: server.port });
   }
   return server;
 }
 
 // Same handler (Bun fetch or node:http), private Unix socket, this worker only.
-function openPrivateSocket(options) {
-  if (!healthDir || !options || typeof options !== "object") return null;
-  const path = `${healthDir}/${env.WARDEN_APP || "app"}.h${instance}-${workerId}.sock`;
-  if (path.length > 100) return null; // sun_path limit
+function openPrivateBun(options) {
+  const path = privateSocketPath();
+  if (!path || !options || typeof options !== "object") return null;
   try {
     fs.rmSync(path, { force: true });
     const p = Object.create(options);
@@ -118,9 +140,101 @@ function openPrivateSocket(options) {
   }
 }
 
+if (isBun) {
+  originalServe = Bun.serve;
+  Bun.serve = wardenServe;
+}
+
+// ------------------------------------------------------------------ Node
+
+// listen(port[, host][, backlog][, cb]) and listen({ port, ... }[, cb]) with
+// reusePort added; pipes, handles and fds are left alone.
+function withReusePort(args) {
+  const a0 = args[0];
+  if (a0 && typeof a0 === "object" && !Array.isArray(a0)) {
+    if (a0.path !== undefined || a0.fd !== undefined || a0._handle || a0.handle) return args;
+    return [{ ...a0, reusePort: true }, ...args.slice(1)];
+  }
+  if (typeof a0 === "number" || (typeof a0 === "string" && /^\d+$/.test(a0))) {
+    const opts = { port: Number(a0), reusePort: true };
+    let i = 1;
+    if (typeof args[i] === "string") opts.host = args[i++];
+    if (typeof args[i] === "number") opts.backlog = args[i++];
+    const cb = typeof args[i] === "function" ? args[i] : undefined;
+    return cb ? [opts, cb] : [opts];
+  }
+  if (a0 === undefined || typeof a0 === "function") {
+    // listen() / listen(cb): a random port; nothing to share.
+    return args;
+  }
+  return args;
+}
+
+function trackNodeServer(server) {
+  if (servers.has(server)) return;
+  servers.add(server);
+  if (server instanceof http.Server) {
+    server.on("request", (req, res) => {
+      nodeInflight++;
+      res.once("close", () => nodeInflight--);
+      if (draining) {
+        try {
+          if (!res.headersSent) res.setHeader("connection", "close");
+        } catch {}
+      }
+    });
+  }
+  server.once("listening", () => {
+    const addr = server.address();
+    if (!addr || typeof addr !== "object") return; // a Unix socket
+    const isApp = appPort == null || addr.port === appPort;
+    if (!isApp) return;
+    if (!privateServer && server instanceof http.Server) {
+      openPrivateNode(server, (socket) =>
+        report(socket ? { ev: "listening", port: addr.port, socket } : { ev: "listening", port: addr.port }),
+      );
+    } else {
+      report({ ev: "listening", port: addr.port });
+    }
+  });
+}
+
+function openPrivateNode(appServer, done) {
+  const path = privateSocketPath();
+  if (!path) return done(null);
+  try {
+    fs.rmSync(path, { force: true });
+    const p = http.createServer((req, res) => appServer.emit("request", req, res));
+    privateServer = p;
+    p.once("error", () => done(null));
+    p.listen(path, () => {
+      privatePath = path;
+      done(path);
+    });
+  } catch {
+    done(null);
+  }
+}
+
+if (!isBun) {
+  const origListen = net.Server.prototype.listen;
+  net.Server.prototype.listen = function (...args) {
+    if (this !== privateServer) {
+      trackNodeServer(this);
+      if (forceReusePort) args = withReusePort(args);
+    }
+    return origListen.apply(this, args);
+  };
+}
+
+// ---------------------------------------------------------------- common
+
 function closePrivateSocket() {
   try {
-    if (privateServer) privateServer.stop(true);
+    if (privateServer) {
+      if (isBun) privateServer.stop(true);
+      else privateServer.close();
+    }
   } catch {}
   try {
     if (privatePath) fs.rmSync(privatePath, { force: true });
@@ -134,18 +248,29 @@ if (heartbeatMs > 0) {
   if (t && typeof t.unref === "function") t.unref();
 }
 
-Bun.serve = wardenServe;
+// PM2 apps call process.send('ready') (wait_ready) and some call process.send
+// unguarded. Without an IPC channel it would be undefined and throw; here it
+// reports readiness to Warden instead.
+if (!inWorker && typeof process.send !== "function") {
+  process.send = function (msg, ...rest) {
+    if (msg === "ready" || (msg && typeof msg === "object" && msg.type === "ready")) report({ ev: "ready" });
+    const cb = rest.find((x) => typeof x === "function");
+    if (cb) queueMicrotask(() => cb(null));
+    return true;
+  };
+}
 
 function pending() {
+  if (!isBun) return nodeInflight;
   let n = 0;
   for (const s of servers) n += s.pendingRequests || 0;
   return n;
 }
 
 async function markNodeResponsesClose() {
-  // node:http responses don't go through a fetch handler; add the header there.
+  // node:http responses (Bun's node:http included) don't go through a fetch
+  // handler; add the header there.
   try {
-    const http = await import("node:http");
     const proto = http.ServerResponse && http.ServerResponse.prototype;
     if (!proto || proto.__wardenPatched) return;
     const set = (res) => {
@@ -167,35 +292,47 @@ async function markNodeResponsesClose() {
   } catch {}
 }
 
+function stopAccepting(s) {
+  try {
+    if (isBun) s.stop(false); // stop accepting; keep serving open connections
+    else {
+      s.close();
+      if (typeof s.closeIdleConnections === "function") s.closeIdleConnections();
+    }
+  } catch {}
+}
+
+function stopAll(s) {
+  try {
+    if (isBun) s.stop(true);
+    else if (typeof s.closeAllConnections === "function") s.closeAllConnections();
+  } catch {}
+}
+
 async function drain() {
   if (drainStarted) return;
   drainStarted = true;
   draining = true;
   report({ ev: "draining" });
   await markNodeResponsesClose();
-  for (const s of servers) {
-    try {
-      s.stop(false); // stop accepting; keep serving open connections
-    } catch {}
-  }
+  for (const s of servers) stopAccepting(s);
   const t0 = Date.now();
   while (Date.now() - t0 < drainMs || pending() > 0) {
-    await Bun.sleep(20);
+    await sleep(20);
+    // Node: keep-alive connections that went idle since.
+    if (!isBun) for (const s of servers) if (typeof s.closeIdleConnections === "function") s.closeIdleConnections();
   }
-  for (const s of servers) {
-    try {
-      s.stop(true);
-    } catch {}
-  }
+  for (const s of servers) stopAll(s);
   closePrivateSocket();
   drainDone = true;
   drainFinished();
 }
 
-// The app's own SIGTERM handlers (e.g. NestJS enableShutdownHooks) would close
-// every connection at once and cut the drain short. Keep them registered, but
-// run them only after the drain: they still get to close DB pools etc.
-function deferAppSigtermHandlers(ours) {
+// The app's own stop-signal handlers (e.g. NestJS enableShutdownHooks) would
+// close every connection at once and cut the drain short. Keep them
+// registered, but run them only after the drain: they still get to close DB
+// pools etc.
+function deferAppStopHandlers(ours) {
   const wrapped = new WeakMap();
   const wrap = (fn) => {
     let w = wrapped.get(fn);
@@ -217,7 +354,7 @@ function deferAppSigtermHandlers(ours) {
     const orig = process[m];
     if (typeof orig !== "function") continue;
     process[m] = function (ev, fn, ...rest) {
-      if (ev === "SIGTERM" && typeof fn === "function" && fn !== ours) fn = wrap(fn);
+      if (ev === stopSignal && typeof fn === "function" && fn !== ours) fn = wrap(fn);
       return orig.call(this, ev, fn, ...rest);
     };
   }
@@ -225,7 +362,7 @@ function deferAppSigtermHandlers(ours) {
     const orig = process[m];
     if (typeof orig !== "function") continue;
     process[m] = function (ev, fn, ...rest) {
-      if (ev === "SIGTERM" && wrapped.has(fn)) fn = wrapped.get(fn);
+      if (ev === stopSignal && wrapped.has(fn)) fn = wrapped.get(fn);
       return orig.call(this, ev, fn, ...rest);
     };
   }
@@ -234,11 +371,7 @@ function deferAppSigtermHandlers(ours) {
 if (inWorker) {
   // Close our listeners however this Worker ends (uncaught error, process.exit).
   process.on("exit", () => {
-    for (const s of servers) {
-      try {
-        s.stop(true);
-      } catch {}
-    }
+    for (const s of servers) stopAll(s);
     closePrivateSocket();
   });
   self.addEventListener("message", async (e) => {
@@ -248,9 +381,9 @@ if (inWorker) {
     }
   });
 } else if (drainMs > 0) {
-  const onSigterm = async () => {
+  const onStop = async () => {
     if (drainStarted) {
-      // The app re-raised SIGTERM after its own cleanup (NestJS does this
+      // The app re-raised the signal after its own cleanup (NestJS does this
       // once it has removed its handler): nothing left to wait for.
       if (drainDone) process.exit(0);
       return;
@@ -264,8 +397,8 @@ if (inWorker) {
     await Promise.allSettled([...appHandlers]);
     if (!appHandlerNoPromise) process.exit(0);
   };
-  process.on("SIGTERM", onSigterm);
-  deferAppSigtermHandlers(onSigterm);
+  process.on(stopSignal, onStop);
+  deferAppStopHandlers(onStop);
 }
 
 if (!inWorker) {

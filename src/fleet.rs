@@ -714,34 +714,106 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
         );
         return 2;
     }
-    // 4. A script: write a config for it, like `pm2 start server.js -i 4 --name api`.
-    if path.is_file() {
-        return match quick_config(path, opts) {
-            Ok((name, text)) => {
-                let file = config_dir().join(format!("{name}.toml"));
-                if file.exists() {
-                    eprintln!(
-                        "warden: app {name:?} already exists ({}). Use `warden start {name}`, or `warden delete {name}` \
-                         first to replace it",
-                        file.display()
-                    );
-                    return 1;
-                }
-                if let Err(e) = write_private(&file, &text, 0o644) {
-                    eprintln!("warden: {e}");
-                    return 1;
-                }
-                println!("{name}: wrote {} (edit it for health checks, limits and more)", file.display());
-                start_app(&ctx, &app_from_config(&file)).await
+    // 4. Anything else PM2 would run: a script, a program, a command line.
+    let what_kind = match launch_kind(what) {
+        Some(k) => k,
+        None => {
+            eprintln!(
+                "warden: no app, config file, script or program named {what:?}; `warden list` shows the apps on \
+                 this host. To run a command line, quote it: warden start \"python3 worker.py\" --name worker"
+            );
+            return 2;
+        }
+    };
+    match quick_config(&what_kind, opts) {
+        Ok((name, text)) => {
+            let file = config_dir().join(format!("{name}.toml"));
+            if file.exists() {
+                eprintln!(
+                    "warden: app {name:?} already exists ({}). Use `warden start {name}`, or `warden delete {name}` \
+                     first to replace it",
+                    file.display()
+                );
+                return 1;
             }
-            Err(e) => {
+            if let Err(e) = write_private(&file, &text, 0o644) {
                 eprintln!("warden: {e}");
-                2
+                return 1;
             }
-        };
+            println!("{name}: wrote {} (edit it for health checks, limits and more)", file.display());
+            start_app(&ctx, &app_from_config(&file)).await
+        }
+        Err(e) => {
+            eprintln!("warden: {e}");
+            2
+        }
     }
-    eprintln!("warden: no app, config file or script named {what:?}; `warden list` shows the apps on this host");
-    2
+}
+
+/// What `warden start <what>` runs when `what` is not an app or a config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Launch {
+    /// A file: run with an interpreter picked by extension, or directly.
+    Script(PathBuf),
+    /// A program on PATH (`npm`, `python3`, `redis-server`).
+    Program(String),
+    /// A command line, run with `sh -c`.
+    Shell(String),
+}
+
+pub fn launch_kind(what: &str) -> Option<Launch> {
+    let p = Path::new(what);
+    if p.is_file() {
+        return Some(Launch::Script(p.to_path_buf()));
+    }
+    if what.chars().any(char::is_whitespace) {
+        return Some(Launch::Shell(what.to_string()));
+    }
+    if !what.contains('/') && which(what) {
+        return Some(Launch::Program(what.to_string()));
+    }
+    None
+}
+
+/// Interpreter for a script by its extension; `None` = run it directly.
+fn interpreter_for(ext: &str) -> Result<Option<String>, String> {
+    Ok(Some(
+        match ext {
+            "ts" | "tsx" | "mts" | "cts" => "bun",
+            "js" | "mjs" | "cjs" | "jsx" => {
+                if which("node") {
+                    "node"
+                } else {
+                    "bun"
+                }
+            }
+            "py" => "python3",
+            "sh" => "sh",
+            "bash" => "bash",
+            "rb" => "ruby",
+            "pl" => "perl",
+            "php" => "php",
+            "lua" => "lua",
+            _ => return Ok(None),
+        }
+        .to_string(),
+    ))
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+/// Shell text that needs `sh` itself (so no `exec` prefix).
+fn shell_syntax(cmd: &str) -> bool {
+    ["&&", "||", ";", "|", "&", ">", "<", "$(", "`", "\n", "cd "].iter().any(|t| cmd.contains(t))
+}
+
+fn sanitize_name(s: &str) -> String {
+    let n: String = s.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
+    let n = n.trim_matches('-').to_string();
+    if n.is_empty() || n == "all" { "app".into() } else { n }
 }
 
 async fn start_app(ctx: &Ctx, app: &App) -> i32 {
@@ -914,37 +986,66 @@ fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
-/// The config `warden start server.js -i 4 --name api --port 3000` writes.
-pub fn quick_config(script: &Path, o: &StartOpts) -> Result<(String, String), String> {
-    let abs = std::fs::canonicalize(script).map_err(|e| format!("{}: {e}", script.display()))?;
-    let dir = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
-    let stem = abs.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "app".into());
-    let name: String = o.name.clone().unwrap_or_else(|| {
-        stem.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect()
-    });
-    let ext = abs.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
-    let interpreter = match o.interpreter.as_deref() {
-        Some("none") => None,
-        Some(i) => Some(i.to_string()),
-        None => match ext.as_str() {
-            "ts" | "tsx" | "mts" | "cts" => Some("bun".into()),
-            "js" | "mjs" | "cjs" | "jsx" => Some(if which("node") { "node".into() } else { "bun".into() }),
-            _ => None,
-        },
-    };
-    let (command, mut args) = match &interpreter {
-        Some(i) => (i.clone(), vec![abs.display().to_string()]),
-        None => (abs.display().to_string(), vec![]),
+/// The config `warden start <script | program | "command line"> [flags]`
+/// writes. Flags follow PM2's names.
+pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), String> {
+    let cwd_now = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let (default_name, command, mut args, dir) = match what {
+        Launch::Script(script) => {
+            let abs = std::fs::canonicalize(script).map_err(|e| format!("{}: {e}", script.display()))?;
+            let dir = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"));
+            let stem = abs.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "app".into());
+            let ext = abs.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+            let interpreter = match o.interpreter.as_deref() {
+                Some("none") => None,
+                Some(i) => Some(i.to_string()),
+                None => interpreter_for(&ext)?,
+            };
+            let file = abs.display().to_string();
+            match interpreter {
+                Some(i) => {
+                    let mut a = o.interpreter_args.clone();
+                    a.push(file);
+                    (stem, i, a, dir)
+                }
+                None if is_executable(&abs) => (stem, file, vec![], dir),
+                None => {
+                    return Err(format!(
+                        "don't know how to run {}: it is not executable and .{ext} has no default interpreter; \
+                         pass --interpreter <program>",
+                        script.display()
+                    ));
+                }
+            }
+        }
+        Launch::Program(p) => (p.clone(), p.clone(), vec![], cwd_now.clone()),
+        Launch::Shell(cmd) => {
+            let first = cmd.split_whitespace().next().unwrap_or("app");
+            let base = Path::new(first).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let line = if shell_syntax(cmd) { cmd.clone() } else { format!("exec {cmd}") };
+            (base, "sh".to_string(), vec!["-c".to_string(), line], cwd_now.clone())
+        }
     };
     args.extend(o.script_args.iter().cloned());
+    let name = sanitize_name(&o.name.clone().unwrap_or(default_name));
     let count = match o.instances.as_deref() {
-        None => 1,
-        Some("max") | Some("0") => cpus(),
-        Some("-1") => cpus().saturating_sub(1).max(1),
-        Some(n) => n.parse::<usize>().map_err(|_| format!("-i {n:?}: expected a number or \"max\""))?,
+        None => "1".to_string(),
+        Some("max") | Some("0") => "\"max\"".into(),
+        Some("-1") | Some("max-1") => "\"max-1\"".into(),
+        Some(n) => {
+            n.parse::<usize>().map(|n| n.to_string()).map_err(|_| format!("-i {n:?}: expected a number or \"max\""))?
+        }
     };
+    let js = crate::config::is_bun(&command) || crate::config::is_node(&command);
+    let shim = o.shim.unwrap_or(js);
+
     let mut t = String::new();
-    t += &format!("# Written by `warden start {}`. Every setting: warden.example.toml\n\n[app]\n", script.display());
+    let shown = match what {
+        Launch::Script(p) => p.display().to_string(),
+        Launch::Program(p) => p.clone(),
+        Launch::Shell(c) => format!("\"{c}\""),
+    };
+    t += &format!("# Written by `warden start {shown}`. Every setting: warden.example.toml\n\n[app]\n");
     t += &format!("name = {}\n", toml_str(&name));
     if let Some(ns) = &o.namespace {
         t += &format!("namespace = {}\n", toml_str(ns));
@@ -956,6 +1057,9 @@ pub fn quick_config(script: &Path, o: &StartOpts) -> Result<(String, String), St
     if let Some(p) = o.port {
         t += &format!("port = {p}\n");
     }
+    if o.shim.is_some() {
+        t += &format!("shim = {shim}\n");
+    }
     if !o.env.is_empty() {
         t += "\n[app.env]\n";
         for (k, v) in &o.env {
@@ -963,15 +1067,68 @@ pub fn quick_config(script: &Path, o: &StartOpts) -> Result<(String, String), St
         }
     }
     t += &format!("\n[workers]\ncount = {count}\n");
+    if o.wait_ready {
+        t += "wait_ready = true\n";
+    }
+    if let Some(ms) = o.listen_timeout_ms {
+        t += &format!("ready_timeout = {}\n", ms.div_ceil(1000).max(1));
+    }
+    let mut restart = String::new();
+    if o.autorestart == Some(false) {
+        restart += "enabled = false\n";
+    }
+    if let Some(ms) = o.restart_delay_ms {
+        restart += &format!("backoff_initial = {}\n", ms.max(1));
+        restart += &format!("backoff_max = {}\n", (ms.max(1) * 16).max(10_000));
+    }
+    if let Some(n) = o.max_restarts {
+        restart += &format!("max_restarts = {n}\n");
+    }
+    if let Some(c) = &o.cron {
+        restart += &format!("schedule = {}\n", toml_str(c));
+    }
+    if !o.stop_exit_codes.is_empty() {
+        let codes: Vec<String> = o.stop_exit_codes.iter().map(|c| c.to_string()).collect();
+        restart += &format!("stop_exit_codes = [{}]\n", codes.join(", "));
+    }
+    if !restart.is_empty() {
+        t += &format!("\n[restart]\n{restart}");
+    }
+    let mut shutdown = String::new();
+    if let Some(sig) = &o.kill_signal {
+        shutdown += &format!("signal = {}\n", toml_str(sig));
+    }
+    if let Some(ms) = o.kill_timeout_ms {
+        shutdown += &format!("grace_period = {}\n", ms.div_ceil(1000).max(1));
+    }
+    if !shutdown.is_empty() {
+        t += &format!("\n[shutdown]\n{shutdown}");
+    }
     if let Some(mb) = o.max_memory_mb {
         t += &format!("\n[limits]\nmax_memory = {mb}\n");
     }
-    Config::parse(&t).map_err(|e| format!("the generated config is invalid: {e}"))?;
+    let abs = |p: &PathBuf| if p.is_absolute() { p.clone() } else { cwd_now.join(p) };
+    let mut logging = String::new();
+    if let Some(f) = &o.out_file {
+        logging += &format!("out_file = {}\n", toml_str(&abs(f).display().to_string()));
+    }
+    if let Some(f) = &o.err_file {
+        logging += &format!("err_file = {}\n", toml_str(&abs(f).display().to_string()));
+    }
+    if let Some(f) = &o.log_file {
+        logging += &format!("file = {}\n", toml_str(&abs(f).display().to_string()));
+    }
+    if o.time {
+        logging += "file_timestamps = true\n";
+    }
+    if (o.out_file.is_some() || o.err_file.is_some()) && !o.merge_logs && count != "1" {
+        logging += "per_worker_files = true\n";
+    }
+    if !logging.is_empty() {
+        t += &format!("\n[logging]\n{logging}");
+    }
+    Config::parse(&t).map_err(|e| format!("the generated config is invalid: {e}\n{t}"))?;
     Ok((name, t))
-}
-
-fn cpus() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// Stop the supervisor itself (systemd unit, or a background one).
@@ -1399,7 +1556,7 @@ mod tests {
             script_args: vec!["--verbose".into()],
             ..Default::default()
         };
-        let (name, text) = quick_config(&script, &o).unwrap();
+        let (name, text) = quick_config(&Launch::Script(script.clone()), &o).unwrap();
         assert_eq!(name, "api");
         let c = Config::parse(&text).unwrap();
         assert_eq!(c.app.command, "bun");
@@ -1407,7 +1564,43 @@ mod tests {
         assert_eq!((c.workers.count, c.app.port, c.limits.max_memory), (4, Some(3000), 300));
         assert_eq!(c.app.env.get("NODE_ENV").map(String::as_str), Some("production"));
         let bad = StartOpts { instances: Some("lots".into()), ..Default::default() };
-        assert!(quick_config(&script, &bad).is_err());
+        assert!(quick_config(&Launch::Script(script.clone()), &bad).is_err());
+        // A command line and a program.
+        let (name, text) =
+            quick_config(&Launch::Shell("python3 -m http.server 8000".into()), &StartOpts::default()).unwrap();
+        assert_eq!(name, "python3");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(
+            (c.app.command.as_str(), c.app.args.clone()),
+            ("sh", vec!["-c".to_string(), "exec python3 -m http.server 8000".to_string()])
+        );
+        assert!(!c.shim_enabled());
+        let (_, text) = quick_config(&Launch::Shell("cd /tmp && ./run".into()), &StartOpts::default()).unwrap();
+        assert!(text.contains("\"cd /tmp && ./run\""), "no exec for shell syntax: {text}");
+        let o = StartOpts {
+            script_args: vec!["start".into()],
+            kill_signal: Some("SIGINT".into()),
+            kill_timeout_ms: Some(1600),
+            cron: Some("0 3 * * *".into()),
+            stop_exit_codes: vec![0],
+            autorestart: Some(false),
+            out_file: Some("/var/log/web-out.log".into()),
+            instances: Some("2".into()),
+            ..Default::default()
+        };
+        let (name, text) = quick_config(&Launch::Program("npm".into()), &o).unwrap();
+        assert_eq!(name, "npm");
+        let c = Config::parse(&text).unwrap();
+        assert_eq!(c.app.args, vec!["start".to_string()]);
+        assert_eq!((c.shutdown.signal.as_str(), c.shutdown.grace_period), ("SIGINT", 2));
+        assert_eq!(c.restart.schedule.as_deref(), Some("0 3 * * *"));
+        assert_eq!(c.restart.stop_exit_codes, vec![0]);
+        assert!(!c.restart.enabled);
+        assert!(c.logging.per_worker_files);
+        // A file with an unknown extension that isn't executable.
+        let data = dir.join("notes.txt");
+        std::fs::write(&data, "").unwrap();
+        assert!(quick_config(&Launch::Script(data), &StartOpts::default()).unwrap_err().contains("--interpreter"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

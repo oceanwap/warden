@@ -56,6 +56,10 @@ pub struct App {
     /// Group name for fleet commands (`warden reload backend`), like PM2's
     /// namespace. Default: "default".
     pub namespace: Option<String>,
+    /// Env var holding the worker's 0-based index (PM2's `instance_var`), so
+    /// apps that run cron jobs only on instance 0 keep working. "" = unset.
+    #[serde(default = "default_instance_var")]
+    pub instance_var: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -77,11 +81,22 @@ pub enum PortStrategy {
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Workers {
+    /// A number, "max" (one per CPU) or "max-N".
+    #[serde(deserialize_with = "count_or_max")]
     pub count: usize,
     pub mode: Mode,
     pub port_strategy: PortStrategy,
     /// Seconds a worker may take to start listening.
     pub ready_timeout: u64,
+    /// Ready when the app calls `process.send('ready')` (PM2's `wait_ready`),
+    /// not when it starts listening.
+    pub wait_ready: bool,
+    /// Milliseconds an app without a port must stay up to count as ready
+    /// (PM2's `min_uptime`).
+    pub min_uptime: u64,
+    /// Start the new worker before stopping the old one in rolling restarts.
+    /// Default: yes, unless the app can't share its port (see `overlap()`).
+    pub overlap: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -98,6 +113,11 @@ pub struct Restart {
     /// Seconds after which a FAILED worker is tried again (like Kubernetes'
     /// CrashLoopBackOff cap). 0 = stay FAILED until `warden restart`.
     pub failed_cooldown: u64,
+    /// Cron schedule (5 fields, server local time) for a rolling restart,
+    /// e.g. "0 3 * * *" (PM2's `cron_restart`).
+    pub schedule: Option<String>,
+    /// Exit codes that mean "done, don't restart" (PM2's `stop_exit_codes`).
+    pub stop_exit_codes: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -108,6 +128,9 @@ pub struct Shutdown {
     /// Milliseconds the shim keeps answering (with `Connection: close`)
     /// after closing its listener. 0 disables the shim's SIGTERM handling.
     pub drain_ms: u64,
+    /// Signal that asks a worker to stop: SIGTERM, or SIGINT for apps written
+    /// for PM2 (its default). SIGKILL follows after `grace_period`.
+    pub signal: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -215,10 +238,76 @@ pub struct Logging {
     /// Also write the log to this file, rotated by size (for people who
     /// `tail -f` log files, as with PM2). Default: stdout only (journald).
     pub file: Option<PathBuf>,
-    /// Rotate `file` when it reaches this size.
-    pub file_max_mb: u64,
-    /// Rotated files kept (`file.1` … `file.N`).
-    pub file_keep: u32,
+    /// How every log file (file, out_file, err_file) is rotated.
+    pub rotate: Rotate,
+    /// Worker stdout as the app wrote it (PM2's `out_file`).
+    pub out_file: Option<PathBuf>,
+    /// Worker stderr as the app wrote it (PM2's `error_file`).
+    pub err_file: Option<PathBuf>,
+    /// One out/err file per worker (`out-2.log`), like PM2 without
+    /// `merge_logs`. Default: one file for all workers.
+    pub per_worker_files: bool,
+    /// Prefix out/err lines with a timestamp (PM2's `time`).
+    pub file_timestamps: bool,
+}
+
+/// Log rotation, built in (no pm2-logrotate module needed).
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Rotate {
+    /// Rotate when a file reaches this size: "10M", "1G", "500K" or bytes.
+    /// 0 = only on `interval`.
+    #[serde(deserialize_with = "size_bytes")]
+    pub max_size: u64,
+    /// Rotated files kept per log file; older ones are deleted.
+    pub keep: u32,
+    /// Also rotate on a schedule (cron, server local time), e.g.
+    /// "0 0 * * *" for daily files.
+    pub interval: Option<String>,
+    /// gzip rotated files (`app.log.1.gz`).
+    pub compress: bool,
+    /// Name rotated files by time (`app.log.2026-09-30T00-00-00`) instead
+    /// of by number (`app.log.1`).
+    pub date_suffix: bool,
+    /// Also delete rotated files older than this many days. 0 = keep `keep`.
+    pub max_age_days: u64,
+}
+
+impl Default for Rotate {
+    fn default() -> Self {
+        Rotate { max_size: 10 << 20, keep: 5, interval: None, compress: false, date_suffix: false, max_age_days: 0 }
+    }
+}
+
+/// `max_size = "10M"` or `max_size = 10485760`.
+fn size_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum S {
+        Num(u64),
+        Text(String),
+    }
+    match S::deserialize(d)? {
+        S::Num(n) => Ok(n),
+        S::Text(t) => parse_size(&t).map_err(D::Error::custom),
+    }
+}
+
+pub fn parse_size(t: &str) -> Result<u64, String> {
+    let u = t.trim().to_ascii_uppercase();
+    let u = u.strip_suffix('B').unwrap_or(&u);
+    let (num, mult) = match u.chars().last() {
+        Some('K') => (&u[..u.len() - 1], 1u64 << 10),
+        Some('M') => (&u[..u.len() - 1], 1 << 20),
+        Some('G') => (&u[..u.len() - 1], 1 << 30),
+        _ => (u, 1),
+    };
+    let n: f64 = num.trim().parse().map_err(|_| format!("{t:?} is not a size like \"10M\" or \"1G\""))?;
+    if !(0.0..=1e15).contains(&n) {
+        return Err(format!("{t:?} is out of range"));
+    }
+    Ok((n * mult as f64) as u64)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -249,9 +338,53 @@ fn default_command() -> String {
     "bun".into()
 }
 
+fn default_instance_var() -> String {
+    "NODE_APP_INSTANCE".into()
+}
+
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// `count = 4`, `count = "max"`, `count = "max-1"`.
+fn count_or_max<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum N {
+        Num(i64),
+        Text(String),
+    }
+    match N::deserialize(d)? {
+        N::Num(n) if n >= 0 => Ok(n as usize),
+        N::Num(n) => Err(D::Error::custom(format!("workers.count = {n}: must be positive, \"max\" or \"max-N\""))),
+        N::Text(t) => {
+            let t = t.trim();
+            let cpus = cpu_count();
+            if t == "max" {
+                return Ok(cpus);
+            }
+            match t.strip_prefix("max-").and_then(|n| n.trim().parse::<usize>().ok()) {
+                Some(n) => Ok(cpus.saturating_sub(n).max(1)),
+                None => {
+                    Err(D::Error::custom(format!("workers.count = {t:?}: expected a number, \"max\" or \"max-N\"")))
+                }
+            }
+        }
+    }
+}
+
 impl Default for Workers {
     fn default() -> Self {
-        Self { count: 1, mode: Mode::Process, port_strategy: PortStrategy::Shared, ready_timeout: 30 }
+        Self {
+            count: 1,
+            mode: Mode::Process,
+            port_strategy: PortStrategy::Shared,
+            ready_timeout: 30,
+            wait_ready: false,
+            min_uptime: 1000,
+            overlap: None,
+        }
     }
 }
 
@@ -264,13 +397,15 @@ impl Default for Restart {
             backoff_initial: 100,
             backoff_max: 10_000,
             failed_cooldown: 300,
+            schedule: None,
+            stop_exit_codes: Vec::new(),
         }
     }
 }
 
 impl Default for Shutdown {
     fn default() -> Self {
-        Self { grace_period: 30, drain_ms: 500 }
+        Self { grace_period: 30, drain_ms: 500, signal: "SIGTERM".into() }
     }
 }
 
@@ -320,8 +455,11 @@ impl Default for Logging {
             timestamps: None,
             worker_output: WorkerOutput::Capture,
             file: None,
-            file_max_mb: 10,
-            file_keep: 5,
+            rotate: Rotate::default(),
+            out_file: None,
+            err_file: None,
+            per_worker_files: false,
+            file_timestamps: false,
         }
     }
 }
@@ -366,8 +504,32 @@ impl Config {
         if a.name == "all" {
             return Err("app.name cannot be \"all\" (that targets every app)".into());
         }
-        if self.logging.file_max_mb == 0 {
-            return Err("logging.file_max_mb must be at least 1".into());
+        if self.workers.wait_ready && !self.shim_enabled() {
+            return Err("workers.wait_ready needs Warden's shim, which loads into bun and node commands \
+                        (process.send('ready') has nowhere to go otherwise); use a port or min_uptime instead"
+                .into());
+        }
+        if crate::signals::parse(&self.shutdown.signal).is_none() {
+            return Err(format!(
+                "shutdown.signal = {:?} is not a signal name (use SIGTERM or SIGINT)",
+                self.shutdown.signal
+            ));
+        }
+        if let Some(expr) = &self.restart.schedule {
+            crate::schedule::Cron::parse(expr).map_err(|e| format!("restart.schedule = {expr:?}: {e}"))?;
+        }
+        if (self.logging.out_file.is_some() || self.logging.err_file.is_some())
+            && self.logging.worker_output == WorkerOutput::Inherit
+        {
+            return Err("logging.out_file / err_file need worker_output = \"capture\" (with \"inherit\", \
+                        worker output bypasses Warden)"
+                .into());
+        }
+        if let Some(expr) = &self.logging.rotate.interval {
+            crate::schedule::Cron::parse(expr).map_err(|e| format!("logging.rotate.interval = {expr:?}: {e}"))?;
+        }
+        if self.logging.rotate.max_size != 0 && self.logging.rotate.max_size < 4096 {
+            return Err("logging.rotate.max_size must be at least 4K (or 0 to rotate only on the interval)".into());
         }
         if self.workers.count == 0 || self.workers.count > 1024 {
             return Err("workers.count must be between 1 and 1024".into());
@@ -472,7 +634,7 @@ impl Config {
     fn check_bounds(&self) -> Result<(), String> {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86_400;
-        let checks: [(&str, u64, u64); 23] = [
+        let checks: [(&str, u64, u64); 25] = [
             ("workers.ready_timeout", self.workers.ready_timeout, HOUR),
             ("restart.max_restarts", self.restart.max_restarts as u64, 10_000),
             ("restart.restart_window", self.restart.restart_window, 30 * DAY),
@@ -494,8 +656,10 @@ impl Config {
             ("watchdog.timeout", self.watchdog.timeout, DAY),
             ("limits.max_memory", self.limits.max_memory, 1 << 20),
             ("limits.max_lifetime", self.limits.max_lifetime, 365 * DAY),
-            ("logging.file_max_mb", self.logging.file_max_mb, 100_000),
-            ("logging.file_keep", self.logging.file_keep as u64, 1000),
+            ("logging.rotate.max_size", self.logging.rotate.max_size, 1 << 40),
+            ("workers.min_uptime", self.workers.min_uptime, HOUR * 1000),
+            ("logging.rotate.keep", self.logging.rotate.keep as u64, 1000),
+            ("logging.rotate.max_age_days", self.logging.rotate.max_age_days, 3650),
         ];
         for (name, value, max) in checks {
             if value > max {
@@ -512,7 +676,39 @@ impl Config {
     pub fn shim_enabled(&self) -> bool {
         match self.workers.mode {
             Mode::Worker => true,
-            Mode::Process => self.app.shim.unwrap_or_else(|| is_bun(&self.app.command)),
+            Mode::Process => self.app.shim.unwrap_or_else(|| is_bun(&self.app.command) || is_node(&self.app.command)),
+        }
+    }
+
+    /// Log files as the writer thread needs them.
+    pub fn log_files(&self) -> crate::logging::Files {
+        let l = &self.logging;
+        crate::logging::Files {
+            file: l.file.clone(),
+            out_file: l.out_file.clone(),
+            err_file: l.err_file.clone(),
+            per_worker: l.per_worker_files,
+            timestamps: l.file_timestamps,
+            rotate: crate::logging::RotatePolicy::from(&l.rotate),
+        }
+    }
+
+    /// The signal that asks a worker to stop (validated at load).
+    pub fn stop_signal(&self) -> i32 {
+        crate::signals::parse(&self.shutdown.signal).unwrap_or(libc::SIGTERM)
+    }
+
+    /// Can a new worker run next to the old one during a rolling restart?
+    /// Not when each worker owns its port (offset), or when the app binds a
+    /// port without Warden's shim (no SO_REUSEPORT: the new one would fail
+    /// with EADDRINUSE). Then the old worker stops first.
+    pub fn overlap(&self) -> bool {
+        match self.workers.overlap {
+            Some(v) => v,
+            None => {
+                self.workers.port_strategy != PortStrategy::Offset
+                    && (self.app.port.is_none() || self.shim_enabled() || self.workers.mode == Mode::Worker)
+            }
         }
     }
 
@@ -582,6 +778,10 @@ pub fn socket_path_lenient(path: &Path) -> Option<PathBuf> {
 
 pub fn is_bun(command: &str) -> bool {
     Path::new(command).file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "bun" || n == "bun.exe")
+}
+
+pub fn is_node(command: &str) -> bool {
+    Path::new(command).file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "node" || n == "nodejs")
 }
 
 /// Directory for the control socket and the embedded JS files.
@@ -699,8 +899,8 @@ mod tests {
     fn health_socket_paths_must_fit() {
         let long = format!("{MIN}[health]\npath = \"/health\"\n[control]\nsocket = \"/{}/c.sock\"\n", "d".repeat(80));
         assert!(Config::parse(&long).unwrap_err().contains("shorter"));
-        let node = "[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\n[health]\npath = \"/health\"\n";
-        assert!(Config::parse(node).unwrap_err().contains("set health.url"));
+        let py = "[app]\nname = \"a\"\ncommand = \"python3\"\nargs = [\"s.py\"]\n[health]\npath = \"/health\"\n";
+        assert!(Config::parse(py).unwrap_err().contains("set health.url"));
     }
 
     #[test]
@@ -794,7 +994,14 @@ level = "info"
     #[test]
     fn shim_default_follows_command() {
         let node = "[app]\nname = \"a\"\ncommand = \"/usr/bin/node\"\nargs = [\"s.js\"]\n";
-        assert!(!Config::parse(node).unwrap().shim_enabled());
+        assert!(Config::parse(node).unwrap().shim_enabled(), "node gets the shim via --import");
+        let py = "[app]\nname = \"a\"\ncommand = \"python3\"\nargs = [\"s.py\"]\n";
+        assert!(!Config::parse(py).unwrap().shim_enabled());
         assert!(is_bun("/home/x/.bun/bin/bun"));
+        // No shim and a port: a rolling restart stops the old worker first.
+        let c = Config::parse(&format!("{py}port = 8000\n")).unwrap();
+        assert!(!c.overlap());
+        assert!(Config::parse(&format!("{node}port = 8000\n")).unwrap().overlap());
+        assert!(Config::parse(py).unwrap().overlap(), "no port: nothing to share");
     }
 }

@@ -61,9 +61,19 @@ OPTIONS:
         --no-wait         Return as soon as a reload/restart has started
     -h, --help            Show this help
 
-START OPTIONS (script):
-    --name <NAME>  -i, --instances <N|max>  --port <PORT>  --interpreter <bun|node|none>
-    --namespace <NS>  --cwd <DIR>  --env KEY=VALUE  --max-memory-restart <300M>  -- <script args>
+START OPTIONS (a script, a program or a command line, as with PM2):
+    warden start server.js --name api -i 4 --port 3000
+    warden start worker.py --name queue                 (interpreter picked by extension)
+    warden start ./bin/server --name go-api -- --flag   (any executable)
+    warden start npm --name web -- start                (a program on PATH)
+    warden start \"python3 -m http.server 8000\" --name files   (a command line)
+    --name <NAME>  -i, --instances <N|max|max-1>  --port <PORT>  --namespace <NS>  --cwd <DIR>
+    --interpreter <bun|node|python3|bash|none|...>  --interpreter-args \"<args>\" (also --node-args)
+    --env KEY=VALUE  --max-memory-restart <300M>  --cron \"<m h dom mon dow>\"  --no-autorestart
+    --kill-signal SIGINT  --kill-timeout <ms>  --restart-delay <ms>  --max-restarts <N>
+    --stop-exit-codes 0,1  --wait-ready  --listen-timeout <ms>  --no-shim
+    -o, --output <file>  -e, --error <file>  -l, --log <file>  --time  --merge-logs
+    -- <args for the app>
 
 reload, deploy and restart app:N wait for the rollout, print its progress and
 exit 1 if it failed (or 2 if Warden is unreachable), so they fit `ExecReload=`
@@ -81,7 +91,7 @@ pub enum Command {
     Act(Action),
     Start {
         what: String,
-        opts: StartOpts,
+        opts: Box<StartOpts>,
     },
     Delete {
         target: String,
@@ -124,11 +134,27 @@ pub struct StartOpts {
     pub instances: Option<String>,
     pub port: Option<u16>,
     pub interpreter: Option<String>,
+    pub interpreter_args: Vec<String>,
     pub namespace: Option<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub max_memory_mb: Option<u64>,
     pub script_args: Vec<String>,
+    pub autorestart: Option<bool>,
+    pub kill_timeout_ms: Option<u64>,
+    pub kill_signal: Option<String>,
+    pub restart_delay_ms: Option<u64>,
+    pub max_restarts: Option<u32>,
+    pub cron: Option<String>,
+    pub stop_exit_codes: Vec<i32>,
+    pub wait_ready: bool,
+    pub listen_timeout_ms: Option<u64>,
+    pub time: bool,
+    pub out_file: Option<PathBuf>,
+    pub err_file: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub merge_logs: bool,
+    pub shim: Option<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -153,6 +179,10 @@ fn parse_level(s: &str) -> Option<Level> {
         "error" => Some(Level::Error),
         _ => None,
     }
+}
+
+fn num(flag: &str, v: &str) -> Result<u64, String> {
+    v.trim().parse().map_err(|_| format!("{flag} expects a number, got {v:?}"))
 }
 
 /// `300M`, `1G`, `512` (MB) → MB.
@@ -194,8 +224,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--nostream" | "--no-stream" => follow = Some(false),
             "-w" | "--worker" => worker = Some(value(a)?),
             "--events" => events = true,
-            "--err" | "--error" => stream = Some("stderr".into()),
-            "--out" | "--output" => stream = Some("stdout".into()),
+            "--err" => stream = Some("stderr".into()),
+            "--out" => stream = Some("stdout".into()),
             "--json" => json = true,
             "--no-wait" => no_wait = true,
             "-y" | "--yes" => yes = true,
@@ -213,6 +243,36 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 so.env.push((k.to_string(), v.to_string()));
             }
             "--max-memory-restart" => so.max_memory_mb = Some(parse_mb(&value(a)?)?),
+            "--interpreter-args" | "--node-args" => {
+                so.interpreter_args.extend(value(a)?.split_whitespace().map(String::from))
+            }
+            "--no-autorestart" => so.autorestart = Some(false),
+            "--kill-timeout" => so.kill_timeout_ms = Some(num(a, &value(a)?)?),
+            "--kill-signal" => so.kill_signal = Some(value(a)?),
+            "--restart-delay" | "--exp-backoff-restart-delay" => so.restart_delay_ms = Some(num(a, &value(a)?)?),
+            "--max-restarts" => so.max_restarts = Some(num(a, &value(a)?)? as u32),
+            "--cron" | "--cron-restart" => so.cron = Some(value(a)?),
+            "--stop-exit-codes" => {
+                for c in value(a)?.split([',', ' ']).filter(|c| !c.is_empty()) {
+                    so.stop_exit_codes
+                        .push(c.parse().map_err(|_| format!("--stop-exit-codes: {c:?} is not a number"))?);
+                }
+            }
+            "--wait-ready" => so.wait_ready = true,
+            "--listen-timeout" => so.listen_timeout_ms = Some(num(a, &value(a)?)?),
+            "--time" => so.time = true,
+            "-o" | "--output" => so.out_file = Some(value(a)?.into()),
+            "-e" | "--error" => so.err_file = Some(value(a)?.into()),
+            "--error-file" | "--err-file" => so.err_file = Some(value(a)?.into()),
+            "-l" | "--log" => so.log_file = Some(value(a)?.into()),
+            "--merge-logs" => so.merge_logs = true,
+            "--shim" => so.shim = Some(true),
+            "--no-shim" => so.shim = Some(false),
+            "--shutdown-with-message" => {
+                return Err("--shutdown-with-message is not supported: Warden stops workers with a signal \
+                            (--kill-signal)"
+                    .into());
+            }
             "--watch" => {
                 return Err(
                     "--watch is not supported: Warden is for production; restart on deploy with `warden reload`".into(),
@@ -250,7 +310,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             too_many(1)?;
             match one(&rest) {
                 None => Command::Run,
-                Some(what) => Command::Start { what, opts: so.clone() },
+                Some(what) => Command::Start { what, opts: Box::new(so.clone()) },
             }
         }
         "run" => {

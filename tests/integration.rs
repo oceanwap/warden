@@ -1252,3 +1252,175 @@ fn pm2_style_fleet_workflow() {
     let (code, _) = f.cli(&["start", "web"]);
     assert_eq!(code, 2, "a deleted app is unknown");
 }
+
+fn have_node() -> bool {
+    Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+/// Node apps get the shim through `--import`: several workers share the
+/// port (SO_REUSEPORT), each knows its NODE_APP_INSTANCE, and a rolling
+/// restart under load drops nothing.
+#[test]
+fn node_workers_share_a_port_through_the_shim() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"nodeapp\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+         [health]\npath = \"/whoami\"\n[reload]\nhealth_passes = 1\nhealth_interval_ms = 100\n[shutdown]\ndrain_ms = 200\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("nodeapp", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    let mut seen = HashSet::new();
+    for _ in 0..60 {
+        seen.insert(get(port, "/whoami").expect("request failed"));
+    }
+    let instances: HashSet<String> = seen.iter().map(|s| s.split(':').nth(1).unwrap().to_string()).collect();
+    assert_eq!(instances, HashSet::from(["0".to_string(), "1".to_string()]), "{seen:?}");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let fail = Arc::new(AtomicUsize::new(0));
+    let ok = Arc::new(AtomicUsize::new(0));
+    let client = {
+        let (stop, fail, ok) = (stop.clone(), fail.clone(), ok.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if get(port, "/whoami").is_some() {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    fail.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let before = pid_set(&w.status().unwrap());
+    let (code, out) = w.cli(&["restart"]);
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let after = pid_set(&w.status().unwrap());
+    assert!(before.is_disjoint(&after), "every worker replaced");
+    eprintln!("node rolling restart: {} ok, {} failed", ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
+    assert!(ok.load(Ordering::Relaxed) > 50);
+    assert_eq!(fail.load(Ordering::Relaxed), 0, "requests failed during the rolling restart");
+}
+
+/// Apps written for PM2: readiness from process.send('ready'), graceful stop
+/// on SIGINT.
+#[test]
+fn pm2_style_wait_ready_and_sigint() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"pm2app\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n\
+         env = {{ FIXTURE_WAIT_READY = \"1500\", FIXTURE_SIGINT_ONLY = \"1\" }}\n\
+         [workers]\ncount = 1\nwait_ready = true\n[shutdown]\nsignal = \"SIGINT\"\ngrace_period = 10\n",
+        fixture("node_app.mjs")
+    );
+    let t0 = Instant::now();
+    let mut w = Warden::start("pm2app", port, &cfg);
+    // Listening early is not enough: ready only after process.send('ready').
+    w.wait_for("listening", T, |_| get(port, "/whoami").is_some());
+    assert_eq!(w.status().unwrap()["workers_ready"], 0, "not ready before process.send('ready')");
+    w.wait_for("ready", T, ready(1));
+    assert!(t0.elapsed() >= Duration::from_millis(1400), "{:?}", t0.elapsed());
+    let (code, took) = w.terminate(Duration::from_secs(8));
+    assert_eq!(code, Some(0));
+    assert!(took < Duration::from_secs(5), "stopped by SIGINT, not by the SIGKILL after grace: {took:?}");
+    let log = w.log();
+    assert!(log.contains("got SIGINT"), "{log}");
+    assert!(!log.contains("ignoring SIGTERM"), "{log}");
+}
+
+/// Any long-running command, not just HTTP apps: no port means ready after
+/// min_uptime; exit codes in stop_exit_codes mean "done".
+#[test]
+fn plain_processes_min_uptime_and_stop_exit_codes() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = "[app]\nname = \"plain\"\ncommand = \"sh\"\nargs = [\"-c\", \"echo started; exec sleep 300\"]\n\
+               [workers]\ncount = 2\nmin_uptime = 700\n";
+    let w = Warden::start("plain", port, cfg);
+    let t0 = Instant::now();
+    w.wait_for("2 ready", T, ready(2));
+    assert!(t0.elapsed() >= Duration::from_millis(600), "ready only after min_uptime: {:?}", t0.elapsed());
+    let before = pid_set(&w.status().unwrap());
+    let (code, out) = w.cli(&["restart"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(before.is_disjoint(&pid_set(&w.status().unwrap())));
+    assert!(w.log().contains("OUT   worker=1 stdout: started"));
+
+    let port = free_port();
+    let cfg = "[app]\nname = \"oneshot\"\ncommand = \"sh\"\nargs = [\"-c\", \"sleep 0.3; exit 0\"]\n\
+               [workers]\nmin_uptime = 100\n[restart]\nstop_exit_codes = [0]\n";
+    let w = Warden::start("oneshot", port, cfg);
+    let s = w.wait_for("done", T, |s| s["workers"][0]["state"] == "STOPPED");
+    assert!(s["workers"][0]["last_exit"].as_str().unwrap().contains("(done)"), "{s:#?}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(w.status().unwrap()["workers"][0]["restarts"], 0, "not restarted");
+}
+
+/// `warden start` runs anything PM2 would: a command line, a program on
+/// PATH, a script by extension, an executable.
+#[test]
+fn start_runs_any_command() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("anycmd");
+    let port = free_port();
+    // A command line (PM2: pm2 start "python3 -m http.server 8000" --name files).
+    let out = f.ok(&["start", "sleep 300", "--name", "sleeper"]);
+    assert!(out.contains("sleeper: online (1/1"), "{out}");
+    // A program on PATH with args after --.
+    let out = f.ok(&[
+        "start",
+        "python3",
+        "--name",
+        "files",
+        "--port",
+        &port.to_string(),
+        "--",
+        "-m",
+        "http.server",
+        &port.to_string(),
+        "--bind",
+        "127.0.0.1",
+    ]);
+    assert!(out.contains("files: online (1/1"), "{out}");
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("python's http.server listens");
+    write!(conn, "GET / HTTP/1.0\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    let _ = conn.read_to_string(&mut resp);
+    assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
+    // A script picked by extension, and an executable with a shebang.
+    let py = f.home.join("tick.py");
+    std::fs::write(&py, "import time\nprint('tick', flush=True)\ntime.sleep(300)\n").unwrap();
+    f.ok(&["start", py.to_str().unwrap(), "--name", "ticker", "--kill-signal", "SIGINT"]);
+    let sh = f.home.join("loop.sh");
+    std::fs::write(&sh, "#!/bin/sh\necho looping\nexec sleep 300\n").unwrap();
+    std::fs::set_permissions(&sh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    f.ok(&["start", sh.to_str().unwrap(), "--name", "looper", "-o", f.home.join("looper-out.log").to_str().unwrap()]);
+    let list = f.ok(&["list"]);
+    for app in ["sleeper", "files", "ticker", "looper"] {
+        assert!(list.lines().any(|l| l.starts_with(app) && l.contains("RUNNING")), "{app}:\n{list}");
+    }
+    let cfg = std::fs::read_to_string(f.home.join("ticker.toml")).unwrap();
+    assert!(cfg.contains("command = \"python3\"") && cfg.contains("signal = \"SIGINT\""), "{cfg}");
+    f.wait("out file", |f| std::fs::read_to_string(f.home.join("looper-out.log")).is_ok_and(|t| t == "looping\n"));
+    // Rolling restart of a plain process: a new pid, still one worker.
+    let before = f.pids("ticker");
+    f.ok(&["restart", "ticker"]);
+    let after = f.pids("ticker");
+    assert!(after.len() == 1 && after != before, "{before:?} -> {after:?}");
+    // Nothing to run.
+    let (code, out) = f.cli(&["start", "no-such-program-xyz"]);
+    assert_eq!(code, 2);
+    assert!(out.contains("quote it"), "{out}");
+}

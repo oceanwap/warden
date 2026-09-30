@@ -61,7 +61,103 @@ pub struct Sinks {
     pub stdout: bool,
     pub timestamps: bool,
     pub journald: bool,
+    /// Everything: Warden's events and worker output.
     pub file: Option<FileSink>,
+    /// Worker stdout / stderr as the app wrote it (PM2's out_file / error_file).
+    pub out: Option<StreamFiles>,
+    pub err: Option<StreamFiles>,
+    /// Prefix lines in `out` / `err` with a timestamp (PM2's `time`).
+    pub stream_timestamps: bool,
+}
+
+/// Log files settings (from `[logging]`).
+#[derive(Debug, Clone, Default)]
+pub struct Files {
+    pub file: Option<PathBuf>,
+    pub out_file: Option<PathBuf>,
+    pub err_file: Option<PathBuf>,
+    /// One file per worker (`out-1.log`), like PM2 without `merge_logs`.
+    pub per_worker: bool,
+    pub timestamps: bool,
+    pub rotate: RotatePolicy,
+}
+
+/// When and how log files rotate (`[logging.rotate]`).
+#[derive(Debug, Clone)]
+pub struct RotatePolicy {
+    /// Bytes; 0 = never by size.
+    pub max_size: u64,
+    pub keep: u32,
+    pub interval: Option<crate::schedule::Cron>,
+    pub compress: bool,
+    pub date_suffix: bool,
+    pub max_age: Option<Duration>,
+}
+
+impl Default for RotatePolicy {
+    fn default() -> Self {
+        RotatePolicy::from(&crate::config::Rotate::default())
+    }
+}
+
+impl From<&crate::config::Rotate> for RotatePolicy {
+    fn from(r: &crate::config::Rotate) -> Self {
+        RotatePolicy {
+            max_size: r.max_size,
+            keep: r.keep,
+            interval: r.interval.as_deref().and_then(|e| crate::schedule::Cron::parse(e).ok()),
+            compress: r.compress,
+            date_suffix: r.date_suffix,
+            max_age: (r.max_age_days > 0).then(|| Duration::from_secs(r.max_age_days * 86_400)),
+        }
+    }
+}
+
+/// Worker output of one stream: one file, or one per worker.
+pub struct StreamFiles {
+    base: PathBuf,
+    per_worker: bool,
+    policy: RotatePolicy,
+    files: std::collections::HashMap<String, FileSink>,
+}
+
+impl StreamFiles {
+    fn new(base: PathBuf, per_worker: bool, policy: RotatePolicy) -> Self {
+        StreamFiles { base, per_worker, policy, files: std::collections::HashMap::new() }
+    }
+
+    /// `out.log` → `out-2.log` for worker 2.
+    fn path_for(&self, worker: &str) -> PathBuf {
+        if !self.per_worker {
+            return self.base.clone();
+        }
+        let stem = self.base.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let name = match self.base.extension() {
+            Some(e) => format!("{stem}-{worker}.{}", e.to_string_lossy()),
+            None => format!("{stem}-{worker}"),
+        };
+        self.base.with_file_name(name)
+    }
+
+    fn write(&mut self, worker: &str, line: &[u8]) -> Result<(), String> {
+        let key = if self.per_worker { worker.to_string() } else { String::new() };
+        if !self.files.contains_key(&key) {
+            let f = FileSink::new(self.path_for(worker), self.policy.clone());
+            self.files.insert(key.clone(), f);
+        }
+        match self.files.get_mut(&key) {
+            Some(f) => f.write(line),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `<ts> OUT   worker=<w> <stream>: <text>` → (w, stream, text).
+fn split_output(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.get(TS_LEN..)?.strip_prefix("OUT   worker=")?;
+    let (worker, rest) = rest.split_once(' ')?;
+    let (stream, text) = rest.split_once(": ")?;
+    Some((worker, stream, text))
 }
 
 struct Logger {
@@ -114,25 +210,25 @@ impl Ring {
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
-/// Start logging. `file`: also write to this file, rotated at `max_bytes`,
+/// Start logging. `files`: also write to these files, rotated per `rotate`,
 /// keeping `keep` old files. `$WARDEN_LOG_FILE` overrides the file and
 /// `WARDEN_LOG_STDOUT=0` turns stdout off (both set by `warden start <app>`
 /// when it runs a supervisor in the background).
-pub fn init(level: Level, timestamps: Option<bool>, file: Option<(PathBuf, u64, u32)>) {
+pub fn init(level: Level, timestamps: Option<bool>, mut files: Files) {
     let journald = std::env::var_os("JOURNAL_STREAM").is_some();
-    let file = match std::env::var_os("WARDEN_LOG_FILE") {
-        Some(p) if !p.is_empty() => {
-            let (max, keep) = file.as_ref().map(|f| (f.1, f.2)).unwrap_or((10 << 20, 5));
-            Some((PathBuf::from(p), max, keep))
-        }
-        _ => file,
-    };
+    if let Some(p) = std::env::var_os("WARDEN_LOG_FILE").filter(|p| !p.is_empty()) {
+        files.file = Some(PathBuf::from(p));
+    }
     let sinks = Sinks {
         stdout: std::env::var("WARDEN_LOG_STDOUT").map(|v| v != "0").unwrap_or(true),
         timestamps: timestamps.unwrap_or(!journald),
         journald,
-        file: file.as_ref().map(|(p, max, keep)| FileSink::new(p.clone(), *max, *keep)),
+        file: files.file.clone().map(|p| FileSink::new(p, files.rotate.clone())),
+        out: files.out_file.clone().map(|p| StreamFiles::new(p, files.per_worker, files.rotate.clone())),
+        err: files.err_file.clone().map(|p| StreamFiles::new(p, files.per_worker, files.rotate.clone())),
+        stream_timestamps: files.timestamps,
     };
+    let file = files.file;
     let (tx, _) = broadcast::channel(256);
     let (wtx, wrx) = channel::<Queued>();
     let ok = LOGGER
@@ -147,7 +243,7 @@ pub fn init(level: Level, timestamps: Option<bool>, file: Option<(PathBuf, u64, 
             output_bytes: AtomicUsize::new(0),
             dropped_output: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
-            file_path: file.map(|f| f.0),
+            file_path: file,
         })
         .is_ok();
     if ok {
@@ -302,20 +398,25 @@ pub fn clear() {
     }
 }
 
-/// A log file rotated by size: `app.log` → `app.log.1` → … → `app.log.N`.
+/// A log file rotated by size and/or on a schedule. Numbered
+/// (`app.log.1` newest … `app.log.N`) or dated (`app.log.2026-09-30T00-00-00`),
+/// optionally gzipped; old ones are pruned by count and age.
 pub struct FileSink {
     path: PathBuf,
     file: Option<std::fs::File>,
     size: u64,
-    max: u64,
-    keep: u32,
+    policy: RotatePolicy,
+    next_rotation: Option<SystemTime>,
     /// Last time an error was reported (at most once a minute).
     last_error: Option<Instant>,
+    /// The previous rotation's compression, finished before names shift again.
+    compressing: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FileSink {
-    pub fn new(path: PathBuf, max: u64, keep: u32) -> Self {
-        FileSink { path, file: None, size: 0, max: max.max(1024), keep, last_error: None }
+    pub fn new(path: PathBuf, policy: RotatePolicy) -> Self {
+        let next_rotation = policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
+        FileSink { path, file: None, size: 0, policy, next_rotation, last_error: None, compressing: None }
     }
 
     fn open(&mut self) -> std::io::Result<()> {
@@ -329,35 +430,101 @@ impl FileSink {
         Ok(())
     }
 
+    fn sibling(&self, suffix: &str) -> PathBuf {
+        let mut s = self.path.clone().into_os_string();
+        s.push(suffix);
+        PathBuf::from(s)
+    }
+
     fn rotate(&mut self) -> std::io::Result<()> {
         self.file = None;
-        let name = |i: u32| -> PathBuf {
-            let mut s = self.path.clone().into_os_string();
-            s.push(format!(".{i}"));
-            PathBuf::from(s)
-        };
-        if self.keep == 0 {
+        if let Some(h) = self.compressing.take() {
+            let _ = h.join();
+        }
+        let p = &self.policy;
+        let rotated = if p.keep == 0 && !p.date_suffix {
             std::fs::remove_file(&self.path).or_else(ignore_missing)?;
-        } else {
-            std::fs::remove_file(name(self.keep)).or_else(ignore_missing)?;
-            for i in (1..self.keep).rev() {
-                std::fs::rename(name(i), name(i + 1)).or_else(ignore_missing)?;
+            None
+        } else if p.date_suffix {
+            let stamp = timestamp_now().get(..19).unwrap_or("").replace(':', "-");
+            let mut dest = self.sibling(&format!(".{stamp}"));
+            let mut n = 1;
+            while dest.exists() || self.sibling(&format!(".{stamp}.gz")).exists() && n == 1 {
+                dest = self.sibling(&format!(".{stamp}-{n}"));
+                n += 1;
             }
-            std::fs::rename(&self.path, name(1)).or_else(ignore_missing)?;
+            std::fs::rename(&self.path, &dest).or_else(ignore_missing)?;
+            Some(dest)
+        } else {
+            let numbered = |i: u32, gz: bool| self.sibling(&format!(".{i}{}", if gz { ".gz" } else { "" }));
+            for gz in [false, true] {
+                std::fs::remove_file(numbered(p.keep, gz)).or_else(ignore_missing)?;
+                for i in (1..p.keep).rev() {
+                    std::fs::rename(numbered(i, gz), numbered(i + 1, gz)).or_else(ignore_missing)?;
+                }
+            }
+            let dest = numbered(1, false);
+            std::fs::rename(&self.path, &dest).or_else(ignore_missing)?;
+            Some(dest)
+        };
+        self.prune();
+        if let (Some(done), true) = (rotated, self.policy.compress) {
+            // Off the writer thread: a 10 MB file takes ~100 ms to compress.
+            self.compressing = std::thread::Builder::new()
+                .name("warden-gzip".into())
+                .spawn(move || {
+                    if let Err(e) = gzip_file(&done) {
+                        event(
+                            Level::Warn,
+                            "could not compress a rotated log file; it stays uncompressed",
+                            &[("file", &done.display()), ("error", &e)],
+                        );
+                    }
+                })
+                .ok();
         }
         self.open()
     }
 
-    /// Append one line; rotates first when it would pass the size limit.
+    /// Rotated files beyond `keep`, or older than `max_age`, are deleted.
+    fn prune(&self) {
+        let (Some(dir), Some(name)) = (self.path.parent(), self.path.file_name()) else { return };
+        let prefix = format!("{}.", name.to_string_lossy());
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let mut old: Vec<(SystemTime, PathBuf)> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+            .filter(|e| !e.file_name().to_string_lossy().contains(".tmp"))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+            .collect();
+        old.sort_by_key(|o| std::cmp::Reverse(o.0)); // newest first
+        let now = SystemTime::now();
+        for (i, (mtime, path)) in old.iter().enumerate() {
+            let too_many = i >= self.policy.keep as usize;
+            let too_old = self.policy.max_age.is_some_and(|age| now.duration_since(*mtime).is_ok_and(|d| d > age));
+            if too_many || too_old {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Append one line; rotates first when the size or the schedule says so.
     pub fn write(&mut self, line: &[u8]) -> Result<(), String> {
         let needed = line.len() as u64 + 1;
         let res = (|| -> std::io::Result<()> {
             if self.file.is_none() {
                 self.open()?;
-            } else if self.size > 0 && self.size + needed > self.max {
+            }
+            let due = self.next_rotation.is_some_and(|t| SystemTime::now() >= t);
+            if due {
+                self.next_rotation = self.policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
+                if self.size > 0 {
+                    self.rotate()?;
+                }
+            } else if self.policy.max_size > 0 && self.size > 0 && self.size + needed > self.policy.max_size {
                 // `warden flush` may have truncated it: trust the file, not the count.
                 self.size = self.file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(self.size);
-                if self.size > 0 && self.size + needed > self.max {
+                if self.size > 0 && self.size + needed > self.policy.max_size {
                     self.rotate()?;
                 }
             }
@@ -381,6 +548,25 @@ impl FileSink {
         }
         due
     }
+}
+
+/// `file` → `file.gz` (written to a temp name first), then `file` removed.
+fn gzip_file(path: &std::path::Path) -> std::io::Result<()> {
+    let mut gz_name = path.as_os_str().to_owned();
+    gz_name.push(".gz");
+    let dest = PathBuf::from(gz_name);
+    let mut tmp_name = dest.clone().into_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    {
+        let mut input = std::fs::File::open(path)?;
+        let out = std::fs::File::create(&tmp)?;
+        let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
+        std::io::copy(&mut input, &mut enc)?;
+        enc.finish()?.sync_all()?;
+    }
+    std::fs::rename(&tmp, &dest)?;
+    std::fs::remove_file(path)
 }
 
 fn ignore_missing(e: std::io::Error) -> std::io::Result<()> {
@@ -417,6 +603,7 @@ fn write_loop(rx: Receiver<Queued>, mut sinks: Sinks) {
     let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
     let mut scratch = String::new();
     let mut file_error: Option<String> = None;
+    let mut last_stream_error: Option<Instant> = None;
     loop {
         let first = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(q) => Some(q),
@@ -441,6 +628,26 @@ fn write_loop(rx: Receiver<Queued>, mut sinks: Sinks) {
                 if let Err(e) = f.write(line.as_bytes()) {
                     if f.should_report() {
                         file_error = Some(e);
+                    }
+                }
+            }
+            if level.is_none() && (sinks.out.is_some() || sinks.err.is_some()) {
+                if let Some((worker, stream, text)) = split_output(line) {
+                    let ts = sinks.stream_timestamps;
+                    let target = if stream == "stderr" { sinks.err.as_mut() } else { sinks.out.as_mut() };
+                    if let Some(t) = target {
+                        let res = if ts {
+                            let stamped = format!("{}: {text}", line.get(..TS_LEN - 1).unwrap_or(""));
+                            t.write(worker, stamped.as_bytes())
+                        } else {
+                            t.write(worker, text.as_bytes())
+                        };
+                        if let Err(e) = res {
+                            if last_stream_error.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) {
+                                last_stream_error = Some(Instant::now());
+                                file_error = Some(e);
+                            }
+                        }
                     }
                 }
             }
@@ -632,7 +839,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("warden-logfile-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("app.log");
-        let mut f = FileSink::new(path.clone(), 1024, 2);
+        let policy = RotatePolicy { max_size: 1024, keep: 2, ..RotatePolicy::default() };
+        let mut f = FileSink::new(path.clone(), policy.clone());
         let line = [b'x'; 99];
         for _ in 0..40 {
             f.write(&line).unwrap();
@@ -646,8 +854,80 @@ mod tests {
         f.write(&line).unwrap();
         assert_eq!(size(&path), 100);
         // An unwritable path reports an error instead of panicking.
-        let mut bad = FileSink::new(PathBuf::from("/proc/warden-nope/app.log"), 1024, 1);
+        let mut bad = FileSink::new(PathBuf::from("/proc/warden-nope/app.log"), policy);
         assert!(bad.write(b"x").unwrap_err().contains("/proc/warden-nope/app.log"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_compress_date_and_age() {
+        let dir = std::env::temp_dir().join(format!("warden-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let line = [b'x'; 499];
+        // Compressed, numbered.
+        let path = dir.join("c.log");
+        let mut f =
+            FileSink::new(path.clone(), RotatePolicy { max_size: 1024, keep: 3, compress: true, ..Default::default() });
+        for _ in 0..12 {
+            f.write(&line).unwrap();
+        }
+        let t0 = Instant::now();
+        while (dir.join("c.log.1").exists() || !dir.join("c.log.1.gz").exists())
+            && t0.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(dir.join("c.log.1.gz").exists(), "{:?}", std::fs::read_dir(&dir).unwrap().collect::<Vec<_>>());
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(dir.join("c.log.1.gz")).unwrap()),
+            &mut text,
+        )
+        .unwrap();
+        assert_eq!(text.len(), 1000, "two 500-byte lines per rotated file");
+        assert!(!dir.join("c.log.4.gz").exists() && !dir.join("c.log.4").exists(), "keep = 3");
+        // Dated names, pruned by count.
+        let path = dir.join("d.log");
+        let mut f = FileSink::new(
+            path.clone(),
+            RotatePolicy { max_size: 1024, keep: 2, date_suffix: true, ..Default::default() },
+        );
+        for _ in 0..12 {
+            f.write(&line).unwrap();
+        }
+        let dated: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
+            .filter(|n| n.starts_with("d.log."))
+            .collect();
+        assert_eq!(dated.len(), 2, "{dated:?}");
+        assert!(dated.iter().all(|n| n.starts_with("d.log.20")), "{dated:?}");
+        // Size 0 = never by size.
+        let path = dir.join("n.log");
+        let mut f = FileSink::new(path.clone(), RotatePolicy { max_size: 0, ..Default::default() });
+        for _ in 0..12 {
+            f.write(&line).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 6000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worker_output_files() {
+        let line = "2026-09-30T12:00:01.123Z OUT   worker=2 stderr: boom: bad thing";
+        assert_eq!(split_output(line), Some(("2", "stderr", "boom: bad thing")));
+        assert_eq!(split_output("2026-09-30T12:00:01.123Z INFO  worker ready worker=1"), None);
+        let dir = std::env::temp_dir().join(format!("warden-streams-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut per = StreamFiles::new(dir.join("api-out.log"), true, RotatePolicy::default());
+        per.write("1", b"a").unwrap();
+        per.write("2", b"b").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("api-out-1.log")).unwrap(), "a\n");
+        assert_eq!(std::fs::read_to_string(dir.join("api-out-2.log")).unwrap(), "b\n");
+        let mut merged = StreamFiles::new(dir.join("all.log"), false, RotatePolicy::default());
+        merged.write("1", b"a").unwrap();
+        merged.write("2", b"b").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("all.log")).unwrap(), "a\nb\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -655,7 +935,15 @@ mod tests {
     fn journald_and_plain_forms() {
         let line = "2026-09-30T12:00:01.123Z WARN  thing happened";
         let mut buf = String::new();
-        let mut s = Sinks { stdout: true, timestamps: true, journald: false, file: None };
+        let mut s = Sinks {
+            stdout: true,
+            timestamps: true,
+            journald: false,
+            file: None,
+            out: None,
+            err: None,
+            stream_timestamps: false,
+        };
         assert_eq!(stdout_form(&s, Some(Level::Warn), line, &mut buf), line);
         s.timestamps = false;
         assert_eq!(stdout_form(&s, Some(Level::Warn), line, &mut buf), "WARN  thing happened");

@@ -12,6 +12,7 @@ mod metrics;
 mod networking;
 mod process;
 mod restart;
+mod schedule;
 mod signals;
 mod supervisor;
 mod systemd;
@@ -121,8 +122,7 @@ fn run_supervisor(rt: &tokio::runtime::Runtime, args: &cli::Args, path: PathBuf)
     if let Some(s) = args.socket.clone() {
         c.control.socket = Some(s);
     }
-    let file = c.logging.file.clone().map(|p| (p, c.logging.file_max_mb << 20, c.logging.file_keep));
-    logging::init(c.logging.level, c.logging.timestamps, file);
+    logging::init(c.logging.level, c.logging.timestamps, c.log_files());
     guard::install_panic_hook();
     let cfg_path = std::fs::canonicalize(&path).unwrap_or(path);
     let run = std::panic::AssertUnwindSafe(|| rt.block_on(supervisor::run(c, Some(cfg_path))));

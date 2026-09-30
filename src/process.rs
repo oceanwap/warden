@@ -65,7 +65,7 @@ pub enum ProcEvent {
 /// Handle to a running process. Dropping it does not kill the process.
 pub struct Handle {
     pub pid: u32,
-    ctl: mpsc::UnboundedSender<i32>,
+    ctl: mpsc::UnboundedSender<(i32, bool)>,
 }
 
 impl Handle {
@@ -73,7 +73,12 @@ impl Handle {
     /// stopasgroup/killasgroup), so `bun run <script>` wrappers or helpers the
     /// app spawned are not orphaned. Other signals go to the process only.
     pub fn signal(&self, sig: i32) {
-        let _ = self.ctl.send(sig);
+        let _ = self.ctl.send((sig, sig == libc::SIGKILL || sig == libc::SIGTERM));
+    }
+
+    /// The configured stop signal (SIGTERM or e.g. SIGINT): to the group.
+    pub fn signal_group(&self, sig: i32) {
+        let _ = self.ctl.send((sig, true));
     }
 }
 
@@ -120,12 +125,12 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     drop(ipc_write);
     let pid = child.id().unwrap_or(0);
     let label = spec.label.clone();
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<i32>();
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<(i32, bool)>();
 
     // Readers of the worker's output and IPC pipe. If one of them fails, the
     // worker could block on a full pipe or lose its readiness/heartbeat
     // channel, so it is killed and restarted rather than left half-supervised.
-    let reader_failed = |what: &'static str, ctl: mpsc::UnboundedSender<i32>, label: String| {
+    let reader_failed = |what: &'static str, ctl: mpsc::UnboundedSender<(i32, bool)>, label: String| {
         move |msg: String| {
             crate::error!(
                 "worker's output reader failed; killing the worker so it restarts cleanly",
@@ -134,7 +139,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                 panic = msg,
                 hint = "this is a Warden bug: please report it with the log lines above",
             );
-            let _ = ctl.send(libc::SIGKILL);
+            let _ = ctl.send((libc::SIGKILL, true));
         }
     };
     if let Some(out) = child.stdout.take() {
@@ -178,14 +183,14 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             loop {
                 tokio::select! {
                     st = child.wait() => break st,
-                    Some(sig) = ctl_rx.recv() => {
+                    Some((sig, to_group)) = ctl_rx.recv() => {
                         // child.id() is None once reaped; never signal a reused pid.
                         if let Some(p) = child.id() {
                             let p = p as i32;
                             // SAFETY: plain kill(2).
                             // The group contains the process itself: signal once.
                             unsafe {
-                                let group = (sig == libc::SIGKILL || sig == libc::SIGTERM) && libc::kill(-p, sig) == 0;
+                                let group = to_group && libc::kill(-p, sig) == 0;
                                 if !group {
                                     libc::kill(p, sig);
                                 }

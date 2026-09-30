@@ -304,6 +304,7 @@ impl Supervisor {
         if diff(&old.watchdog, &new.watchdog) {
             applied.push("watchdog");
         }
+        let schedule_changed = old.restart.schedule != new.restart.schedule;
         if diff(&old.restart, &new.restart) {
             applied.push("restart");
         }
@@ -349,6 +350,9 @@ impl Supervisor {
         self.cfg.health.enabled = enabled;
         self.cfg.health.interval = interval;
         self.policy = Policy::from(&self.cfg.restart);
+        if schedule_changed {
+            self.schedule_next();
+        }
         if !applied.is_empty() {
             info!("config reloaded", applied = applied.join(","));
         }
@@ -373,10 +377,11 @@ impl Supervisor {
             let current = slot.current;
             let serving = current.filter(|_| matches!(slot.state, State::Running | State::Restarting));
             let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
-            let offset = self.cfg.workers.port_strategy == PortStrategy::Offset;
+            let overlap = self.cfg.overlap();
             let step = match (serving, current) {
-                // Each worker owns its port: stop, then start (a gap for this worker only).
-                (Some(old), _) if offset => {
+                // Each worker owns its port, or the app can't share it: stop,
+                // then start (a gap for this worker only).
+                (Some(old), _) if !overlap => {
                     self.stop_instance(old);
                     Step::Draining { slot: slot_id, old, then_spawn: true }
                 }

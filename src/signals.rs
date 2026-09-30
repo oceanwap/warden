@@ -64,6 +64,22 @@ pub fn parse(name: &str) -> Option<i32> {
     })
 }
 
+/// `SIGINT` for 2, and so on; `SIG<n>` for anything else.
+pub fn name(sig: i32) -> String {
+    let known = [
+        (libc::SIGHUP, "SIGHUP"),
+        (libc::SIGINT, "SIGINT"),
+        (libc::SIGQUIT, "SIGQUIT"),
+        (libc::SIGUSR1, "SIGUSR1"),
+        (libc::SIGUSR2, "SIGUSR2"),
+        (libc::SIGTERM, "SIGTERM"),
+        (libc::SIGKILL, "SIGKILL"),
+        (libc::SIGWINCH, "SIGWINCH"),
+        (libc::SIGPWR, "SIGPWR"),
+    ];
+    known.iter().find(|(n, _)| *n == sig).map(|(_, s)| s.to_string()).unwrap_or_else(|| format!("SIG{sig}"))
+}
+
 /// Install handlers and forward signals to `tx` until the receiver is gone.
 pub fn listen(tx: mpsc::UnboundedSender<Sig>) -> std::io::Result<()> {
     let mut term = signal(SignalKind::terminate())?;
