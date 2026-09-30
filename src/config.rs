@@ -980,7 +980,13 @@ pub fn runtime_dir() -> PathBuf {
         return PathBuf::from(d).join("warden");
     }
     let uid = crate::sys::uid();
-    std::env::temp_dir().join(format!("warden-{uid}"))
+    #[cfg(target_os = "linux")]
+    let tmp = std::env::temp_dir();
+    // Not Linux: macOS's per-user $TMPDIR (/var/folders/…/T/) leaves too
+    // little of the ~104-byte socket path for the workers' health sockets.
+    #[cfg(not(target_os = "linux"))]
+    let tmp = PathBuf::from("/tmp");
+    tmp.join(format!("warden-{uid}"))
 }
 
 /// One app's runtime directory: matches systemd's `RuntimeDirectory=warden/%i`.

@@ -53,9 +53,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --bin warden 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      # The runner's own systemd service leaks INVOCATION_ID into every step,
+      # and Warden would take that service for its own unit (`warden kill`
+      # then goes through systemctl). Run as from a terminal.
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+        run: env -u INVOCATION_ID cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       # TEMPORARY: job logs need auth; surface failing tests as an annotation.
       - name: Annotate test failures
         if: failure()
@@ -92,9 +95,12 @@ jobs:
         run: npm ci --no-audit --no-fund
       - run: cargo build --all-targets
       - run: cargo test --bin warden 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      # The runner's own systemd service leaks INVOCATION_ID into every step,
+      # and Warden would take that service for its own unit (`warden kill`
+      # then goes through systemctl). Run as from a terminal.
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+        run: env -u INVOCATION_ID cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       # TEMPORARY: job logs need auth; surface failing tests as an annotation.
       - name: Annotate test failures
         if: failure()

@@ -423,11 +423,17 @@ pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
 /// send(2) on a socket, never raising SIGPIPE. Not Linux: SO_NOSIGPIPE on
 /// the socket instead of MSG_NOSIGNAL (set on every call: the socket may
 /// come from anywhere), and no MSG_MORE, so `more` is ignored (headers may
-/// go out in their own packet).
+/// go out in their own packet). macOS refuses socket options with EINVAL
+/// once the connection is reset; send then reports the real error (EPIPE,
+/// ECONNRESET), and the option set by an earlier call still holds.
 #[cfg(not(target_os = "linux"))]
 pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
     let _ = more;
-    setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)?;
+    if let Err(e) = setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1) {
+        if e.raw_os_error() != Some(libc::EINVAL) {
+            return Err(e);
+        }
+    }
     // SAFETY: `buf` is a valid slice for its length and send only reads it;
     // `sock` is borrowed and stays open for the call.
     let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
@@ -977,8 +983,11 @@ mod tests {
                 }
             }
         }
-        // 0, 1, 2, the IPC fd 3, and the fd `ls` opened for /proc/self/fd.
-        assert!(fds.iter().all(|f| *f <= 4), "unexpected inherited descriptors: {fds:?}");
+        // 0, 1, 2, the IPC fd 3, and the fd `ls` opened for /proc/self/fd,
+        // plus any this test process itself inherited without close-on-exec
+        // (a CI runner leaks a few into its steps): those reach every child.
+        let leaked_to_us = |fd: u32| fd > 2 && !fd_flags(fd as RawFd).0;
+        assert!(fds.iter().all(|f| *f <= 4 || leaked_to_us(*f)), "unexpected inherited descriptors: {fds:?}");
         assert!(fds.contains(&3), "{fds:?}");
         let mut msg = String::new();
         std::fs::File::from(r).read_to_string(&mut msg).unwrap();

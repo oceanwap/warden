@@ -1030,6 +1030,8 @@ mod tests {
     fn generated_configs_parse_and_keep_secrets_out() {
         let dir = std::env::temp_dir().join(format!("warden-migrate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // Scripts are resolved to real paths (macOS: /var is /private/var).
+        let dir = std::fs::canonicalize(&dir).unwrap();
         let script = dir.join("server.js");
         std::fs::write(&script, "").unwrap();
         let mut a = Pm2App {
