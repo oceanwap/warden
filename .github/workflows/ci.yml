@@ -1,0 +1,87 @@
+# Linux x86_64 and ARM64 are the production targets: everything runs there,
+# integration tests included. macOS is for development: build, lint, unit tests.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain Warden is developed with. Bump it on purpose: a new release
+  # brings new clippy lints, and `-D warnings` turns them into failures.
+  RUST_TOOLCHAIN: "1.95.0"
+  # What the integration tests and the benchmarks run on.
+  BUN_VERSION: "1.3.13"
+  NODE_VERSION: "22"
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: bench/package-lock.json
+      # bench/node_modules has the real PM2 that the pm2-migrate integration
+      # test drives (without it that test skips).
+      - name: npm ci (bench/)
+        working-directory: bench
+        run: npm ci --no-audit --no-fund
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --bin warden
+      - run: cargo test --test integration
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: bench/package-lock.json
+      - name: npm ci (bench/)
+        working-directory: bench
+        run: npm ci --no-audit --no-fund
+      - run: cargo build --all-targets
+      - run: cargo test --bin warden
+      - run: cargo test --test integration
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - run: cargo build
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --bin warden

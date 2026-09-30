@@ -29,6 +29,25 @@ fn check(rc: libc::c_int) -> io::Result<libc::c_int> {
     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(rc) }
 }
 
+/// Not Linux: FD_CLOEXEC (and O_NONBLOCK with `also_nonblock`) set after the
+/// descriptor exists, where Linux passes O_CLOEXEC / SOCK_NONBLOCK at
+/// creation. A fork on another thread in between inherits the descriptor
+/// until its exec (the standard library's own pipes and sockets have the
+/// same window on macOS).
+#[cfg(not(target_os = "linux"))]
+fn set_cloexec(fd: BorrowedFd<'_>, also_nonblock: bool) -> io::Result<()> {
+    // SAFETY: fcntl on a borrowed descriptor, which stays open for the call,
+    // with integer arguments only; no memory is passed.
+    unsafe {
+        check(libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC))?;
+        if also_nonblock {
+            let fl = check(libc::fcntl(fd.as_raw_fd(), libc::F_GETFL))?;
+            check(libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK))?;
+        }
+    }
+    Ok(())
+}
+
 /// Effective user id.
 pub fn euid() -> u32 {
     // SAFETY: geteuid takes no arguments and cannot fail.
@@ -65,6 +84,7 @@ pub fn isatty(fd: RawFd) -> bool {
 }
 
 /// Memory page size in bytes (cached).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // for /proc metrics
 pub fn page_size() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     // SAFETY: sysconf has no preconditions; -1 (unknown) falls back to 4096.
@@ -75,6 +95,7 @@ pub fn page_size() -> u64 {
 }
 
 /// Clock ticks per second for /proc CPU times (cached).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // for /proc metrics
 pub fn clock_ticks() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     // SAFETY: sysconf has no preconditions; -1 (unknown) falls back to 100.
@@ -118,6 +139,7 @@ pub fn signal_child(pid: u32, sig: i32, group: bool) {
 
 /// A pipe whose ends are close-on-exec (only the fd we dup2 into a child
 /// survives exec).
+#[cfg(target_os = "linux")]
 pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as RawFd; 2];
     // SAFETY: `fds` is a valid array of two ints for pipe2 to fill.
@@ -125,6 +147,23 @@ pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
     // SAFETY: pipe2 just created these descriptors; nothing else owns them,
     // so wrapping each in exactly one OwnedFd is sound.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// A pipe whose ends are close-on-exec. Not Linux: no pipe2, so pipe(2) and
+/// then FD_CLOEXEC on each end (see `set_cloexec` for the window).
+#[cfg(not(target_os = "linux"))]
+pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::AsFd;
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a valid array of two ints for pipe to fill.
+    check(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
+    // SAFETY: pipe just created these descriptors; nothing else owns them,
+    // so wrapping each in exactly one OwnedFd is sound (and closes both if
+    // setting the flag fails below).
+    let (r, w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    set_cloexec(r.as_fd(), false)?;
+    set_cloexec(w.as_fd(), false)?;
+    Ok((r, w))
 }
 
 /// Broken-down local time for `secs` since the epoch.
@@ -152,11 +191,18 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Result<std::net::TcpListener> {
     let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: socket(2) with constant arguments.
+    #[cfg(target_os = "linux")]
     let raw = check(unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
+    // SAFETY: socket(2) with constant arguments (not Linux: no SOCK_CLOEXEC
+    // or SOCK_NONBLOCK; both are set right below).
+    #[cfg(not(target_os = "linux"))]
+    let raw = check(unsafe { libc::socket(family, libc::SOCK_STREAM, 0) })?;
     // SAFETY: socket(2) just returned `raw`; the OwnedFd is its only owner,
     // so every early return below closes it (no leak on error paths).
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     use std::os::fd::AsFd;
+    #[cfg(not(target_os = "linux"))]
+    set_cloexec(fd.as_fd(), true)?;
     setsockopt_int(fd.as_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
     if reuse_port {
         setsockopt_int(fd.as_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
@@ -164,6 +210,8 @@ pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Resul
     match addr {
         SocketAddr::V4(a) => {
             let sin = libc::sockaddr_in {
+                #[cfg(not(target_os = "linux"))]
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: a.port().to_be(),
                 sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
@@ -181,6 +229,8 @@ pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Resul
         }
         SocketAddr::V6(a) => {
             let sin6 = libc::sockaddr_in6 {
+                #[cfg(not(target_os = "linux"))]
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: a.port().to_be(),
                 sin6_flowinfo: a.flowinfo(),
@@ -204,6 +254,7 @@ pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Resul
 
 /// One sendfile(2) call: up to `count` bytes of `input` from `*offset` to
 /// `out`; advances `*offset`. The caller loops and waits on EAGAIN.
+#[cfg(target_os = "linux")]
 pub fn sendfile(out: BorrowedFd<'_>, input: BorrowedFd<'_>, offset: &mut i64, count: usize) -> io::Result<usize> {
     let mut off: libc::off_t = *offset as libc::off_t;
     // SAFETY: both descriptors are borrowed, so they stay open (and can't be
@@ -218,8 +269,48 @@ pub fn sendfile(out: BorrowedFd<'_>, input: BorrowedFd<'_>, offset: &mut i64, co
     Ok(n as usize)
 }
 
+/// One sendfile(2) call, as on Linux: up to `count` bytes of `input` from
+/// `*offset` to the socket `out`; advances `*offset`; Ok(0) at end of file.
+/// macOS's sendfile takes (file, socket, offset, &len) and reports bytes sent
+/// in `len`, also when it fails with EAGAIN or EINTR after a partial send:
+/// that progress is returned as Ok(n), and the next call says WouldBlock.
+#[cfg(not(target_os = "linux"))]
+pub fn sendfile(out: BorrowedFd<'_>, input: BorrowedFd<'_>, offset: &mut i64, count: usize) -> io::Result<usize> {
+    if count == 0 {
+        // A length of 0 means "to the end of the file" to macOS.
+        return Ok(0);
+    }
+    let mut len: libc::off_t = count.min(i64::MAX as usize) as libc::off_t;
+    // SAFETY: both descriptors are borrowed, so they stay open for the whole
+    // call; `len` is a valid, exclusively borrowed off_t; a null header /
+    // trailer list is allowed. sendfile touches no Rust memory besides `len`.
+    let rc = unsafe {
+        libc::sendfile(input.as_raw_fd(), out.as_raw_fd(), *offset as libc::off_t, &mut len, std::ptr::null_mut(), 0)
+    };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if len <= 0 || !matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+            return Err(e);
+        }
+    }
+    *offset += len as i64;
+    Ok(len as usize)
+}
+
+/// openat2 `resolve` flags, named here so callers compile on every platform
+/// (outside Linux, `openat2` is Unsupported and never reads them).
+#[cfg(target_os = "linux")]
+pub use libc::{RESOLVE_BENEATH, RESOLVE_CACHED, RESOLVE_NO_MAGICLINKS};
+#[cfg(not(target_os = "linux"))]
+pub const RESOLVE_BENEATH: u64 = 0x08;
+#[cfg(not(target_os = "linux"))]
+pub const RESOLVE_CACHED: u64 = 0x20;
+#[cfg(not(target_os = "linux"))]
+pub const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+
 /// The kernel's `struct open_how` (linux/openat2.h, version 0: 24 bytes).
 /// Our own definition because libc's is `#[non_exhaustive]`.
+#[cfg(target_os = "linux")]
 #[repr(C)]
 struct OpenHow {
     flags: u64,
@@ -233,6 +324,7 @@ struct OpenHow {
 /// window between a check and the open). One syscall instead of a
 /// userspace realpath walk. ENOSYS on kernels before 5.6, EPERM where a
 /// seccomp filter blocks it: callers fall back.
+#[cfg(target_os = "linux")]
 pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: u64) -> io::Result<OwnedFd> {
     let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u32 as u64, mode: 0, resolve };
     // SAFETY: `path` is a NUL-terminated string that outlives the call;
@@ -255,10 +347,19 @@ pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: 
     Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
 }
 
+/// Not Linux: there is no openat2; always `Unsupported`, and callers use
+/// their realpath check instead (`warden serve` starts in that mode).
+#[cfg(not(target_os = "linux"))]
+pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: u64) -> io::Result<OwnedFd> {
+    let _ = (dir, path, flags, resolve);
+    Err(io::Error::new(io::ErrorKind::Unsupported, "openat2 is Linux-only"))
+}
+
 /// pidfd_open(2): a descriptor that becomes readable when process `pid`
 /// exits, for watching a process that is not our child (`wardend` watching
 /// supervisors) without polling and without pid-reuse races. ENOSYS before
 /// Linux 5.3 (callers fall back to `kill(pid, 0)`), ESRCH if it is gone.
+#[cfg(target_os = "linux")]
 #[allow(dead_code)] // used by wardend
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     let Ok(p) = libc::pid_t::try_from(pid) else {
@@ -275,6 +376,15 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open returned a new descriptor (close-on-exec by
     // definition) that nothing else owns.
     Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
+/// Not Linux: no pidfds; always `Unsupported`, and callers fall back to
+/// polling `kill(pid, 0)`.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)] // used by wardend
+pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    let _ = pid;
+    Err(io::Error::new(io::ErrorKind::Unsupported, "pidfd_open is Linux-only"))
 }
 
 /// pread that never waits for the disk: preadv2(RWF_NOWAIT) returns
@@ -301,11 +411,26 @@ pub fn pread_nowait(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Resu
 /// send(2) on a socket, never raising SIGPIPE; with `more`, MSG_MORE tells
 /// the kernel more data follows (response headers before a sendfile body),
 /// so headers and the first body bytes share a packet.
+#[cfg(target_os = "linux")]
 pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
     let flags = libc::MSG_NOSIGNAL | if more { libc::MSG_MORE } else { 0 };
     // SAFETY: `buf` is a valid slice for its length and send only reads it;
     // `sock` is borrowed and stays open for the call.
     let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+/// send(2) on a socket, never raising SIGPIPE. Not Linux: SO_NOSIGPIPE on
+/// the socket instead of MSG_NOSIGNAL (set on every call: the socket may
+/// come from anywhere), and no MSG_MORE, so `more` is ignored (headers may
+/// go out in their own packet).
+#[cfg(not(target_os = "linux"))]
+pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
+    let _ = more;
+    setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)?;
+    // SAFETY: `buf` is a valid slice for its length and send only reads it;
+    // `sock` is borrowed and stays open for the call.
+    let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
@@ -326,8 +451,17 @@ fn setsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int, val
 /// TCP_DEFER_ACCEPT on a listener: accept(2) wakes the server only once
 /// the client has sent data (its request), not on the bare handshake. The
 /// kernel still answers the handshake, so TCP health checks work.
+#[cfg(target_os = "linux")]
 pub fn tcp_defer_accept(listener: BorrowedFd<'_>, secs: i32) -> io::Result<()> {
     setsockopt_int(listener, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, secs)
+}
+
+/// Not Linux: no TCP_DEFER_ACCEPT, so a no-op: accept(2) wakes on the bare
+/// handshake, which is just as correct, a little busier.
+#[cfg(not(target_os = "linux"))]
+pub fn tcp_defer_accept(listener: BorrowedFd<'_>, secs: i32) -> io::Result<()> {
+    let _ = (listener, secs);
+    Ok(())
 }
 
 /// Index of the first `byte` in `hay`: the C library's memchr, which is
@@ -366,9 +500,19 @@ pub fn child_dup_ipc(write_fd: RawFd, target: RawFd) -> io::Result<()> {
 }
 
 /// The child gets `sig` when its parent thread (Warden) dies.
+#[cfg(target_os = "linux")]
 pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
     // SAFETY: prctl(PR_SET_PDEATHSIG) takes the signal as an integer.
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, sig as libc::c_ulong) }).map(|_| ())
+}
+
+/// Not Linux: there is no parent-death signal, so this is a no-op. On macOS
+/// workers survive a supervisor killed with SIGKILL (a normal stop still
+/// stops them); they keep running until killed by hand.
+#[cfg(not(target_os = "linux"))]
+pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
+    let _ = sig;
+    Ok(())
 }
 
 /// New session: no controlling terminal, own process group.
@@ -383,7 +527,12 @@ mod tests {
     use std::io::{Read, Write};
 
     fn open_fds() -> usize {
-        std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+        #[cfg(target_os = "linux")]
+        let dir = "/proc/self/fd";
+        // No /proc: macOS lists the caller's descriptors in /dev/fd.
+        #[cfg(not(target_os = "linux"))]
+        let dir = "/dev/fd";
+        std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
     }
 
     /// Descriptor counting only means something when nothing else in the
@@ -410,6 +559,7 @@ mod tests {
         (fdfl & libc::FD_CLOEXEC != 0, fl & libc::O_NONBLOCK != 0)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn ids_match_proc() {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
@@ -425,6 +575,7 @@ mod tests {
         assert_eq!(is_root(), uids[1] == 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn nofile_limit_matches_proc() {
         let (soft, hard) = nofile_limit();
@@ -491,8 +642,12 @@ mod tests {
         signal_child(child.id(), libc::SIGKILL, true);
         child.wait().unwrap();
         // Gone, or a zombie waiting for init to reap it: either way it was killed.
+        #[cfg(target_os = "linux")]
         let dead =
             || std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map(|s| s.contains(") Z ")).unwrap_or(true);
+        // No /proc: gone once launchd has reaped it.
+        #[cfg(not(target_os = "linux"))]
+        let dead = || kill(grandchild, 0).is_err();
         let t0 = std::time::Instant::now();
         while !dead() && t0.elapsed() < std::time::Duration::from_secs(2) {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -746,11 +901,47 @@ mod tests {
             }
         }
         let e = err.expect("writing to a closed peer must fail");
+        #[cfg(target_os = "linux")]
         assert!(matches!(e.raw_os_error(), Some(libc::EPIPE) | Some(libc::ECONNRESET)), "unexpected error {e}");
+        // macOS's sendfile also says ENOTCONN once the reset has landed.
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            matches!(e.raw_os_error(), Some(libc::EPIPE) | Some(libc::ECONNRESET) | Some(libc::ENOTCONN)),
+            "unexpected error {e}"
+        );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path2);
     }
 
+    /// Everywhere: the IPC fd lands on fd 3, the parent-death call succeeds
+    /// (a no-op outside Linux) and setsid makes the child a group leader.
+    #[test]
+    fn child_helpers_are_async_signal_safe_everywhere() {
+        use std::os::unix::process::CommandExt;
+        let (r, w) = pipe_cloexec().unwrap();
+        let wfd = w.as_raw_fd();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo ok >&3; echo $$; ps -o pgid= -p $$"]).stdout(std::process::Stdio::piped());
+        // SAFETY (test): the closure only calls the async-signal-safe helpers.
+        unsafe {
+            cmd.pre_exec(move || {
+                child_dup_ipc(wfd, 3)?;
+                child_parent_death_signal(libc::SIGTERM)?;
+                child_new_session()
+            });
+        }
+        let out = cmd.output().unwrap();
+        drop(w);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let ids: Vec<i64> = text.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        assert_eq!(ids.len(), 2, "{text}");
+        assert_eq!(ids[0], ids[1], "setsid: the child leads its own process group");
+        let mut msg = String::new();
+        std::fs::File::from(r).read_to_string(&mut msg).unwrap();
+        assert_eq!(msg, "ok\n");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn child_helpers_work_between_fork_and_exec() {
         use std::os::unix::process::CommandExt;
@@ -828,14 +1019,38 @@ mod tests {
         openat2(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags, resolve)
     }
 
+    #[cfg(target_os = "linux")]
     fn read_all(fd: OwnedFd) -> String {
         let mut s = String::new();
         std::fs::File::from(fd).read_to_string(&mut s).unwrap();
         s
     }
 
-    const BENEATH: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
+    const BENEATH: u64 = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
 
+    /// Not Linux: the Linux-only calls say so (callers fall back) or do
+    /// nothing, and never touch the descriptors they are given.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn linux_only_calls_are_unsupported_or_no_ops() {
+        use std::os::fd::AsFd;
+        let (base, dir) = tree();
+        assert_eq!(open_rel(&dir, "a.txt", BENEATH).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(pidfd_open(std::process::id()).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let (file, path) = temp_file(b"abc");
+        let mut buf = [0u8; 3];
+        assert_eq!(pread_nowait(file.as_fd(), &mut buf, 0).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        child_parent_death_signal(libc::SIGTERM).unwrap();
+        // The descriptors still work.
+        assert!(dir.metadata().unwrap().is_dir());
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"abc");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn openat2_stays_beneath_the_directory() {
         let (base, dir) = tree();
@@ -873,6 +1088,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openat2_cached_lookups_answer_or_say_eagain() {
         let (base, dir) = tree();
@@ -905,11 +1121,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openat2_does_not_leak_descriptors() {
         run_isolated("openat2_leak_probe");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn openat2_leak_probe() {
         if !in_probe() {
@@ -966,6 +1184,7 @@ mod tests {
     // --------------------------------------------------------------- send
 
     /// Readable (the process exited) within `ms`?
+    #[cfg(target_os = "linux")]
     fn readable_within(fd: &OwnedFd, ms: i32) -> bool {
         let mut p = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
         // SAFETY: one live pollfd, count 1.
@@ -973,6 +1192,7 @@ mod tests {
         n == 1 && p.revents & libc::POLLIN != 0
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_signals_exit_of_a_process() {
         let mut child = std::process::Command::new("sleep").arg("0.2").spawn().unwrap();
@@ -992,6 +1212,7 @@ mod tests {
         run_isolated("pidfd_leak_probe");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pidfd_leak_probe() {
         if !in_probe() {
@@ -1065,6 +1286,23 @@ mod tests {
 
     // ---------------------------------------------------- socket and pipe options
 
+    /// Everywhere (a no-op outside Linux): a deferred listener still accepts
+    /// a client that sends its request.
+    #[test]
+    fn defer_accept_keeps_accepting() {
+        use std::os::fd::AsFd;
+        let l = listen_tcp("127.0.0.1:0".parse().unwrap(), false, 16).unwrap();
+        tcp_defer_accept(l.as_fd(), 5).unwrap();
+        let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        l.set_nonblocking(false).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 3];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"GET");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn defer_accept_is_set_and_connections_still_arrive() {
         use std::os::fd::AsFd;

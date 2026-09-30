@@ -88,6 +88,8 @@ pub fn main() -> i32 {
     let auth = cfg.basic_auth.as_deref().map(|a| format!("Basic {}", base64(a.as_bytes())));
     // Troubleshooting and tests: force a slower way of opening files.
     let open_mode = match std::env::var("WARDEN_STATIC_OPEN").as_deref() {
+        // Not Linux: no openat2 (sys::openat2 is Unsupported), realpath only.
+        _ if !cfg!(target_os = "linux") => OPEN_LEGACY,
         Ok("beneath") => OPEN_BENEATH,
         Ok("legacy") => OPEN_LEGACY,
         _ => OPEN_CACHED,
@@ -524,8 +526,8 @@ async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
     if mode != OPEN_LEGACY {
         let path = std::ffi::CString::new(if rel.is_empty() { "." } else { rel })
             .map_err(|_| Error::from(ErrorKind::InvalidInput))?;
-        let beneath = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
-        let resolve = if mode == OPEN_CACHED { beneath | libc::RESOLVE_CACHED } else { beneath };
+        let beneath = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
+        let resolve = if mode == OPEN_CACHED { beneath | crate::sys::RESOLVE_CACHED } else { beneath };
         let mut result = crate::sys::openat2(site.dir.as_fd(), &path, OPEN_FLAGS, resolve);
         if mode == OPEN_CACHED {
             match &result {

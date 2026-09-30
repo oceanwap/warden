@@ -408,6 +408,22 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 | `logs app3 --nostream` (ms) | 1.9 | 156.9 |
 <!-- bench:end -->
 
+## Platforms
+
+- **Linux x86_64 and ARM64**: supported for production. CI runs formatting,
+  clippy, the unit tests and the integration tests on both.
+- **macOS**: for development only, to run an app locally with the same
+  config. CI builds it and runs clippy and the unit tests (Apple Silicon).
+  What it lacks:
+  - `SO_REUSEPORT` does not load-balance on macOS: several workers can
+    share the port, but connections are not spread across them. Use
+    `[workers] count = 1` locally.
+  - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
+  - `warden serve` checks static paths with realpath instead of `openat2`
+    (same confinement, slower).
+  - No `/proc`: the CPU and RSS columns and metrics are empty.
+- **Windows**: not supported. WSL2 works as Linux.
+
 ## Development
 
 ```sh
@@ -428,8 +444,8 @@ canary, rollback), `src/supervisor/upkeep.rs` (watchdog, recycling),
 
 Limitations:
 
-- Linux is authoritative. macOS works for development, but has no `/proc`
-  readiness or per-connection balancing.
+- Linux is authoritative. macOS works for development; see
+  [Platforms](#platforms) for what it lacks.
 - Worker mode needs Bun and the shim.
 - Node apps share the port through Warden's shim (`--import`, Node ≥ 22.12
   for `reusePort`); older Node needs `port_strategy = "offset"`.
