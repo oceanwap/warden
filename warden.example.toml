@@ -78,13 +78,30 @@ level = "info"                               # debug | info | warn | error
 # timestamps = true                          # default: off under journald (it adds its own)
 worker_output = "capture"                    # "capture" (through Warden: prefixed, in `warden logs`, in files)
                                              # | "inherit" (workers write straight to Warden's stdout)
+                                             # | "direct" (straight into out_file/err_file, see below)
 max_lines_per_sec = 10000                    # worker output kept per worker and stream; the excess is counted
                                              # and dropped. 0 = keep every line (a flooding app is slowed instead)
+                                             # (capture only)
 # file = "/var/log/warden/api.log"           # example; everything, as `warden logs` shows it
 # out_file = "/var/log/warden/api-out.log"   # example; worker stdout as written (PM2's out_file)
 # err_file = "/var/log/warden/api-err.log"   # example; worker stderr as written (PM2's error_file)
 per_worker_files = false                     # api-out-1.log, api-out-2.log… (PM2 without merge_logs)
-file_timestamps = false                      # prefix out/err lines with a timestamp (PM2's `time`)
+file_timestamps = false                      # prefix out/err lines with a timestamp (PM2's `time`; capture only)
+#
+# worker_output = "direct" is for apps that log heavily and only need the files:
+#   + the kernel moves the bytes from each worker's pipe into its file (splice): no parsing, no copy
+#     through Warden, no line budget, no line lost; the file is byte for byte what the app wrote
+#     (no prefix, no timestamp), rotated by [logging.rotate] at line boundaries (a rotated file ends
+#     with the line that reached max_size)
+#   - nothing goes to stdout/journald or into memory. `warden logs` reads the tails of the files
+#     (stamped with the file's last write time, since lines carry none) and `-f` follows new lines;
+#     `tail -f` works as always. A slow disk slows the app's writes (as if it wrote the file itself)
+#     instead of dropping lines
+#   needs out_file. stderr goes to err_file, or into out_file (like `2>&1`, in the order written)
+#   when err_file is unset. Several worker processes (workers.count > 1 in process mode) need
+#   per_worker_files = true: each worker's bytes arrive unparsed, and in one shared file a partial
+#   line of one could meet another's. Filesystems without splice work too, copied through Warden
+#   (one warning says so).
 
 [logging.rotate]                             # every log file above; built in, no logrotate needed
 max_size = "10M"                             # rotate at this size ("500K", "1G"; 0 = only on interval)

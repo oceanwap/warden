@@ -175,6 +175,55 @@ pub fn for_each_line(path: &Path, each: &mut dyn FnMut(&str) -> bool) -> Result<
     Ok(true)
 }
 
+/// The last `n` lines of `path` (read from at most `max_bytes` before its
+/// end; a line cut at that start is dropped, a last line without `\n`
+/// kept) and the file's modification time. Reads only what is in the page
+/// cache (`WouldBlock` otherwise), so the supervisor can serve `warden
+/// logs` from `worker_output = "direct"` files without waiting for a disk.
+pub fn tail_lines(path: &Path, n: usize, max_bytes: u64) -> std::io::Result<(SystemTime, Vec<String>)> {
+    use std::os::fd::AsFd;
+    let f = std::fs::File::open(path)?;
+    let meta = f.metadata()?;
+    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+    if !meta.is_file() || n == 0 {
+        return Ok((mtime, Vec::new()));
+    }
+    // One byte more than asked: a newline there means the first line is whole.
+    let start = if meta.len() > max_bytes { meta.len() - max_bytes - 1 } else { 0 };
+    let mut buf = vec![0u8; (meta.len() - start) as usize];
+    let mut done = 0;
+    while done < buf.len() {
+        let at = start + done as u64;
+        let k = match crate::sys::pread_nowait(f.as_fd(), &mut buf[done..], at) {
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                std::os::unix::fs::FileExt::read_at(&f, &mut buf[done..], at)?
+            }
+            r => r?,
+        };
+        if k == 0 {
+            break; // truncated meanwhile
+        }
+        done += k;
+    }
+    buf.truncate(done);
+    let mut text = &buf[..];
+    if start > 0 {
+        text = match text.iter().position(|&b| b == b'\n') {
+            Some(i) => &text[i + 1..],
+            None => &[],
+        };
+    }
+    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    if text.is_empty() {
+        return Ok((mtime, Vec::new()));
+    }
+    let mut lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
+    let lines = lines.split_off(lines.len().saturating_sub(n));
+    let lines =
+        lines.iter().map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned()).collect();
+    Ok((mtime, lines))
+}
+
 /// journald under systemd: the same framed lines as a log file
 /// (`<ts> <message>`), built from `journalctl -o json`.
 pub fn journal_lines(unit: &str, q: &Query, each: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
@@ -394,6 +443,30 @@ mod tests {
         assert_eq!(v["message"], "Error: ECONNREFUSED db:5432");
         let v: serde_json::Value = serde_json::from_str(&to_json("api", "plain app line")).unwrap();
         assert_eq!(v["message"], "plain app line");
+    }
+
+    #[test]
+    fn tails_of_files() {
+        let dir = std::env::temp_dir().join(format!("warden-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("out.log");
+        let tail = |n, max| tail_lines(&p, n, max).map(|(_, l)| l);
+        std::fs::write(&p, "").unwrap();
+        assert!(tail(5, 1024).unwrap().is_empty());
+        std::fs::write(&p, "one\ntwo\r\nthree\nno newline").unwrap();
+        let _ = std::fs::read(&p); // in the page cache
+        assert_eq!(tail(2, 1024).unwrap(), vec!["three", "no newline"]);
+        assert_eq!(tail(10, 1024).unwrap(), vec!["one", "two", "three", "no newline"]);
+        assert!(tail(0, 1024).unwrap().is_empty());
+        std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(tail(10, 1024).unwrap(), vec!["one", "two", "three"]);
+        // Reading from the middle: the cut first line is dropped.
+        assert_eq!(tail(10, 8).unwrap(), vec!["three"]);
+        assert_eq!(tail(10, 6).unwrap(), vec!["three"], "starts right after a newline: whole");
+        assert_eq!(tail(10, 5).unwrap(), Vec::<String>::new());
+        assert_eq!(tail_lines(&dir.join("missing"), 5, 64).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

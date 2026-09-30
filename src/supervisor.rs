@@ -505,7 +505,7 @@ impl Supervisor {
             cwd: a.working_directory.clone(),
             env,
             label: self.label(slot_id),
-            inherit_output: self.cfg.logging.worker_output == crate::config::WorkerOutput::Inherit,
+            output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
     }

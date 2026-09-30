@@ -346,6 +346,52 @@ pub fn memchr(byte: u8, hay: &[u8]) -> Option<usize> {
     }
 }
 
+// ------------------------------------------------------------- splice
+//
+// `[logging] worker_output = "direct"`: worker output moves from its pipe
+// to the log file inside the kernel, never through Warden's memory.
+
+/// One splice(2) call: moves up to `len` bytes from the pipe `pipe` into
+/// `out` without copying them through userspace. With `off_out`, the bytes
+/// land at `*off_out` (which is advanced by the count, like pwrite: the
+/// file position is untouched); without, at `out`'s file position.
+///
+/// Flags are SPLICE_F_NONBLOCK (an empty pipe is `WouldBlock`, never a
+/// wait; it says nothing about `out`, which is written like write(2)) and
+/// SPLICE_F_MOVE (a hint to move pages rather than copy). Ok(0) means the
+/// pipe is empty and every writer has closed it (EOF). EINVAL means one of
+/// the two can't splice (`pipe` is not a pipe, `out` is opened O_APPEND,
+/// or its filesystem has no splice support) and ENOSYS/EPERM that the call
+/// itself is unavailable (old kernel, seccomp): callers fall back to
+/// read/write.
+#[cfg(target_os = "linux")]
+pub fn splice(pipe: BorrowedFd<'_>, out: BorrowedFd<'_>, off_out: Option<&mut u64>, len: usize) -> io::Result<usize> {
+    let flags = libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE;
+    let mut off: libc::loff_t = 0;
+    let off_ptr: *mut libc::loff_t = match &off_out {
+        Some(o) => {
+            off = libc::loff_t::try_from(**o)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("splice offset {o} out of range")))?;
+            &mut off
+        }
+        None => std::ptr::null_mut(),
+    };
+    // SAFETY: both descriptors are borrowed, so they stay open (and can't be
+    // reused for something else) for the whole call. off_in is null (a pipe
+    // has no offset); off_out is null or points to `off`, a live,
+    // exclusively borrowed loff_t on this stack frame that the kernel reads
+    // and updates. splice moves bytes between the two kernel objects and
+    // touches no other Rust memory.
+    let n = unsafe { libc::splice(pipe.as_raw_fd(), std::ptr::null_mut(), out.as_raw_fd(), off_ptr, len, flags) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if let Some(o) = off_out {
+        *o = off as u64;
+    }
+    Ok(n as usize)
+}
+
 // ------------------------------------------------ between fork and exec
 //
 // These run in the child after fork(2) and before exec: only
@@ -1130,6 +1176,175 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------- splice
+
+    #[cfg(target_os = "linux")]
+    mod splice_tests {
+        use super::*;
+        use std::os::fd::AsFd;
+
+        /// A fresh, empty scratch file opened read-write (no O_APPEND).
+        fn scratch() -> (std::fs::File, std::path::PathBuf) {
+            let (_, p) = temp_file(b"");
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+            (f, p)
+        }
+
+        /// Splice everything a writer thread puts in a pipe into `out` at
+        /// `off`, waiting on EAGAIN; returns the bytes moved.
+        fn splice_all(data: Vec<u8>, out: &std::fs::File, off: &mut u64, chunk: usize) -> usize {
+            let (r, w) = pipe_cloexec().unwrap();
+            let writer = std::thread::spawn(move || std::fs::File::from(w).write_all(&data).unwrap());
+            let mut moved = 0;
+            loop {
+                match splice(r.as_fd(), out.as_fd(), Some(&mut *off), chunk) {
+                    Ok(0) => break,
+                    Ok(n) => moved += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            writer.join().unwrap();
+            moved
+        }
+
+        #[test]
+        fn splice_moves_exact_bytes_for_many_sizes() {
+            let data: Vec<u8> =
+                (0..(3 << 20) as u32 + 7).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+            for len in [0usize, 1, 2, 4095, 4096, 4097, 65_535, 65_536, 65_537, 1 << 20, data.len()] {
+                for chunk in [1usize, 4096, 1 << 20] {
+                    if chunk == 1 && len > 70_000 {
+                        continue; // byte-at-a-time over megabytes proves nothing more
+                    }
+                    let (f, p) = scratch();
+                    let mut off = 0u64;
+                    let moved = splice_all(data[..len].to_vec(), &f, &mut off, chunk);
+                    assert_eq!((moved, off), (len, len as u64), "len {len} chunk {chunk}");
+                    let got = std::fs::read(&p).unwrap();
+                    assert!(got == data[..len], "bytes differ for len {len}, chunk {chunk}");
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+
+        #[test]
+        fn splice_writes_at_the_offset_and_leaves_the_rest() {
+            let (mut f, p) = scratch();
+            f.write_all(&[b'a'; 10_000]).unwrap();
+            // Overwrite in the middle; the file position (10000) is not used or moved.
+            let mut off = 1_000u64;
+            assert_eq!(splice_all(vec![b'b'; 5_000], &f, &mut off, 1 << 20), 5_000);
+            assert_eq!(off, 6_000);
+            // Past the end: the gap reads as zeros (callers never leave one).
+            let mut off = 12_000u64;
+            assert_eq!(splice_all(vec![b'c'; 100], &f, &mut off, 1 << 20), 100);
+            assert_eq!(off, 12_100);
+            let got = std::fs::read(&p).unwrap();
+            assert_eq!(got.len(), 12_100);
+            assert!(got[..1_000].iter().all(|&b| b == b'a'));
+            assert!(got[1_000..6_000].iter().all(|&b| b == b'b'));
+            assert!(got[6_000..10_000].iter().all(|&b| b == b'a'));
+            assert!(got[10_000..12_000].iter().all(|&b| b == 0));
+            assert!(got[12_000..].iter().all(|&b| b == b'c'));
+            // Without an offset: the file position, which advances.
+            use std::io::Seek;
+            f.seek(io::SeekFrom::Start(2)).unwrap();
+            let (r, w) = pipe_cloexec().unwrap();
+            std::fs::File::from(w).write_all(b"XYZ").unwrap();
+            assert_eq!(splice(r.as_fd(), f.as_fd(), None, 64).unwrap(), 3);
+            assert_eq!(f.stream_position().unwrap(), 5);
+            assert_eq!(&std::fs::read(&p).unwrap()[..6], b"aaXYZa");
+            // An offset beyond what the kernel takes is refused, not wrapped.
+            let mut huge = u64::MAX;
+            assert_eq!(
+                splice(r.as_fd(), f.as_fd(), Some(&mut huge), 1).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(huge, u64::MAX);
+            let _ = std::fs::remove_file(p);
+        }
+
+        #[test]
+        fn splice_on_an_empty_pipe_would_block_then_sees_eof() {
+            let (f, p) = scratch();
+            let (r, w) = pipe_cloexec().unwrap();
+            // The read end is blocking: SPLICE_F_NONBLOCK alone must keep us from waiting.
+            let mut off = 0u64;
+            let t0 = std::time::Instant::now();
+            let e = splice(r.as_fd(), f.as_fd(), Some(&mut off), 4096).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "{e}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+            assert_eq!(off, 0, "offset untouched on error");
+            // Data, then EOF once every writer is gone.
+            let mut w = std::fs::File::from(w);
+            w.write_all(b"last line without newline").unwrap();
+            drop(w);
+            assert_eq!(splice(r.as_fd(), f.as_fd(), Some(&mut off), 4096).unwrap(), 25);
+            assert_eq!(splice(r.as_fd(), f.as_fd(), Some(&mut off), 4096).unwrap(), 0, "EOF");
+            assert_eq!(std::fs::read(&p).unwrap(), b"last line without newline");
+            let _ = std::fs::remove_file(p);
+        }
+
+        #[test]
+        fn splice_refuses_what_it_cannot_do() {
+            let (f, p) = scratch();
+            let (other, p2) = temp_file(b"not a pipe");
+            let mut off = 0u64;
+            // Input is a regular file, not a pipe: EINVAL (neither end is a pipe).
+            let e = splice(other.as_fd(), f.as_fd(), Some(&mut off), 10).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{e}");
+            // Output opened O_APPEND: EINVAL, which is why callers track the offset.
+            let appending = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            let (r, w) = pipe_cloexec().unwrap();
+            std::fs::File::from(w).write_all(b"x").unwrap();
+            let e = splice(r.as_fd(), appending.as_fd(), None, 10).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{e}");
+            // Output not writable (opened read-only): EBADF.
+            let e = splice(r.as_fd(), other.as_fd(), Some(&mut off), 10).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::EBADF), "{e}");
+            // An offset for a pipe output: ESPIPE.
+            let (_r2, w2) = pipe_cloexec().unwrap();
+            let e = splice(r.as_fd(), w2.as_fd(), Some(&mut off), 10).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ESPIPE), "{e}");
+            assert_eq!(off, 0);
+            // The byte is still in the pipe after all those failures.
+            assert_eq!(splice(r.as_fd(), f.as_fd(), Some(&mut off), 10).unwrap(), 1);
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p2);
+        }
+
+        #[test]
+        fn splice_does_not_leak_descriptors() {
+            run_isolated("splice_tests::splice_leak_probe");
+        }
+
+        #[test]
+        fn splice_leak_probe() {
+            if !in_probe() {
+                return;
+            }
+            let (f, p) = scratch();
+            let (other, p2) = temp_file(b"x");
+            let before = open_fds();
+            let mut off = 0u64;
+            for i in 0..500 {
+                let (r, w) = pipe_cloexec().unwrap();
+                let mut w = std::fs::File::from(w);
+                let _ = splice(r.as_fd(), f.as_fd(), Some(&mut off), 64); // EAGAIN
+                w.write_all(b"line\n").unwrap();
+                assert_eq!(splice(r.as_fd(), f.as_fd(), Some(&mut off), 64).unwrap(), 5);
+                drop(w);
+                assert_eq!(splice(r.as_fd(), f.as_fd(), Some(&mut off), 64).unwrap(), 0);
+                assert!(splice(other.as_fd(), f.as_fd(), Some(&mut off), 64).is_err());
+                assert_eq!(off, 5 * (i + 1));
+            }
+            assert_eq!(open_fds(), before, "every descriptor closed, success or error");
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p2);
         }
     }
 }
