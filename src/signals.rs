@@ -36,6 +36,34 @@ impl Sig {
     }
 }
 
+/// A signal by name (`SIGUSR2`, `usr2`) or number (`12`).
+pub fn parse(name: &str) -> Option<i32> {
+    let upper = name.trim().to_ascii_uppercase();
+    if let Ok(n) = upper.parse::<i32>() {
+        return (1..=64).contains(&n).then_some(n);
+    }
+    let bare = upper.strip_prefix("SIG").unwrap_or(&upper);
+    Some(match bare {
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        "TERM" => libc::SIGTERM,
+        "KILL" => libc::SIGKILL,
+        "CONT" => libc::SIGCONT,
+        "STOP" => libc::SIGSTOP,
+        "TSTP" => libc::SIGTSTP,
+        "WINCH" => libc::SIGWINCH,
+        "ALRM" => libc::SIGALRM,
+        "PIPE" => libc::SIGPIPE,
+        "TTIN" => libc::SIGTTIN,
+        "TTOU" => libc::SIGTTOU,
+        "PWR" => libc::SIGPWR,
+        _ => return None,
+    })
+}
+
 /// Install handlers and forward signals to `tx` until the receiver is gone.
 pub fn listen(tx: mpsc::UnboundedSender<Sig>) -> std::io::Result<()> {
     let mut term = signal(SignalKind::terminate())?;
@@ -58,4 +86,16 @@ pub fn listen(tx: mpsc::UnboundedSender<Sig>) -> std::io::Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_names_and_numbers() {
+        assert_eq!(super::parse("SIGUSR2"), Some(libc::SIGUSR2));
+        assert_eq!(super::parse("usr2"), Some(libc::SIGUSR2));
+        assert_eq!(super::parse("15"), Some(15));
+        assert_eq!(super::parse("0"), None);
+        assert_eq!(super::parse("SIGNOPE"), None);
+    }
 }

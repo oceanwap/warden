@@ -208,7 +208,13 @@ mod tests {
     fn prometheus_text() {
         let st = Status {
             app: "api".into(),
+            namespace: "default".into(),
             mode: "process".into(),
+            config_path: None,
+            unit: None,
+            stopped: false,
+            log_file: None,
+            version: "0".into(),
             pid: 1,
             uptime_secs: 10,
             workers_configured: 2,

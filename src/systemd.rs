@@ -43,3 +43,30 @@ pub fn reloading() {
     let usec = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000;
     notify(&format!("RELOADING=1\nMONOTONIC_USEC={usec}"));
 }
+
+/// The systemd unit running us (`warden@api.service`), from our cgroup.
+/// Only when systemd started us (`INVOCATION_ID` is set), so a shell inside
+/// some user service is not mistaken for a unit.
+pub fn own_unit() -> Option<String> {
+    std::env::var_os("INVOCATION_ID")?;
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    unit_from_cgroup(&cg)
+}
+
+fn unit_from_cgroup(cg: &str) -> Option<String> {
+    cg.lines()
+        .filter_map(|l| l.splitn(3, ':').nth(2))
+        .flat_map(|path| path.split('/'))
+        .rfind(|c| c.ends_with(".service"))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unit_from_cgroup() {
+        let cg = "0::/system.slice/system-warden.slice/warden@api.service\n";
+        assert_eq!(super::unit_from_cgroup(cg).as_deref(), Some("warden@api.service"));
+        assert_eq!(super::unit_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), None);
+    }
+}

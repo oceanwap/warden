@@ -185,6 +185,18 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         cfg_path,
     };
 
+    // `warden save` recorded a worker count / stopped state for this app:
+    // honour it, as `pm2 resurrect` would after a reboot.
+    let saved = crate::fleet::saved_state(&sup.cfg.app.name, sup.cfg_path.as_deref());
+    if let Some(s) = saved.as_ref().filter(|s| s.workers != sup.count && (1..=1024).contains(&s.workers)) {
+        info!(
+            "using the worker count saved by `warden save`",
+            config = sup.count,
+            saved = s.workers,
+            hint = "run `warden save` again after scaling to change it",
+        );
+        sup.count = s.workers;
+    }
     info!(
         "starting application",
         app = sup.cfg.app.name,
@@ -197,7 +209,14 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
-    sup.start_all();
+    if saved.as_ref().is_some_and(|s| s.stopped) {
+        info!("workers stay stopped, as saved by `warden save`", hint = "`warden start <app>` starts them");
+        sup.stopped = true;
+        sup.announced_ready = true;
+        systemd::notify("READY=1\nSTATUS=workers stopped (saved state)");
+    } else {
+        sup.start_all();
+    }
 
     loop {
         tokio::select! {
@@ -214,6 +233,10 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         }
     }
     info!("stopped", app = sup.cfg.app.name);
+    // Let control tasks deliver replies already sent (e.g. to the `shutdown`
+    // that ended us) before the runtime goes away.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Best effort: a leftover socket is detected and replaced at the next start.
     let _ = std::fs::remove_file(&socket);
     Ok(())
 }
@@ -1037,7 +1060,27 @@ impl Supervisor {
 
     fn on_request(&mut self, req: Request) -> Response {
         match req {
-            Request::Status => Response { ok: true, message: None, status: Some(self.status()), seq: None },
+            Request::Status => Response { status: Some(self.status()), ..Response::ok("") },
+            Request::Start => {
+                if self.shutting_down {
+                    return Response::err("shutting down");
+                }
+                if !self.stopped {
+                    return Response::ok("already running");
+                }
+                if !self.insts.is_empty() {
+                    // Still stopping: start again once every worker has exited.
+                    self.start_after_stop = true;
+                    return Response::ok("starting workers once the last ones have stopped");
+                }
+                info!("starting all workers on request");
+                self.stopped = false;
+                self.start_all();
+                Response::ok("starting workers")
+            }
+            Request::Reset { worker } => self.reset(worker),
+            Request::Signal { signal, worker } => self.send_signal(&signal, worker),
+            Request::Config { show_secrets } => Response { info: Some(self.info(show_secrets)), ..Response::ok("") },
             Request::Reload { safe } => self.request_reload(safe),
             Request::Stop => {
                 if self.shutting_down {
@@ -1057,30 +1100,45 @@ impl Supervisor {
                 self.begin_shutdown("control request");
                 Response::ok("shutting down")
             }
-            Request::Restart { worker: None } => {
+            Request::Restart { worker: None, hard } => {
                 if self.shutting_down {
                     return Response::err("shutting down");
                 }
                 if self.insts.is_empty() {
+                    info!("starting all workers (restart of a stopped app)");
                     self.stopped = false;
                     self.start_all();
-                } else {
+                    return Response::ok("starting workers");
+                }
+                if hard || self.stopped {
                     info!("restarting all workers (stop, then start)");
                     self.stopped = true;
                     self.start_after_stop = true;
                     self.stop_all();
+                    return Response::ok("restarting all workers at once (brief downtime)");
                 }
-                Response::ok("restarting all workers; use `warden safe-reload` for zero-downtime")
+                for s in self.slots.values_mut() {
+                    s.tracker.reset();
+                    s.failed_at = None;
+                }
+                let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+                match self.begin_rollout(Kind::Restart, ids, String::new(), false) {
+                    Ok(seq) => Response::started("rolling restart started", seq),
+                    Err(e) => Response::err(e),
+                }
             }
-            Request::Restart { worker: Some(id) } => {
+            Request::Restart { worker: Some(id), hard } => {
+                if hard {
+                    return Response::err("--hard restarts whole apps; without it, one worker is replaced gracefully");
+                }
                 if self.shutting_down || self.stopped {
-                    return Response::err("workers are stopped or shutting down");
+                    return Response::err("workers are stopped or shutting down; `warden start` starts them");
                 }
                 if self.is_worker_mode() {
-                    return Response::err("worker mode restarts the whole host; use `warden safe-reload`");
+                    return Response::err("worker mode restarts the whole host; use `warden restart <app>`");
                 }
                 if !self.slots.contains_key(&id) {
-                    return Response::err(format!("no worker {id}"));
+                    return Response::err(format!("no worker {id} (this app has {} worker(s))", self.count));
                 }
                 if let Some(s) = self.slots.get_mut(&id) {
                     s.tracker.reset();
@@ -1092,10 +1150,95 @@ impl Supervisor {
                 }
             }
             Request::Scale { count } => self.scale(count),
-            Request::Logs { .. } | Request::LogLevel { .. } => {
+            Request::Logs { .. } | Request::LogLevel { .. } | Request::Flush => {
                 Response::err("internal: this request is answered by the control socket")
             }
         }
+    }
+
+    /// `warden reset`: restart counters to zero, FAILED workers retried now.
+    fn reset(&mut self, worker: Option<usize>) -> Response {
+        if let Some(id) = worker {
+            if !self.slots.contains_key(&id) {
+                return Response::err(format!("no worker {id} (this app has {} worker(s))", self.count));
+            }
+        }
+        let ids: Vec<usize> = self.slots.keys().copied().filter(|id| worker.is_none_or(|w| w == *id)).collect();
+        let mut retried = Vec::new();
+        for id in &ids {
+            let Some(s) = self.slots.get_mut(id) else { continue };
+            s.tracker.reset();
+            s.restarts = 0;
+            s.crashes = 0;
+            if s.state == State::Failed && !self.stopped && !self.shutting_down {
+                s.failed_at = None;
+                s.token += 1;
+                s.state = State::Restarting;
+                retried.push((*id, s.token));
+            }
+        }
+        info!("counters reset on request", workers = ids.len(), failed_retried = retried.len());
+        for (id, token) in &retried {
+            self.on_restart_due(*id, *token);
+        }
+        let what = match worker {
+            Some(id) => format!("worker {id}"),
+            None => format!("{} worker(s)", ids.len()),
+        };
+        if retried.is_empty() {
+            Response::ok(format!("reset {what}"))
+        } else {
+            Response::ok(format!("reset {what}; restarting {} FAILED worker(s)", retried.len()))
+        }
+    }
+
+    /// `warden signal SIGUSR2 api[:N]`: to each worker process (in worker
+    /// mode, the host process: Workers get no signals).
+    fn send_signal(&mut self, name: &str, worker: Option<usize>) -> Response {
+        let Some(sig) = crate::signals::parse(name) else {
+            return Response::err(format!("unknown signal {name:?}; use a name like SIGUSR2 or USR2, or a number"));
+        };
+        if self.is_worker_mode() && worker.is_some_and(|w| w != 1) {
+            return Response::err("worker mode: signals go to the host process; omit the worker number");
+        }
+        let mut sent = Vec::new();
+        for s in self.slots.values() {
+            if worker.is_some_and(|w| w != s.id) && !self.is_worker_mode() {
+                continue;
+            }
+            if let Some(i) = s.current.and_then(|c| self.insts.get(&c)) {
+                i.handle.signal(sig);
+                sent.push(i.handle.pid.to_string());
+            }
+        }
+        if sent.is_empty() {
+            return Response::err("no running worker to signal");
+        }
+        info!("signal sent on request", signal = name, pids = sent.join(","));
+        Response::ok(format!("sent {name} to pid {}", sent.join(", ")))
+    }
+
+    /// Effective config and paths for `describe`, `config` and `env`.
+    fn info(&self, show_secrets: bool) -> serde_json::Value {
+        let mut v = serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null);
+        if let Some(env) = v.pointer_mut("/app/env").and_then(|e| e.as_object_mut()) {
+            for (k, val) in env.iter_mut() {
+                if !show_secrets && !is_plain_env(k) {
+                    let n = val.as_str().map(str::len).unwrap_or(0);
+                    *val = serde_json::Value::String(format!("(hidden, {n} chars)"));
+                }
+            }
+        }
+        serde_json::json!({
+            "config": v,
+            "config_path": self.cfg_path.as_ref().map(|p| p.display().to_string()),
+            "socket": self.cfg.socket_path().display().to_string(),
+            "runtime_dir": self.runtime_dir.display().to_string(),
+            "log_file": crate::logging::file_path().map(|p| p.display().to_string()),
+            "unit": systemd::own_unit(),
+            "shim": self.shim_path.as_ref().map(|p| p.display().to_string()),
+            "workers_running": self.count,
+        })
     }
 
     fn scale(&mut self, n: usize) -> Response {
@@ -1247,7 +1390,13 @@ impl Supervisor {
         let rollout = self.rollout_status();
         Status {
             app: self.cfg.app.name.clone(),
+            namespace: self.cfg.app.namespace.clone().unwrap_or_else(|| "default".into()),
             mode: mode_name(self.cfg.workers.mode).into(),
+            config_path: self.cfg_path.as_ref().map(|p| p.display().to_string()),
+            unit: systemd::own_unit(),
+            stopped: self.stopped,
+            log_file: crate::logging::file_path().map(|p| p.display().to_string()),
+            version: env!("CARGO_PKG_VERSION").into(),
             pid: me,
             uptime_secs: self.started.elapsed().as_secs(),
             workers_configured: self.count,
@@ -1271,6 +1420,13 @@ impl Supervisor {
             workers,
         }
     }
+}
+
+/// Env keys whose values are shown by `describe` / `env` without
+/// `--show-secrets`: well-known, never secret.
+pub fn is_plain_env(key: &str) -> bool {
+    matches!(key, "NODE_ENV" | "PORT" | "HOST" | "HOSTNAME" | "TZ" | "LOG_LEVEL" | "NODE_OPTIONS" | "BUN_ENV")
+        || key.starts_with("WARDEN_")
 }
 
 /// Insert `--preload=<shim>` where Bun accepts it: after `run` when the args

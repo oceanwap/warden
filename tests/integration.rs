@@ -723,7 +723,7 @@ fn stop_after_restart_all_still_shuts_down() {
     let port = free_port();
     let mut w = Warden::start("restartall", port, &gated("restartall", port, 2, ""));
     w.wait_for("ready", T, ready(2));
-    assert_eq!(w.cli(&["restart"]).0, 0);
+    assert_eq!(w.cli(&["restart", "--hard"]).0, 0);
     let (code, took) = w.terminate(Duration::from_secs(10));
     assert_eq!(code, Some(0));
     assert!(took < Duration::from_secs(5), "{took:?}");
@@ -733,7 +733,7 @@ fn stop_after_restart_all_still_shuts_down() {
     let port = free_port();
     let w = Warden::start("restartstop", port, &gated("restartstop", port, 2, ""));
     w.wait_for("ready", T, ready(2));
-    assert_eq!(w.cli(&["restart"]).0, 0);
+    assert_eq!(w.cli(&["restart", "--hard"]).0, 0);
     assert_eq!(w.cli(&["stop"]).0, 0);
     std::thread::sleep(Duration::from_millis(1500));
     let s = w.status().unwrap();
@@ -1068,4 +1068,187 @@ fn runtime_log_level() {
     let (_, out) = w.cli(&["logs", "--events", "-n", "300"]);
     let after = out.rsplit("log level changed").next().unwrap_or("");
     assert!(!after.contains("DEBUG") && !after.contains("INFO "), "nothing below WARN after the change:\n{after}");
+}
+
+/// A PM2-style host: several apps, each with its own background supervisor,
+/// driven only through `warden <command> <target>` (no -c).
+struct Fleet {
+    home: PathBuf,
+}
+
+impl Fleet {
+    fn new(name: &str) -> Fleet {
+        let home = std::env::temp_dir().join(format!("wf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        Fleet { home }
+    }
+
+    fn cli(&self, args: &[&str]) -> (i32, String) {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("WARDEN_HOME", &self.home)
+            .env("WARDEN_RUNTIME_DIR", self.home.join("run"))
+            .env_remove("WARDEN_CONFIG")
+            .current_dir(&self.home)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+        (out.status.code().unwrap_or(-1), text)
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let (code, out) = self.cli(args);
+        assert_eq!(code, 0, "warden {} failed:\n{out}", args.join(" "));
+        out
+    }
+
+    fn list(&self) -> Vec<Value> {
+        let out = self.ok(&["list", "--json"]);
+        serde_json::from_str::<Value>(&out).unwrap().as_array().unwrap().clone()
+    }
+
+    fn app(&self, name: &str) -> Value {
+        self.list().into_iter().find(|a| a["app"] == name).unwrap_or(Value::Null)
+    }
+
+    fn pids(&self, name: &str) -> Vec<u64> {
+        let a = self.app(name);
+        a["status"]["workers"]
+            .as_array()
+            .map(|w| w.iter().filter_map(|x| x["pid"].as_u64()).collect())
+            .unwrap_or_default()
+    }
+
+    fn wait(&self, what: &str, f: impl Fn(&Fleet) -> bool) {
+        let t0 = Instant::now();
+        while t0.elapsed() < T {
+            if f(self) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for {what}:\n{}", self.cli(&["list"]).1);
+    }
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        let _ = self.cli(&["kill", "--yes"]);
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+#[test]
+fn pm2_style_fleet_workflow() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("pm2");
+    let (p1, p2) = (free_port(), free_port());
+    let app = fixture("app.ts");
+
+    // `pm2 start app.ts -i 2 --name api` habits: a config is written, the app runs in the background.
+    let out = f.ok(&[
+        "start",
+        &app,
+        "--name",
+        "api",
+        "-i",
+        "2",
+        "--port",
+        &p1.to_string(),
+        "--namespace",
+        "backend",
+        "--env",
+        "API_TOKEN=s3cret",
+        "--env",
+        "NODE_ENV=production",
+    ]);
+    assert!(out.contains("api: online (2/2 workers ready)"), "{out}");
+    assert!(f.home.join("api.toml").is_file());
+    f.ok(&["start", &app, "--name", "web", "--port", &p2.to_string(), "--namespace", "backend"]);
+    let (code, out) = f.cli(&["start", &app, "--name", "api"]);
+    assert_eq!(code, 1, "a second app with the same name is refused: {out}");
+    assert!(out.contains("already exists"), "{out}");
+    assert!(get(p1, "/whoami").is_some() && get(p2, "/whoami").is_some());
+
+    // list: one row per worker, both apps.
+    let out = f.ok(&["list"]);
+    assert_eq!(out.lines().filter(|l| l.starts_with("api ") && l.contains("RUNNING")).count(), 2, "{out}");
+    assert_eq!(out.lines().filter(|l| l.starts_with("web ") && l.contains("RUNNING")).count(), 1, "{out}");
+    assert_eq!(f.list().len(), 2);
+
+    // PM2 numeric ids are explained, not guessed.
+    let (code, out) = f.cli(&["restart", "0"]);
+    assert_eq!(code, 2);
+    assert!(out.contains("names apps, not numeric ids"), "{out}");
+    let (code, out) = f.cli(&["restart"]);
+    assert_eq!(code, 2);
+    assert!(out.contains("which app?"), "{out}");
+
+    // restart = rolling and gated: every api pid changes, web is untouched.
+    let (api0, web0) = (f.pids("api"), f.pids("web"));
+    f.ok(&["restart", "api"]);
+    let api1 = f.pids("api");
+    assert!(api1.iter().all(|p| !api0.contains(p)) && api1.len() == 2, "{api0:?} -> {api1:?}");
+    assert_eq!(f.pids("web"), web0);
+    // One worker.
+    f.ok(&["restart", "api:2"]);
+    let api2 = f.pids("api");
+    assert_eq!(api2[0], api1[0]);
+    assert_ne!(api2[1], api1[1]);
+
+    // Namespaces as targets: stop both, start one.
+    f.ok(&["stop", "backend"]);
+    f.wait("both stopped", |f| {
+        f.list().iter().all(|a| {
+            a["status"]["stopped"] == true
+                && a["status"]["workers"].as_array().unwrap().iter().all(|w| w["state"] == "STOPPED")
+        })
+    });
+    assert!(f.ok(&["list"]).contains("stopped"));
+    let out = f.ok(&["start", "api"]);
+    assert!(out.contains("online (2/2"), "{out}");
+
+    // Scale relative to now, save, kill everything, resurrect.
+    f.ok(&["scale", "api", "+1"]);
+    f.wait("3 api workers", |f| f.app("api")["status"]["workers_ready"] == 3);
+    let out = f.ok(&["save"]);
+    assert!(out.contains("api: saved (3 workers)") && out.contains("web: saved (1 workers, stopped)"), "{out}");
+    f.ok(&["kill", "--yes"]);
+    f.wait("all offline", |f| f.list().iter().all(|a| a["status"].is_null()));
+    assert!(f.ok(&["list"]).contains("offline"));
+    let out = f.ok(&["resurrect"]);
+    assert!(out.contains("api: online (3/3 workers ready)"), "{out}");
+    assert!(out.contains("web: stopped"), "{out}");
+
+    // describe / env: secrets hidden unless asked.
+    let out = f.ok(&["describe", "api"]);
+    assert!(out.contains("namespace backend") && out.contains("restart") && out.contains("Worker"), "{out}");
+    assert!(!out.contains("s3cret") && out.contains("NODE_ENV=production"), "{out}");
+    let out = f.ok(&["env", "api"]);
+    assert!(out.contains("API_TOKEN=(hidden") && !out.contains("s3cret"), "{out}");
+    assert!(f.ok(&["env", "api", "--show-secrets"]).contains("API_TOKEN=s3cret"));
+
+    // logs, signal, reset.
+    let out = f.ok(&["logs", "api", "--nostream", "--events", "--lines", "50"]);
+    assert!(out.contains("worker ready"), "{out}");
+    f.ok(&["start", "web"]);
+    let out = f.ok(&["logs", "--nostream", "--events"]);
+    assert!(out.lines().any(|l| l.starts_with("api ")) && out.lines().any(|l| l.starts_with("web ")), "{out}");
+    let out = f.ok(&["signal", "SIGCONT", "api:1"]);
+    assert!(out.contains("sent SIGCONT to pid"), "{out}");
+    assert!(f.ok(&["reset", "api"]).contains("reset 3 worker(s)"));
+
+    // The background supervisor writes its own rotated log file.
+    let log = std::fs::read_to_string(f.home.join("state/logs/api.log")).unwrap_or_default();
+    assert!(log.contains("starting application app=api"), "{log}");
+
+    // delete: gone from the list, config kept aside.
+    f.ok(&["delete", "web"]);
+    assert!(f.home.join("deleted/web.toml").is_file());
+    assert!(f.app("web").is_null());
+    let (code, _) = f.cli(&["start", "web"]);
+    assert_eq!(code, 2, "a deleted app is unknown");
 }

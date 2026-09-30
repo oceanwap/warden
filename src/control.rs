@@ -17,9 +17,12 @@ pub enum Request {
     Stop,
     /// Stop all workers and exit the supervisor.
     Shutdown,
-    /// Restart one worker (graceful), or all workers (stop, then start).
+    /// Replace workers one at a time through the health gates (all, or one);
+    /// `hard`: stop every worker, then start them again (PM2's `restart`).
     Restart {
         worker: Option<usize>,
+        #[serde(default)]
+        hard: bool,
     },
     /// Rolling restart: each new worker must pass the gates before the old one
     /// is drained. `safe`: preflight, canary soak with rollback, pauses.
@@ -30,6 +33,28 @@ pub enum Request {
     Scale {
         count: usize,
     },
+    /// Start the workers of a stopped app.
+    Start,
+    /// Clear restart counters and FAILED state (one worker or all), and
+    /// start FAILED workers now.
+    Reset {
+        #[serde(default)]
+        worker: Option<usize>,
+    },
+    /// Send a signal to the workers (or one worker): `SIGUSR2`, `USR2`, `12`.
+    Signal {
+        signal: String,
+        #[serde(default)]
+        worker: Option<usize>,
+    },
+    /// The effective config and paths, with env values hidden unless
+    /// `show_secrets`.
+    Config {
+        #[serde(default)]
+        show_secrets: bool,
+    },
+    /// Empty the in-memory log buffers and truncate the log file.
+    Flush,
     Logs {
         lines: usize,
         follow: bool,
@@ -39,6 +64,9 @@ pub enum Request {
         /// Only Warden's own events, no worker output.
         #[serde(default)]
         events: bool,
+        /// Only worker output on this stream: "stdout" or "stderr".
+        #[serde(default)]
+        stream: Option<String>,
     },
     /// Show or change the log level at runtime (not saved to the config).
     #[serde(rename = "log-level")]
@@ -63,24 +91,42 @@ pub struct Response {
     /// Rollout started by this request; poll `status.last_rollout` for its outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// `config`: the effective config and paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<serde_json::Value>,
 }
 
 impl Response {
     pub fn ok(msg: impl Into<String>) -> Self {
-        Response { ok: true, message: Some(msg.into()), status: None, seq: None }
+        Response { ok: true, message: Some(msg.into()), status: None, seq: None, info: None }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Response { ok: false, message: Some(msg.into()), status: None, seq: None }
+        Response { ok: false, message: Some(msg.into()), status: None, seq: None, info: None }
     }
     pub fn started(msg: impl Into<String>, seq: u64) -> Self {
-        Response { ok: true, message: Some(msg.into()), status: None, seq: Some(seq) }
+        Response { ok: true, message: Some(msg.into()), status: None, seq: Some(seq), info: None }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
     pub app: String,
+    #[serde(default)]
+    pub namespace: String,
     pub mode: String,
+    /// The config file this supervisor was started with.
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// systemd unit running this supervisor (`warden@api.service`), if any.
+    #[serde(default)]
+    pub unit: Option<String>,
+    /// `warden stop`: workers stopped on request, supervisor idle.
+    #[serde(default)]
+    pub stopped: bool,
+    #[serde(default)]
+    pub log_file: Option<String>,
+    #[serde(default)]
+    pub version: String,
     pub pid: u32,
     pub uptime_secs: u64,
     pub workers_configured: usize,
@@ -275,8 +321,8 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
         }
     };
     match req {
-        Request::Logs { lines, follow, worker, events } => {
-            let keep = |l: &str| log_filter(l, worker.as_deref(), events);
+        Request::Logs { lines, follow, worker, events, stream } => {
+            let keep = |l: &str| log_filter(l, worker.as_deref(), events) && stream_filter(l, stream.as_deref());
             // Subscribe first so nothing is lost between the snapshot and the stream.
             let mut rx = crate::logging::subscribe();
             let recent = crate::logging::recent_matching(lines, &keep);
@@ -301,6 +347,11 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
                     Err(_) => return Ok(()),
                 }
             }
+        }
+        Request::Flush => {
+            crate::logging::clear();
+            crate::info!("logs flushed on request");
+            reply(&mut w, &Response::ok("log buffer emptied and log file truncated")).await
         }
         Request::LogLevel { level } => {
             let old = crate::logging::level();
@@ -362,6 +413,14 @@ pub fn log_filter(line: &str, worker: Option<&str>, events_only: bool) -> bool {
             line.match_indices(&needle)
                 .any(|(i, _)| matches!(line.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\n')))
         }
+    }
+}
+
+/// `--out` / `--err`: only worker output lines on that stream.
+pub fn stream_filter(line: &str, stream: Option<&str>) -> bool {
+    match stream {
+        None => true,
+        Some(s) => line.contains(" OUT   worker=") && line.contains(&format!(" {s}: ")),
     }
 }
 
@@ -449,7 +508,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&Request::Status).unwrap(), r#"{"cmd":"status"}"#);
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"cmd":"restart","worker":2}"#).unwrap(),
-            Request::Restart { worker: Some(2) }
+            Request::Restart { worker: Some(2), hard: false }
         );
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"cmd":"scale","count":3}"#).unwrap(),
@@ -458,7 +517,7 @@ mod tests {
         // Older clients send logs without the filter fields.
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"cmd":"logs","lines":5,"follow":false}"#).unwrap(),
-            Request::Logs { lines: 5, follow: false, worker: None, events: false }
+            Request::Logs { lines: 5, follow: false, worker: None, events: false, stream: None }
         );
         assert_eq!(
             serde_json::to_string(&Request::LogLevel { level: Some(crate::config::Level::Debug) }).unwrap(),

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub app: App,
@@ -32,7 +32,7 @@ pub struct Config {
     pub control: Control,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct App {
     pub name: String,
@@ -53,16 +53,19 @@ pub struct App {
     /// Inject Warden's Bun shim (reusePort, readiness, drain).
     /// Default: on when `command` is `bun`.
     pub shim: Option<bool>,
+    /// Group name for fleet commands (`warden reload backend`), like PM2's
+    /// namespace. Default: "default".
+    pub namespace: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Process,
     Worker,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PortStrategy {
     /// All workers bind the same port with SO_REUSEPORT.
@@ -71,7 +74,7 @@ pub enum PortStrategy {
     Offset,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Workers {
     pub count: usize,
@@ -81,7 +84,7 @@ pub struct Workers {
     pub ready_timeout: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Restart {
     pub enabled: bool,
@@ -97,7 +100,7 @@ pub struct Restart {
     pub failed_cooldown: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Shutdown {
     /// Seconds to wait for workers to exit before SIGKILL.
@@ -107,7 +110,7 @@ pub struct Shutdown {
     pub drain_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnHealthFailure {
     /// Only log and export the metric.
@@ -118,7 +121,7 @@ pub enum OnHealthFailure {
     Reload,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Health {
     pub enabled: bool,
@@ -148,7 +151,7 @@ pub struct Health {
 
 /// Gates every replacement worker must pass before the one it replaces is
 /// drained (reload, safe-reload, restart N, health/memory/lifetime recycling).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Reload {
     /// Consecutive health passes on the new worker's private socket. 0 = listening is enough.
@@ -172,7 +175,7 @@ pub struct Reload {
 
 /// Liveness: the shim sends a heartbeat from each worker's event loop. No
 /// heartbeat for `timeout` seconds = hung worker, killed and restarted.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Watchdog {
     /// Seconds. 0 disables the watchdog.
@@ -180,7 +183,7 @@ pub struct Watchdog {
 }
 
 /// Graceful recycling (zero downtime: replacement first).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
     /// MB of RSS per worker process (worker mode: the host process). 0 = off.
@@ -199,7 +202,7 @@ pub enum Level {
     Error = 3,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Logging {
     pub level: Level,
@@ -209,27 +212,36 @@ pub struct Logging {
     /// prefix and into `warden logs`. "inherit": workers write straight to
     /// Warden's stdout — for very chatty apps.
     pub worker_output: WorkerOutput,
+    /// Also write the log to this file, rotated by size (for people who
+    /// `tail -f` log files, as with PM2). Default: stdout only (journald).
+    pub file: Option<PathBuf>,
+    /// Rotate `file` when it reaches this size.
+    pub file_max_mb: u64,
+    /// Rotated files kept (`file.1` … `file.N`).
+    pub file_keep: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerOutput {
     Capture,
     Inherit,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Metrics {
     /// e.g. "127.0.0.1:9464". Prometheus text format at /metrics.
     pub listen: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Control {
-    /// Unix socket for the CLI. Default: $XDG_RUNTIME_DIR/warden/<name>.sock
-    /// or /tmp/warden-<uid>/<name>.sock.
+    /// Unix socket for the CLI. Default: `<runtime dir>/<name>/control.sock`,
+    /// where the runtime dir is /run/warden for root (systemd's
+    /// RuntimeDirectory=warden/%i), else $XDG_RUNTIME_DIR/warden or
+    /// /tmp/warden-<uid>; $WARDEN_RUNTIME_DIR overrides it.
     pub socket: Option<PathBuf>,
 }
 
@@ -303,7 +315,14 @@ impl Default for Watchdog {
 
 impl Default for Logging {
     fn default() -> Self {
-        Self { level: Level::Info, timestamps: None, worker_output: WorkerOutput::Capture }
+        Self {
+            level: Level::Info,
+            timestamps: None,
+            worker_output: WorkerOutput::Capture,
+            file: None,
+            file_max_mb: 10,
+            file_keep: 5,
+        }
     }
 }
 
@@ -335,6 +354,20 @@ impl Config {
         }
         if a.command.is_empty() {
             return Err("app.command must not be empty".into());
+        }
+        if let Some(ns) = &a.namespace {
+            if ns.is_empty() || !ns.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
+                return Err("app.namespace must be non-empty and contain only [A-Za-z0-9._-]".into());
+            }
+            if ns == "all" {
+                return Err("app.namespace cannot be \"all\" (that targets every app)".into());
+            }
+        }
+        if a.name == "all" {
+            return Err("app.name cannot be \"all\" (that targets every app)".into());
+        }
+        if self.logging.file_max_mb == 0 {
+            return Err("logging.file_max_mb must be at least 1".into());
         }
         if self.workers.count == 0 || self.workers.count > 1024 {
             return Err("workers.count must be between 1 and 1024".into());
@@ -439,7 +472,7 @@ impl Config {
     fn check_bounds(&self) -> Result<(), String> {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86_400;
-        let checks: [(&str, u64, u64); 21] = [
+        let checks: [(&str, u64, u64); 23] = [
             ("workers.ready_timeout", self.workers.ready_timeout, HOUR),
             ("restart.max_restarts", self.restart.max_restarts as u64, 10_000),
             ("restart.restart_window", self.restart.restart_window, 30 * DAY),
@@ -461,6 +494,8 @@ impl Config {
             ("watchdog.timeout", self.watchdog.timeout, DAY),
             ("limits.max_memory", self.limits.max_memory, 1 << 20),
             ("limits.max_lifetime", self.limits.max_lifetime, 365 * DAY),
+            ("logging.file_max_mb", self.logging.file_max_mb, 100_000),
+            ("logging.file_keep", self.logging.file_keep as u64, 1000),
         ];
         for (name, value, max) in checks {
             if value > max {
@@ -515,7 +550,7 @@ impl Config {
     pub fn socket_path(&self) -> PathBuf {
         match &self.control.socket {
             Some(p) => p.clone(),
-            None => runtime_dir().join(format!("{}.sock", self.app.name)),
+            None => app_runtime_dir(&self.app.name).join("control.sock"),
         }
     }
 }
@@ -542,7 +577,7 @@ pub fn socket_path_lenient(path: &Path) -> Option<PathBuf> {
             _ => {}
         }
     }
-    socket.or_else(|| name.map(|n| runtime_dir().join(format!("{n}.sock"))))
+    socket.or_else(|| name.map(|n| app_runtime_dir(&n).join("control.sock")))
 }
 
 pub fn is_bun(command: &str) -> bool {
@@ -550,13 +585,25 @@ pub fn is_bun(command: &str) -> bool {
 }
 
 /// Directory for the control socket and the embedded JS files.
+/// Where every app's runtime directory lives (sockets, shim).
 pub fn runtime_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("WARDEN_RUNTIME_DIR") {
+        return PathBuf::from(d);
+    }
+    // SAFETY: geteuid / getuid never fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return PathBuf::from("/run/warden");
+    }
     if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(d).join("warden");
     }
-    // SAFETY: getuid never fails.
     let uid = unsafe { libc::getuid() };
     std::env::temp_dir().join(format!("warden-{uid}"))
+}
+
+/// One app's runtime directory: matches systemd's `RuntimeDirectory=warden/%i`.
+pub fn app_runtime_dir(name: &str) -> PathBuf {
+    runtime_dir().join(name)
 }
 
 #[cfg(test)]
@@ -741,7 +788,7 @@ level = "info"
         assert!(Config::load(&f).is_err());
         assert_eq!(socket_path_lenient(&f), Some(PathBuf::from("/run/warden/api.sock")));
         std::fs::write(&f, "[app]\nname = \"api\" # comment\n[workers\n").unwrap();
-        assert_eq!(socket_path_lenient(&f), Some(runtime_dir().join("api.sock")));
+        assert_eq!(socket_path_lenient(&f), Some(runtime_dir().join("api").join("control.sock")));
     }
 
     #[test]
