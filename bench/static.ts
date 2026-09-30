@@ -20,6 +20,7 @@ import { join } from "node:path";
 import {
   BIN, TMP, WARDEN, baseEnv, childrenOf, listenersOnPort, machine, mb, oha, parseArgs, pkgVersion,
   pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor, type LoadResult,
+  onAppCpus,
 } from "./lib.ts";
 
 const args = parseArgs();
@@ -71,7 +72,7 @@ async function startWarden(): Promise<Running> {
     `[app]\nname = "bench-static"\nport = ${PORT}\n[workers]\ncount = ${WORKERS}\n[static]\nroot = ${JSON.stringify(SITE)}\n` +
       `[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(join(TMP, "warden-static.sock"))}\n`,
   );
-  const w = spawn([WARDEN, "start", "-c", cfg], { env: baseEnv, stdout: "ignore", stderr: "ignore" });
+  const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
   return {
     pids: () => [w.pid, ...childrenOf(w.pid)],
     managerPids: () => [w.pid],
@@ -108,7 +109,7 @@ http {
 }
 `,
   );
-  const n = spawn([nginx, "-c", conf, "-p", dir], { env: baseEnv, stdout: "ignore", stderr: "ignore" });
+  const n = spawn(onAppCpus([nginx, "-c", conf, "-p", dir]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
   return {
     pids: () => [n.pid, ...childrenOf(n.pid)],
     managerPids: () => [n.pid],
@@ -135,7 +136,7 @@ async function startPm2Serve(): Promise<Running> {
     `module.exports = { apps: [{ name: "static", script: "serve", exec_mode: "cluster", instances: ${WORKERS},
       env: { PM2_SERVE_PATH: ${JSON.stringify(SITE)}, PM2_SERVE_PORT: ${PORT} } }] };`,
   );
-  const r = spawnSync([pm2, "start", eco], { env, stdout: "ignore", stderr: "pipe" });
+  const r = spawnSync(onAppCpus([pm2, "start", eco]), { env, stdout: "ignore", stderr: "pipe" });
   if (r.exitCode !== 0) throw new Error("pm2 start failed: " + r.stderr.toString());
   const daemon = () => {
     try {
@@ -156,7 +157,7 @@ async function startPm2Serve(): Promise<Running> {
 async function startServe(): Promise<Running> {
   const main = join(TMP, "..", "node_modules/serve/build/main.js");
   if (!existsSync(main)) throw new Error("run `cd bench && npm install` first (serve)");
-  const s = spawn(["node", main, "-l", `tcp://127.0.0.1:${PORT}`, "--no-clipboard", "--no-request-logging", SITE], {
+  const s = spawn(onAppCpus(["node", main, "-l", `tcp://127.0.0.1:${PORT}`, "--no-clipboard", "--no-request-logging", SITE]), {
     env: baseEnv,
     stdout: "ignore",
     stderr: "ignore",

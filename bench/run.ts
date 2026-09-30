@@ -13,6 +13,7 @@
 //
 // Scenarios:
 //   bare            N copies started directly (what N systemd units would do)
+//   shim            the same, with Warden's shim loaded as under Warden: its cost alone
 //   pm2             PM2 the usual way: cluster mode for Node, fork mode for Bun
 //   watt            Platformatic Watt (wattpm), N worker threads (Node only)
 //   warden-process  Warden, N worker processes
@@ -28,6 +29,7 @@ import { join } from "node:path";
 import {
   BIN, ROOT, SHIM, TMP, WARDEN, baseEnv, cpuSeconds, listenersOnPort, machine, mb, oha as ohaRaw,
   parseArgs, pkgVersion, pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor,
+  onAppCpus,
 } from "./lib.ts";
 
 const args = parseArgs();
@@ -172,16 +174,21 @@ interface Running {
 }
 
 const runtimeBin = app.runtime === "bun" ? "bun" : "node";
-function appArgs(): string[] {
-  if (!app.needsShim) return [app.entry];
+function appArgs(withShim = app.needsShim): string[] {
+  if (!withShim) return [app.entry];
   return app.runtime === "bun" ? [`--preload=${SHIM}`, app.entry] : [`--import=${SHIM}`, app.entry];
 }
 const appEnv = { ...baseEnv, PORT: String(PORT), WARDEN_REUSE_PORT: "1", WARDEN_DRAIN_MS: "0" };
 
-async function startBare(): Promise<Running> {
+/** `shim`: the same bare processes with Warden's shim loaded as under
+ *  Warden (heartbeat on, drain hooks, reusePort): its cost in isolation. */
+async function startBare(shim = false): Promise<Running> {
   const procs: Subprocess[] = [];
   for (let i = 0; i < WORKERS; i++) {
-    procs.push(spawn([runtimeBin, ...appArgs()], { cwd: app.cwd, env: appEnv, stdout: "ignore", stderr: "ignore" }));
+    const env = shim
+      ? { ...appEnv, WARDEN_WORKER_ID: String(i + 1), WARDEN_HEARTBEAT_MS: "1000", WARDEN_DRAIN_MS: "500", WARDEN_APP: "bench" }
+      : appEnv;
+    procs.push(spawn(onAppCpus([runtimeBin, ...appArgs(shim || app.needsShim)]), { cwd: app.cwd, env, stdout: "ignore", stderr: "ignore" }));
   }
   return {
     appPids: async () => procs.filter((p) => p.exitCode === null).map((p) => p.pid),
@@ -214,7 +221,7 @@ async function startPm2(): Promise<Running> {
       exec_mode: ${JSON.stringify(cluster ? "cluster" : "fork")}, instances: ${WORKERS}, autorestart: true, restart_delay: 0,
       env: ${JSON.stringify({ PORT: String(PORT), WARDEN_REUSE_PORT: "1", WARDEN_DRAIN_MS: "0", ...(cluster ? { BENCH_NO_REUSEPORT: "1" } : {}) })} }] };`,
   );
-  const r = spawnSync([pm2, "start", eco], { env, stdout: "ignore", stderr: "pipe" });
+  const r = spawnSync(onAppCpus([pm2, "start", eco]), { env, stdout: "ignore", stderr: "pipe" });
   if (r.exitCode !== 0) throw new Error("pm2 start failed: " + r.stderr.toString());
   const jlist = () => JSON.parse(spawnSync([pm2, "jlist"], { env }).stdout.toString() || "[]") as any[];
   const daemon = () => {
@@ -264,7 +271,7 @@ async function startWatt(): Promise<Running> {
   writeFileSync(join(dir, "app/watt.json"), JSON.stringify({ $schema: "https://schemas.platformatic.dev/@platformatic/node/3.71.0.json" }));
   writeFileSync(join(dir, "app/entry.mjs"), `import ${JSON.stringify(app.entry)};\n`);
   symlinkSync(join(ROOT, "bench/node_modules"), join(dir, "node_modules"));
-  const w = spawn([wattpm, "start", dir], { cwd: dir, env: { ...baseEnv, PORT: String(PORT) }, stdout: "ignore", stderr: "ignore" });
+  const w = spawn(onAppCpus([wattpm, "start", dir]), { cwd: dir, env: { ...baseEnv, PORT: String(PORT) }, stdout: "ignore", stderr: "ignore" });
   return {
     // One process: the runtime and its worker threads.
     appPids: async () => [w.pid],
@@ -296,7 +303,7 @@ async function startWarden(mode: "process" | "worker"): Promise<Running> {
       `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n` +
       `[shutdown]\ngrace_period = 10\ndrain_ms = 0\n[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(sock)}\n`,
   );
-  const w = spawn([WARDEN, "start", "-c", cfg], { env: baseEnv, stdout: "ignore", stderr: "ignore" });
+  const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
   const status = () => {
     const r = spawnSync([WARDEN, "status", "--json", "--socket", sock]);
     return r.exitCode === 0 ? JSON.parse(r.stdout.toString()) : null;
@@ -320,6 +327,8 @@ function start(name: string): Promise<Running> {
   switch (name) {
     case "bare":
       return startBare();
+    case "shim":
+      return startBare(true);
     case "pm2":
       return startPm2();
     case "watt":

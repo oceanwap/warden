@@ -18,7 +18,7 @@
 import { spawn, spawnSync } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { BIN, ROOT, TMP, WARDEN, baseEnv, cpuSeconds, machine, mb, parseArgs, pkgVersion, rss, saveResults, sleep, table, version } from "./lib.ts";
+import { BIN, ROOT, TMP, WARDEN, baseEnv, cpuSeconds, machine, mb, parseArgs, pkgVersion, rss, saveResults, sleep, table, version, onAppCpus } from "./lib.ts";
 
 const args = parseArgs();
 const WORKERS = Number(args.workers ?? 4);
@@ -65,7 +65,7 @@ async function startWarden(load: Load, done: string, keepAll = false): Promise<R
       (keepAll ? "max_lines_per_sec = 0\n" : "") +
       `[control]\nsocket = ${JSON.stringify(join(DIR, "w.sock"))}\n`,
   );
-  const w = spawn([WARDEN, "start", "-c", cfg], { env: baseEnv, stdout: "ignore", stderr: "ignore" });
+  const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
   return {
     manager: () => [w.pid],
     logFiles: () => [out],
@@ -89,7 +89,7 @@ async function startPm2(load: Load, done: string): Promise<Running> {
       exec_mode: "fork", instances: ${load.workers},
       env: ${JSON.stringify({ ...load.env, LOG_DONE_DIR: done })} }] };`,
   );
-  const r = spawnSync([pm2, "start", eco], { env, stdout: "ignore", stderr: "pipe" });
+  const r = spawnSync(onAppCpus([pm2, "start", eco]), { env, stdout: "ignore", stderr: "pipe" });
   if (r.exitCode !== 0) throw new Error("pm2 start failed: " + r.stderr.toString());
   const daemon = () => {
     try {

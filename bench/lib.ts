@@ -112,13 +112,41 @@ export interface LoadResult {
   errors: number;
 }
 
-/** oha against `url` for `seconds`. */
+// Where things run and what generates the load, for every suite:
+//   --app-cpus 0-3        pin the apps and their manager to these CPUs (taskset)
+//   --loadgen-cpus 4-7    pin the load generator to these CPUs
+//   --loadgen oha|wrk     oha (default) or wrk (lighter: more headroom on small machines)
+// (or BENCH_APP_CPUS, BENCH_LOADGEN_CPUS, BENCH_LOADGEN in the environment).
+const globalArgs = parseArgs();
+export const APP_CPUS: string | undefined = globalArgs["app-cpus"] ?? process.env.BENCH_APP_CPUS;
+export const LOADGEN_CPUS: string | undefined = globalArgs["loadgen-cpus"] ?? process.env.BENCH_LOADGEN_CPUS;
+export const LOADGEN: string = globalArgs["loadgen"] ?? process.env.BENCH_LOADGEN ?? "oha";
+if (LOADGEN !== "oha" && LOADGEN !== "wrk") throw new Error(`--loadgen ${LOADGEN}: oha or wrk`);
+
+/** `cmd` pinned to the app CPUs (children inherit the affinity). */
+export const onAppCpus = (cmd: string[]) => (APP_CPUS ? ["taskset", "-c", APP_CPUS, ...cmd] : cmd);
+const onLoadgenCpus = (cmd: string[]) => (LOADGEN_CPUS ? ["taskset", "-c", LOADGEN_CPUS, ...cmd] : cmd);
+
+/** CPUs in a taskset list like "0-3,6". */
+function cpuCount(list: string | undefined): number {
+  if (!list) return navigator.hardwareConcurrency;
+  return list.split(",").reduce((n, part) => {
+    const [a, b] = part.split("-").map(Number);
+    return n + (b === undefined ? 1 : b - a + 1);
+  }, 0);
+}
+
+/** A load test against `url` for `seconds` with the configured generator. */
 export function oha(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] } = {}): LoadResult {
+  return LOADGEN === "wrk" ? wrk(url, seconds, connections, opts) : ohaRun(url, seconds, connections, opts);
+}
+
+function ohaRun(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] }): LoadResult {
   const cmd = ["oha", "-z", `${seconds}s`, "-c", String(connections), "--no-tui", "--output-format", "json"];
   if (opts.keepalive === false) cmd.push("--disable-keepalive");
   for (const h of opts.headers ?? []) cmd.push("-H", h);
   cmd.push(url);
-  const r = spawnSync(cmd, { stdout: "pipe", stderr: "pipe" });
+  const r = spawnSync(onLoadgenCpus(cmd), { stdout: "pipe", stderr: "pipe" });
   const j = JSON.parse(r.stdout.toString());
   const ok = j.statusCodeDistribution?.["200"] ?? 0;
   // oha cancels the requests still in flight when -z expires; those are not errors.
@@ -134,6 +162,40 @@ export function oha(url: string, seconds: number, connections: number, opts: { k
     mb_per_s: +((j.summary.sizePerSec ?? 0) / 1048576).toFixed(1),
     ok,
     errors,
+  };
+}
+
+// wrk prints its summary as text; this script prints the exact numbers.
+const WRK_REPORT = `done = function(s, lat, req)
+  local e = s.errors
+  io.write(string.format('WRKJSON {"requests":%d,"bytes":%d,"duration_us":%d,"errors":%d,"non2xx":%d,"p50":%d,"p95":%d,"p99":%d}\\n',
+    s.requests, s.bytes, s.duration, e.connect + e.read + e.write + e.timeout, e.status,
+    lat:percentile(50), lat:percentile(95), lat:percentile(99)))
+end
+`;
+
+function wrk(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] }): LoadResult {
+  const script = join(TMP, "wrk-report.lua");
+  mkdirSync(TMP, { recursive: true });
+  writeFileSync(script, WRK_REPORT);
+  const threads = Math.max(1, Math.min(cpuCount(LOADGEN_CPUS), connections));
+  const cmd = ["wrk", "-t", String(threads), "-c", String(connections), "-d", `${seconds}s`, "--timeout", "2s", "-s", script];
+  if (opts.keepalive === false) cmd.push("-H", "Connection: close");
+  for (const h of opts.headers ?? []) cmd.push("-H", h);
+  cmd.push(url);
+  const r = spawnSync(onLoadgenCpus(cmd), { stdout: "pipe", stderr: "pipe" });
+  const line = r.stdout.toString().split("\n").find((l) => l.startsWith("WRKJSON "));
+  if (!line) throw new Error(`wrk failed: ${r.stderr.toString() || r.stdout.toString()}`);
+  const j = JSON.parse(line.slice("WRKJSON ".length));
+  const secs = j.duration_us / 1e6;
+  return {
+    rps: Math.round(j.requests / secs),
+    p50_ms: +(j.p50 / 1000).toFixed(2),
+    p95_ms: +(j.p95 / 1000).toFixed(2),
+    p99_ms: +(j.p99 / 1000).toFixed(2),
+    mb_per_s: +(j.bytes / secs / 1048576).toFixed(1),
+    ok: j.requests - j.non2xx,
+    errors: j.errors + j.non2xx,
   };
 }
 
@@ -163,6 +225,9 @@ export function machine() {
     cpus: navigator.hardwareConcurrency,
     cpu_model: (readFileSync("/proc/cpuinfo", "utf8").match(/model name\s*:\s*(.*)/) ?? [])[1] ?? "unknown",
     warden: version([WARDEN, "version"]),
+    loadgen: LOADGEN === "wrk" ? version(["wrk", "--version"]).split(" [")[0] : version(["oha", "--version"]),
+    app_cpus: APP_CPUS ?? "all",
+    loadgen_cpus: LOADGEN_CPUS ?? "all",
     tcp_migrate_req: existsSync("/proc/sys/net/ipv4/tcp_migrate_req")
       ? readFileSync("/proc/sys/net/ipv4/tcp_migrate_req", "utf8").trim()
       : "n/a",
