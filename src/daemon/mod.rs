@@ -1250,7 +1250,7 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
-    use super::{already_resurrected, boot_id};
+    use super::already_resurrected;
 
     #[test]
     fn resurrect_runs_once_per_boot() {
@@ -1264,8 +1264,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn boot_id_is_stable_within_a_boot() {
-        let a = boot_id().expect("Linux has a boot id");
+        let a = super::boot_id().expect("Linux has a boot id");
         assert_eq!(a.len(), 36, "{a}");
-        assert_eq!(boot_id().as_deref(), Some(a.as_str()));
+        assert_eq!(super::boot_id().as_deref(), Some(a.as_str()));
     }
 }
