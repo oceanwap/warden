@@ -12,7 +12,6 @@
 //! default, request heads are capped at 16 KB and must arrive within 10 s.
 
 use crate::config::Static;
-use std::os::fd::FromRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -81,62 +80,10 @@ pub fn main() -> i32 {
     }
 }
 
-/// A TCP listener with SO_REUSEPORT (std can't set it before bind).
 fn reuseport_listener(host: &str, port: u16, reuse_port: bool) -> Result<std::net::TcpListener, String> {
     let ip: std::net::IpAddr = host.parse().map_err(|_| format!("static.host {host:?} is not an IP address"))?;
     let addr = std::net::SocketAddr::new(ip, port);
-    let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
-    // SAFETY: plain socket syscalls on a descriptor we own; closed on error.
-    unsafe {
-        let fd = libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0);
-        if fd < 0 {
-            return Err(format!("socket: {}", std::io::Error::last_os_error()));
-        }
-        let one: libc::c_int = 1;
-        let set = |opt| libc::setsockopt(fd, libc::SOL_SOCKET, opt, &one as *const _ as *const libc::c_void, 4);
-        set(libc::SO_REUSEADDR);
-        if reuse_port {
-            set(libc::SO_REUSEPORT);
-        }
-        let (sa, len) = sockaddr(&addr);
-        if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, len) != 0 || libc::listen(fd, 1024) != 0 {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(format!("cannot listen on {addr}: {e}"));
-        }
-        Ok(std::net::TcpListener::from_raw_fd(fd))
-    }
-}
-
-fn sockaddr(addr: &std::net::SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    // SAFETY: zeroed sockaddr_storage is a valid value; we fill the variant we use.
-    let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        std::net::SocketAddr::V4(a) => {
-            let sin = libc::sockaddr_in {
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: sockaddr_in fits in sockaddr_storage.
-            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in, sin) };
-            std::mem::size_of::<libc::sockaddr_in>()
-        }
-        std::net::SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: 0,
-                sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
-                sin6_scope_id: 0,
-            };
-            // SAFETY: sockaddr_in6 fits in sockaddr_storage.
-            unsafe { std::ptr::write(&mut ss as *mut _ as *mut libc::sockaddr_in6, sin6) };
-            std::mem::size_of::<libc::sockaddr_in6>()
-        }
-    };
-    (ss, len as libc::socklen_t)
+    crate::sys::listen_tcp(addr, reuse_port, 1024).map_err(|e| format!("cannot listen on {addr}: {e}"))
 }
 
 /// One JSON line to Warden on the IPC pipe (fd from WARDEN_IPC_FD).
@@ -144,10 +91,8 @@ fn report(msg: serde_json::Value) {
     let Some(fd) = std::env::var("WARDEN_IPC_FD").ok().and_then(|v| v.parse::<i32>().ok()) else { return };
     let mut line = msg.to_string();
     line.push('\n');
-    // SAFETY: write(2) on the inherited pipe; a failure only loses the message.
-    unsafe {
-        libc::write(fd, line.as_ptr() as *const libc::c_void, line.len());
-    }
+    // A lost message only delays readiness/heartbeat; Warden handles that.
+    let _ = crate::sys::write_fd(fd, line.as_bytes());
 }
 
 async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
@@ -290,29 +235,22 @@ async fn sendfile_all(
     offset: u64,
     count: u64,
 ) -> std::io::Result<u64> {
-    use std::os::fd::AsRawFd;
-    let (out_fd, in_fd) = (sock.as_raw_fd(), file.as_raw_fd());
-    let mut off: libc::off_t = offset as libc::off_t;
+    use std::os::fd::AsFd;
+    let mut off = offset as i64;
     let mut left = count;
     while left > 0 {
         sock.writable().await?;
         let chunk = left.min(1 << 30) as usize;
         let res = sock.try_io(tokio::io::Interest::WRITABLE, || {
-            // SAFETY: both fds are open for the whole call (`sock` and `file`
-            // are borrowed, so neither can be closed or reused meanwhile);
-            // `off` is a valid, exclusively borrowed off_t. sendfile only
-            // reads the file and writes the socket; it touches no Rust memory
-            // besides `off`.
-            let n = unsafe { libc::sendfile(out_fd, in_fd, &mut off, chunk) };
-            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as u64) }
+            crate::sys::sendfile(sock.as_fd(), file.as_fd(), &mut off, chunk)
         });
         match res {
+            // The file shrank under us: the promised Content-Length can't be
+            // met, so the connection must close.
             Ok(0) => {
-                // The file shrank under us: the promised Content-Length can't
-                // be met, so the connection must close.
                 return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file truncated while sending"));
             }
-            Ok(n) => left -= n.min(left),
+            Ok(n) => left -= (n as u64).min(left),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }

@@ -42,8 +42,7 @@ fn home() -> Option<PathBuf> {
 }
 
 fn is_root() -> bool {
-    // SAFETY: geteuid never fails.
-    unsafe { libc::geteuid() == 0 }
+    crate::sys::is_root()
 }
 
 fn user_dir(xdg: &str, fallback: &str) -> PathBuf {
@@ -552,8 +551,7 @@ async fn logs(
         return logs_history(sels, lines, query, json).await;
     }
     // Like PM2: stream by default on a terminal; print and exit when piped.
-    // SAFETY: isatty has no preconditions.
-    let follow = follow.unwrap_or_else(|| unsafe { libc::isatty(1) == 1 });
+    let follow = follow.unwrap_or_else(|| crate::sys::isatty(1));
     let lines = lines.unwrap_or(15);
     // Text / time / level filters run here; ask for more so N survive them.
     let fetch = if query.is_filtering() { 4000 } else { lines };
@@ -1168,13 +1166,12 @@ fn spawn_background(name: &str, cfg: &Path) -> Result<std::process::Child, Strin
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(err);
-    // SAFETY: setsid is async-signal-safe; it detaches from our terminal and
-    // process group so Ctrl-C here or closing the shell does not reach it.
+    // SAFETY: the closure only calls setsid (async-signal-safe): it detaches
+    // from our terminal and process group, so Ctrl-C here or closing the
+    // shell does not reach the supervisor.
+    #[allow(unsafe_code)]
     unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+        cmd.pre_exec(crate::sys::child_new_session);
     }
     cmd.spawn().map_err(|e| format!("starting the supervisor: {e}"))
 }
@@ -1434,8 +1431,7 @@ pub async fn kill(args: &Args) -> i32 {
         println!("no app is running");
         return 0;
     }
-    // SAFETY: isatty has no preconditions.
-    if !args.yes && unsafe { libc::isatty(0) == 1 } {
+    if !args.yes && crate::sys::isatty(0) {
         let names: Vec<&str> = running.iter().map(|s| s.app.name.as_str()).collect();
         eprint!("Stop {} app(s): {}? [y/N] ", names.len(), names.join(", "));
         let mut answer = String::new();
@@ -1695,8 +1691,7 @@ pub async fn unstartup(args: &Args) -> i32 {
 // -------------------------------------------------------------------- top
 
 pub async fn top(args: &Args) -> i32 {
-    // SAFETY: isatty has no preconditions.
-    let tty = unsafe { libc::isatty(1) == 1 };
+    let tty = crate::sys::isatty(1);
     loop {
         let ctx = context(args);
         let apps: Vec<App> = match resolve(&ctx, args.target.as_deref(), false) {

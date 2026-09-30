@@ -6,7 +6,7 @@
 //! and its pid cannot have been reused.
 
 use serde::Deserialize;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
@@ -103,22 +103,14 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         cmd.env(k, v);
     }
     cmd.env("WARDEN_IPC_FD", IPC_FD.to_string());
-    // SAFETY: only async-signal-safe libc calls between fork and exec.
+    // SAFETY: the closure only calls the async-signal-safe helpers in
+    // `sys` (dup2, fcntl, prctl): no allocation or locking after fork.
+    #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
-            if libc::dup2(write_fd, IPC_FD) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if write_fd == IPC_FD {
-                // dup2 onto itself keeps FD_CLOEXEC; clear it so the fd survives exec.
-                libc::fcntl(IPC_FD, libc::F_SETFD, 0);
-            }
-            #[cfg(target_os = "linux")]
-            {
-                // If Warden dies without cleaning up (SIGKILL), take the workers with it.
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            }
-            Ok(())
+            crate::sys::child_dup_ipc(write_fd, IPC_FD)?;
+            // If Warden dies without cleaning up (SIGKILL), take the workers with it.
+            crate::sys::child_parent_death_signal(libc::SIGTERM)
         });
     }
     let mut child = cmd.spawn()?;
@@ -185,16 +177,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                     st = child.wait() => break st,
                     Some((sig, to_group)) = ctl_rx.recv() => {
                         // child.id() is None once reaped; never signal a reused pid.
+                        // The group contains the process itself: signal once.
                         if let Some(p) = child.id() {
-                            let p = p as i32;
-                            // SAFETY: plain kill(2).
-                            // The group contains the process itself: signal once.
-                            unsafe {
-                                let group = to_group && libc::kill(-p, sig) == 0;
-                                if !group {
-                                    libc::kill(p, sig);
-                                }
-                            }
+                            crate::sys::signal_child(p, sig, to_group);
                         }
                     }
                 }
@@ -220,13 +205,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                 // an orphan (tokio reaps it later), so the pid is still ours:
                 // kill the group now, then report the exit so crash handling
                 // starts a fresh worker instead of the slot looking alive forever.
-                if pid > 0 {
-                    // SAFETY: plain kill(2) on our still-unreaped child.
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                        libc::kill(pid as i32, libc::SIGKILL);
-                    }
-                }
+                // Our still-unreaped child: its pid can't have been reused.
+                crate::sys::signal_child(pid, libc::SIGKILL, true);
+                crate::sys::signal_child(pid, libc::SIGKILL, false);
                 crate::error!(
                     "Warden lost track of a worker (its supervising task failed); killed it so it restarts",
                     worker = label,
@@ -240,9 +221,10 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         // Anything the worker left behind in its process group (helpers that
         // ignored SIGTERM) goes with it. The group id can't be reused while any
         // member is alive, so this can only hit the worker's own group.
-        if pid > 0 {
-            // SAFETY: plain kill(2) on our child's process group.
-            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if let Ok(p) = i32::try_from(pid) {
+            if p > 1 {
+                let _ = crate::sys::kill(-p, libc::SIGKILL);
+            }
         }
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note });
     });
@@ -251,24 +233,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
 }
 
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    #[cfg(target_os = "linux")]
-    // SAFETY: fds is a valid 2-element array.
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
-    let rc = unsafe {
-        let rc = libc::pipe(fds.as_mut_ptr());
-        if rc == 0 {
-            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        rc
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: pipe just returned these fds and nothing else owns them.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    crate::sys::pipe_cloexec()
 }
 
 /// Forward a child stream line by line to the log, capping line length.

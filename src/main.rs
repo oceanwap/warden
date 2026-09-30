@@ -1,6 +1,10 @@
 //! warden: a fast, crash-safe supervisor for Bun and Node apps.
 //! See docs/architecture.md for the design and the findings behind it.
 
+// Unsafe code is confined to `sys` (syscall wrappers, each tested) and the
+// two `Command::pre_exec` call sites; everything else is checked by the compiler.
+#![deny(unsafe_code)]
+
 mod cli;
 mod config;
 mod control;
@@ -17,6 +21,8 @@ mod schedule;
 mod signals;
 mod static_server;
 mod supervisor;
+#[allow(unsafe_code)]
+mod sys;
 mod systemd;
 mod worker;
 

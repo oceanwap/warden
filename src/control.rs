@@ -210,8 +210,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("chmod {}: {e}", dir.display()))?;
     }
     let meta = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
+    let euid = crate::sys::euid();
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(format!("{} must be a real directory, not a symlink", dir.display()));
     }

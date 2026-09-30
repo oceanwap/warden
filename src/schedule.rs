@@ -136,12 +136,7 @@ impl Cron {
 }
 
 fn local(secs: i64) -> Option<libc::tm> {
-    let t: libc::time_t = secs as libc::time_t;
-    // SAFETY: localtime_r writes into the tm we own and reads only `t`.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() { None } else { Some(tm) }
-    }
+    crate::sys::localtime(secs)
 }
 
 #[cfg(test)]

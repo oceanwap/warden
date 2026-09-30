@@ -18,9 +18,8 @@ pub fn proc_stats(pid: u32) -> Option<ProcStats> {
         let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let ticks = parse_stat_cpu_ticks(&stat)?;
-        // SAFETY: sysconf has no preconditions.
-        let (page, hz) = unsafe { (libc::sysconf(libc::_SC_PAGESIZE), libc::sysconf(libc::_SC_CLK_TCK)) };
-        Some(ProcStats { rss_bytes: resident * page.max(1) as u64, cpu_seconds: ticks as f64 / hz.max(1) as f64 })
+        let (page, hz) = (crate::sys::page_size(), crate::sys::clock_ticks());
+        Some(ProcStats { rss_bytes: resident * page, cpu_seconds: ticks as f64 / hz as f64 })
     }
     #[cfg(not(target_os = "linux"))]
     {

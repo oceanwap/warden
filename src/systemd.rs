@@ -37,10 +37,7 @@ pub fn watchdog_requested() -> bool {
 
 /// `RELOADING=1` must carry the monotonic timestamp for `Type=notify-reload`.
 pub fn reloading() {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: valid pointer to a timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    let usec = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000;
+    let usec = crate::sys::monotonic_usec();
     notify(&format!("RELOADING=1\nMONOTONIC_USEC={usec}"));
 }
 

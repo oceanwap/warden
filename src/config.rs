@@ -885,14 +885,13 @@ pub fn runtime_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("WARDEN_RUNTIME_DIR") {
         return PathBuf::from(d);
     }
-    // SAFETY: geteuid / getuid never fail.
-    if unsafe { libc::geteuid() } == 0 {
+    if crate::sys::is_root() {
         return PathBuf::from("/run/warden");
     }
     if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(d).join("warden");
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::sys::uid();
     std::env::temp_dir().join(format!("warden-{uid}"))
 }
 
