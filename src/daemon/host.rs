@@ -132,6 +132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // /proc
     fn samples_this_host() {
         let mut s = Sampler::default();
         let Some(Event::Host { cpu_percent, mem_used_bytes, mem_total_bytes, .. }) = s.sample() else {

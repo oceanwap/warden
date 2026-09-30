@@ -1020,7 +1020,8 @@ pub fn runtime_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     if crate::sys::is_root() {
-        return PathBuf::from("/run/warden");
+        // macOS has no /run (and a read-only /): /var/run is its place for this.
+        return PathBuf::from(if cfg!(target_os = "linux") { "/run/warden" } else { "/var/run/warden" });
     }
     if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(d).join("warden");

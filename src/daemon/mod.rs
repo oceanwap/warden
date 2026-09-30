@@ -702,6 +702,7 @@ impl Daemon {
 
     async fn start(&self, name: &str) -> DaemonReply {
         let found = fleet::discover();
+        let app = found.iter().find(|a| a.name == name).cloned();
         let socket = {
             let mut core = self.core.borrow_mut();
             core.merge(found);
@@ -711,17 +712,101 @@ impl Daemon {
             Some(s) if s.exists() => watcher::poll_status(s).await.ok().map(|st| st.pid),
             _ => None,
         };
+        // An app with a systemd unit is started by systemd, as `warden start` does.
+        if answering.is_none() {
+            if let Some((scope, unit)) = app.as_ref().and_then(fleet::systemd_unit_for) {
+                return start_unit(scope, &unit).await;
+            }
+        }
         self.core.borrow_mut().start(name, answering)
+    }
+
+    /// `--resurrect`: start every app `warden save` recorded that is not
+    /// running, in the background, watched like any other.
+    async fn resurrect(&self) {
+        let saved = match fleet::saved_apps() {
+            Ok(Some(s)) if !s.is_empty() => s,
+            Ok(_) => {
+                crate::info!(
+                    "nothing to resurrect: no app is saved",
+                    hint = "`warden save` records the running apps; wardend --resurrect starts them when it starts",
+                );
+                return;
+            }
+            Err(e) => {
+                crate::error!(
+                    "cannot read the saved apps; resurrecting none",
+                    error = e,
+                    hint = "run `warden save` again to rewrite it (`warden start <app>` starts one meanwhile)",
+                );
+                return;
+            }
+        };
+        for s in saved {
+            if !s.config.is_file() {
+                crate::warn!(
+                    "a saved app's config is gone; not starting it",
+                    app = s.name,
+                    config = s.config.display(),
+                    hint = "`warden save` again to forget it",
+                );
+                continue;
+            }
+            let app = fleet::app_from_config(&s.config);
+            if let Some(p) = &app.problem {
+                crate::error!(
+                    "a saved app's config does not load; not starting it",
+                    app = app.name,
+                    error = p,
+                    hint = format!("fix {}, then `warden start {}`", s.config.display(), app.name),
+                );
+                continue;
+            }
+            if app.socket.exists() && watcher::poll_status(app.socket.clone()).await.is_ok() {
+                crate::debug!("saved app already running", app = app.name);
+                continue;
+            }
+            let mut core = self.core.borrow_mut();
+            let name: Arc<str> = app.name.as_str().into();
+            core.apps.entry(name.clone()).or_insert_with(|| Rec::new(&app));
+            if let Ok(pid) = core.spawn(&name, &s.config, false) {
+                crate::info!("resurrected a saved app", app = name, pid = pid);
+            }
+            core.apps_changed();
+        }
+    }
+}
+
+/// `systemctl [--user] start --no-block <unit>`: queued, not waited for (a
+/// Type=notify start can take a minute; wardend's one thread must not wait).
+async fn start_unit(scope: fleet::Scope, unit: &str) -> DaemonReply {
+    let Some(bin) = fleet::systemctl_bin() else { return reply_err("systemd is not running on this host".into()) };
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args(scope.flag()).args(["start", "--no-block", unit]).stdin(std::process::Stdio::null());
+    match tokio::time::timeout(Duration::from_secs(10), cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => reply_ok(format!(
+            "starting {unit} (systemd runs it; `systemctl {}status {unit}` shows how it goes)",
+            scope.shown()
+        )),
+        Ok(Ok(out)) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let why = err.trim().lines().last().unwrap_or("no output").to_string();
+            reply_err(format!("`systemctl {}start {unit}` failed: {why}", scope.shown()))
+        }
+        Ok(Err(e)) => reply_err(format!("running systemctl: {e}")),
+        Err(_) => reply_err(format!("`systemctl {}start {unit}` did not return within 10 s", scope.shown())),
     }
 }
 
 /// `warden daemon`: run wardend in the foreground until SIGTERM, SIGINT or
-/// a `shutdown` request.
-pub fn main(rt: &tokio::runtime::Runtime) -> i32 {
+/// a `shutdown` request. `resurrect`: first start the saved apps that are
+/// not running (launchd, containers; never under systemd, where each app
+/// has its own unit).
+pub fn main(rt: &tokio::runtime::Runtime, resurrect: bool) -> i32 {
     crate::logging::init(config::Level::Info, None, crate::logging::Files::default());
     crate::guard::install_panic_hook();
     let local = tokio::task::LocalSet::new();
-    let run = std::panic::AssertUnwindSafe(|| rt.block_on(local.run_until(run())));
+    let run = std::panic::AssertUnwindSafe(|| rt.block_on(local.run_until(run(resurrect))));
     let code = match std::panic::catch_unwind(run) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => {
@@ -744,7 +829,7 @@ pub fn main(rt: &tokio::runtime::Runtime) -> i32 {
     code
 }
 
-async fn run() -> Result<(), String> {
+async fn run(resurrect: bool) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     let path = socket_path();
     if let Some(pid) = client::hello_pid(&path).await {
@@ -791,6 +876,10 @@ async fn run() -> Result<(), String> {
     let watchdog = crate::systemd::watchdog_requested();
     crate::guard::spawn_essential("wardend socket", serve(d.clone(), listener));
     crate::guard::spawn_essential("wardend host metrics", host_loop(d.clone()));
+    if resurrect {
+        d.discover();
+        d.resurrect().await;
+    }
 
     let mut discover = tokio::time::interval(DISCOVER_EVERY);
     discover.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

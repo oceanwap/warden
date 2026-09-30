@@ -226,8 +226,12 @@ pub fn tail_lines(path: &Path, n: usize, max_bytes: u64) -> std::io::Result<(Sys
 
 /// journald under systemd: the same framed lines as a log file
 /// (`<ts> <message>`), built from `journalctl -o json`.
-pub fn journal_lines(unit: &str, q: &Query, each: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+/// `user`: a unit of the user's own systemd manager (`warden startup --user`).
+pub fn journal_lines(unit: &str, user: bool, q: &Query, each: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
     let mut cmd = std::process::Command::new("journalctl");
+    if user {
+        cmd.arg("--user");
+    }
     cmd.args(["-u", unit, "-o", "json", "--no-pager", "-q"]);
     let to_journal = |t: &str| format!("{} UTC", t.trim_end_matches('Z').replace('T', " ").get(..19).unwrap_or(""));
     if let Some(s) = &q.since {

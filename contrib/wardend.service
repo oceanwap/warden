@@ -2,7 +2,9 @@
 # it restarts the supervisors `warden start` launched in the background when
 # they die, and serves live events (`warden events`, the GUI) on
 # /run/warden/wardend.sock. Apps never depend on it: stopping, restarting or
-# killing it stops no app.
+# killing it stops no app. It never resurrects apps here: each has its own
+# warden@<app> unit, and starting them too would start them twice.
+#   sudo warden startup          (installs it with this binary's path), or:
 #   cp contrib/wardend.service /etc/systemd/system/
 #   systemctl enable --now wardend
 

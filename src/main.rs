@@ -23,6 +23,7 @@ mod process;
 mod restart;
 mod schedule;
 mod signals;
+mod startup;
 mod static_server;
 mod supervisor;
 #[allow(unsafe_code)]
@@ -94,14 +95,16 @@ fn main() {
         Command::Delete { target } => rt.block_on(fleet::delete(&args, &target)),
         Command::Save => rt.block_on(fleet::save(&args)),
         Command::Resurrect => rt.block_on(fleet::resurrect(&args)),
-        Command::Startup => rt.block_on(fleet::startup(&args)),
-        Command::Unstartup => rt.block_on(fleet::unstartup(&args)),
+        Command::Startup(want) => rt.block_on(startup::startup(&args, want)),
+        Command::Unstartup(want) => rt.block_on(startup::unstartup(&args, want)),
         Command::Kill => rt.block_on(fleet::kill(&args)),
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
-        Command::Daemon(cli::DaemonCmd::Run { background: false }) => daemon::main(&rt),
-        Command::Daemon(cli::DaemonCmd::Run { background: true }) => rt.block_on(daemon::client::start_background()),
+        Command::Daemon(cli::DaemonCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
+        Command::Daemon(cli::DaemonCmd::Run { background: true, resurrect }) => {
+            rt.block_on(daemon::client::start_background(resurrect))
+        }
         Command::Daemon(cli::DaemonCmd::Status) => rt.block_on(daemon::client::status(args.json)),
         Command::Daemon(cli::DaemonCmd::Stop) => rt.block_on(daemon::client::stop()),
         Command::Events { logs, interval_ms } => {

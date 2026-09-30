@@ -43,14 +43,14 @@ pub(crate) async fn hello_pid(path: &Path) -> Option<u32> {
     }
 }
 
-/// `warden daemon --background`.
-pub async fn start_background() -> i32 {
+/// `warden daemon --background [--resurrect]`.
+pub async fn start_background(resurrect: bool) -> i32 {
     let path = socket_path();
     if let Some(pid) = hello_pid(&path).await {
         println!("wardend is already running (pid {pid}); `warden daemon status` shows it");
         return 0;
     }
-    let mut child = match fleet::spawn_daemon() {
+    let mut child = match fleet::spawn_daemon(resurrect) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("warden: cannot start wardend: {e}");
@@ -87,7 +87,16 @@ pub(crate) async fn autostart() {
     if hello_pid(&socket_path()).await.is_some() {
         return;
     }
-    match fleet::spawn_daemon() {
+    // systemd or launchd runs it (`warden startup`): a second one would
+    // only fight it for the socket.
+    if crate::startup::wardend_managed() {
+        eprintln!(
+            "warden: wardend is set up as a service (`warden startup`) but is not running, so nothing restarts \
+             this supervisor if it dies; `warden startup` starts it again"
+        );
+        return;
+    }
+    match fleet::spawn_daemon(false) {
         Ok(c) => println!(
             "wardend started in the background (pid {}): it restarts supervisors that die; `warden daemon stop` \
              stops it (apps keep running), WARDEN_NO_DAEMON=1 skips it",
@@ -97,8 +106,38 @@ pub(crate) async fn autostart() {
     }
 }
 
-/// Stop wardend; `Ok(None)` when it was not running. Apps keep running.
-pub(crate) async fn stop_daemon() -> Result<Option<u32>, String> {
+/// Stop wardend; `Ok(None)` when it was not running, else what was done.
+/// Apps keep running. Under systemd (`Restart=always`) stopping the process
+/// would only restart it: the unit is stopped instead.
+pub(crate) async fn stop_daemon() -> Result<Option<String>, String> {
+    if fleet::systemctl_bin().is_some() {
+        for scope in [fleet::Scope::System, fleet::Scope::User] {
+            if !scope.has_unit("wardend.service") || !fleet::unit_active(scope, "wardend.service") {
+                continue;
+            }
+            return match fleet::run_systemctl(scope, &["stop", "wardend.service"]) {
+                Ok(()) => Ok(Some(
+                    "stopped wardend.service (systemd starts it again at boot; `warden unstartup` removes it)".into(),
+                )),
+                Err(e) => Err(format!(
+                    "wardend runs as the systemd unit wardend.service, which would start it again if only its \
+                     process stopped, and stopping the unit failed ({e}). Fix: `sudo systemctl {}stop wardend`",
+                    scope.shown()
+                )),
+            };
+        }
+    }
+    let Some(pid) = stop_daemon_process().await? else { return Ok(None) };
+    let note = if crate::startup::wardend_managed() {
+        " (launchd starts it again at the next login or boot; `warden unstartup` removes it)"
+    } else {
+        ""
+    };
+    Ok(Some(format!("stopped (pid {pid}){note}")))
+}
+
+/// Ask the running wardend process to exit; its pid, `None` if none runs.
+pub(crate) async fn stop_daemon_process() -> Result<Option<u32>, String> {
     let path = socket_path();
     let Some(pid) = hello_pid(&path).await else { return Ok(None) };
     let r = request(&path, &DaemonRequest::Shutdown, Duration::from_secs(5)).await?;
@@ -119,8 +158,8 @@ pub(crate) async fn stop_daemon() -> Result<Option<u32>, String> {
 /// `warden daemon stop`.
 pub async fn stop() -> i32 {
     match stop_daemon().await {
-        Ok(Some(pid)) => {
-            println!("wardend stopped (pid {pid}); every app keeps running");
+        Ok(Some(what)) => {
+            println!("wardend {what}; every app keeps running");
             0
         }
         Ok(None) => {
