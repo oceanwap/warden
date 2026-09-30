@@ -1231,6 +1231,13 @@ pub(crate) fn spawn_background(name: &str, cfg: &Path) -> Result<std::process::C
 }
 
 /// The environment and working directory a supervisor was started with.
+///
+/// Trust: wardend restarts a dead supervisor with this environment, as its
+/// own user. It only adopts supervisors whose control socket sits in its
+/// runtime directory, which `control::ensure_private_dir` guarantees only
+/// that user can write (owned by it, not a symlink, no group/other write).
+/// So no other user can plant a supervisor, or an environment, for wardend
+/// to run; keep that check in front of any new way of finding supervisors.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Origin {
     pub env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
@@ -1550,13 +1557,32 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
 /// Stop the supervisor itself (systemd unit, or a background one).
 async fn stop_supervisor(app: &App, st: Option<&Status>, disable: bool) -> Result<String, String> {
     let running_unit = st.and_then(|s| s.unit.clone()).map(|u| (scope_of_running_unit(), u));
-    if let Some((scope, unit)) = running_unit.or_else(|| systemd_unit_for(app)) {
+    // A supervisor that answers and runs outside systemd (started in the
+    // background before `warden startup` installed a unit for it) is not
+    // the unit: `systemctl stop` would succeed on the inactive unit and
+    // leave it running. Stop it directly; `delete` also disables the unit.
+    let outside_systemd = st.is_some_and(|s| s.unit.is_none());
+    let installed = if outside_systemd { None } else { systemd_unit_for(app) };
+    if let Some((scope, unit)) = running_unit.or(installed) {
         let verb = if disable { vec!["disable", "--now"] } else { vec!["stop"] };
         let mut a = verb.clone();
         a.push(&unit);
         run_systemctl(scope, &a)?;
         return Ok(format!("{} {unit}", if disable { "disabled and stopped" } else { "stopped" }));
     }
+    let also_disable = if disable && outside_systemd { systemd_unit_for(app) } else { None };
+    let stopped = shutdown_directly(app).await?;
+    match also_disable {
+        Some((scope, unit)) => {
+            run_systemctl(scope, &["disable", &unit])?;
+            Ok(format!("{stopped}; {unit} disabled"))
+        }
+        None => Ok(stopped),
+    }
+}
+
+/// Ask a supervisor to shut down and wait until its socket is gone.
+async fn shutdown_directly(app: &App) -> Result<String, String> {
     if !reachable(app) {
         return Ok("was not running".into());
     }

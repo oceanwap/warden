@@ -92,7 +92,8 @@ file_timestamps = false                      # prefix out/err lines with a times
 #   + the kernel moves the bytes from each worker's pipe into its file (splice): no parsing, no copy
 #     through Warden, no line budget, no line lost; the file is byte for byte what the app wrote
 #     (no prefix, no timestamp), rotated by [logging.rotate] at line boundaries (a rotated file ends
-#     with the line that reached max_size)
+#     with the line that reached max_size; a line that never ends is cut once the file is
+#     max_size + max(max_size, 1 MiB) long)
 #   - nothing goes to stdout/journald or into memory. `warden logs` reads the tails of the files
 #     (stamped with the file's last write time, since lines carry none) and `-f` follows new lines;
 #     `tail -f` works as always. A slow disk slows the app's writes (as if it wrote the file itself)

@@ -91,6 +91,53 @@ pub enum Request {
 
 /// Most control connections served at once; more are refused with a message.
 pub const MAX_CONNECTIONS: usize = 64;
+/// Long-lived streams (`subscribe`, `logs -f`) served at once. They have
+/// their own budget and give back their request slot, so viewers (a GUI
+/// reconnecting in a loop, many `warden events`) can never use up the slots
+/// `status`, `stop` or `restart` need: the operator can always reach a
+/// supervisor, however many clients watch it.
+pub const MAX_STREAMS: usize = 32;
+
+/// A connection's place in the budget: a request slot, until it becomes a
+/// stream (`into_stream`).
+pub struct Slot {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    streams: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Slot {
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit, streams: std::sync::Arc<tokio::sync::Semaphore>) -> Slot {
+        Slot { permit, streams }
+    }
+
+    /// Move this connection from the request budget to the stream budget
+    /// (the request slot is freed). Err: the message for the client.
+    pub fn become_stream(&mut self, what: &str) -> Result<(), String> {
+        match self.streams.clone().try_acquire_owned() {
+            Ok(p) => {
+                self.permit = p;
+                Ok(())
+            }
+            Err(_) => {
+                static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = crate::sys::monotonic_usec();
+                let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+                if last == 0 || now.saturating_sub(last) >= 10_000_000 {
+                    LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+                    crate::warn!(
+                        "too many live streams; refusing a new one",
+                        what = what,
+                        limit = MAX_STREAMS,
+                        hint = "close some `warden events` / `warden logs -f` sessions or GUI windows; commands still get through",
+                    );
+                }
+                Err(format!(
+                    "too many live streams (subscriptions and `logs -f`, limit {MAX_STREAMS}); close some and try again"
+                ))
+            }
+        }
+    }
+}
 /// A client must send its request line within this time.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -267,6 +314,7 @@ pub async fn bind(path: &Path) -> Result<UnixListener, String> {
 
 pub async fn serve(listener: UnixListener, tx: mpsc::UnboundedSender<ControlMsg>) {
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let streams = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS));
     let mut last_refusal_log: Option<std::time::Instant> = None;
     let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
@@ -305,16 +353,16 @@ pub async fn serve(listener: UnixListener, tx: mpsc::UnboundedSender<ControlMsg>
             continue;
         };
         let tx = tx.clone();
+        let slot = Slot::new(permit, streams.clone());
         crate::guard::spawn_request("control request", async move {
-            let _permit = permit;
-            if let Err(e) = handle(stream, tx).await {
+            if let Err(e) = handle(stream, tx, slot).await {
                 crate::debug!("control connection ended with an error", error = e);
             }
         });
     }
 }
 
-async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> std::io::Result<()> {
+async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>, mut slot: Slot) -> std::io::Result<()> {
     crate::guard::fault("control");
     let (r, mut w) = stream.into_split();
     let mut line = String::new();
@@ -338,6 +386,12 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
     };
     match req {
         Request::Logs { lines, follow, worker, events, stream } => {
+            if follow {
+                if let Err(msg) = slot.become_stream("logs -f") {
+                    // `logs` answers with plain lines.
+                    return w.write_all(format!("warden: {msg}\n").as_bytes()).await;
+                }
+            }
             let keep = |l: &str| log_filter(l, worker.as_deref(), events) && stream_filter(l, stream.as_deref());
             // Subscribe first so nothing is lost between the snapshot and the stream.
             let mut rx = crate::logging::subscribe();
@@ -365,6 +419,9 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
             }
         }
         Request::Subscribe { interval_ms, logs } => {
+            if let Err(msg) = slot.become_stream("subscribe") {
+                return reply(&mut w, &Response::err(msg)).await;
+            }
             // Anything the client sent after its request line is ignored; the
             // raw read half only tells us when it hangs up.
             let r = reader.into_inner().into_inner();
@@ -725,7 +782,9 @@ mod tests {
         req: &str,
     ) -> (Lines, OwnedWriteHalf, tokio::task::JoinHandle<std::io::Result<()>>) {
         let (client, server) = UnixStream::pair().unwrap();
-        let server = tokio::spawn(handle(server, fake_supervisor(app)));
+        let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1)).try_acquire_owned().unwrap();
+        let slot = Slot::new(permit, std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS)));
+        let server = tokio::spawn(handle(server, fake_supervisor(app), slot));
         let (r, mut w) = client.into_split();
         w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
         (BufReader::new(r).lines(), w, server)

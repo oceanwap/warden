@@ -73,7 +73,10 @@ once. If the supervisor is already exiting, the answer is one
 waits up to 200 ms for its subscribers to take `bye` before it exits, never
 longer: a client that is not reading then sees EOF without `bye`.
 
-A subscription counts against the socket's 64-connection limit.
+Streams (`subscribe`, `logs -f`) have their own budget of 32 per socket
+(`control::MAX_STREAMS`) and free their request slot, so however many
+clients watch, the 64 slots for commands stay available. The 33rd stream
+gets an error line (`too many live streams`); `wardend` then polls `status`.
 
 ## Events
 

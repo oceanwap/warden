@@ -1060,6 +1060,25 @@ fn control_connections_are_bounded() {
     // Slots free up as soon as those clients go away.
     w.wait_for("status works again", T, |_| true);
     w.wait_log("too many control connections; refusing new ones", Duration::from_secs(3));
+
+    // Streams have their own budget (review R3): 32 subscriptions and
+    // `logs -f` sessions, then the next is refused, and commands still
+    // get through however many are open.
+    let mut streams: Vec<Events> = (0..32).map(|_| Events::open(&w, r#"{"cmd":"subscribe"}"#)).collect();
+    for e in &mut streams {
+        assert_eq!(e.next()["type"], "hello");
+    }
+    let mut extra = Events::open(&w, r#"{"cmd":"subscribe"}"#);
+    let refused = extra.next();
+    assert!(refused["message"].as_str().unwrap_or("").contains("too many live streams"), "{refused}");
+    let (_, out) = w.request(r#"{"cmd":"logs","lines":1,"follow":true}"#);
+    assert!(out.contains("too many live streams"), "{out}");
+    let (_, out) = w.request(r#"{"cmd":"status"}"#);
+    assert!(out.contains(r#""ok":true"#), "status with 32 streams open: {out}");
+    w.wait_log("too many live streams; refusing a new one", Duration::from_secs(3));
+    drop(streams);
+    let mut again = Events::open(&w, r#"{"cmd":"subscribe"}"#);
+    assert_eq!(again.next()["type"], "hello", "a stream slot is free again");
 }
 
 /// A6: the log level can be changed at runtime and filters apply to `logs`.
@@ -3117,6 +3136,39 @@ fn startup_installs_system_units_and_wardend() {
         assert!(t0.elapsed() < T, "the old wardend kept running");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn kill_and_delete_after_startup_stop_a_supervisor_running_outside_its_unit() {
+    // Review R1: after `warden startup` installed a unit for an app that
+    // still runs in the background, `systemctl stop` would succeed on the
+    // inactive unit and leave the app running.
+    let f = Fleet::new("st-outside");
+    sleeper_config(&f, "api");
+    sleeper_config(&f, "web");
+    let fakes = Fakes::new(&f, &[]);
+    let env = fakes.env();
+    let (code, out) = run_with(&f, &["start", "all"], &env);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = run_with(&f, &["startup", "--system"], &env);
+    assert_eq!(code, 0, "{out}");
+    fakes.take();
+
+    let (code, out) = run_with(&f, &["kill", "api", "--yes"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(!f.home.join("run/api/control.sock").exists(), "api still running after: {out}");
+    assert!(f.app("api")["status"].is_null(), "{out}");
+    let calls = fakes.take();
+    assert!(!calls.contains("stop warden@api"), "went through the inactive unit:\n{calls}");
+
+    // delete: stopped directly, and the installed unit disabled so it
+    // doesn't come back at the next boot.
+    let (code, out) = run_with(&f, &["delete", "web"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(!f.home.join("run/web/control.sock").exists(), "web still running after: {out}");
+    let calls = fakes.take();
+    assert!(calls.lines().any(|l| l == "systemctl disable warden@web.service"), "{calls}");
+    assert!(out.contains("warden@web.service disabled"), "{out}");
 }
 
 #[test]

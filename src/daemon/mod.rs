@@ -970,6 +970,7 @@ async fn host_loop(d: Rc<Daemon>) {
 
 async fn serve(d: Rc<Daemon>, listener: UnixListener) {
     let slots = Arc::new(tokio::sync::Semaphore::new(control::MAX_CONNECTIONS));
+    let streams = Arc::new(tokio::sync::Semaphore::new(control::MAX_STREAMS));
     let mut last_refusal_log: Option<Instant> = None;
     let mut last_accept_log: Option<Instant> = None;
     loop {
@@ -1005,9 +1006,9 @@ async fn serve(d: Rc<Daemon>, listener: UnixListener) {
             continue;
         };
         let d = d.clone();
+        let slot = control::Slot::new(permit, streams.clone());
         crate::guard::spawn_request("wardend request", async move {
-            let _permit = permit;
-            if let Err(e) = handle(d, stream).await {
+            if let Err(e) = handle(d, stream, slot).await {
                 crate::debug!("wardend connection ended with an error", error = e);
             }
         });
@@ -1028,7 +1029,7 @@ async fn reply(w: &mut OwnedWriteHalf, r: &DaemonReply) -> std::io::Result<()> {
     send(w, s.as_bytes()).await
 }
 
-async fn handle(d: Rc<Daemon>, stream: UnixStream) -> std::io::Result<()> {
+async fn handle(d: Rc<Daemon>, stream: UnixStream, mut slot: control::Slot) -> std::io::Result<()> {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
@@ -1058,13 +1059,23 @@ async fn handle(d: Rc<Daemon>, stream: UnixStream) -> std::io::Result<()> {
             reply(&mut w, &DaemonReply { ok: true, apps: Some(apps), ..Default::default() }).await
         }
         DaemonRequest::Subscribe { interval_ms, logs, apps } => {
+            if let Err(msg) = slot.become_stream("subscribe") {
+                return reply(&mut w, &reply_err(msg)).await;
+            }
             subscribe(d, reader, w, events::interval(interval_ms), logs, apps).await
         }
         DaemonRequest::Start { app } => {
             let r = d.start(&app).await;
             reply(&mut w, &r).await
         }
-        DaemonRequest::App { app, request } => forward(d, &app, request, reader, w).await,
+        DaemonRequest::App { app, request } => {
+            if matches!(request, control::Request::Logs { follow: true, .. } | control::Request::Subscribe { .. }) {
+                if let Err(msg) = slot.become_stream("forwarded stream") {
+                    return reply(&mut w, &reply_err(msg)).await;
+                }
+            }
+            forward(d, &app, request, reader, w).await
+        }
         DaemonRequest::Shutdown => {
             let r = reply(&mut w, &reply_ok("wardend is exiting; every app keeps running".into())).await;
             d.shutdown.notify_one();

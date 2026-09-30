@@ -56,6 +56,7 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `cannot open the worker output file; the worker's output is discarded until it can` | Direct mode: the directory is missing and can't be created, or isn't writable | Fix the path or permissions; Warden retries every second and `worker output file is writable again` reports what was lost |
 | `cannot write the worker output file; its output is discarded until writes work again` | Direct mode: disk full, quota, I/O error. The worker keeps running (its output is read and dropped, never left to block it) | Free space (`df -h`); writing resumes by itself |
 | `cannot rotate the worker output file; it keeps growing` | Warden can't rename or create files in the log directory | Fix the directory's permissions; retried every minute |
+| `a worker wrote a line far longer than the log file limit; splitting it across rotated files` | Direct mode rotates at line ends; a line that doesn't end within `max_size` + max(`max_size`, 1 MiB) is cut | The line continues at the start of the next file. If the app really writes such lines, raise `[logging.rotate] max_size` |
 | Direct mode: `warden logs` shows worker lines all with the same time | The files carry no timestamps; lines read from them are stamped with the file's last write | Intended. `warden logs -f` stamps new lines as they arrive; for per-line times let the app's logger write them |
 | `worker output not shown: its file is not in memory right now` | Direct mode: `warden logs` reads the files' tails only from the page cache, so it never waits for a disk | Read the file itself (`tail`, `less`) |
 
@@ -73,6 +74,7 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 |---|---|---|
 | `not answering; see <log>` | The app's supervisor isn't running | `warden start <app>`; the log path in the message has the reason it stopped |
 | `too many control connections; refusing new ones` | More than 64 clients at once (a monitoring loop without timeouts?) | Fix the client; each request has a 5 s timeout |
+| `too many live streams; refusing a new one` | More than 32 `warden events` / `warden logs -f` sessions or GUI windows on one socket | Close some; commands (`status`, `stop`, `restart`) still get through, streams have their own budget |
 | Permission denied on the control socket | It is 0600 and owned by the user Warden runs as | Run the CLI as that user (or `sudo -u <user>`) |
 
 ## Reboots, crashes and wardend

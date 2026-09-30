@@ -643,10 +643,13 @@ impl Watcher {
         let socket_left = self.spec.socket.exists();
         let (on_purpose, detail) = match (&self.bye, self.streaming) {
             (Some(reason), _) => (true, format!("on request ({})", if reason.is_empty() { "bye" } else { reason })),
+            // No `bye` seen: a supervisor that exits on purpose still removes
+            // its socket as its very last step; a crashed one leaves it
+            // behind. The `bye` can be missed when wardend was stalled
+            // (SIGSTOP, overload) past the supervisor's short flush window:
+            // restarting an app the operator just stopped would be worse.
+            (None, _) if !socket_left => (true, "on request (it removed its control socket)".to_string()),
             (None, true) => (false, "without `bye`: a crash, an OOM kill or kill -9".to_string()),
-            // Polled (no `bye` possible): a supervisor that exits on purpose
-            // removes its socket; a crashed one leaves it behind.
-            (None, false) if !socket_left => (true, "on request (it removed its control socket)".to_string()),
             (None, false) if self.shutting_down => (true, "on request (it was shutting down)".to_string()),
             (None, false) => {
                 (false, "without removing its control socket: a crash, an OOM kill or kill -9".to_string())
@@ -815,6 +818,20 @@ mod tests {
             let (on_purpose, detail) = s.kill_and_wait_gone().await;
             assert!(!on_purpose, "{detail}");
             assert!(detail.contains("without `bye`"), "{detail}");
+        });
+    }
+
+    #[test]
+    fn missed_bye_but_socket_removed_means_exited() {
+        // Review R2: wardend stalled past the supervisor's bye flush, then
+        // the supervisor removed its socket on the way out: on purpose.
+        local(async {
+            let mut s = setup("missed-bye", streaming(false));
+            attached(&mut s).await;
+            std::fs::remove_file(&s.socket).unwrap();
+            let (on_purpose, detail) = s.kill_and_wait_gone().await;
+            assert!(on_purpose, "{detail}");
+            assert!(detail.contains("removed its control socket"), "{detail}");
         });
     }
 

@@ -1127,6 +1127,14 @@ impl DirectFile {
         None
     }
 
+    /// Not empty, and the last byte written ends a line.
+    fn ends_at_line_end(&self) -> bool {
+        use std::os::unix::fs::FileExt;
+        let (Some(f), true) = (&self.file, self.readable) else { return false };
+        let mut b = [0u8; 1];
+        self.offset > 0 && matches!(f.read_at(&mut b, self.offset - 1), Ok(1)) && b[0] == b'\n'
+    }
+
     fn ends_mid_line(&self) -> bool {
         use std::os::unix::fs::FileExt;
         let (Some(f), true) = (&self.file, self.readable) else { return false };
@@ -1239,6 +1247,22 @@ impl DirectFile {
                     (false, 0) => usize::MAX,
                     (false, max) => max.saturating_sub(self.offset).try_into().unwrap_or(usize::MAX),
                 };
+                // Full, and its last line is complete (a splice can stop
+                // exactly on a newline at the limit): rotate before writing,
+                // or the next whole line would land in this file too.
+                if room == 0 && self.rotate_retry.is_none() && self.ends_at_line_end() {
+                    if let Err(e) = self.rotate_now() {
+                        self.rotate_retry = Some(Instant::now() + ROTATE_RETRY);
+                        crate::error!(
+                            "cannot rotate the worker output file; it keeps growing",
+                            file = self.rot.path.display(),
+                            error = e,
+                            hint =
+                                "Warden must be able to rename and create files in that directory; retried in a minute",
+                        );
+                    }
+                    continue;
+                }
                 // The line that reaches the limit is the file's last.
                 let from = room.saturating_sub(1);
                 let end = match rest.get(from..).and_then(|r| r.iter().position(|&b| b == b'\n')) {
@@ -1246,6 +1270,22 @@ impl DirectFile {
                     // Room for all of it, or the line goes on: rotate once it ends.
                     _ => {
                         self.write_or_drop(rest);
+                        // A line that never ends (megabytes without `\n`)
+                        // would grow the file without bound: past the limit
+                        // plus max(limit, 1 MiB), cut it mid-line.
+                        let hard = max.saturating_add(max.max(LONG_LINE_SLACK));
+                        if max > 0 && self.offset >= hard && self.rotate_retry.is_none() {
+                            long_line_warning(&self.rot.path, max);
+                            if let Err(e) = self.rotate_now() {
+                                self.rotate_retry = Some(Instant::now() + ROTATE_RETRY);
+                                crate::error!(
+                                    "cannot rotate the worker output file; it keeps growing",
+                                    file = self.rot.path.display(),
+                                    error = e,
+                                    hint = "Warden must be able to rename and create files in that directory; retried in a minute",
+                                );
+                            }
+                        }
                         break;
                     }
                 };
@@ -1466,6 +1506,28 @@ const DIRECT_TAIL_MAX: u64 = 256 * 1024;
 /// output, stamped with the file's last write (lines carry no time of
 /// their own). Only the page cache is read, so the event loop never waits
 /// for the disk; otherwise one line says where the output is.
+/// How far past `max_size` a direct-mode file may grow waiting for a line
+/// to end (at least; `max_size` itself if that is larger).
+const LONG_LINE_SLACK: u64 = 1 << 20;
+
+/// At most one warning a minute: an app that writes endless lines would
+/// otherwise log one per rotation.
+fn long_line_warning(path: &std::path::Path, max: u64) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::sys::monotonic_usec();
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 60_000_000 {
+        return;
+    }
+    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    crate::warn!(
+        "a worker wrote a line far longer than the log file limit; splitting it across rotated files",
+        file = path.display(),
+        max_size = max,
+        hint = "the line continues at the start of the next file; if the app really writes such lines, raise [logging.rotate] max_size",
+    );
+}
+
 fn direct_tail(k: &Known, n: usize) -> Vec<Line> {
     let (path, worker, stream) = k;
     let bytes = (n as u64).saturating_mul(1024).clamp(DIRECT_TAIL_MIN, DIRECT_TAIL_MAX);
@@ -2037,6 +2099,56 @@ mod tests {
             assert!(all == data, "splice={splice}: the files together are not what was written");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn direct_files_rotate_when_a_line_ends_exactly_at_the_limit() {
+        // The first 4096 bytes end with a newline: that file is complete,
+        // and the next line starts the new one (found under load, when a
+        // splice happened to stop exactly there).
+        for splice in [true, false] {
+            let dir = scratch_dir(&format!("exact-{splice}"));
+            let path = dir.join("out.log");
+            let policy = RotatePolicy { max_size: 4096, keep: 10, ..RotatePolicy::default() };
+            let w = DirectWriter::open(path.clone(), policy, "1", "stdout");
+            w.file.borrow_mut().splice &= splice;
+            let mut data = vec![b'a'; 4095];
+            data.extend_from_slice(b"\nnext line\n");
+            let (pipe, t) = feed(data.clone());
+            assert_eq!(pump(&w, &pipe, true), None);
+            t.join().unwrap();
+            let files = chain(&path);
+            assert_eq!(files.len(), 2, "splice={splice}: {files:?}");
+            assert_eq!(std::fs::read(&files[0]).unwrap().len(), 4096, "splice={splice}");
+            assert_eq!(std::fs::read(&files[1]).unwrap(), b"next line\n", "splice={splice}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn direct_files_cut_a_line_that_never_ends() {
+        // Review R4: 3 MiB without a newline and a 4 KiB limit: rotation
+        // may wait for a line end, but not forever.
+        let dir = scratch_dir("endless");
+        let path = dir.join("out.log");
+        let policy = RotatePolicy { max_size: 4096, keep: 100, ..RotatePolicy::default() };
+        let w = DirectWriter::open(path.clone(), policy, "1", "stdout");
+        let mut data = b"short line\n".to_vec();
+        data.extend((0..3 << 20).map(|j| b'a' + (j % 26) as u8));
+        let (pipe, t) = feed(data.clone());
+        assert_eq!(pump(&w, &pipe, true), None);
+        t.join().unwrap();
+        let files = chain(&path);
+        assert!(files.len() >= 3, "{} files", files.len());
+        let mut all = Vec::new();
+        for f in &files {
+            let bytes = std::fs::read(f).unwrap();
+            let bound = 4096 + (1 << 20) + DIRECT_CHUNK as u64;
+            assert!((bytes.len() as u64) <= bound, "{} holds {} bytes", f.display(), bytes.len());
+            all.extend(bytes);
+        }
+        assert!(all == data, "the files together are not what was written");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
