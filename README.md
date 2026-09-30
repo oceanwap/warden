@@ -410,8 +410,8 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 
 ## Platforms
 
-- **Linux x86_64 and ARM64**: supported for production. CI runs formatting,
-  clippy, the unit tests and the integration tests on both.
+- **Linux x86_64 and ARM64**: supported for production. CI runs the unit
+  and integration tests on both (and formatting and clippy on x86_64).
 - **macOS**: for development only, to run an app locally with the same
   config. CI builds it and runs clippy and the unit tests (Apple Silicon).
   What it lacks:
