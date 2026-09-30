@@ -43,7 +43,7 @@ pub fn listen(tx: mpsc::UnboundedSender<Sig>) -> std::io::Result<()> {
     let mut hup = signal(SignalKind::hangup())?;
     let mut usr1 = signal(SignalKind::user_defined1())?;
     let mut usr2 = signal(SignalKind::user_defined2())?;
-    tokio::task::spawn_local(async move {
+    crate::guard::spawn_essential("signal handler", async move {
         loop {
             let s = tokio::select! {
                 _ = term.recv() => Sig::Term,

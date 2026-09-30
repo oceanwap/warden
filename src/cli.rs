@@ -1,6 +1,7 @@
 //! Command-line parsing and the client side of the control commands.
 //! Hand-rolled to keep the dependency list short.
 
+use crate::config::Level;
 use crate::control::{self, Request, Status};
 use std::path::PathBuf;
 
@@ -21,7 +22,10 @@ COMMANDS:
     stop           Stop all workers; the supervisor stays up
     shutdown       Stop all workers and exit the supervisor
     scale <N>      Change the number of workers (runtime only, not saved)
-    logs           Recent log lines  [-n LINES] [-f|--follow]
+    logs           Recent log lines  [-n LINES] [-f|--follow] [--worker N] [--events]
+                   --worker N: one worker's output and Warden's events about it
+                   --events:   Warden's own events only, no worker output
+    log-level [L]  Show, or set to debug|info|warn|error, until the next restart
     check          Validate the config file and exit
     version        Print the version
 
@@ -63,6 +67,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut no_wait = false;
     let mut lines = 50usize;
     let mut follow = false;
+    let mut worker: Option<String> = None;
+    let mut events = false;
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
     while let Some(a) = it.next() {
@@ -72,6 +78,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "-s" | "--socket" => socket = Some(value(a)?.into()),
             "-n" | "--lines" => lines = value(a)?.parse().map_err(|_| "-n expects a number".to_string())?,
             "-f" | "--follow" => follow = true,
+            "-w" | "--worker" => worker = Some(value(a)?),
+            "--events" => events = true,
             "--json" => json = true,
             "--no-wait" => no_wait = true,
             "-h" | "--help" => positional.insert(0, "help".into()),
@@ -112,10 +120,25 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             Command::Client(Request::Restart { worker: if arg.is_some() { Some(number("restart")?) } else { None } })
         }
         "scale" => Command::Client(Request::Scale { count: number("scale")? }),
-        "logs" => Command::Client(Request::Logs { lines, follow }),
+        "logs" => Command::Client(Request::Logs { lines, follow, worker, events }),
+        "log-level" => Command::Client(Request::LogLevel {
+            level: match arg.as_deref() {
+                None => None,
+                Some("debug") => Some(Level::Debug),
+                Some("info") => Some(Level::Info),
+                Some("warn" | "warning") => Some(Level::Warn),
+                Some("error") => Some(Level::Error),
+                Some(other) => return Err(format!("unknown log level {other:?} (debug, info, warn or error)")),
+            },
+        }),
         other => return Err(format!("unknown command {other:?} (see `warden --help`)")),
     };
-    if arg.is_some() && !matches!(command, Command::Client(Request::Restart { .. } | Request::Scale { .. })) {
+    if arg.is_some()
+        && !matches!(
+            command,
+            Command::Client(Request::Restart { .. } | Request::Scale { .. } | Request::LogLevel { .. })
+        )
+    {
         return Err(format!("{cmd} takes no argument"));
     }
     Ok(Args { command, config, socket, json, no_wait })
@@ -276,7 +299,20 @@ mod tests {
         assert_eq!(p("restart 2").unwrap().command, Command::Client(Request::Restart { worker: Some(2) }));
         assert_eq!(p("restart").unwrap().command, Command::Client(Request::Restart { worker: None }));
         assert_eq!(p("scale 8").unwrap().command, Command::Client(Request::Scale { count: 8 }));
-        assert_eq!(p("logs -n 5 -f").unwrap().command, Command::Client(Request::Logs { lines: 5, follow: true }));
+        assert_eq!(
+            p("logs -n 5 -f").unwrap().command,
+            Command::Client(Request::Logs { lines: 5, follow: true, worker: None, events: false })
+        );
+        assert_eq!(
+            p("logs --worker 2 --events").unwrap().command,
+            Command::Client(Request::Logs { lines: 50, follow: false, worker: Some("2".into()), events: true })
+        );
+        assert_eq!(p("log-level").unwrap().command, Command::Client(Request::LogLevel { level: None }));
+        assert_eq!(
+            p("log-level debug").unwrap().command,
+            Command::Client(Request::LogLevel { level: Some(Level::Debug) })
+        );
+        assert!(p("log-level loud").is_err());
         assert!(p("scale").is_err());
         assert!(p("scale x").is_err());
         assert!(p("status 3").is_err());

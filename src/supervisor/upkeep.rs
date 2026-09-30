@@ -16,7 +16,9 @@ use super::*;
 
 impl Supervisor {
     pub(super) fn on_tick(&mut self) {
+        crate::guard::fault("tick");
         self.ticks += 1;
+        self.systemd_watchdog();
         if self.shutting_down || self.stopped {
             return;
         }
@@ -30,6 +32,22 @@ impl Supervisor {
             self.check_workers_health();
         }
         self.process_pending();
+    }
+
+    /// CP2: tell systemd we're alive (`WatchdogSec=`), but only while the event
+    /// loop keeps up: ticks arriving more than 2 s late mean something blocks
+    /// it (a stalled stdout, a bug), and systemd should restart us.
+    fn systemd_watchdog(&mut self) {
+        let now = Instant::now();
+        let gap = now.duration_since(self.last_tick);
+        self.last_tick = now;
+        if gap < Duration::from_secs(3) {
+            if self.watchdog_enabled {
+                systemd::notify("WATCHDOG=1");
+            }
+        } else {
+            warn!("event loop was blocked", for_ms = gap.as_millis().saturating_sub(1000));
+        }
     }
 
     /// Queue a graceful (new first, then drain old) replacement of one worker.
@@ -130,7 +148,7 @@ impl Supervisor {
         let mut due = Vec::new();
         for i in self.insts.values_mut() {
             if i.role == Role::Current && !i.stopping && i.recycle_at.is_some_and(|t| now >= t) {
-                i.recycle_at = Some(now + retry);
+                i.recycle_at = Some(crate::restart::later(now, retry));
                 due.push(i.slot);
             }
         }
@@ -171,22 +189,25 @@ impl Supervisor {
     }
 
     fn check_workers_health(&mut self) {
-        let Some(path) = self.cfg.health_path() else { return };
+        let Some(path) = self.cfg.live_path() else { return };
         let timeout = Duration::from_secs(self.cfg.health.timeout);
+        let initial_delay = Duration::from_secs(self.cfg.health.initial_delay);
         for (id, i) in self.insts.iter_mut() {
-            if i.role != Role::Current
-                || i.stopping
-                || i.ready_at.is_none()
-                || i.health_inflight
-                || i.sockets.is_empty()
-            {
+            if i.role != Role::Current || i.stopping || i.health_inflight || i.sockets.is_empty() {
+                continue;
+            }
+            // W9: give a freshly started worker time to warm up.
+            if i.ready_at.is_none_or(|t| t.elapsed() < initial_delay) {
                 continue;
             }
             i.health_inflight = true;
             let sockets: Vec<PathBuf> = i.sockets.values().cloned().collect();
             let (inst, path, tx) = (*id, path.clone(), self.tx.clone());
             tokio::task::spawn_local(async move {
-                let result = rollout::check_instance_sockets(sockets, path, timeout).await;
+                // A failed check task must still answer, or the worker is never checked again.
+                let result = crate::guard::catch_unwind(rollout::check_instance_sockets(sockets, path, timeout))
+                    .await
+                    .unwrap_or_else(|p| Err(format!("internal error in the health check: {p}")));
                 let _ = tx.send(Event::WorkerHealth { inst, result });
             });
         }

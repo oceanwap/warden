@@ -122,8 +122,15 @@ pub enum OnHealthFailure {
 #[serde(deny_unknown_fields, default)]
 pub struct Health {
     pub enabled: bool,
-    /// Path checked on each worker's private socket (shim). Default: the path of `url`.
+    /// Path checked on each worker's private socket (shim); sets both
+    /// `live_path` and `ready_path`. Default: the path of `url`.
     pub path: Option<String>,
+    /// Liveness: "is this process OK" — no dependency checks. Periodic checks
+    /// on it drive replacement of a failing worker.
+    pub live_path: Option<String>,
+    /// Readiness: "can it serve" — may check dependencies. New workers must
+    /// pass it in rollout gates.
+    pub ready_path: Option<String>,
     /// Optional app-level check through the shared port (any worker may answer).
     pub url: String,
     /// Seconds.
@@ -131,6 +138,11 @@ pub struct Health {
     /// Seconds.
     pub timeout: u64,
     pub failure_threshold: u32,
+    /// Seconds after a worker is ready before periodic checks start.
+    pub initial_delay: u64,
+    /// Fraction of workers failing at the same time that means "a dependency
+    /// is down, not the workers": replacements are held. 1.0 disables.
+    pub outage_threshold: f64,
     pub on_failure: OnHealthFailure,
 }
 
@@ -177,13 +189,14 @@ pub struct Limits {
     pub max_lifetime: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum Level {
-    Debug,
-    Info,
-    Warn,
-    Error,
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +205,17 @@ pub struct Logging {
     pub level: Level,
     /// `true`, `false`, or omitted = auto (off under journald).
     pub timestamps: Option<bool>,
+    /// "capture" (default): worker lines go through Warden with a `worker=N`
+    /// prefix and into `warden logs`. "inherit": workers write straight to
+    /// Warden's stdout — for very chatty apps.
+    pub worker_output: WorkerOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerOutput {
+    Capture,
+    Inherit,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -243,10 +267,14 @@ impl Default for Health {
         Self {
             enabled: false,
             path: None,
+            live_path: None,
+            ready_path: None,
             url: String::new(),
             interval: 5,
             timeout: 2,
             failure_threshold: 3,
+            initial_delay: 10,
+            outage_threshold: 0.5,
             on_failure: OnHealthFailure::Replace,
         }
     }
@@ -275,7 +303,7 @@ impl Default for Watchdog {
 
 impl Default for Logging {
     fn default() -> Self {
-        Self { level: Level::Info, timestamps: None }
+        Self { level: Level::Info, timestamps: None, worker_output: WorkerOutput::Capture }
     }
 }
 
@@ -300,6 +328,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
+        self.check_bounds()?;
         let a = &self.app;
         if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
             return Err("app.name must be non-empty and contain only [A-Za-z0-9._-]".into());
@@ -354,18 +383,23 @@ impl Config {
         if !h.url.is_empty() {
             crate::health::parse_url(&h.url).map_err(|e| format!("health.url: {e}"))?;
         }
-        if let Some(p) = &h.path {
-            if !p.starts_with('/') || p.contains(char::is_whitespace) {
-                return Err("health.path must start with '/' and contain no spaces".into());
+        for (name, p) in
+            [("health.path", &h.path), ("health.live_path", &h.live_path), ("health.ready_path", &h.ready_path)]
+        {
+            if let Some(p) = p {
+                if !p.starts_with('/') || p.contains(char::is_whitespace) {
+                    return Err(format!("{name} must start with '/' and contain no spaces"));
+                }
             }
         }
-        if h.enabled && h.url.is_empty() && h.path.is_none() {
+        let per_worker = h.path.is_some() || h.live_path.is_some() || h.ready_path.is_some();
+        if h.enabled && h.url.is_empty() && !per_worker {
             return Err("health.enabled needs health.path (per-worker) and/or health.url (app-level)".into());
         }
-        if h.path.is_some() && h.url.is_empty() && !self.shim_enabled() {
-            return Err("health.path is checked through the Bun shim's private socket; without the shim (non-Bun command or shim = false) set health.url instead".into());
+        if per_worker && h.url.is_empty() && !self.shim_enabled() {
+            return Err("health paths are checked through the Bun shim's private socket; without the shim (non-Bun command or shim = false) set health.url instead".into());
         }
-        if self.health_path().is_some() && self.shim_enabled() {
+        if self.any_worker_path() && self.shim_enabled() {
             // The shim names each worker's socket <dir>/<name>.h<instance>-<worker>.sock
             // and Unix socket paths are limited to ~104 bytes.
             let dir = self.socket_path().parent().map(|d| d.as_os_str().len()).unwrap_or(0);
@@ -399,6 +433,46 @@ impl Config {
         Ok(())
     }
 
+    /// Upper bounds on every number, so no value can overflow time arithmetic
+    /// (`Instant + Duration`) or counters at runtime. Generous: they only
+    /// exclude values that are certainly mistakes.
+    fn check_bounds(&self) -> Result<(), String> {
+        const HOUR: u64 = 3600;
+        const DAY: u64 = 86_400;
+        let checks: [(&str, u64, u64); 21] = [
+            ("workers.ready_timeout", self.workers.ready_timeout, HOUR),
+            ("restart.max_restarts", self.restart.max_restarts as u64, 10_000),
+            ("restart.restart_window", self.restart.restart_window, 30 * DAY),
+            ("restart.backoff_initial", self.restart.backoff_initial, HOUR * 1000),
+            ("restart.backoff_max", self.restart.backoff_max, HOUR * 1000),
+            ("restart.failed_cooldown", self.restart.failed_cooldown, 30 * DAY),
+            ("shutdown.grace_period", self.shutdown.grace_period, HOUR),
+            ("shutdown.drain_ms", self.shutdown.drain_ms, HOUR * 1000),
+            ("health.interval", self.health.interval, HOUR),
+            ("health.timeout", self.health.timeout, HOUR),
+            ("health.failure_threshold", self.health.failure_threshold as u64, 1000),
+            ("health.initial_delay", self.health.initial_delay, DAY),
+            ("reload.health_passes", self.reload.health_passes as u64, 1000),
+            ("reload.health_interval_ms", self.reload.health_interval_ms, 60_000),
+            ("reload.min_ready", self.reload.min_ready, DAY),
+            ("reload.canary_soak", self.reload.canary_soak, DAY),
+            ("reload.pause", self.reload.pause, DAY),
+            ("reload.timeout", self.reload.timeout, DAY),
+            ("watchdog.timeout", self.watchdog.timeout, DAY),
+            ("limits.max_memory", self.limits.max_memory, 1 << 20),
+            ("limits.max_lifetime", self.limits.max_lifetime, 365 * DAY),
+        ];
+        for (name, value, max) in checks {
+            if value > max {
+                return Err(format!("{name} = {value} is out of range (maximum {max})"));
+            }
+        }
+        if !(0.0..=1.0).contains(&self.health.outage_threshold) {
+            return Err("health.outage_threshold must be between 0.0 and 1.0 (1.0 disables the guard)".into());
+        }
+        Ok(())
+    }
+
     /// Whether to inject the Bun shim.
     pub fn shim_enabled(&self) -> bool {
         match self.workers.mode {
@@ -421,6 +495,21 @@ impl Config {
             return Some(p.clone());
         }
         crate::health::parse_url(&self.health.url).ok().map(|t| t.path)
+    }
+
+    /// Liveness path (periodic checks, drives replacement).
+    pub fn live_path(&self) -> Option<String> {
+        self.health.live_path.clone().or_else(|| self.health_path())
+    }
+
+    /// Readiness path (rollout gates).
+    pub fn ready_path(&self) -> Option<String> {
+        self.health.ready_path.clone().or_else(|| self.health_path())
+    }
+
+    /// Any per-worker health path configured.
+    pub fn any_worker_path(&self) -> bool {
+        self.live_path().is_some() || self.ready_path().is_some()
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -490,6 +579,73 @@ mod tests {
         assert_eq!(c.watchdog.timeout, 60);
         assert_eq!(c.restart.failed_cooldown, 300);
         assert_eq!(c.health_path(), None);
+    }
+
+    /// Every numeric field: huge, boundary and random values either parse
+    /// within bounds or are rejected with the field's name; never a panic, and
+    /// anything accepted is safe for `Instant + Duration`.
+    #[test]
+    fn numeric_fields_are_bounded() {
+        let fields = [
+            ("workers", "ready_timeout"),
+            ("restart", "max_restarts"),
+            ("restart", "restart_window"),
+            ("restart", "backoff_initial"),
+            ("restart", "backoff_max"),
+            ("restart", "failed_cooldown"),
+            ("shutdown", "grace_period"),
+            ("shutdown", "drain_ms"),
+            ("health", "interval"),
+            ("health", "timeout"),
+            ("health", "failure_threshold"),
+            ("health", "initial_delay"),
+            ("reload", "health_passes"),
+            ("reload", "health_interval_ms"),
+            ("reload", "min_ready"),
+            ("reload", "canary_soak"),
+            ("reload", "pause"),
+            ("reload", "timeout"),
+            ("watchdog", "timeout"),
+            ("limits", "max_memory"),
+            ("limits", "max_lifetime"),
+        ];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (section, key) in fields {
+            let mut values = vec![0u64, 1, 59, 3600, 86_400, u32::MAX as u64, i64::MAX as u64, u64::MAX];
+            values.extend((0..40).map(|_| next() >> (next() % 64)));
+            for v in values {
+                let text = format!("{MIN}[{section}]\n{key} = {v}\n");
+                match std::panic::catch_unwind(|| Config::parse(&text)) {
+                    Err(_) => panic!("{section}.{key} = {v} panicked"),
+                    Ok(Err(e)) => {
+                        assert!(
+                            e.contains(key) || e.contains("TOML") || e.contains("invalid"),
+                            "{section}.{key} = {v}: {e}"
+                        )
+                    }
+                    Ok(Ok(c)) => {
+                        let now = std::time::Instant::now();
+                        for secs in [
+                            c.reload.timeout,
+                            c.limits.max_lifetime,
+                            c.restart.failed_cooldown,
+                            c.shutdown.grace_period,
+                        ] {
+                            let _ = now + std::time::Duration::from_secs(secs);
+                        }
+                    }
+                }
+            }
+        }
+        let e = Config::parse(&format!("{MIN}[reload]\ntimeout = 18446744073709551615\n")).unwrap_err();
+        assert!(e.contains("reload.timeout") && e.contains("out of range"), "{e}");
+        assert!(Config::parse(&format!("{MIN}[health]\noutage_threshold = 1.5\n")).is_err());
     }
 
     #[test]

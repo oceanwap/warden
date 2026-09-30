@@ -52,6 +52,16 @@ struct Warden {
 
 impl Warden {
     fn start(name: &str, port: u16, toml: &str) -> Warden {
+        Self::start_env(name, port, toml, &[])
+    }
+
+    fn start_env(name: &str, port: u16, toml: &str, env: &[(&str, &str)]) -> Warden {
+        Self::start_opts(name, port, toml, env, false)
+    }
+
+    /// `stall_stdout`: Warden's stdout is a pipe nobody reads (a stuck log
+    /// consumer); stderr still goes to the log file.
+    fn start_opts(name: &str, port: u16, toml: &str, env: &[(&str, &str)], stall_stdout: bool) -> Warden {
         let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -62,7 +72,8 @@ impl Warden {
         let child = Command::new(BIN)
             .args(["start", "-c"])
             .arg(&cfg)
-            .stdout(log.try_clone().unwrap())
+            .envs(env.iter().copied())
+            .stdout(if stall_stdout { Stdio::piped() } else { Stdio::from(log.try_clone().unwrap()) })
             .stderr(log)
             .spawn()
             .unwrap();
@@ -100,6 +111,44 @@ impl Warden {
 
     fn log(&self) -> String {
         std::fs::read_to_string(self.dir.join("warden.log")).unwrap_or_default()
+    }
+
+    /// Wait until the log file contains `needle` (the writer thread is async).
+    fn wait_log(&self, needle: &str, timeout: Duration) -> String {
+        let t0 = Instant::now();
+        loop {
+            let log = self.log();
+            if log.contains(needle) {
+                return log;
+            }
+            if t0.elapsed() > timeout {
+                panic!("log never contained {needle:?} (waited {timeout:?}):\n{log}");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.dir.join("w.sock")
+    }
+
+    /// One request straight over the control socket (no CLI process), timed.
+    fn request(&self, req: &str) -> (Duration, String) {
+        let t0 = Instant::now();
+        let mut s = std::os::unix::net::UnixStream::connect(self.socket()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        writeln!(s, "{req}").unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        (t0.elapsed(), out)
+    }
+
+    fn rss_kb(&self) -> u64 {
+        let st = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap_or_default();
+        st.lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0)
     }
 
     fn pids(s: &Value) -> Vec<u64> {
@@ -752,4 +801,271 @@ fn other_servers_in_the_app_are_not_mistaken_for_it() {
     // ...and the private health socket belongs to the app server, so the gates pass.
     let (code, out) = w.cli(&["safe-reload"]);
     assert_eq!(code, 0, "{out}");
+}
+
+// ------------------------------------------------------ v0.2 crash protection
+
+#[test]
+fn systemd_ready_and_watchdog_pings_stop_when_frozen() {
+    if !have_bun() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("warden-it-notify-sock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("notify.sock");
+    let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let recv_for = |d: Duration| {
+        let (t0, mut msgs) = (Instant::now(), Vec::new());
+        let mut buf = [0u8; 512];
+        while t0.elapsed() < d {
+            if let Ok(n) = sock.recv(&mut buf) {
+                msgs.push(String::from_utf8_lossy(&buf[..n]).to_string());
+            }
+        }
+        msgs
+    };
+    let port = free_port();
+    let w = Warden::start_env(
+        "notify",
+        port,
+        &gated("notify", port, 2, ""),
+        &[("NOTIFY_SOCKET", path.to_str().unwrap()), ("WATCHDOG_USEC", "10000000")],
+    );
+    let first = recv_for(Duration::from_secs(4));
+    assert!(first.iter().any(|m| m.starts_with("READY=1")), "{first:?}");
+    let pings = first.iter().filter(|m| *m == "WATCHDOG=1").count();
+    assert!(pings >= 2, "expected a ping per second: {first:?}");
+
+    w.signal(libc::SIGSTOP);
+    let frozen = recv_for(Duration::from_millis(3500));
+    w.signal(libc::SIGCONT);
+    assert!(!frozen.iter().any(|m| m == "WATCHDOG=1"), "no pings while frozen: {frozen:?}");
+    let after = recv_for(Duration::from_secs(3));
+    assert!(after.iter().filter(|m| *m == "WATCHDOG=1").count() >= 1, "pings resume: {after:?}");
+    assert!(w.log().contains("event loop was blocked"));
+}
+
+fn fault_warden(name: &str, fault: &str, count: usize) -> (Warden, u16) {
+    let port = free_port();
+    let w = Warden::start_env(name, port, &gated(name, port, count, ""), &[("WARDEN_FAULT", fault)]);
+    (w, port)
+}
+
+#[test]
+fn a_panicking_waiter_task_restarts_its_worker() {
+    if !have_bun() {
+        return;
+    }
+    let (w, port) = fault_warden("fault-waiter", "waiter:1", 2);
+    let s = w.wait_for("both ready after the injected fault", T, |s| {
+        s["workers_ready"] == 2 && s["workers"].as_array().unwrap().iter().any(|x| x["crashes"] == 1)
+    });
+    let crashed = s["workers"].as_array().unwrap().iter().find(|x| x["crashes"] == 1).unwrap();
+    assert!(crashed["last_exit"].as_str().unwrap().contains("internal error"), "{crashed:#?}");
+    assert!(w.log().contains("Warden lost track of a worker"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 2, "exactly the two supervised workers listen");
+}
+
+#[test]
+fn a_panicking_output_reader_restarts_its_worker() {
+    if !have_bun() {
+        return;
+    }
+    let (w, port) = fault_warden("fault-stdout", "stdout:1", 2);
+    w.wait_for("both ready after the injected fault", T, |s| {
+        s["workers_ready"] == 2 && s["workers"].as_array().unwrap().iter().any(|x| x["crashes"] == 1)
+    });
+    assert!(w.log().contains("output reader failed"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 2);
+}
+
+#[test]
+fn a_panicking_control_request_only_drops_that_request() {
+    if !have_bun() {
+        return;
+    }
+    let (w, _port) = fault_warden("fault-control", "control:1", 1);
+    // The first request hits the fault; retry until the supervisor answers.
+    let t0 = Instant::now();
+    let mut first_failed = false;
+    loop {
+        let (code, _) = w.cli(&["status", "--json"]);
+        if code == 0 {
+            break;
+        }
+        first_failed = true;
+        assert!(t0.elapsed() < T, "control socket never recovered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(first_failed, "the injected fault should have failed one request");
+    assert!(w.log().contains("request handler failed"));
+    w.wait_for("still supervising", T, ready(1));
+}
+
+#[test]
+fn a_panic_in_the_event_loop_exits_and_takes_workers_down() {
+    if !have_bun() {
+        return;
+    }
+    let (mut w, port) = fault_warden("fault-tick", "tick:4", 2);
+    let t0 = Instant::now();
+    let code = loop {
+        if let Some(st) = w.child.try_wait().unwrap() {
+            break st.code();
+        }
+        assert!(t0.elapsed() < T, "warden should have exited");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(code, Some(0));
+    assert!(w.log().contains("warden panicked at"), "{}", w.log());
+    // Workers drain and exit via the parent-death signal.
+    let t1 = Instant::now();
+    while listeners(port) > 0 {
+        assert!(t1.elapsed() < Duration::from_secs(5), "workers outlived Warden");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn simple(name: &str, port: u16, count: usize, extra: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = {count}\n[restart]\nbackoff_initial = 50\n[shutdown]\ngrace_period = 5\ndrain_ms = 100\n{extra}",
+        fixture("app.ts")
+    )
+}
+
+/// CP5 / S12: the log consumer stops reading. Supervision, the control socket
+/// and memory must be unaffected; dropped lines are counted.
+#[test]
+fn stalled_stdout_does_not_block_supervision() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start_opts("stalled", port, &simple("stalled", port, 2, ""), &[("FIXTURE_SPAM", "1")], true);
+    w.wait_for("2 ready workers", T, ready(2));
+    let s = w.wait_for("dropped log lines", T, |s| s["log_lines_dropped"].as_u64().unwrap_or(0) > 0);
+
+    let mut lat: Vec<Duration> = (0..20)
+        .map(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            let (d, out) = w.request(r#"{"cmd":"status"}"#);
+            assert!(out.contains("\"ok\":true"), "{out}");
+            d
+        })
+        .collect();
+    lat.sort();
+    eprintln!("status latency with a stalled stdout: p50 {:?}, max {:?}", lat[10], lat[19]);
+    assert!(lat[10] < Duration::from_millis(100), "p50 {:?}", lat[10]);
+    assert!(lat[19] < Duration::from_millis(500), "max {:?}", lat[19]);
+
+    // Crash handling still works.
+    let victim = s["workers"][0]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    w.wait_for("worker 1 restarted", T, |s| {
+        s["workers"][0]["state"] == "RUNNING" && s["workers"][0]["pid"].as_u64() != Some(victim)
+    });
+
+    // Memory stays bounded while output keeps being dropped.
+    std::thread::sleep(Duration::from_secs(3));
+    let rss = w.rss_kb();
+    eprintln!("warden RSS with a stalled stdout: {rss} kB");
+    assert!(rss > 0 && rss < 40 * 1024, "RSS {rss} kB");
+
+    // Events survive in memory even though worker output floods the log.
+    let (code, out) = w.cli(&["logs", "--events", "-n", "200"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("worker crashed") || out.contains("worker exited"), "{out}");
+    assert!(!out.contains(" OUT "), "--events must not show worker output");
+    let (_, out) = w.cli(&["logs", "--worker", "2", "-n", "5"]);
+    assert!(out.lines().all(|l| l.contains("worker=2")), "{out}");
+}
+
+/// CP6: a worker that floods fd 3 with messages and junk is rate-limited,
+/// summarised in a bounded number of lines, and Warden's memory stays flat.
+#[test]
+fn ipc_flood_is_bounded() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start_env("ipcflood", port, &simple("ipcflood", port, 1, ""), &[("FIXTURE_IPC_FLOOD", "1")]);
+    w.wait_for("1 ready worker", T, ready(1));
+    std::thread::sleep(Duration::from_secs(4));
+    let rss = w.rss_kb();
+    eprintln!("warden RSS under an IPC flood: {rss} kB");
+    assert!(rss > 0 && rss < 20 * 1024, "RSS {rss} kB");
+    let (d, _) = w.request(r#"{"cmd":"status"}"#);
+    assert!(d < Duration::from_millis(500), "status took {d:?}");
+    let log = w.log();
+    assert!(log.contains("worker floods Warden's IPC pipe"), "{log}");
+    assert!(log.contains("worker sent invalid IPC messages"), "{log}");
+    let summaries = log.matches("worker sent invalid IPC messages").count();
+    assert!(summaries <= 2, "invalid IPC input must be summarised, not logged per line ({summaries} lines)");
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["state"], "RUNNING");
+}
+
+/// CP6: idle and excess control connections can't wedge the control socket.
+#[test]
+fn control_connections_are_bounded() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("ctlcap", port, &simple("ctlcap", port, 1, ""));
+    w.wait_for("1 ready worker", T, ready(1));
+
+    // An idle client gets an answer after the request timeout.
+    let t0 = Instant::now();
+    let mut idle = std::os::unix::net::UnixStream::connect(w.socket()).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut out = String::new();
+    let _ = idle.read_to_string(&mut out);
+    assert!(out.contains("no request received"), "{out}");
+    assert!(t0.elapsed() >= Duration::from_secs(4) && t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+
+    // 64 idle connections fill the slots: the 65th is refused, with a reason.
+    let held: Vec<_> = (0..64).map(|_| std::os::unix::net::UnixStream::connect(w.socket()).unwrap()).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let (_, out) = w.request(r#"{"cmd":"status"}"#);
+    assert!(out.contains("too many control connections"), "{out}");
+    drop(held);
+    // Slots free up as soon as those clients go away.
+    w.wait_for("status works again", T, |_| true);
+    w.wait_log("too many control connections; refusing new ones", Duration::from_secs(3));
+}
+
+/// A6: the log level can be changed at runtime and filters apply to `logs`.
+#[test]
+fn runtime_log_level() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("loglevel", port, &gated("loglevel", port, 1, ""));
+    w.wait_for("1 ready worker", T, ready(1));
+    let (code, out) = w.cli(&["log-level"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("log level: info"), "{out}");
+    let (code, out) = w.cli(&["log-level", "debug"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("log level: debug (was info"), "{out}");
+    // A restart runs the gates, which log each check at DEBUG.
+    let (code, out) = w.cli(&["restart", "1"]);
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = w.cli(&["logs", "--events", "-n", "300"]);
+    assert!(out.contains("DEBUG gate health check passed"), "{out}");
+    assert!(out.contains("log level changed from=info to=debug"), "{out}");
+    let (code, _) = w.cli(&["log-level", "loud"]);
+    assert_eq!(code, 2);
+    w.cli(&["log-level", "warn"]);
+    let (code, out) = w.cli(&["restart", "1"]);
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = w.cli(&["logs", "--events", "-n", "300"]);
+    let after = out.rsplit("log level changed").next().unwrap_or("");
+    assert!(!after.contains("DEBUG") && !after.contains("INFO "), "nothing below WARN after the change:\n{after}");
 }

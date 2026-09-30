@@ -73,6 +73,11 @@ pub struct Supervisor {
     force_kill: bool,
     supervisor_cpu_prev: Option<(Instant, f64)>,
     ticks: u64,
+    /// Fleet-wide health failure: a dependency is probably down; replacements held.
+    outage: bool,
+    last_tick: Instant,
+    /// systemd set WATCHDOG_USEC for us (WatchdogSec= in the unit).
+    watchdog_enabled: bool,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -92,12 +97,12 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<ControlMsg>();
 
     crate::signals::listen(sig_tx).map_err(|e| format!("installing signal handlers: {e}"))?;
-    tokio::task::spawn_local(control::serve(listener, ctl_tx));
+    crate::guard::spawn_essential("control socket", control::serve(listener, ctl_tx));
 
     if let Some(addr) = &cfg.metrics.listen {
         let addr: std::net::SocketAddr = addr.parse().map_err(|e| format!("metrics.listen: {e}"))?;
         let tx = tx.clone();
-        tokio::task::spawn_local(async move {
+        crate::guard::spawn_essential("metrics endpoint", async move {
             let snapshot = move || {
                 let tx = tx.clone();
                 async move {
@@ -107,7 +112,12 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
                 }
             };
             if let Err(e) = metrics::serve(addr, snapshot).await {
-                error!("metrics endpoint failed", addr = addr, error = e);
+                error!(
+                    "metrics endpoint could not start; Warden keeps running without it",
+                    addr = addr,
+                    error = e,
+                    hint = "is another process using that address? change [metrics] listen",
+                );
             }
         });
     }
@@ -117,7 +127,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         let interval = Duration::from_secs(cfg.health.interval);
         let timeout = Duration::from_secs(cfg.health.timeout);
         let tx = tx.clone();
-        tokio::task::spawn_local(async move {
+        crate::guard::spawn_essential("app health check", async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -132,7 +142,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
 
     {
         let tx = tx.clone();
-        tokio::task::spawn_local(async move {
+        crate::guard::spawn_essential("tick", async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -168,6 +178,9 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         force_kill: false,
         supervisor_cpu_prev: None,
         ticks: 0,
+        outage: false,
+        last_tick: Instant::now(),
+        watchdog_enabled: systemd::watchdog_requested(),
         cfg,
         cfg_path,
     };
@@ -181,7 +194,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         control = socket.display(),
     );
     warn_if_no_migrate_req(&sup.cfg);
-    if sup.cfg.health_path().is_none() {
+    if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
     sup.start_all();
@@ -379,7 +392,14 @@ impl Supervisor {
                 (a.command.clone(), vec![host])
             }
         };
-        process::Spec { program, args, cwd: a.working_directory.clone(), env, label: self.label(slot_id) }
+        process::Spec {
+            program,
+            args,
+            cwd: a.working_directory.clone(),
+            env,
+            label: self.label(slot_id),
+            inherit_output: self.cfg.logging.worker_output == crate::config::WorkerOutput::Inherit,
+        }
     }
 
     fn entry_path(&self) -> PathBuf {
@@ -481,7 +501,7 @@ impl Supervisor {
 
     fn on_proc(&mut self, ev: ProcEvent) {
         match ev {
-            ProcEvent::Exited { inst, code, signal } => self.on_exit(inst, code, signal),
+            ProcEvent::Exited { inst, code, signal, note } => self.on_exit(inst, code, signal, note),
             ProcEvent::Ipc { inst, msg } => self.on_ipc(inst, msg),
         }
     }
@@ -555,7 +575,8 @@ impl Supervisor {
         let now = Instant::now();
         inst.ready_at = Some(now);
         if lifetime > 0 {
-            inst.recycle_at = Some(now + upkeep::jittered(Duration::from_secs(lifetime), inst_id));
+            inst.recycle_at =
+                Some(crate::restart::later(now, upkeep::jittered(Duration::from_secs(lifetime), inst_id)));
         }
         let ms = inst.started.elapsed().as_millis();
         let (slot_id, role, pid) = (inst.slot, inst.role, inst.handle.pid);
@@ -588,7 +609,7 @@ impl Supervisor {
         }
     }
 
-    fn on_exit(&mut self, inst_id: u64, code: Option<i32>, signal: Option<i32>) {
+    fn on_exit(&mut self, inst_id: u64, code: Option<i32>, signal: Option<i32>, note: Option<String>) {
         let Some(inst) = self.insts.remove(&inst_id) else { return };
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
@@ -598,7 +619,9 @@ impl Supervisor {
         let label = self.label(slot_id);
         let uptime = inst.started.elapsed();
         let is_current = self.slots.get(&slot_id).is_some_and(|s| s.current == Some(inst_id));
-        let reason = if inst.timed_out {
+        let reason = if let Some(n) = note {
+            n
+        } else if inst.timed_out {
             "not ready in time".to_string()
         } else if inst.hung {
             format!("hung: no heartbeat for {}s ({why})", self.cfg.watchdog.timeout)
@@ -894,7 +917,7 @@ impl Supervisor {
         }
     }
 
-    /// Per-worker check over the worker's private socket.
+    /// Per-worker check over the worker's private socket (liveness path).
     fn on_worker_health(&mut self, inst_id: u64, result: Result<(), String>) {
         let threshold = self.cfg.health.failure_threshold;
         let on_failure = self.cfg.health.on_failure;
@@ -904,6 +927,7 @@ impl Supervisor {
             return;
         }
         let (slot, pid) = (inst.slot, inst.handle.pid);
+        let mut replace = None;
         match result {
             Ok(()) => {
                 if inst.healthy == Some(false) {
@@ -914,23 +938,80 @@ impl Supervisor {
             }
             Err(e) => {
                 inst.health_fails += 1;
-                warn!(
-                    "worker health check failed",
-                    worker = slot,
-                    pid = pid,
-                    error = e,
-                    consecutive = inst.health_fails
-                );
-                // Re-trigger every `threshold` failures in case a replacement failed.
-                if inst.health_fails >= threshold && (inst.health_fails - threshold) % threshold == 0 {
+                // First failure: WARN. Repeats stay at DEBUG until the
+                // threshold turns it into one ERROR (no log storm, A5).
+                if inst.health_fails == 1 {
+                    warn!(
+                        "worker health check failed",
+                        worker = slot,
+                        pid = pid,
+                        error = e,
+                        threshold = threshold,
+                        hint = "Warden acts after `threshold` failures in a row ([health] failure_threshold)",
+                    );
+                } else {
+                    debug!(
+                        "worker health check failed again",
+                        worker = slot,
+                        pid = pid,
+                        error = e,
+                        consecutive = inst.health_fails
+                    );
+                }
+                if inst.health_fails >= threshold {
+                    if inst.healthy != Some(false) {
+                        let action = match on_failure {
+                            OnHealthFailure::Log => "logging only ([health] on_failure = \"log\")",
+                            _ => "replacing it gracefully",
+                        };
+                        error!(
+                            "worker unhealthy",
+                            worker = slot,
+                            pid = pid,
+                            failures = inst.health_fails,
+                            error = e,
+                            action = action,
+                        );
+                    }
                     inst.healthy = Some(false);
-                    error!("worker unhealthy", worker = slot, pid = pid, failures = inst.health_fails);
-                    if on_failure != OnHealthFailure::Log {
-                        self.request_replace(slot, format!("failed {threshold} health checks"), false);
+                    // Re-trigger every `threshold` failures in case a replacement failed.
+                    if (inst.health_fails - threshold) % threshold == 0 && on_failure != OnHealthFailure::Log {
+                        replace = Some(format!("failed {} health checks", inst.health_fails));
                     }
                 }
             }
         }
+        self.update_outage();
+        if let Some(reason) = replace {
+            if self.outage {
+                debug!("replacement held: fleet-wide health failure", worker = slot);
+            } else {
+                self.request_replace(slot, reason, false);
+            }
+        }
+    }
+
+    /// DS2: when a large share of workers fail their checks at once, the cause
+    /// is almost always a shared dependency (database, network), and replacing
+    /// workers only adds reconnect pressure. Hold replacements until it clears.
+    fn update_outage(&mut self) {
+        let threshold = self.cfg.health.outage_threshold;
+        let live: Vec<&Instance> =
+            self.insts.values().filter(|i| i.role == Role::Current && !i.stopping && i.ready_at.is_some()).collect();
+        let failing = live.iter().filter(|i| i.healthy == Some(false)).count();
+        // One worker can't tell a dependency outage from a broken worker.
+        let outage = threshold < 1.0 && live.len() >= 2 && failing as f64 >= threshold * live.len() as f64;
+        if outage && !self.outage {
+            error!(
+                "dependency outage suspected: holding worker replacements",
+                failing = failing,
+                workers = live.len(),
+                outage_threshold = threshold,
+            );
+        } else if !outage && self.outage {
+            info!("fleet health recovered: replacements resumed", failing = failing, workers = live.len());
+        }
+        self.outage = outage;
     }
 
     // -------------------------------------------------------------- control
@@ -1007,7 +1088,9 @@ impl Supervisor {
                 }
             }
             Request::Scale { count } => self.scale(count),
-            Request::Logs { .. } => Response::err("logs are served by the control socket"),
+            Request::Logs { .. } | Request::LogLevel { .. } => {
+                Response::err("internal: this request is answered by the control socket")
+            }
         }
     }
 
@@ -1174,6 +1257,11 @@ impl Supervisor {
             host,
             reloading: rollout.is_some(),
             shutting_down: self.shutting_down,
+            health_suspended: self.outage,
+            log_lines_dropped: {
+                let (o, e) = crate::logging::dropped();
+                o + e
+            },
             rollout,
             last_rollout: self.last_rollout.clone(),
             workers,

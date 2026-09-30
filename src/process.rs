@@ -23,6 +23,9 @@ pub struct Spec {
     pub env: Vec<(String, String)>,
     /// Prefix for this process's output lines (`worker=<label>`).
     pub label: String,
+    /// Let the worker write straight to Warden's stdout/stderr (no prefix,
+    /// no copying through Warden; `warden logs` won't show its output).
+    pub inherit_output: bool,
 }
 
 /// Message written by the shim / worker-mode host on fd 3, one JSON object per line.
@@ -46,8 +49,17 @@ pub struct IpcMsg {
 
 #[derive(Debug)]
 pub enum ProcEvent {
-    Exited { inst: u64, code: Option<i32>, signal: Option<i32> },
-    Ipc { inst: u64, msg: IpcMsg },
+    /// `note` explains exits Warden didn't observe normally (lost track of it).
+    Exited {
+        inst: u64,
+        code: Option<i32>,
+        signal: Option<i32>,
+        note: Option<String>,
+    },
+    Ipc {
+        inst: u64,
+        msg: IpcMsg,
+    },
 }
 
 /// Handle to a running process. Dropping it does not kill the process.
@@ -70,10 +82,11 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     let write_fd = std::os::fd::AsRawFd::as_raw_fd(&ipc_write);
 
     let mut cmd = Command::new(&spec.program);
+    let out = || if spec.inherit_output { Stdio::inherit() } else { Stdio::piped() };
     cmd.args(&spec.args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out())
+        .stderr(out())
         // Own process group: a terminal Ctrl-C reaches Warden only, and Warden
         // orchestrates the drain. SIGKILL goes to the group to catch grandchildren.
         .process_group(0)
@@ -106,36 +119,117 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     let mut child = cmd.spawn()?;
     drop(ipc_write);
     let pid = child.id().unwrap_or(0);
+    let label = spec.label.clone();
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<i32>();
 
+    // Readers of the worker's output and IPC pipe. If one of them fails, the
+    // worker could block on a full pipe or lose its readiness/heartbeat
+    // channel, so it is killed and restarted rather than left half-supervised.
+    let reader_failed = |what: &'static str, ctl: mpsc::UnboundedSender<i32>, label: String| {
+        move |msg: String| {
+            crate::error!(
+                "worker's output reader failed; killing the worker so it restarts cleanly",
+                worker = label,
+                reader = what,
+                panic = msg,
+                hint = "this is a Warden bug: please report it with the log lines above",
+            );
+            let _ = ctl.send(libc::SIGKILL);
+        }
+    };
     if let Some(out) = child.stdout.take() {
-        tokio::task::spawn_local(pump_output(out, spec.label.clone(), "stdout"));
+        let on_fail = reader_failed("stdout", ctl_tx.clone(), label.clone());
+        let fut = pump_output(out, label.clone(), "stdout");
+        tokio::task::spawn_local(async move {
+            if let Err(m) = crate::guard::catch_unwind(fut).await {
+                on_fail(m);
+            }
+        });
     }
     if let Some(err) = child.stderr.take() {
-        tokio::task::spawn_local(pump_output(err, spec.label.clone(), "stderr"));
+        let on_fail = reader_failed("stderr", ctl_tx.clone(), label.clone());
+        let fut = pump_output(err, label.clone(), "stderr");
+        tokio::task::spawn_local(async move {
+            if let Err(m) = crate::guard::catch_unwind(fut).await {
+                on_fail(m);
+            }
+        });
     }
-    if let Ok(rx) = tokio::net::unix::pipe::Receiver::from_owned_fd(ipc_read) {
-        tokio::task::spawn_local(pump_ipc(rx, inst, events.clone(), spec.label.clone()));
+    match tokio::net::unix::pipe::Receiver::from_owned_fd(ipc_read) {
+        Ok(rx) => {
+            let on_fail = reader_failed("ipc", ctl_tx.clone(), label.clone());
+            let fut = pump_ipc(rx, inst, events.clone(), label.clone());
+            tokio::task::spawn_local(async move {
+                if let Err(m) = crate::guard::catch_unwind(fut).await {
+                    on_fail(m);
+                }
+            });
+        }
+        Err(e) => crate::warn!(
+            "cannot read the worker's IPC pipe; readiness falls back to /proc and the watchdog is off for it",
+            worker = label,
+            error = e,
+        ),
     }
 
-    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<i32>();
     tokio::task::spawn_local(async move {
-        let status = loop {
-            tokio::select! {
-                st = child.wait() => break st,
-                Some(sig) = ctl_rx.recv() => {
-                    // child.id() is None once reaped; never signal a reused pid.
-                    if let Some(p) = child.id() {
-                        let p = p as i32;
-                        // SAFETY: plain kill(2).
-                        // The group contains the process itself: signal once.
-                        unsafe {
-                            let group = (sig == libc::SIGKILL || sig == libc::SIGTERM) && libc::kill(-p, sig) == 0;
-                            if !group {
-                                libc::kill(p, sig);
+        let waited = crate::guard::catch_unwind(async move {
+            crate::guard::fault("waiter");
+            loop {
+                tokio::select! {
+                    st = child.wait() => break st,
+                    Some(sig) = ctl_rx.recv() => {
+                        // child.id() is None once reaped; never signal a reused pid.
+                        if let Some(p) = child.id() {
+                            let p = p as i32;
+                            // SAFETY: plain kill(2).
+                            // The group contains the process itself: signal once.
+                            unsafe {
+                                let group = (sig == libc::SIGKILL || sig == libc::SIGTERM) && libc::kill(-p, sig) == 0;
+                                if !group {
+                                    libc::kill(p, sig);
+                                }
                             }
                         }
                     }
                 }
+            }
+        })
+        .await;
+        let (code, signal, note) = match waited {
+            Ok(Ok(st)) => {
+                use std::os::unix::process::ExitStatusExt;
+                (st.code(), st.signal(), None)
+            }
+            Ok(Err(e)) => {
+                crate::error!(
+                    "waiting for the worker failed; treating it as exited",
+                    worker = label,
+                    pid = pid,
+                    error = e
+                );
+                (None, None, Some(format!("wait failed: {e}")))
+            }
+            Err(msg) => {
+                // The task that owned the worker died. Its Child handle is now
+                // an orphan (tokio reaps it later), so the pid is still ours:
+                // kill the group now, then report the exit so crash handling
+                // starts a fresh worker instead of the slot looking alive forever.
+                if pid > 0 {
+                    // SAFETY: plain kill(2) on our still-unreaped child.
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
+                }
+                crate::error!(
+                    "Warden lost track of a worker (its supervising task failed); killed it so it restarts",
+                    worker = label,
+                    pid = pid,
+                    panic = msg,
+                    hint = "this is a Warden bug: please report it with the log lines above",
+                );
+                (None, Some(libc::SIGKILL), Some(format!("killed by Warden after an internal error: {msg}")))
             }
         };
         // Anything the worker left behind in its process group (helpers that
@@ -145,14 +239,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             // SAFETY: plain kill(2) on our child's process group.
             unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         }
-        let (code, signal) = match status {
-            Ok(st) => {
-                use std::os::unix::process::ExitStatusExt;
-                (st.code(), st.signal())
-            }
-            Err(_) => (None, None),
-        };
-        let _ = events.send(ProcEvent::Exited { inst, code, signal });
+        let _ = events.send(ProcEvent::Exited { inst, code, signal, note });
     });
 
     Ok(Handle { pid, ctl: ctl_tx })
@@ -180,35 +267,117 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Forward a child stream line by line to the log, capping line length.
+/// Per-worker budget for output lines. Above it, lines are dropped (and
+/// counted) instead of letting one chatty worker eat Warden's CPU (CP6).
+const OUTPUT_LINES_PER_SEC: u32 = 10_000;
+/// Per-worker budget for fd-3 IPC messages (heartbeats are 1/s per Worker).
+const IPC_MSGS_PER_SEC: u32 = 1_000;
+/// Longest IPC line kept; Warden's shim sends a few hundred bytes at most.
+const MAX_IPC_LINE: usize = 64 * 1024;
+
+/// Fixed one-second window counter.
+struct RateLimit {
+    window: std::time::Instant,
+    used: u32,
+    limit: u32,
+    dropped: u64,
+    last_report: Option<std::time::Instant>,
+    last_bad_report: Option<std::time::Instant>,
+}
+
+impl RateLimit {
+    fn new(limit: u32) -> Self {
+        RateLimit {
+            window: std::time::Instant::now(),
+            used: 0,
+            limit,
+            dropped: 0,
+            last_report: None,
+            last_bad_report: None,
+        }
+    }
+    fn allow(&mut self) -> bool {
+        if self.window.elapsed() >= std::time::Duration::from_secs(1) {
+            self.window = std::time::Instant::now();
+            self.used = 0;
+        }
+        self.used += 1;
+        if self.used > self.limit {
+            self.dropped += 1;
+            false
+        } else {
+            true
+        }
+    }
+    /// Same cadence for a second kind of report (invalid input).
+    fn report_bad(&mut self) -> bool {
+        let due = self.last_bad_report.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10));
+        if due {
+            self.last_bad_report = Some(std::time::Instant::now());
+        }
+        due
+    }
+    /// Drops since the last report: the first right away, then at most one
+    /// report per 10 s.
+    fn report(&mut self) -> Option<u64> {
+        let due = self.last_report.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10));
+        if self.dropped > 0 && due {
+            self.last_report = Some(std::time::Instant::now());
+            Some(std::mem::take(&mut self.dropped))
+        } else {
+            None
+        }
+    }
+}
+
+/// Forward a child stream line by line to the log, capping line length and rate.
 async fn pump_output<R: tokio::io::AsyncRead + Unpin>(mut r: R, label: String, stream: &'static str) {
+    crate::guard::fault(stream);
     let mut chunk = [0u8; 8192];
     let mut line: Vec<u8> = Vec::with_capacity(256);
+    let mut rate = RateLimit::new(OUTPUT_LINES_PER_SEC);
     loop {
         let n = match r.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e) => {
+                crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
+                break;
+            }
             Ok(n) => n,
         };
         for &b in &chunk[..n] {
             if b == b'\n' {
-                emit(&label, stream, &mut line);
+                emit(&label, stream, &mut line, &mut rate);
             } else {
                 line.push(b);
                 if line.len() >= MAX_LINE {
-                    emit(&label, stream, &mut line);
+                    emit(&label, stream, &mut line, &mut rate);
                 }
             }
         }
+        if let Some(n) = rate.report() {
+            crate::warn!(
+                "worker writes too much output; lines dropped",
+                worker = label,
+                stream = stream,
+                dropped = n,
+                limit_per_s = OUTPUT_LINES_PER_SEC,
+                hint = "lower the app's log level, or set [logging] worker_output = \"inherit\" to bypass Warden",
+            );
+        }
     }
     if !line.is_empty() {
-        emit(&label, stream, &mut line);
+        emit(&label, stream, &mut line, &mut rate);
     }
 }
 
-fn emit(label: &str, stream: &str, line: &mut Vec<u8>) {
-    if line.last() == Some(&b'\r') {
-        line.pop();
+fn emit(label: &str, stream: &str, line: &mut Vec<u8>, rate: &mut RateLimit) {
+    if rate.allow() {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        crate::logging::worker_output(label, stream, &String::from_utf8_lossy(line));
     }
-    crate::logging::worker_output(label, stream, &String::from_utf8_lossy(line));
     line.clear();
 }
 
@@ -218,25 +387,76 @@ async fn pump_ipc(
     events: mpsc::UnboundedSender<ProcEvent>,
     label: String,
 ) {
+    crate::guard::fault("ipc");
     let mut chunk = [0u8; 4096];
     let mut buf: Vec<u8> = Vec::new();
+    let mut rate = RateLimit::new(IPC_MSGS_PER_SEC);
+    // Bad input is counted and summarised with the rate report, never logged
+    // per line: a broken or hostile worker must not flood the log (A5).
+    let (mut malformed, mut oversized) = (0u64, 0u64);
+    let mut last_error = String::new();
+    let hint = "something in the app writes to fd 3 (WARDEN_IPC_FD); only Warden's shim should";
     loop {
         let n = match rx.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            Err(e) => {
+                crate::warn!(
+                    "stopped reading the worker's IPC pipe; readiness and heartbeats from it are lost",
+                    worker = label,
+                    error = e,
+                    hint = "the watchdog will replace the worker if heartbeats are required",
+                );
+                return;
+            }
             Ok(n) => n,
         };
         buf.extend_from_slice(&chunk[..n]);
-        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = buf.drain(..=i).collect();
-            match serde_json::from_slice::<IpcMsg>(&line) {
+        let mut start = 0;
+        while let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
+            let line = &buf[start..start + i];
+            start += i + 1;
+            if !rate.allow() {
+                continue;
+            }
+            match serde_json::from_slice::<IpcMsg>(line) {
                 Ok(msg) => {
+                    // The supervisor is gone only while Warden exits.
                     let _ = events.send(ProcEvent::Ipc { inst, msg });
                 }
-                Err(e) => crate::debug!("ignoring malformed IPC line", worker = label, error = e),
+                Err(e) => {
+                    if malformed == 0 {
+                        crate::debug!("ignoring malformed IPC line", worker = label, error = e);
+                    }
+                    malformed += 1;
+                    last_error = e.to_string();
+                }
             }
         }
-        if buf.len() > 64 * 1024 {
+        buf.drain(..start);
+        if buf.len() > MAX_IPC_LINE {
+            oversized += 1;
             buf.clear();
+        }
+        if let Some(n) = rate.report() {
+            crate::warn!(
+                "worker floods Warden's IPC pipe; messages dropped",
+                worker = label,
+                dropped = n,
+                limit_per_s = IPC_MSGS_PER_SEC,
+                hint = hint,
+            );
+        }
+        if malformed + oversized > 0 && rate.report_bad() {
+            crate::warn!(
+                "worker sent invalid IPC messages; ignored",
+                worker = label,
+                malformed = malformed,
+                oversized = oversized,
+                max_bytes = MAX_IPC_LINE,
+                last_error = last_error,
+                hint = hint,
+            );
+            (malformed, oversized) = (0, 0);
         }
     }
 }
@@ -244,6 +464,14 @@ async fn pump_ipc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limit_window() {
+        let mut r = RateLimit::new(3);
+        assert!(r.allow() && r.allow() && r.allow());
+        assert!(!r.allow() && !r.allow());
+        assert_eq!(r.dropped, 2);
+    }
 
     #[test]
     fn ipc_msg_parses() {
@@ -267,6 +495,7 @@ mod tests {
                     cwd: None,
                     env: vec![],
                     label: "t".into(),
+                    inherit_output: false,
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -300,6 +529,7 @@ mod tests {
                     cwd: None,
                     env: vec![],
                     label: "t".into(),
+                    inherit_output: false,
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);

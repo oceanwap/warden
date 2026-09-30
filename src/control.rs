@@ -33,8 +33,25 @@ pub enum Request {
     Logs {
         lines: usize,
         follow: bool,
+        /// Only lines about this worker (its output and Warden's events for it).
+        #[serde(default)]
+        worker: Option<String>,
+        /// Only Warden's own events, no worker output.
+        #[serde(default)]
+        events: bool,
+    },
+    /// Show or change the log level at runtime (not saved to the config).
+    #[serde(rename = "log-level")]
+    LogLevel {
+        #[serde(default)]
+        level: Option<crate::config::Level>,
     },
 }
+
+/// Most control connections served at once; more are refused with a message.
+pub const MAX_CONNECTIONS: usize = 64;
+/// A client must send its request line within this time.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -74,6 +91,12 @@ pub struct Status {
     pub host: Option<HostStatus>,
     pub reloading: bool,
     pub shutting_down: bool,
+    /// DS2: replacements held because most workers fail health at once.
+    #[serde(default)]
+    pub health_suspended: bool,
+    /// Log lines dropped because stdout could not keep up (CP5).
+    #[serde(default)]
+    pub log_lines_dropped: u64,
     /// Rollout in progress (reload, safe-reload, restart N, recycling).
     #[serde(default)]
     pub rollout: Option<RolloutStatus>,
@@ -181,54 +204,173 @@ pub async fn bind(path: &Path) -> Result<UnixListener, String> {
 }
 
 pub async fn serve(listener: UnixListener, tx: mpsc::UnboundedSender<ControlMsg>) {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let mut last_refusal_log: Option<std::time::Instant> = None;
+    let mut last_accept_log: Option<std::time::Instant> = None;
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                // Usually EMFILE/ENFILE: out of file descriptors. Back off
+                // instead of spinning, and say so at most every 10 s.
+                if last_accept_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+                    crate::error!(
+                        "control socket cannot accept connections; retrying",
+                        error = e,
+                        hint = "Warden may be out of file descriptors: check LimitNOFILE and `ls /proc/<warden pid>/fd | wc -l`",
+                    );
+                    last_accept_log = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            if last_refusal_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+                crate::warn!(
+                    "too many control connections; refusing new ones",
+                    limit = MAX_CONNECTIONS,
+                    hint =
+                        "something is opening the control socket in a loop or leaving `warden logs -f` sessions open",
+                );
+                last_refusal_log = Some(std::time::Instant::now());
+            }
+            crate::guard::spawn_request("control refusal", async move {
+                let (_, mut w) = stream.into_split();
+                let msg = format!("too many control connections (limit {MAX_CONNECTIONS}); try again");
+                let _ = tokio::time::timeout(REQUEST_TIMEOUT, write_json(&mut w, &Response::err(msg))).await;
+            });
+            continue;
+        };
         let tx = tx.clone();
-        tokio::task::spawn_local(async move {
-            let _ = handle(stream, tx).await;
+        crate::guard::spawn_request("control request", async move {
+            let _permit = permit;
+            if let Err(e) = handle(stream, tx).await {
+                crate::debug!("control connection ended with an error", error = e);
+            }
         });
     }
 }
 
 async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> std::io::Result<()> {
+    crate::guard::fault("control");
     let (r, mut w) = stream.into_split();
     let mut line = String::new();
     let mut reader = BufReader::new(r.take(64 * 1024));
-    reader.read_line(&mut line).await?;
-    let req: Request = match serde_json::from_str(line.trim()) {
-        Ok(r) => r,
-        Err(e) => return write_json(&mut w, &Response::err(format!("bad request: {e}"))).await,
-    };
-    if let Request::Logs { lines, follow } = req {
-        // Subscribe first so nothing is lost between the snapshot and the stream.
-        let mut rx = crate::logging::subscribe();
-        for l in crate::logging::recent(lines) {
-            w.write_all(l.as_bytes()).await?;
-            w.write_all(b"\n").await?;
+    match tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(res) => {
+            res?;
         }
-        if !follow {
-            return Ok(());
-        }
-        loop {
-            match rx.recv().await {
-                Ok(l) => {
-                    w.write_all(l.as_bytes()).await?;
-                    w.write_all(b"\n").await?;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    w.write_all(format!("... {n} lines skipped\n").as_bytes()).await?;
-                }
-                Err(_) => return Ok(()),
-            }
+        Err(_) => {
+            crate::debug!("control client sent no request in time; closing", timeout_s = REQUEST_TIMEOUT.as_secs());
+            let msg = format!("no request received within {} s", REQUEST_TIMEOUT.as_secs());
+            return reply(&mut w, &Response::err(msg)).await;
         }
     }
-    let (rtx, rrx) = oneshot::channel();
-    let resp = if tx.send((req, rtx)).is_err() {
-        Response::err("supervisor is shutting down")
-    } else {
-        rrx.await.unwrap_or_else(|_| Response::err("supervisor is shutting down"))
+    let req: Request = match serde_json::from_str(line.trim()) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("bad request: {e} (is the `warden` CLI the same version as the running Warden?)");
+            return reply(&mut w, &Response::err(msg)).await;
+        }
     };
-    write_json(&mut w, &resp).await
+    match req {
+        Request::Logs { lines, follow, worker, events } => {
+            let keep = |l: &str| log_filter(l, worker.as_deref(), events);
+            // Subscribe first so nothing is lost between the snapshot and the stream.
+            let mut rx = crate::logging::subscribe();
+            let recent = crate::logging::recent_matching(lines, &keep);
+            for l in recent {
+                w.write_all(l.as_bytes()).await?;
+                w.write_all(b"\n").await?;
+            }
+            if !follow {
+                return Ok(());
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(l) if keep(&l) => {
+                        w.write_all(l.as_bytes()).await?;
+                        w.write_all(b"\n").await?;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let note = format!("... {n} lines skipped (this client reads more slowly than Warden logs)\n");
+                        w.write_all(note.as_bytes()).await?;
+                    }
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
+        Request::LogLevel { level } => {
+            let old = crate::logging::level();
+            let resp = match level {
+                None => Response::ok(format!("log level: {}", level_name(old))),
+                Some(new) => {
+                    // Log at whichever of the two levels lets the line through.
+                    if new > old {
+                        crate::info!("log level changed", from = level_name(old), to = level_name(new));
+                    }
+                    crate::logging::set_level(new);
+                    if new <= old {
+                        crate::info!("log level changed", from = level_name(old), to = level_name(new));
+                    }
+                    Response::ok(format!(
+                        "log level: {} (was {}; until Warden restarts or a reload changes logging.level)",
+                        level_name(new),
+                        level_name(old)
+                    ))
+                }
+            };
+            reply(&mut w, &resp).await
+        }
+        req => {
+            let (rtx, rrx) = oneshot::channel();
+            let resp = if tx.send((req, rtx)).is_err() {
+                Response::err("Warden is shutting down")
+            } else {
+                rrx.await.unwrap_or_else(|_| Response::err("Warden is shutting down"))
+            };
+            reply(&mut w, &resp).await
+        }
+    }
+}
+
+fn level_name(l: crate::config::Level) -> &'static str {
+    use crate::config::Level::*;
+    match l {
+        Debug => "debug",
+        Info => "info",
+        Warn => "warn",
+        Error => "error",
+    }
+}
+
+/// `warden logs --worker N` keeps worker N's output and Warden's events that
+/// name it (`worker=N`); `--events` drops worker output.
+pub fn log_filter(line: &str, worker: Option<&str>, events_only: bool) -> bool {
+    let is_output = line.contains(" OUT   worker=");
+    if events_only && is_output {
+        return false;
+    }
+    match worker {
+        None => true,
+        // Output lines: only the prefix counts, not what the app printed.
+        Some(w) if is_output => line.contains(&format!(" OUT   worker={w} ")),
+        Some(w) => {
+            let needle = format!(" worker={w}");
+            line.match_indices(&needle)
+                .any(|(i, _)| matches!(line.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\n')))
+        }
+    }
+}
+
+/// Write a response, giving up if the client does not read it in time.
+async fn reply(w: &mut tokio::net::unix::OwnedWriteHalf, v: &Response) -> std::io::Result<()> {
+    match tokio::time::timeout(REQUEST_TIMEOUT, write_json(w, v)).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "client did not read the response")),
+    }
 }
 
 async fn write_json(w: &mut tokio::net::unix::OwnedWriteHalf, v: &Response) -> std::io::Result<()> {
@@ -288,6 +430,21 @@ mod tests {
     }
 
     #[test]
+    fn log_filters() {
+        let out = "2026-09-30T12:00:00.000Z OUT   worker=1 stdout: hello worker=12";
+        let ev = "2026-09-30T12:00:00.000Z INFO  worker ready worker=12 pid=5";
+        let other = "2026-09-30T12:00:00.000Z INFO  reload finished";
+        assert!(log_filter(out, None, false) && log_filter(ev, None, false));
+        assert!(!log_filter(out, None, true) && log_filter(ev, None, true) && log_filter(other, None, true));
+        assert!(log_filter(out, Some("1"), false));
+        assert!(!log_filter(ev, Some("1"), false), "worker=12 is not worker=1");
+        assert!(log_filter(ev, Some("12"), false));
+        assert!(!log_filter(out, Some("12"), false), "what the app printed doesn't count");
+        assert!(!log_filter(other, Some("1"), false));
+        assert!(!log_filter(out, Some("1"), true));
+    }
+
+    #[test]
     fn request_wire_format() {
         assert_eq!(serde_json::to_string(&Request::Status).unwrap(), r#"{"cmd":"status"}"#);
         assert_eq!(
@@ -297,6 +454,15 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"cmd":"scale","count":3}"#).unwrap(),
             Request::Scale { count: 3 }
+        );
+        // Older clients send logs without the filter fields.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"logs","lines":5,"follow":false}"#).unwrap(),
+            Request::Logs { lines: 5, follow: false, worker: None, events: false }
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::LogLevel { level: Some(crate::config::Level::Debug) }).unwrap(),
+            r#"{"cmd":"log-level","level":"debug"}"#
         );
     }
 }

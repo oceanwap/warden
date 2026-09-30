@@ -4,6 +4,7 @@
 mod cli;
 mod config;
 mod control;
+mod guard;
 mod health;
 mod logging;
 mod metrics;
@@ -66,13 +67,30 @@ fn main() {
                     c.control.socket = Some(s);
                 }
                 logging::init(c.logging.level, c.logging.timestamps);
-                match rt.block_on(supervisor::run(c, Some(args.config.clone()))) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        error!("fatal", error = e);
+                guard::install_panic_hook();
+                let run = std::panic::AssertUnwindSafe(|| rt.block_on(supervisor::run(c, Some(args.config.clone()))));
+                let code = match std::panic::catch_unwind(run) {
+                    Ok(Ok(())) => 0,
+                    Ok(Err(e)) => {
+                        error!(
+                            "Warden could not start",
+                            error = e,
+                            hint = "fix the problem named in `error`; `warden doctor` checks the usual causes",
+                        );
                         1
                     }
-                }
+                    // The panic hook has already printed where and why.
+                    Err(_) => {
+                        error!(
+                            "Warden's main loop panicked; exiting (workers drain and exit, systemd restarts Warden)",
+                            hint = "this is a Warden bug: please report it with the log lines above",
+                        );
+                        101
+                    }
+                };
+                // Queued lines would be lost on exit: give the writer a moment.
+                logging::flush(std::time::Duration::from_secs(1));
+                code
             }
             Err(e) => {
                 eprintln!("warden: {e}");

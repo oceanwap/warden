@@ -24,6 +24,17 @@ fn send_abstract(_: &std::os::unix::net::UnixDatagram, _: &str, _: &str) -> std:
     Ok(())
 }
 
+/// systemd asks for keep-alive pings by setting WATCHDOG_USEC (and
+/// WATCHDOG_PID, which must be us if present).
+pub fn watchdog_requested() -> bool {
+    let usec = std::env::var("WATCHDOG_USEC").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let pid_ok = match std::env::var("WATCHDOG_PID").ok().and_then(|v| v.parse::<u32>().ok()) {
+        Some(p) => p == std::process::id(),
+        None => true,
+    };
+    usec > 0 && pid_ok && std::env::var_os("NOTIFY_SOCKET").is_some()
+}
+
 /// `RELOADING=1` must carry the monotonic timestamp for `Type=notify-reload`.
 pub fn reloading() {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };

@@ -110,6 +110,18 @@ pub fn render_prometheus(s: &Status) -> String {
         );
     }
     gauge(
+        "warden_log_lines_dropped_total",
+        "Log lines dropped because stdout could not keep up.",
+        "counter",
+        vec![(String::new(), s.log_lines_dropped as f64)],
+    );
+    gauge(
+        "warden_health_suspended",
+        "1 while replacements are held because most workers fail health (dependency outage).",
+        "gauge",
+        vec![(String::new(), s.health_suspended as u8 as f64)],
+    );
+    gauge(
         "warden_rollout_in_progress",
         "1 while a rollout is running.",
         "gauge",
@@ -135,7 +147,7 @@ where
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
         let snapshot = snapshot.clone();
-        tokio::task::spawn_local(async move {
+        crate::guard::spawn_request("metrics request", async move {
             let mut buf = vec![0u8; 4096];
             let mut n = 0;
             let read = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -206,6 +218,8 @@ mod tests {
             host: None,
             reloading: false,
             shutting_down: false,
+            health_suspended: false,
+            log_lines_dropped: 0,
             rollout: None,
             last_rollout: None,
             workers: vec![WorkerStatus {

@@ -7,6 +7,8 @@
 //   FIXTURE_THROW_AFTER=<ms>   uncaught error after <ms> (kills one Worker in worker mode)
 //   FIXTURE_EXTRA_SERVER=1     start an unrelated server (random port, 404 everywhere)
 //                              first, and the app server 400 ms later
+//   FIXTURE_SPAM=1             write stdout lines as fast as possible (stalled-log tests)
+//   FIXTURE_IPC_FLOOD=1        write messages and junk to fd 3 as fast as possible
 // Endpoints:
 //   /whoami  pid:thread      /health  200 or 503
 //   /throw   uncaught error  /exit    exit 3
@@ -23,6 +25,21 @@ if (process.env.FIXTURE_THROW_AFTER) {
 if (process.env.FIXTURE_IGNORE_TERM) process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
 
 const who = `${process.pid}:${threadId}`;
+
+if (process.env.FIXTURE_SPAM) {
+  const line = `spam ${"x".repeat(200)}\n`.repeat(100);
+  const spam = () => { process.stdout.write(line); setImmediate(spam); };
+  spam();
+}
+if (process.env.FIXTURE_IPC_FLOOD) {
+  const fs = require("node:fs");
+  const msgs = '{"ev":"heartbeat"}\n'.repeat(200) + "not json\n" + "z".repeat(100_000);
+  const flood = () => {
+    try { fs.writeSync(3, msgs); } catch {}
+    setImmediate(flood);
+  };
+  setTimeout(flood, 200);
+}
 let sick = process.env.FIXTURE_HEALTH_FAIL === "1";
 const hoard: Uint8Array[] = [];
 

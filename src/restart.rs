@@ -69,6 +69,12 @@ impl Tracker {
     }
 }
 
+/// `now + d` that cannot panic: values are bounded by config validation, and
+/// anything that would still overflow lands a year out instead.
+pub fn later(now: Instant, d: Duration) -> Instant {
+    now.checked_add(d).unwrap_or_else(|| now + Duration::from_secs(365 * 86_400))
+}
+
 /// `initial * 2^(n-1)`, capped at `max`.
 pub fn backoff(p: &Policy, n: u32) -> Duration {
     let shift = n.saturating_sub(1).min(31);
@@ -134,6 +140,13 @@ mod tests {
         assert_eq!(t.on_crash(&p, t0, short), Decision::RestartAfter(Duration::from_millis(400)));
         let later = t0 + Duration::from_secs(200);
         assert_eq!(t.on_crash(&p, later, Duration::from_secs(120)), Decision::RestartAfter(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn later_never_panics() {
+        let now = Instant::now();
+        assert!(later(now, Duration::MAX) > now);
+        assert_eq!(later(now, Duration::from_secs(5)), now + Duration::from_secs(5));
     }
 
     #[test]

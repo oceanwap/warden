@@ -11,6 +11,9 @@
 Description=Warden: %i
 After=network-online.target
 Wants=network-online.target
+# Give up (and alert via OnFailure=, if set) only after 10 crashes in 60 s.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 # READY=1 is sent once every worker is listening.
@@ -21,10 +24,16 @@ Group=www-data
 ExecStart=/usr/local/bin/warden start --config /etc/warden/%i.toml
 # Blocks until the rollout finishes; a failed canary makes `systemctl reload` fail.
 ExecReload=/usr/local/bin/warden safe-reload --config /etc/warden/%i.toml
-TimeoutStartSec=120
-TimeoutReloadSec=600
+# Also bounds `systemctl reload` (systemd applies the start timeout to
+# reloads): leave room for canary_soak + gates for every worker.
+TimeoutStartSec=600
 Restart=always
-RestartSec=2
+# A Warden crash takes its workers down (they drain and exit ~0.7 s later);
+# come back quickly. The outage is drain + RestartSec + app startup.
+RestartSec=500ms
+# Warden pings every second while its event loop keeps up; if it hangs
+# (e.g. stdout stalled), systemd restarts it. Traffic is unaffected until then.
+WatchdogSec=10
 
 # Only Warden gets the first SIGTERM and orchestrates the drain; systemd
 # SIGKILLs the whole cgroup if it is still there after TimeoutStopSec.

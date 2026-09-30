@@ -225,7 +225,8 @@ impl Supervisor {
                 );
                 let tx = self.tx.clone();
                 tokio::task::spawn_local(async move {
-                    let result = fut.await;
+                    let result =
+                        crate::guard::catch_unwind(fut).await.unwrap_or_else(|p| Err(format!("internal error: {p}")));
                     let _ = tx.send(Event::Gate(GateEvent::Preflight { seq, result }));
                 });
             }
@@ -321,8 +322,13 @@ impl Supervisor {
         if diff(&old.workers, &new.workers) {
             ignored.push("workers (use `warden scale` for the count)");
         }
-        if diff(&old.logging, &new.logging) {
-            ignored.push("logging");
+        let mut new_level = None;
+        if old.logging.level != new.logging.level {
+            new_level = Some(new.logging.level);
+            applied.push("logging.level");
+        }
+        if old.logging.timestamps != new.logging.timestamps || old.logging.worker_output != new.logging.worker_output {
+            ignored.push("logging.timestamps/worker_output");
         }
         if diff(&old.metrics, &new.metrics) || diff(&old.control, &new.control) {
             ignored.push("metrics/control");
@@ -335,6 +341,10 @@ impl Supervisor {
         self.cfg.logging = logging;
         self.cfg.metrics = metrics;
         self.cfg.control = control;
+        if let Some(level) = new_level {
+            self.cfg.logging.level = level;
+            crate::logging::set_level(level);
+        }
         self.cfg.health.url = url;
         self.cfg.health.enabled = enabled;
         self.cfg.health.interval = interval;
@@ -362,7 +372,7 @@ impl Supervisor {
             slot.token += 1; // cancel a pending restart timer; this rollout takes over
             let current = slot.current;
             let serving = current.filter(|_| matches!(slot.state, State::Running | State::Restarting));
-            let deadline = Instant::now() + Duration::from_secs(self.cfg.reload.timeout);
+            let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
             let offset = self.cfg.workers.port_strategy == PortStrategy::Offset;
             let step = match (serving, current) {
                 // Each worker owns its port: stop, then start (a gap for this worker only).
@@ -441,7 +451,7 @@ impl Supervisor {
     /// With a health path configured, health gates are mandatory: a worker
     /// that can't be checked fails them (never silently skipped).
     fn can_check(&self, _inst: u64) -> bool {
-        self.cfg.health_path().is_some()
+        self.cfg.ready_path().is_some()
     }
 
     pub(super) fn on_gate(&mut self, ev: GateEvent) {
@@ -517,7 +527,7 @@ impl Supervisor {
                     return;
                 }
                 if !v.soak.is_zero() {
-                    let until = *v.soak_until.get_or_insert(now + v.soak);
+                    let until = *v.soak_until.get_or_insert(crate::restart::later(now, v.soak));
                     if now < until {
                         if checks {
                             v.checking = true;
@@ -546,6 +556,7 @@ impl Supervisor {
                 v.fails = 0;
                 if !soaking && v.passes < required {
                     v.passes += 1;
+                    debug!("gate health check passed", worker = v.slot, passes = v.passes, required = required);
                     if v.passes == required {
                         info!("new worker passed health checks", worker = v.slot, passes = required);
                     }
@@ -570,23 +581,27 @@ impl Supervisor {
     fn launch_check(&self, seq: u64, inst: u64) {
         let Some(i) = self.insts.get(&inst) else { return };
         let sockets: Vec<PathBuf> = i.sockets.values().cloned().collect();
-        let path = self.cfg.health_path().unwrap_or_else(|| "/".into());
+        let path = self.cfg.ready_path().unwrap_or_else(|| "/".into());
         let timeout = Duration::from_secs(self.cfg.health.timeout);
         let url = crate::health::parse_url(&self.cfg.health.url).ok();
         let expected = if self.shim_path.is_some() { self.expected_listeners() } else { 0 };
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
-            let result = if expected > 0 && sockets.len() >= expected {
-                check_sockets(&sockets, &path, timeout).await
-            } else if let Some(t) = url {
-                // No private socket (app without the shim): app-level check.
-                crate::health::check(&t, timeout).await.map(|_| ())
-            } else {
-                Err(format!(
-                    "only {} of {expected} private health socket(s) reported; the app must listen via Bun.serve (or node:http) with Warden's shim, or set [health] url",
-                    sockets.len()
-                ))
+            let check = async move {
+                if expected > 0 && sockets.len() >= expected {
+                    check_sockets(&sockets, &path, timeout).await
+                } else if let Some(t) = url {
+                    // No private socket (app without the shim): app-level check.
+                    crate::health::check(&t, timeout).await.map(|_| ())
+                } else {
+                    Err(format!(
+                        "only {} of {expected} private health socket(s) reported; the app must listen via Bun.serve (or node:http) with Warden's shim, or set [health] url",
+                        sockets.len()
+                    ))
+                }
             };
+            let result =
+                crate::guard::catch_unwind(check).await.unwrap_or_else(|p| Err(format!("internal error: {p}")));
             let _ = tx.send(Event::Gate(GateEvent::Check { seq, inst, result }));
         });
     }
@@ -615,7 +630,7 @@ impl Supervisor {
             run_shell(cmd, self.cfg.app.working_directory.clone(), env, Duration::from_secs(self.cfg.reload.timeout));
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
-            let result = fut.await;
+            let result = crate::guard::catch_unwind(fut).await.unwrap_or_else(|p| Err(format!("internal error: {p}")));
             let _ = tx.send(Event::Gate(GateEvent::Command { seq, inst, result }));
         });
     }
@@ -702,7 +717,7 @@ impl Supervisor {
 
     /// Called from `on_exit` for every exited instance.
     pub(super) fn rollout_on_exit(&mut self, inst: u64, reason: &str) {
-        let deadline = Instant::now() + Duration::from_secs(self.cfg.reload.timeout);
+        let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
         let Some(roll) = &mut self.roll else { return };
         match &mut roll.step {
             Step::Starting { new, .. } if *new == inst => {
