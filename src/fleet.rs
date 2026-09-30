@@ -1906,6 +1906,7 @@ mod tests {
         assert!(resolve(&c, Some("api:x"), true).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn origin_is_read_from_proc() {
         let me = Origin::of(std::process::id()).expect("our own environment");

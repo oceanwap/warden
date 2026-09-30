@@ -971,6 +971,7 @@ pub struct DirectFile {
     /// Where the next byte goes: the file's size, re-read before each write.
     offset: u64,
     /// splice works here; false after EINVAL/ENOSYS/EPERM, and off Linux.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only read by the Linux fast path
     splice: bool,
     /// The schedule asked for a rotation: done at the next line boundary.
     rotate_due: bool,
