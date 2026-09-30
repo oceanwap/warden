@@ -722,8 +722,34 @@ impl Daemon {
     }
 
     /// `--resurrect`: start every app `warden save` recorded that is not
-    /// running, in the background, watched like any other.
+    /// running, in the background, watched like any other. Once per boot:
+    /// when launchd (KeepAlive) restarts a crashed wardend, apps the user
+    /// stopped since boot stay stopped.
     async fn resurrect(&self) {
+        let marker = config::runtime_dir().join("resurrected");
+        let boot = boot_id();
+        if already_resurrected(boot.as_deref(), std::fs::read_to_string(&marker).ok().as_deref()) {
+            crate::info!(
+                "saved apps were already resurrected this boot; not starting them again",
+                marker = marker.display(),
+                hint = "wardend restarted after a crash; apps stopped since boot stay stopped. `warden resurrect` starts the saved apps now",
+            );
+            return;
+        }
+        self.resurrect_saved().await;
+        if let Some(b) = boot {
+            if let Err(e) = std::fs::write(&marker, b) {
+                crate::warn!(
+                    "cannot record that the saved apps were resurrected",
+                    marker = marker.display(),
+                    error = e,
+                    hint = "if wardend restarts before the next boot it resurrects them again; check the runtime directory's permissions",
+                );
+            }
+        }
+    }
+
+    async fn resurrect_saved(&self) {
         let saved = match fleet::saved_apps() {
             Ok(Some(s)) if !s.is_empty() => s,
             Ok(_) => {
@@ -775,6 +801,24 @@ impl Daemon {
             core.apps_changed();
         }
     }
+}
+
+/// Identifies this boot: the kernel's boot id on Linux, the boot time
+/// elsewhere. None if unknown (then every start resurrects, as before).
+fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+fn already_resurrected(boot: Option<&str>, marker: Option<&str>) -> bool {
+    matches!((boot, marker), (Some(b), Some(m)) if !b.is_empty() && m.trim() == b)
 }
 
 /// `systemctl [--user] start --no-block <unit>`: queued, not waited for (a
@@ -1191,4 +1235,26 @@ async fn forward(
         Err(_) => reply_err(format!("{app}'s supervisor did not answer within {} s", FORWARD_TIMEOUT.as_secs())),
     };
     reply(&mut w, &r).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{already_resurrected, boot_id};
+
+    #[test]
+    fn resurrect_runs_once_per_boot() {
+        assert!(!already_resurrected(Some("b1"), None), "first start this boot");
+        assert!(already_resurrected(Some("b1"), Some("b1\n")), "restart in the same boot");
+        assert!(!already_resurrected(Some("b2"), Some("b1")), "after a reboot");
+        assert!(!already_resurrected(None, Some("b1")), "boot unknown: resurrect, as before");
+        assert!(!already_resurrected(Some(""), Some("")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_id_is_stable_within_a_boot() {
+        let a = boot_id().expect("Linux has a boot id");
+        assert_eq!(a.len(), 36, "{a}");
+        assert_eq!(boot_id().as_deref(), Some(a.as_str()));
+    }
 }

@@ -3251,6 +3251,16 @@ fn wardend_resurrect_starts_the_saved_apps() {
     let log = d.log();
     assert!(log.contains("resurrected a saved app app=one"), "{log}");
     assert!(!log.contains("resurrected a saved app app=two"), "{log}");
+
+    // Once per boot: a wardend restarted later (launchd's KeepAlive after a
+    // crash) leaves apps stopped since then stopped.
+    drop(d);
+    f.ok(&["kill", "one", "--yes"]);
+    f.wait("one offline", |f| f.app("one")["status"].is_null());
+    let d = Wardend::start_args(&f, &["daemon", "--resurrect"], &[]);
+    f.wait("second resurrect skipped", |_| d.log().contains("already resurrected this boot"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(f.app("one")["status"].is_null(), "stopped app came back:\n{}", d.log());
 }
 
 #[test]
