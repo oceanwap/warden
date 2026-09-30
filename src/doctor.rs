@@ -300,20 +300,26 @@ async fn apps(args: &Args) -> Vec<Finding> {
 }
 
 fn boot() -> Option<Finding> {
-    // Saved apps come back after a reboot only through the systemd unit.
+    // Saved apps come back after a reboot through what `warden startup` installs.
     let saved = fleet::saved_names();
-    if saved.is_empty() || !Path::new("/run/systemd/system").exists() {
+    if saved.is_empty() {
         return None;
     }
-    Some(if fleet::unit_installed() {
-        f(Level::Ok, "boot", format!("{} saved app(s); the systemd unit is installed", saved.len()), None)
-    } else {
-        f(
+    let n = saved.len();
+    Some(match crate::startup::installed() {
+        Some(what) => f(Level::Ok, "boot", format!("{n} saved app(s); {what} bring them back after a reboot"), None),
+        None if crate::startup::available() => f(
             Level::Warn,
             "boot",
-            format!("{} saved app(s), but no systemd unit: they won't come back after a reboot", saved.len()),
-            Some("sudo warden startup"),
-        )
+            format!("{n} saved app(s), but nothing brings them back after a reboot"),
+            Some("warden startup (as root for system units, else your own user units)"),
+        ),
+        None => f(
+            Level::Info,
+            "boot",
+            format!("{n} saved app(s); no service manager here (no systemd)"),
+            Some("run `warden resurrect` or `warden daemon --resurrect` from your init system or entrypoint"),
+        ),
     })
 }
 

@@ -47,8 +47,11 @@ APPS (familiar from PM2):
                      --basic-auth user:pass (or --basic-auth-username/-password)
     save             Remember the running apps, worker counts and stopped state
     resurrect        Start what `save` remembered
-    startup          Install the systemd unit and enable saved apps at boot (root)
-    unstartup        Disable them again
+    startup          Bring the saved apps and wardend back after a reboot or a crash:
+                     systemd units (root: system units; a user or --user: your own,
+                     with lingering), a launchd job on macOS. Without a service
+                     manager it says what to run at boot instead  [--user|--system]
+    unstartup        Remove what `startup` installed (apps keep running)  [--user|--system]
     kill [target]    Stop every app's supervisor (asks first on a terminal; --yes)
     pm2-migrate      Import PM2's apps: a config, a 0600 .env file and a MIGRATION.md
                      report per app. --from jlist|dump|<ecosystem file>  --env <name>
@@ -60,7 +63,9 @@ WARDEND (optional daemon: restarts background supervisors that die, one socket
 for live events; apps never depend on it and keep running without it):
     daemon           Run wardend in the foreground; --background detaches it (log in
                      the state directory: logs/wardend.log). `warden start` starts it
-                     in the background for you unless WARDEN_NO_DAEMON=1
+                     in the background for you unless WARDEN_NO_DAEMON=1.
+                     --resurrect: first start the apps `warden save` recorded (a
+                     container entrypoint; what launchd runs on macOS)
     daemon status    wardend's pid and every app it watches  [--json]; exit 1 when
                      it is not running
     daemon stop      Stop wardend; every app keeps running (`warden kill` stops it too)
@@ -131,8 +136,8 @@ pub enum Command {
     },
     Save,
     Resurrect,
-    Startup,
-    Unstartup,
+    Startup(crate::startup::Want),
+    Unstartup(crate::startup::Want),
     Kill,
     Top,
     Doctor,
@@ -148,9 +153,10 @@ pub enum Command {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DaemonCmd {
-    /// `warden daemon [--background]`.
+    /// `warden daemon [--background] [--resurrect]`.
     Run {
         background: bool,
+        resurrect: bool,
     },
     Status,
     Stop,
@@ -282,7 +288,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut worker: Option<String> = None;
     let mut q = crate::logview::Query::default();
     let mut history = false;
-    let (mut background, mut with_logs) = (false, false);
+    let (mut background, mut with_logs, mut resurrect) = (false, false, false);
+    let mut scope = crate::startup::Want::Auto;
     let mut interval_ms: Option<u64> = None;
     let mut so = StartOpts::default();
     let mut positional: Vec<String> = Vec::new();
@@ -314,6 +321,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--history" | "--files" | "--all" => history = true,
             "--background" => background = true,
+            "--resurrect" => resurrect = true,
+            "--user" => scope = crate::startup::Want::User,
+            "--system" => scope = crate::startup::Want::System,
             "--logs" => with_logs = true,
             "--interval" => interval_ms = Some(num(a, &value(a)?)?),
             "--json" => json = true,
@@ -561,8 +571,14 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
         "save" | "dump" => Command::Save,
         "resurrect" => Command::Resurrect,
-        "startup" => Command::Startup,
-        "unstartup" => Command::Unstartup,
+        "startup" => {
+            too_many(0)?;
+            Command::Startup(scope)
+        }
+        "unstartup" => {
+            too_many(0)?;
+            Command::Unstartup(scope)
+        }
         "kill" => {
             too_many(1)?;
             target = one(&rest);
@@ -580,7 +596,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         "daemon" | "wardend" => {
             too_many(1)?;
             Command::Daemon(match one(&rest).as_deref() {
-                None | Some("start") | Some("run") => DaemonCmd::Run { background },
+                None | Some("start") | Some("run") => DaemonCmd::Run { background, resurrect },
                 Some("status") => DaemonCmd::Status,
                 Some("stop") => DaemonCmd::Stop,
                 Some(other) => return Err(format!("daemon {other:?}: expected `status`, `stop` or nothing")),
@@ -597,6 +613,14 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         return Err("--background only applies to `warden daemon` (`warden start` already runs apps in the \
                     background)"
             .into());
+    }
+    if resurrect && !matches!(command, Command::Daemon(DaemonCmd::Run { .. })) {
+        return Err(
+            "--resurrect only applies to `warden daemon` (`warden resurrect` starts the saved apps once)".into()
+        );
+    }
+    if scope != crate::startup::Want::Auto && !matches!(command, Command::Startup(_) | Command::Unstartup(_)) {
+        return Err("--user and --system only apply to `warden startup` and `warden unstartup`".into());
     }
     if let Some(w) = worker {
         target = Some(format!("{}:{w}", target.unwrap_or_default()));
@@ -1043,8 +1067,18 @@ mod tests {
 
     #[test]
     fn daemon_and_events_commands() {
-        assert_eq!(p("daemon").unwrap().command, Command::Daemon(DaemonCmd::Run { background: false }));
-        assert_eq!(p("daemon --background").unwrap().command, Command::Daemon(DaemonCmd::Run { background: true }));
+        let run = |background, resurrect| Command::Daemon(DaemonCmd::Run { background, resurrect });
+        assert_eq!(p("daemon").unwrap().command, run(false, false));
+        assert_eq!(p("daemon --background").unwrap().command, run(true, false));
+        assert_eq!(p("daemon --resurrect").unwrap().command, run(false, true));
+        assert_eq!(p("daemon --background --resurrect").unwrap().command, run(true, true));
+        assert!(p("start app.js --resurrect").is_err());
+        use crate::startup::Want;
+        assert_eq!(p("startup").unwrap().command, Command::Startup(Want::Auto));
+        assert_eq!(p("startup --user").unwrap().command, Command::Startup(Want::User));
+        assert_eq!(p("unstartup --system").unwrap().command, Command::Unstartup(Want::System));
+        assert!(p("startup api").is_err());
+        assert!(p("list --user").is_err(), "only for startup");
         assert_eq!(p("daemon status").unwrap().command, Command::Daemon(DaemonCmd::Status));
         assert!(p("daemon status --json").unwrap().json);
         assert_eq!(p("daemon stop").unwrap().command, Command::Daemon(DaemonCmd::Stop));

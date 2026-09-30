@@ -75,10 +75,31 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `too many control connections; refusing new ones` | More than 64 clients at once (a monitoring loop without timeouts?) | Fix the client; each request has a 5 s timeout |
 | Permission denied on the control socket | It is 0600 and owned by the user Warden runs as | Run the CLI as that user (or `sudo -u <user>`) |
 
+## Reboots, crashes and wardend
+
+`warden startup` installs what brings the saved apps back (README:
+"Surviving reboots and crashes"); `warden doctor` says whether anything does.
+
+| You see | Why | Fix |
+|---|---|---|
+| `no service manager found: systemd is not running here` | A container or another init system: nothing to install into, so nothing was | Run `warden resurrect` from the entrypoint or init script, or make `warden daemon --resurrect` the entrypoint (under `docker run --init`) |
+| `writing …/warden@.service: Permission denied; nothing was enabled` | System units need root | `sudo warden startup`, or `warden startup --user` for units of your own |
+| `your systemd user manager did not answer, so nothing is enabled` (`Failed to connect to bus`) | No login session for that user (`su`, cron, a script) | Run `warden startup` from an ssh login as that user; if there is none, as root once `loginctl enable-linger <user>`, then log in and run it again |
+| `could not turn on lingering for <user>` | `loginctl enable-linger` needs root (polkit) on this system | `sudo loginctl enable-linger <user>`. The units are installed; until then the apps start at login and stop at logout |
+| `warden@.service reads <dir>/<app>.toml, but this app's config is …` | The unit reads configs only from the config directory | The message has the `ln -s` to run; then `warden startup` again |
+| `launchctl bootstrap gui/<uid> … failed` (`Domain does not support specified action`) | macOS: no desktop login session (SSH only) | The plist is written and loads at the next desktop login; for boot without a login, `sudo warden startup` (a LaunchDaemon) |
+| `wardend runs as the systemd unit wardend.service … stopping the unit failed` | `warden kill` / `warden daemon stop` as a user who cannot manage that unit; stopping only the process would get it restarted | `sudo systemctl stop wardend` |
+| `wardend is already running (pid N)` repeating in wardend's log | A wardend started by hand holds the socket, and systemd or launchd keeps retrying theirs | `warden daemon stop`; the service manager's own then starts. `warden startup` does this hand-over itself |
+| `supervisor died; restarting it` | A supervisor launched in the background died without saying `bye` (crash, OOM kill, kill -9) | `error=` says how; its log (in `hint=`) says why. wardend restarts it after 1, 2, 4 … 60 s |
+| `supervisor keeps dying; wardend gave up restarting it` | 10 deaths within 10 minutes | Fix the error in `last_lines=`, then `warden start <app>` |
+| `supervisor is unresponsive; not killing it` | No event and no `status` answer for 3 s + 5 s; its workers probably still serve | `cat /proc/<pid>/stack` or `gdb -p <pid>` shows where it is stuck; restart it yourself if it stays stuck |
+| `supervisor died; not restarting it (it was not started in the background)` | It ran in a terminal (or under systemd, which restarts it itself) | `warden start <app>` runs it in the background, where wardend restarts it |
+| `a saved app's config is gone; not starting it` | `warden daemon --resurrect` found a saved app whose config was deleted | `warden save` again to forget it |
+
 ## Containers
 
 - Don't run Warden as PID 1: orphaned grandchildren are never reaped. Use
-  `docker run --init` or `tini`.
+  `docker run --init` or `tini` (also for `warden daemon --resurrect`).
 - `net.ipv4.tcp_migrate_req` is per network namespace: set it for the
   container (`docker run --sysctl net.ipv4.tcp_migrate_req=1`).
 - Some seccomp profiles block `openat2`: see Static files above.

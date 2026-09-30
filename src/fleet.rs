@@ -87,7 +87,7 @@ pub(crate) fn log_path(name: &str) -> PathBuf {
 
 // --------------------------------------------------------------- discovery
 
-fn app_from_config(path: &Path) -> App {
+pub(crate) fn app_from_config(path: &Path) -> App {
     match Config::load(path) {
         Ok(c) => App {
             name: c.app.name.clone(),
@@ -270,7 +270,7 @@ async fn call_with(app: &App, req: &Request, timeout: Duration) -> Result<Respon
     }
 }
 
-async fn status_of(app: &App) -> Result<Status, String> {
+pub(crate) async fn status_of(app: &App) -> Result<Status, String> {
     let r = call_with(app, &Request::Status, STATUS_TIMEOUT).await?;
     r.status.ok_or_else(|| r.message.unwrap_or_else(|| "no status".into()))
 }
@@ -647,7 +647,7 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
             Ok(r) => {
                 let info = r.info.unwrap_or_default();
                 let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
-                let unit = info["unit"].as_str().map(String::from);
+                let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
                 let bg = info["log_file"].as_str().map(PathBuf::from);
                 (cfg.map(|c| (c, bg)), unit)
             }
@@ -701,9 +701,9 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
             }
         };
         if sources.is_empty() {
-            match unit.as_deref() {
-                Some(u) => {
-                    let res = journal_lines(u, &q, &mut |line| {
+            match &unit {
+                Some((scope, u)) => {
+                    let res = journal_lines(u, *scope == Scope::User, &q, &mut |line| {
                         if q.matches(line) { push(emit_prefix(line), &mut out) } else { true }
                     });
                     if let Err(e) = res {
@@ -786,57 +786,121 @@ impl std::io::Write for Filtered {
     }
 }
 
-fn systemctl() -> Option<PathBuf> {
+/// Which systemd manager: the system's (root, /etc/systemd/system) or the
+/// user's own (`systemctl --user`, ~/.config/systemd/user).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    System,
+    User,
+}
+
+impl Scope {
+    /// What this user manages: root the system's units, anyone else their own.
+    pub(crate) fn mine() -> Scope {
+        if is_root() { Scope::System } else { Scope::User }
+    }
+
+    /// Where `warden startup` writes the units (`$WARDEN_UNIT_DIR` /
+    /// `$WARDEN_USER_UNIT_DIR` for tests).
+    pub(crate) fn unit_dir(self) -> PathBuf {
+        match self {
+            Scope::System => std::env::var_os("WARDEN_UNIT_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/etc/systemd/system")),
+            Scope::User => match std::env::var_os("WARDEN_USER_UNIT_DIR").filter(|v| !v.is_empty()) {
+                Some(d) => PathBuf::from(d),
+                None => user_dir("XDG_CONFIG_HOME", ".config").with_file_name("systemd").join("user"),
+            },
+        }
+    }
+
+    /// `systemctl <this> …`: `--user` for the user's manager.
+    pub(crate) fn flag(self) -> Option<&'static str> {
+        match self {
+            Scope::System => None,
+            Scope::User => Some("--user"),
+        }
+    }
+
+    /// `systemctl --user ` or nothing, for messages.
+    pub(crate) fn shown(self) -> &'static str {
+        match self {
+            Scope::System => "",
+            Scope::User => "--user ",
+        }
+    }
+
+    /// A Warden unit file installed for this manager.
+    pub(crate) fn has_unit(self, file: &str) -> bool {
+        self.unit_dir().join(file).exists()
+            || self == Scope::System
+                && ["/lib/systemd/system", "/usr/lib/systemd/system"].iter().any(|d| Path::new(d).join(file).exists())
+    }
+}
+
+/// systemctl, when systemd runs this host (`$WARDEN_SYSTEMCTL` for tests).
+pub(crate) fn systemctl_bin() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("WARDEN_SYSTEMCTL").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(p));
     }
-    if !is_root() || !Path::new("/run/systemd/system").is_dir() {
+    if !Path::new("/run/systemd/system").is_dir() {
         return None;
     }
     ["/usr/bin/systemctl", "/bin/systemctl"].iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-fn unit_dir() -> PathBuf {
-    std::env::var_os("WARDEN_UNIT_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/etc/systemd/system"))
+/// Does the system manager (root's units) apply to us?
+fn systemctl() -> Option<PathBuf> {
+    systemctl_bin().filter(|_| is_root() || std::env::var_os("WARDEN_SYSTEMCTL").is_some())
 }
 
-pub fn unit_installed() -> bool {
-    unit_dir().join("warden@.service").exists()
-        || Path::new("/lib/systemd/system/warden@.service").exists()
-        || Path::new("/usr/lib/systemd/system/warden@.service").exists()
-}
-
-fn run_systemctl(args: &[&str]) -> Result<(), String> {
-    let Some(bin) = systemctl() else { return Err("systemd is not available here".into()) };
+/// `systemctl [--user] <args>`; the last line of its error output on failure.
+pub(crate) fn run_systemctl(scope: Scope, args: &[&str]) -> Result<(), String> {
+    let Some(bin) = systemctl_bin() else { return Err("systemd is not running on this host".into()) };
     let out = std::process::Command::new(&bin)
+        .args(scope.flag())
         .args(args)
         .output()
-        .map_err(|e| format!("running {} {}: {e}", bin.display(), args.join(" ")))?;
+        .map_err(|e| format!("running {} {}{}: {e}", bin.display(), scope.shown(), args.join(" ")))?;
     if out.status.success() {
         Ok(())
     } else {
         Err(format!(
-            "`systemctl {}` failed: {}",
+            "`systemctl {}{}` failed: {}",
+            scope.shown(),
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("no output")
         ))
     }
 }
 
-/// The unit that `warden@.service` would run for this app, if systemd can.
-fn systemd_unit_for(app: &App) -> Option<String> {
-    systemctl()?;
-    let cfg = app.config.as_ref()?;
-    let expected = unit_config_path(&app.name);
-    (unit_installed() && same_file(cfg, &expected)).then(|| format!("warden@{}.service", app.name))
+/// `systemctl [--user] is-active --quiet <unit>`.
+pub(crate) fn unit_active(scope: Scope, unit: &str) -> bool {
+    run_systemctl(scope, &["is-active", "--quiet", unit]).is_ok()
 }
 
-/// `warden@.service` reads `/etc/warden/<app>.toml`.
-fn unit_config_path(name: &str) -> PathBuf {
-    if let Some(h) = home() {
-        return h.join(format!("{name}.toml"));
-    }
-    PathBuf::from(format!("/etc/warden/{name}.toml"))
+/// The unit that `warden@.service` runs for this app (system units for
+/// root, the user's own units for anyone else), if systemd can.
+pub(crate) fn systemd_unit_for(app: &App) -> Option<(Scope, String)> {
+    let scope = Scope::mine();
+    let usable = if scope == Scope::System { systemctl() } else { systemctl_bin() };
+    usable?;
+    let cfg = app.config.as_ref()?;
+    let expected = unit_config_path(&app.name);
+    (scope.has_unit("warden@.service") && same_file(cfg, &expected))
+        .then(|| (scope, format!("warden@{}.service", app.name)))
+}
+
+/// `warden@.service` reads `<config dir>/<app>.toml` (`/etc/warden` for root).
+pub(crate) fn unit_config_path(name: &str) -> PathBuf {
+    config_dir().join(format!("{name}.toml"))
+}
+
+/// Which manager runs a supervisor that reports `unit`: the user's when we
+/// are not root and user units are installed, else the system's.
+fn scope_of_running_unit() -> Scope {
+    if !is_root() && Scope::User.has_unit("warden@.service") { Scope::User } else { Scope::System }
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -1071,9 +1135,9 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         eprintln!("warden: {prefix}not running and no config file is known for it");
         return 2;
     };
-    if let Some(unit) = systemd_unit_for(app) {
-        if let Err(e) = run_systemctl(&["start", &unit]) {
-            eprintln!("warden: {prefix}{e}\n  see `journalctl -u {unit} -n 50`");
+    if let Some((scope, unit)) = systemd_unit_for(app) {
+        if let Err(e) = run_systemctl(scope, &["start", &unit]) {
+            eprintln!("warden: {prefix}{e}\n  see `journalctl {}-u {unit} -n 50`", scope.shown());
             return 1;
         }
         println!("{prefix}started {unit}");
@@ -1209,10 +1273,14 @@ pub(crate) fn spawn_background_as(
         .map_err(|e| format!("starting the supervisor: {e}"))
 }
 
-/// `warden daemon` (wardend) in the background, logging to
+/// `warden daemon [--resurrect]` (wardend) in the background, logging to
 /// `<state dir>/logs/wardend.log`.
-pub(crate) fn spawn_daemon() -> Result<std::process::Child, String> {
-    spawn_detached(&[std::ffi::OsStr::new("daemon")], &crate::daemon::log_path(), None, None)
+pub(crate) fn spawn_daemon(resurrect: bool) -> Result<std::process::Child, String> {
+    let mut args = vec![std::ffi::OsStr::new("daemon")];
+    if resurrect {
+        args.push(std::ffi::OsStr::new("--resurrect"));
+    }
+    spawn_detached(&args, &crate::daemon::log_path(), None, None)
 }
 
 /// What systemd sets for the unit it runs. A process we start in the
@@ -1232,7 +1300,7 @@ const SYSTEMD_ENV: [&str; 8] = [
 
 /// This binary. After an in-place upgrade Linux reports the old inode as
 /// "<path> (deleted)"; the path itself now holds the new binary.
-fn own_exe() -> Result<PathBuf, String> {
+pub(crate) fn own_exe() -> Result<PathBuf, String> {
     let p = std::env::current_exe().map_err(|e| format!("cannot find the warden binary: {e}"))?;
     Ok(match p.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
         Some(s) => PathBuf::from(s),
@@ -1308,7 +1376,7 @@ pub(crate) fn tail(path: &Path, n: usize) -> Vec<String> {
     lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
 }
 
-fn write_private(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+pub(crate) fn write_private(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = path.parent() {
@@ -1481,11 +1549,12 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
 
 /// Stop the supervisor itself (systemd unit, or a background one).
 async fn stop_supervisor(app: &App, st: Option<&Status>, disable: bool) -> Result<String, String> {
-    if let Some(unit) = st.and_then(|s| s.unit.clone()).or_else(|| systemd_unit_for(app)) {
+    let running_unit = st.and_then(|s| s.unit.clone()).map(|u| (scope_of_running_unit(), u));
+    if let Some((scope, unit)) = running_unit.or_else(|| systemd_unit_for(app)) {
         let verb = if disable { vec!["disable", "--now"] } else { vec!["stop"] };
         let mut a = verb.clone();
         a.push(&unit);
-        run_systemctl(&a)?;
+        run_systemctl(scope, &a)?;
         return Ok(format!("{} {unit}", if disable { "disabled and stopped" } else { "stopped" }));
     }
     if !reachable(app) {
@@ -1590,8 +1659,8 @@ pub async fn kill(args: &Args) -> i32 {
 /// `warden kill` (everything): wardend goes last, once the apps are down.
 async fn stop_wardend() -> i32 {
     match crate::daemon::client::stop_daemon().await {
-        Ok(Some(pid)) => {
-            println!("wardend: stopped (pid {pid})");
+        Ok(Some(what)) => {
+            println!("wardend: {what}");
             0
         }
         Ok(None) => 0,
@@ -1622,6 +1691,15 @@ struct Dump {
 /// Names of the apps `warden save` remembered.
 pub fn saved_names() -> Vec<String> {
     read_dump().ok().flatten().map(|d| d.apps.into_iter().map(|a| a.name).collect()).unwrap_or_default()
+}
+
+/// What `warden save` recorded (`None`: nothing saved yet).
+pub(crate) fn saved_apps() -> Result<Option<Vec<Saved>>, String> {
+    Ok(read_dump()?.map(|d| d.apps))
+}
+
+pub(crate) fn dump_file() -> PathBuf {
+    dump_path()
 }
 
 fn read_dump() -> Result<Option<Dump>, String> {
@@ -1675,7 +1753,7 @@ pub async fn save(args: &Args) -> i32 {
         let app = ctx.apps.iter().find(|a| a.name == s.name).cloned();
         let unit = app.as_ref().and_then(systemd_unit_for);
         match unit {
-            Some(u) => match run_systemctl(&["enable", &u]) {
+            Some((scope, u)) => match run_systemctl(scope, &["enable", &u]) {
                 Ok(()) => println!("{}: saved ({} workers{}); {u} enabled at boot", s.name, s.workers, stopped_note(s)),
                 Err(e) => eprintln!("warden: {}: saved, but {e}", s.name),
             },
@@ -1683,8 +1761,11 @@ pub async fn save(args: &Args) -> i32 {
         }
     }
     println!("saved {} app(s) to {}", saved.len(), dump_path().display());
-    if systemctl().is_none() && !saved.is_empty() {
-        println!("after a reboot, run `warden resurrect` (or `warden startup` to have systemd do it)");
+    if !saved.is_empty() && crate::startup::installed().is_none() {
+        println!(
+            "nothing starts them after a reboot yet: `warden startup` sets that up (systemd or launchd), or run \
+             `warden resurrect` from your init system"
+        );
     }
     0
 }
@@ -1720,123 +1801,6 @@ pub async fn resurrect(args: &Args) -> i32 {
         }
         worst = worst.max(start_app(&ctx, &app).await);
     }
-    worst
-}
-
-// ---------------------------------------------------------- startup
-
-const UNIT_TEMPLATE: &str = include_str!("../contrib/warden@.service");
-const SYSCTL_CONF: &str = include_str!("../contrib/99-warden.conf");
-
-fn sysctl_dir() -> PathBuf {
-    std::env::var_os("WARDEN_SYSCTL_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/etc/sysctl.d"))
-}
-
-/// Write `text` to `path` unless it already has it; say what happened.
-fn install_file(path: &Path, text: &str) -> Result<&'static str, String> {
-    if std::fs::read_to_string(path).is_ok_and(|t| t == text) {
-        return Ok("unchanged");
-    }
-    write_private(path, text, 0o644)?;
-    Ok("written")
-}
-
-pub async fn startup(args: &Args) -> i32 {
-    if systemctl().is_none() {
-        eprintln!(
-            "warden: startup needs systemd and root (sudo warden startup). Without systemd, run \
-             `warden resurrect` from your init system or container entrypoint at boot"
-        );
-        return 2;
-    }
-    let exe =
-        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "/usr/local/bin/warden".into());
-    let unit = UNIT_TEMPLATE.replace("/usr/local/bin/warden", &exe);
-    let unit_path = unit_dir().join("warden@.service");
-    let sysctl_path = sysctl_dir().join("99-warden.conf");
-    for (path, text) in [(&unit_path, unit.as_str()), (&sysctl_path, SYSCTL_CONF)] {
-        match install_file(path, text) {
-            Ok(what) => println!("{}: {what}", path.display()),
-            Err(e) => {
-                eprintln!("warden: {e}");
-                return 1;
-            }
-        }
-    }
-    if std::env::var_os("WARDEN_SYSCTL_DIR").is_none() {
-        match std::process::Command::new("sysctl").args(["-q", "-p"]).arg(&sysctl_path).status() {
-            Ok(s) if s.success() => println!("applied {}", sysctl_path.display()),
-            _ => eprintln!("warden: could not apply {} now; it applies at the next boot", sysctl_path.display()),
-        }
-    }
-    if let Err(e) = run_systemctl(&["daemon-reload"]) {
-        eprintln!("warden: {e}");
-        return 1;
-    }
-    let ctx = context(args);
-    let saved: Vec<String> = match read_dump() {
-        Ok(Some(d)) => d.apps.into_iter().map(|s| s.name).collect(),
-        _ => ctx.apps.iter().map(|a| a.name.clone()).collect(),
-    };
-    let mut worst = 0;
-    for name in saved {
-        let Some(app) = ctx.apps.iter().find(|a| a.name == name) else { continue };
-        let expected = unit_config_path(&name);
-        if !app.config.as_ref().is_some_and(|c| same_file(c, &expected)) {
-            eprintln!(
-                "warden: {name}: the unit reads {}; move or link the config there to run it under systemd",
-                expected.display()
-            );
-            worst = 1;
-            continue;
-        }
-        let unit = format!("warden@{name}.service");
-        match run_systemctl(&["enable", &unit]) {
-            Ok(()) => println!("{name}: {unit} enabled at boot"),
-            Err(e) => {
-                eprintln!("warden: {name}: {e}");
-                worst = 1;
-            }
-        }
-        if let Ok(st) = status_of(app).await {
-            if st.unit.is_none() {
-                println!(
-                    "{name}: running outside systemd now; it moves under systemd at the next boot, or now with \
-                     `warden kill {name} --yes && systemctl start {unit}`"
-                );
-            }
-        }
-    }
-    worst
-}
-
-pub async fn unstartup(args: &Args) -> i32 {
-    if systemctl().is_none() {
-        eprintln!("warden: unstartup needs systemd and root");
-        return 2;
-    }
-    let ctx = context(args);
-    let mut worst = 0;
-    for app in &ctx.apps {
-        let unit = format!("warden@{}.service", app.name);
-        match run_systemctl(&["disable", &unit]) {
-            Ok(()) => println!("{}: {unit} disabled (still running until stopped)", app.name),
-            Err(e) => {
-                eprintln!("warden: {}: {e}", app.name);
-                worst = 1;
-            }
-        }
-    }
-    let unit_path = unit_dir().join("warden@.service");
-    match std::fs::remove_file(&unit_path) {
-        Ok(()) => println!("{}: removed", unit_path.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            eprintln!("warden: {}: {e}", unit_path.display());
-            worst = 1;
-        }
-    }
-    let _ = run_systemctl(&["daemon-reload"]);
     worst
 }
 
@@ -1907,6 +1871,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // /proc
     fn origin_is_read_from_proc() {
         let me = Origin::of(std::process::id()).expect("our own environment");
         let path = me.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());

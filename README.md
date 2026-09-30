@@ -140,7 +140,7 @@ has everything; the differences are in the right column.
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
 | `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files, pipe-friendly |
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server on par with nginx (see Benchmarks) |
-| `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app, no daemon |
+| `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](#surviving-reboots-and-crashes) |
 | `pm2 monit` | `warden top` | |
 | | `warden doctor` | Environment problems (kernel settings, limits, ports, permissions), each with its fix |
 
@@ -207,6 +207,41 @@ owns it, it is not a symlink, and no other user can write to it.
 - Logs go to stdout in journald format (timestamps dropped, priority prefixes
   added). Use `journalctl -u warden@api`.
 - Metrics: set `[metrics] listen = "127.0.0.1:9464"` to get Prometheus text at `/metrics`.
+- `sudo warden startup` installs the unit (with this binary's path), the
+  sysctl file and [`contrib/wardend.service`](contrib/wardend.service) for
+  you: see the next section.
+
+## Surviving reboots and crashes
+
+`warden save` records which apps run, with their worker counts. `warden
+startup` makes them come back after a reboot, and keeps them up after a
+crash, with the service manager the host has:
+
+| Host | `warden startup` installs | After a reboot | After a crash |
+|---|---|---|---|
+| Linux, root (`sudo warden startup`) | `warden@.service` (enabled for every saved app), `wardend.service`, the sysctl file | systemd starts each app's unit | systemd restarts the supervisor |
+| Linux, a user (`warden startup`, or `--user` as root) | the same two units in `~/.config/systemd/user`, and `loginctl enable-linger` so they run without a login | your user manager starts at boot and starts the units | your user manager restarts the supervisor |
+| macOS | a launchd job: `~/Library/LaunchAgents/io.github.oceanwap.warden.daemon.plist` (as root `/Library/LaunchDaemons/`: at boot, no login needed) running `warden daemon --resurrect` | launchd starts wardend, which starts the saved apps | wardend restarts dead supervisors; launchd restarts wardend |
+| Containers, other init systems | nothing (it says what to run instead) | `warden resurrect` in the entrypoint, or `warden daemon --resurrect` as the entrypoint | with `warden daemon --resurrect`, wardend restarts dead supervisors |
+
+- Under systemd each app is its own unit (cgroup, limits, `journalctl -u
+  warden@api`), and wardend never starts apps there: it would start them
+  twice. `wardend.service` adds `warden events` and restarts supervisors
+  that `warden start` launched outside a unit.
+- The unit reads `<config dir>/<app>.toml` (`/etc/warden` for root,
+  `~/.config/warden` for a user); `startup` says how to link a config that
+  lives elsewhere.
+- User units and the launchd job carry your `PATH`, so `bun` and `node`
+  resolve, and Warden's directory variables (`WARDEN_HOME`, ...).
+- Lingering needs root on some systems: `startup` then prints the exact
+  `sudo loginctl enable-linger <you>`. Until then the apps start when you log
+  in and stop when you log out.
+- macOS LaunchAgents start at login to the desktop. On a Mac you only reach
+  over SSH, use `sudo warden startup` (a LaunchDaemon).
+- `warden unstartup` removes all of it; running apps keep running. `warden
+  kill` stops wardend's unit or job too, so it stays down until the next boot.
+- In a container, run `warden daemon --resurrect` under an init
+  (`docker run --init`, tini) that reaps orphaned processes.
 
 ## Benchmarks
 
@@ -421,7 +456,10 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
   - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
   - `warden serve` checks static paths with realpath instead of `openat2`
     (same confinement, slower).
-  - No `/proc`: the CPU and RSS columns and metrics are empty.
+  - No `/proc`: the CPU and RSS columns and metrics are empty, wardend
+    sends no `host` events, and it restarts a supervisor with its own
+    environment (the launchd job's `PATH`) instead of the one it was started
+    with.
 - **Windows**: not supported. WSL2 works as Linux.
 
 ## Development

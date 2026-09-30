@@ -10,8 +10,9 @@ line, or a stream of event lines for `subscribe` and `logs --follow`.
 | App control socket | each app's supervisor | `<runtime dir>/<app>/control.sock` |
 | Daemon socket | `wardend` (`warden daemon`), optional | `<runtime dir>/wardend.sock` |
 
-The runtime directory is `$WARDEN_RUNTIME_DIR`, else `/run/warden` for root,
-else `$XDG_RUNTIME_DIR/warden`, else `/tmp/warden-<uid>`.
+The runtime directory is `$WARDEN_RUNTIME_DIR`, else `/run/warden` for root
+(`/var/run/warden` on macOS), else `$XDG_RUNTIME_DIR/warden`, else
+`/tmp/warden-<uid>`.
 
 The wire types live in `src/control.rs` (requests, `Status`) and
 `src/events.rs` (events, daemon requests). `events::PROTOCOL` is the
@@ -199,10 +200,15 @@ else would:
   stops them (parent-death signal). `wardend` logs `unresponsive` with the
   pid and how to get a stack (`gdb -p` / `cat /proc/<pid>/stack`).
 - **`wardend` itself** runs under systemd (`contrib/wardend.service`,
-  `Restart=always`, `KillMode=process`) or detached (`warden daemon
-  --background`; `warden start` does this when it launches a supervisor in
-  the background, unless `WARDEN_NO_DAEMON=1`, and `warden kill` stops it
-  after the apps). When it starts it finds every running supervisor
+  `Restart=always`, `KillMode=process`; `warden startup` installs it, and
+  `warden kill` then stops the unit, not just the process), under launchd
+  (`warden daemon --resurrect`, restarted unless it exited cleanly) or
+  detached (`warden daemon --background`; `warden start` does this when it
+  launches a supervisor in the background, unless `WARDEN_NO_DAEMON=1` or a
+  service manager runs `wardend`, and `warden kill` stops it after the
+  apps). `--resurrect` first starts every app `warden save` recorded that
+  is not running; it is never used under systemd, where each app has its
+  own unit. When it starts it finds every running supervisor
   (`found`); nothing is lost across its restarts because it holds no state
   an app needs. A supervisor it restarts is started as `warden start`
   started it: the same environment and working directory (read from

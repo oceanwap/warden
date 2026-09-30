@@ -1965,10 +1965,14 @@ struct Wardend {
 
 impl Wardend {
     fn start(f: &Fleet, env: &[(&str, &str)]) -> Wardend {
+        Self::start_args(f, &["daemon"], env)
+    }
+
+    fn start_args(f: &Fleet, args: &[&str], env: &[(&str, &str)]) -> Wardend {
         let out = f.home.join("wardend.out");
         let file = std::fs::File::create(&out).unwrap();
         let child = Command::new(BIN)
-            .arg("daemon")
+            .args(args)
             .env("WARDEN_HOME", &f.home)
             .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
             .env_remove("WARDEN_CONFIG")
@@ -2968,4 +2972,304 @@ fn direct_output_flush_and_logs() {
     let after = ticks();
     assert!(after[0] > before && after.windows(2).all(|p| p[1] == p[0] + 1), "{after:?}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- startup (boot and crash survival)
+
+/// Fake systemctl, loginctl and launchctl that log their arguments to
+/// `calls.log` and succeed, except for the (program, argument text, exit
+/// code, error line) cases in `fail`.
+struct Fakes {
+    home: PathBuf,
+}
+
+impl Fakes {
+    fn new(f: &Fleet, fail: &[(&str, &str, i32, &str)]) -> Fakes {
+        let bin = f.home.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for d in ["units", "user-units", "sysctl", "linger", "launchd"] {
+            std::fs::create_dir_all(f.home.join(d)).unwrap();
+        }
+        let log = f.home.join("calls.log");
+        let _ = std::fs::remove_file(&log);
+        for prog in ["systemctl", "loginctl", "launchctl"] {
+            let mut s = format!("#!/bin/sh\necho \"{prog} $*\" >> '{}'\ncase \"$*\" in\n", log.display());
+            for (p, pat, code, err) in fail {
+                if *p == prog {
+                    s += &format!("  *'{pat}'*) echo '{err}' >&2; exit {code};;\n");
+                }
+            }
+            s += "esac\nexit 0\n";
+            let path = bin.join(prog);
+            std::fs::write(&path, s).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        Fakes { home: f.home.clone() }
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        let p = |s: &str| self.home.join(s).display().to_string();
+        vec![
+            ("WARDEN_SYSTEMCTL".into(), p("fakebin/systemctl")),
+            ("WARDEN_LOGINCTL".into(), p("fakebin/loginctl")),
+            ("WARDEN_UNIT_DIR".into(), p("units")),
+            ("WARDEN_USER_UNIT_DIR".into(), p("user-units")),
+            ("WARDEN_SYSCTL_DIR".into(), p("sysctl")),
+            ("WARDEN_LINGER_DIR".into(), p("linger")),
+            ("USER".into(), "wdtester".into()),
+        ]
+    }
+
+    /// With launchctl instead of systemctl (what macOS has).
+    fn launchd_env(&self) -> Vec<(String, String)> {
+        let p = |s: &str| self.home.join(s).display().to_string();
+        vec![("WARDEN_LAUNCHCTL".into(), p("fakebin/launchctl")), ("WARDEN_LAUNCHD_DIR".into(), p("launchd"))]
+    }
+
+    /// The calls logged since the last `take`.
+    fn take(&self) -> String {
+        let log = self.home.join("calls.log");
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        text
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.home.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+}
+
+fn run_with(f: &Fleet, args: &[&str], env: &[(String, String)]) -> (i32, String) {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    f.cli_env(args, &env)
+}
+
+/// An app whose config sits where `warden@.service` reads it (not running).
+fn sleeper_config(f: &Fleet, name: &str) {
+    let cfg = format!("[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n");
+    std::fs::write(f.home.join(format!("{name}.toml")), cfg).unwrap();
+}
+
+#[test]
+fn startup_installs_system_units_and_wardend() {
+    let f = Fleet::new("st-system");
+    sleeper_config(&f, "api");
+    let fakes = Fakes::new(&f, &[]);
+    let (code, out) = run_with(&f, &["startup", "--system"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    let calls = fakes.take();
+    for c in
+        ["systemctl daemon-reload", "systemctl enable warden@api.service", "systemctl enable --now wardend.service"]
+    {
+        assert!(calls.lines().any(|l| l == c), "{c:?} in:\n{calls}");
+    }
+    assert!(!calls.contains("--user") && !calls.contains("loginctl"), "{calls}");
+    let unit = fakes.read("units/warden@.service");
+    let config = format!("\"{}/%i.toml\"", f.home.display());
+    assert!(unit.contains(&format!("ExecStart=\"{BIN}\" start --config {config}")), "{unit}");
+    assert!(unit.contains("User=www-data") && unit.contains("WantedBy=multi-user.target"), "{unit}");
+    let wardend = fakes.read("units/wardend.service");
+    assert!(wardend.contains(&format!("ExecStart=\"{BIN}\" daemon\n")), "no --resurrect under systemd:\n{wardend}");
+    assert!(wardend.contains("KillMode=process") && wardend.contains("Restart=always"), "{wardend}");
+    assert!(f.home.join("sysctl/99-warden.conf").exists());
+    assert!(out.contains("wardend.service: enabled and started"), "{out}");
+
+    // A saved app whose config is not where the unit reads it: told how to fix it.
+    std::fs::create_dir_all(f.home.join("elsewhere")).unwrap();
+    std::fs::write(f.home.join("elsewhere/web.toml"), "[app]\nname = \"web\"\ncommand = \"true\"\n").unwrap();
+    std::fs::create_dir_all(f.home.join("state")).unwrap();
+    let saved = serde_json::json!({"version": 1, "saved_at": "now", "apps": [
+        {"name": "api", "config": f.home.join("api.toml"), "workers": 1, "stopped": false},
+        {"name": "web", "config": f.home.join("elsewhere/web.toml"), "workers": 1, "stopped": false},
+    ]});
+    std::fs::write(f.home.join("state/dump.json"), saved.to_string()).unwrap();
+    let (code, out) = run_with(&f, &["startup", "--system"], &fakes.env());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("warden@.service: unchanged"), "{out}");
+    let fix = format!("ln -s {} {}", f.home.join("elsewhere/web.toml").display(), f.home.join("web.toml").display());
+    assert!(out.contains(&fix) && out.contains("will not come back after a reboot"), "{out}");
+    let calls = fakes.take();
+    assert!(calls.contains("enable warden@api.service") && !calls.contains("warden@web"), "{calls}");
+    std::fs::remove_file(f.home.join("state/dump.json")).unwrap();
+
+    // unstartup: the units disabled and removed; the apps are left alone.
+    let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    let calls = fakes.take();
+    for c in
+        ["systemctl disable warden@api.service", "systemctl disable --now wardend.service", "systemctl daemon-reload"]
+    {
+        assert!(calls.lines().any(|l| l == c), "{c:?} in:\n{calls}");
+    }
+    assert!(!f.home.join("units/warden@.service").exists() && !f.home.join("units/wardend.service").exists());
+
+    // A wardend already running outside systemd hands over to the unit.
+    let d = Wardend::start(&f, &[]);
+    let fakes = Fakes::new(&f, &[("systemctl", "is-active", 3, "")]);
+    let (code, out) = run_with(&f, &["startup", "--system"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("wardend: stopped the one running outside wardend.service"), "{out}");
+    let t0 = Instant::now();
+    while d.try_request(r#"{"cmd":"hello"}"#).is_some() {
+        assert!(t0.elapsed() < T, "the old wardend kept running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn startup_installs_user_units_and_lingering() {
+    let f = Fleet::new("st-user");
+    sleeper_config(&f, "api");
+    let fakes = Fakes::new(&f, &[]);
+    let (code, out) = run_with(&f, &["startup", "--user"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    let calls = fakes.take();
+    for c in [
+        "systemctl --user daemon-reload",
+        "systemctl --user enable warden@api.service",
+        "systemctl --user enable --now wardend.service",
+        "loginctl enable-linger wdtester",
+    ] {
+        assert!(calls.lines().any(|l| l == c), "{c:?} in:\n{calls}");
+    }
+    let unit = fakes.read("user-units/warden@.service");
+    for gone in ["User=", "Group=", "LimitNOFILE", "network-online", "multi-user.target"] {
+        assert!(!unit.contains(gone), "{gone} in a user unit:\n{unit}");
+    }
+    assert!(unit.contains("WantedBy=default.target") && unit.contains("Environment=\"PATH="), "{unit}");
+    assert!(unit.contains(&format!("Environment=\"WARDEN_HOME={}\"", f.home.display())), "{unit}");
+    let wardend = fakes.read("user-units/wardend.service");
+    assert!(wardend.contains("WantedBy=default.target") && !wardend.contains("--resurrect"), "{wardend}");
+    assert!(!f.home.join("units/warden@.service").exists(), "nothing in the system directory");
+    assert!(out.contains("lingering enabled for wdtester"), "{out}");
+
+    // Lingering already on: loginctl is not asked again.
+    std::fs::write(f.home.join("linger/wdtester"), "").unwrap();
+    let (code, out) = run_with(&f, &["startup", "--user"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("lingering is on for wdtester") && !fakes.take().contains("loginctl"), "{out}");
+    std::fs::remove_file(f.home.join("linger/wdtester")).unwrap();
+
+    // Lingering needs privileges: the exact command, and why.
+    let fakes = Fakes::new(&f, &[("loginctl", "enable-linger", 1, "Access denied")]);
+    let (code, out) = run_with(&f, &["startup", "--user"], &fakes.env());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("Access denied") && out.contains("sudo loginctl enable-linger wdtester"), "{out}");
+    assert!(out.contains("only when you log in"), "{out}");
+
+    // No user manager to talk to (no login session).
+    let fakes =
+        Fakes::new(&f, &[("systemctl", "--user daemon-reload", 1, "Failed to connect to bus: No medium found")]);
+    let (code, out) = run_with(&f, &["startup", "--user"], &fakes.env());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("No medium found") && out.contains("user manager did not answer"), "{out}");
+    assert!(!fakes.take().contains("enable"), "nothing enabled");
+
+    // unstartup --user.
+    let fakes = Fakes::new(&f, &[]);
+    let (code, out) = run_with(&f, &["unstartup", "--user"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    let calls = fakes.take();
+    assert!(calls.contains("systemctl --user disable --now wardend.service"), "{calls}");
+    assert!(!f.home.join("user-units/warden@.service").exists() && out.contains("lingering stays on"), "{out}");
+}
+
+#[test]
+fn startup_writes_a_launchd_job() {
+    let f = Fleet::new("st-launchd");
+    let fakes = Fakes::new(&f, &[]);
+    let uid = unsafe { libc::getuid() };
+    let plist = "launchd/io.github.oceanwap.warden.daemon.plist";
+    for (flag, domain) in [("--system", "system".to_string()), ("--user", format!("gui/{uid}"))] {
+        let (code, out) = run_with(&f, &["startup", flag], &fakes.launchd_env());
+        assert_eq!(code, 0, "{out}");
+        let calls = fakes.take();
+        let target = format!("{domain}/io.github.oceanwap.warden.daemon");
+        assert!(calls.contains(&format!("launchctl print {target}")), "{calls}");
+        let bootstrap = format!("launchctl bootstrap {domain} {}", f.home.join(plist).display());
+        assert!(calls.lines().any(|l| l == bootstrap), "{bootstrap:?} in:\n{calls}");
+        let p = fakes.read(plist);
+        let flat: String = p.split_whitespace().collect();
+        assert!(
+            flat.contains(&format!("<string>{BIN}</string><string>daemon</string><string>--resurrect</string>")),
+            "{p}"
+        );
+        assert!(flat.contains("<key>RunAtLoad</key><true/>") && flat.contains("<key>KeepAlive</key>"), "{p}");
+        assert!(flat.contains("<key>PATH</key>") && p.contains("state/logs/wardend.log"), "{p}");
+        assert!(out.contains(&format!("{target}: loaded")), "{out}");
+    }
+
+    // Loading needs a desktop session: the plist stays, and the fix says so.
+    let fakes = Fakes::new(
+        &f,
+        &[("launchctl", "bootstrap", 125, "Bootstrap failed: 125: Domain does not support specified action")],
+    );
+    let (code, out) = run_with(&f, &["startup", "--user"], &fakes.launchd_env());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("Domain does not support") && out.contains("sudo warden startup"), "{out}");
+
+    let fakes = Fakes::new(&f, &[]);
+    let (code, out) = run_with(&f, &["unstartup", "--user"], &fakes.launchd_env());
+    assert_eq!(code, 0, "{out}");
+    assert!(fakes.take().contains(&format!("launchctl bootout gui/{uid}/io.github.oceanwap.warden.daemon")));
+    assert!(!f.home.join(plist).exists(), "{out}");
+}
+
+#[test]
+fn startup_without_a_service_manager_says_what_to_run() {
+    if std::path::Path::new("/run/systemd/system").exists() || cfg!(target_os = "macos") {
+        eprintln!("skipping: this host has a service manager");
+        return;
+    }
+    let f = Fleet::new("st-none");
+    let (code, out) = f.cli(&["startup"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("warden resurrect") && out.contains("warden daemon --resurrect"), "{out}");
+}
+
+#[test]
+fn wardend_resurrect_starts_the_saved_apps() {
+    let f = Fleet::new("wd-resurrect");
+    sleeper_config(&f, "one");
+    sleeper_config(&f, "two");
+    f.ok(&["start", "all"]);
+    f.ok(&["save"]);
+    f.ok(&["kill", "--yes"]);
+    f.wait("all offline", |f| f.list().iter().all(|a| a["status"].is_null()));
+    // `two` is running already: it must not be started twice.
+    f.ok(&["start", "two"]);
+    let two = supervisor_pid(&f, "two");
+
+    let d = Wardend::start_args(&f, &["daemon", "--resurrect"], &[]);
+    let a = d.wait_app("one resurrected", "one", |a| a["state"] == "running");
+    assert_eq!(a["supervised_by"], "wardend", "{a:#}");
+    f.wait("one online", |f| f.app("one")["status"]["workers_ready"] == 1);
+    assert_eq!(supervisor_pid(&f, "two"), two, "not started twice");
+    let log = d.log();
+    assert!(log.contains("resurrected a saved app app=one"), "{log}");
+    assert!(!log.contains("resurrected a saved app app=two"), "{log}");
+}
+
+#[test]
+fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
+    let f = Fleet::new("wd-units");
+    sleeper_config(&f, "api");
+    let fakes = Fakes::new(&f, &[]);
+    for dir in ["units", "user-units"] {
+        std::fs::write(f.home.join(dir).join("warden@.service"), "[Service]\n").unwrap();
+        std::fs::write(f.home.join(dir).join("wardend.service"), "[Service]\n").unwrap();
+    }
+    let env = fakes.env();
+    let envs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let d = Wardend::start(&f, &envs);
+    let r = d.request(r#"{"cmd":"start","app":"api"}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["message"].as_str().unwrap().starts_with("starting warden@api.service"), "{r}");
+    assert!(fakes.take().contains("start --no-block warden@api.service"));
+
+    // `warden kill`: wardend runs as a unit with Restart=always, so the unit is stopped.
+    let (code, out) = f.cli_env(&["kill", "--yes"], &envs);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("wardend: stopped wardend.service"), "{out}");
+    assert!(fakes.take().contains("stop wardend.service"));
 }

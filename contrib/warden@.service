@@ -1,4 +1,5 @@
-# systemd unit for Warden. One instance per app:
+# systemd unit for Warden. One instance per app. `sudo warden startup` installs
+# it (with this binary's path) and enables it for every saved app; by hand:
 #   cp contrib/warden@.service /etc/systemd/system/
 #   install -m 644 warden.example.toml /etc/warden/travelerwe-api.toml   # edit it
 #   systemctl enable --now warden@travelerwe-api
