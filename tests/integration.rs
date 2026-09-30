@@ -3150,7 +3150,8 @@ fn kill_and_delete_after_startup_stop_a_supervisor_running_outside_its_unit() {
     let env = fakes.env();
     let (code, out) = run_with(&f, &["start", "all"], &env);
     assert_eq!(code, 0, "{out}");
-    let (code, out) = run_with(&f, &["startup", "--system"], &env);
+    // System units as root, user units otherwise (as `startup` picks).
+    let (code, out) = run_with(&f, &["startup"], &env);
     assert_eq!(code, 0, "{out}");
     fakes.take();
 
@@ -3167,7 +3168,9 @@ fn kill_and_delete_after_startup_stop_a_supervisor_running_outside_its_unit() {
     assert_eq!(code, 0, "{out}");
     assert!(!f.home.join("run/web/control.sock").exists(), "web still running after: {out}");
     let calls = fakes.take();
-    assert!(calls.lines().any(|l| l == "systemctl disable warden@web.service"), "{calls}");
+    let disable =
+        |l: &str| l == "systemctl disable warden@web.service" || l == "systemctl --user disable warden@web.service";
+    assert!(calls.lines().any(disable), "{calls}");
     assert!(out.contains("warden@web.service disabled"), "{out}");
 }
 
