@@ -14,7 +14,7 @@
 
 use crate::ssh;
 use iced::futures::channel::mpsc;
-use iced::futures::{SinkExt, Stream};
+use iced::futures::{SinkExt, Stream, StreamExt};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -340,8 +340,31 @@ pub async fn app_logs(socket: &Path, app: &str, lines: usize) -> Result<Vec<Stri
 
 /// The live feed from wardend at `endpoint`, reconnecting forever. Dropping
 /// the stream closes the connection (and the SSH tunnel).
+///
+/// The socket is read by a task of its own: iced polls a subscription's
+/// stream only while the window takes its messages, and a reader that waits
+/// for the window would make wardend drop it. Must run inside a tokio
+/// runtime (iced's executor, or a test's).
 pub fn feed(endpoint: Endpoint, opts: FeedOptions) -> impl Stream<Item = FeedMsg> + Send + 'static {
-    iced::stream::channel(8, async move |out: mpsc::Sender<FeedMsg>| run_feed(endpoint, opts, out).await)
+    iced::stream::channel(8, async move |mut out: mpsc::Sender<FeedMsg>| {
+        let (tx, mut rx) = mpsc::channel(8);
+        let _reader = AbortOnDrop(tokio::spawn(run_feed(endpoint, opts, tx)).abort_handle());
+        while let Some(m) = rx.next().await {
+            if out.send(m).await.is_err() {
+                return;
+            }
+        }
+    })
+}
+
+/// Stops the reader task (and with it the connection and the tunnel) when
+/// the stream is dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 enum End {

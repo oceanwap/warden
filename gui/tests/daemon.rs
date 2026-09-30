@@ -273,6 +273,46 @@ async fn no_wardend_means_not_running_with_the_path() {
     assert!(err.contains("not running") && err.contains("warden daemon --background"), "{err}");
 }
 
+/// An app that prints as fast as it can (Warden keeps ~10,000 lines a
+/// second of it), and a window that takes a batch only twice a second (at
+/// most 4,000 lines a second): batches stay bounded, the loss is counted,
+/// and the stream stays up. The reader task keeps reading meanwhile, so
+/// wardend never has to drop the GUI for not reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_flood_stays_bounded_and_connected() {
+    let mut host = Host::new("flood");
+    host.warden(&["start", "yes flood-line-with-some-text-in-it", "--name", "flood"]);
+    host.start_wardend();
+    let socket = host.socket();
+    let mut logs: Feed = Box::pin(client::feed(Endpoint::Socket(socket), FeedOptions::logs_of("flood")));
+    let (mut lines, mut lost, mut batches) = (0usize, 0u64, 0usize);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        match next(&mut logs).await {
+            FeedMsg::Batch(b) => {
+                assert!(b.logs.len() <= client::BATCH_LOG_CAP, "a batch holds {} lines", b.logs.len());
+                lines += b.logs.iter().filter(|(a, l)| a == "flood" && l.contains("flood-line")).count();
+                lost += b.logs_dropped;
+                lost += b
+                    .events
+                    .iter()
+                    .map(|e| if let Event::Lagged { dropped, .. } = e { *dropped } else { 0 })
+                    .sum::<u64>();
+                batches += 1;
+                // A slow window: two frames a second.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            FeedMsg::Disconnected { error, .. } => panic!("the flood dropped the stream: {error}\n{}", host.log()),
+            _ => {}
+        }
+    }
+    // `yes` writes far more than the supervisor forwards (its subscribers
+    // lag): what is lost upstream arrives as `lagged`, counted like the
+    // lines a batch drops.
+    assert!(batches >= 5 && lines > 100, "{batches} batches, {lines} lines, {lost} lost");
+    assert!(lost > 0, "a flood loses lines (counted); nothing waits for this reader");
+}
+
 #[tokio::test]
 async fn add_app_with_an_env_file_then_check_and_save_its_config() {
     let host = Host::new("add");
