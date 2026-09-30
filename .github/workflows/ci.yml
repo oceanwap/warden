@@ -13,6 +13,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    # -eo pipefail: a failing `cargo test | tee` fails the step.
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
   # The toolchain Warden is developed with. Bump it on purpose: a new release
@@ -47,8 +52,24 @@ jobs:
         run: npm ci --no-audit --no-fund
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --bin warden
-      - run: cargo test --test integration
+      - run: cargo test --bin warden 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      - name: cargo test --test integration
+        if: ${{ !cancelled() }}
+        run: cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      # TEMPORARY: job logs need auth; surface failing tests as an annotation.
+      - name: Annotate test failures
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || exit 0
+          python3 - "$RUNNER_TEMP/test.log" <<'PY'
+          import re, sys
+          t = open(sys.argv[1], errors="replace").read()
+          t = re.sub(r"\x1b\[[0-9;]*m", "", t)
+          blocks = re.findall(r"\nfailures:\n(.*?)\nfailures:\n", t, re.S)
+          out = "\n".join(blocks) or t[-6000:]
+          out = out[:20000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=test failures::" + out)
+          PY
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
@@ -70,8 +91,24 @@ jobs:
         working-directory: bench
         run: npm ci --no-audit --no-fund
       - run: cargo build --all-targets
-      - run: cargo test --bin warden
-      - run: cargo test --test integration
+      - run: cargo test --bin warden 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      - name: cargo test --test integration
+        if: ${{ !cancelled() }}
+        run: cargo test --test integration 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      # TEMPORARY: job logs need auth; surface failing tests as an annotation.
+      - name: Annotate test failures
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || exit 0
+          python3 - "$RUNNER_TEMP/test.log" <<'PY'
+          import re, sys
+          t = open(sys.argv[1], errors="replace").read()
+          t = re.sub(r"\x1b\[[0-9;]*m", "", t)
+          blocks = re.findall(r"\nfailures:\n(.*?)\nfailures:\n", t, re.S)
+          out = "\n".join(blocks) or t[-6000:]
+          out = out[:20000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=test failures::" + out)
+          PY
 
   macos:
     runs-on: macos-latest
@@ -84,4 +121,18 @@ jobs:
           components: clippy
       - run: cargo build
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --bin warden
+      - run: cargo test --bin warden 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      # TEMPORARY: job logs need auth; surface failing tests as an annotation.
+      - name: Annotate test failures
+        if: failure()
+        run: |
+          [ -f "$RUNNER_TEMP/test.log" ] || exit 0
+          python3 - "$RUNNER_TEMP/test.log" <<'PY'
+          import re, sys
+          t = open(sys.argv[1], errors="replace").read()
+          t = re.sub(r"\x1b\[[0-9;]*m", "", t)
+          blocks = re.findall(r"\nfailures:\n(.*?)\nfailures:\n", t, re.S)
+          out = "\n".join(blocks) or t[-6000:]
+          out = out[:20000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=test failures::" + out)
+          PY
