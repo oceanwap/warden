@@ -12,9 +12,11 @@
 //! default, request heads are capped at 16 KB and must arrive within 10 s.
 
 use crate::config::Static;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -25,6 +27,13 @@ const MAX_CONNECTIONS: usize = 10_000;
 
 struct Site {
     root: PathBuf,
+    /// The root directory, opened once: files are opened relative to it.
+    dir: Arc<OwnedFd>,
+    /// How files are opened (OPEN_*); can only step down, never back up.
+    open_mode: AtomicU8,
+    /// RESOLVE_CACHED lookups answered from the dentry cache / not.
+    cached_hits: AtomicU64,
+    cached_misses: AtomicU64,
     cfg: Static,
     auth: Option<String>,
     draining: AtomicBool,
@@ -69,8 +78,31 @@ pub fn main() -> i32 {
             return 1;
         }
     };
+    let dir = match std::fs::File::open(&root) {
+        Ok(f) => Arc::new(OwnedFd::from(f)),
+        Err(e) => {
+            eprintln!("warden serve-static: cannot open static.root {}: {e}", root.display());
+            return 78;
+        }
+    };
     let auth = cfg.basic_auth.as_deref().map(|a| format!("Basic {}", base64(a.as_bytes())));
-    let site = Arc::new(Site { root, cfg, auth, draining: AtomicBool::new(false), active: AtomicUsize::new(0) });
+    // Troubleshooting and tests: force a slower way of opening files.
+    let open_mode = match std::env::var("WARDEN_STATIC_OPEN").as_deref() {
+        Ok("beneath") => OPEN_BENEATH,
+        Ok("legacy") => OPEN_LEGACY,
+        _ => OPEN_CACHED,
+    };
+    let site = Arc::new(Site {
+        root,
+        dir,
+        open_mode: AtomicU8::new(open_mode),
+        cached_hits: AtomicU64::new(0),
+        cached_misses: AtomicU64::new(0),
+        cfg,
+        auth,
+        draining: AtomicBool::new(false),
+        active: AtomicUsize::new(0),
+    });
     match rt.block_on(serve(site, port)) {
         Ok(()) => 0,
         Err(e) => {
@@ -98,6 +130,9 @@ fn report(msg: serde_json::Value) {
 async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let reuse = std::env::var("WARDEN_REUSE_PORT").is_ok_and(|v| v == "1");
     let std_listener = reuseport_listener(&site.cfg.host, port, reuse)?;
+    // Wake up for a connection only once its request has arrived. Optional:
+    // without it the server is just as correct, a little busier.
+    let _ = crate::sys::tcp_defer_accept(std_listener.as_fd(), HEAD_TIMEOUT.as_secs() as i32);
     let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| e.to_string())?;
     let worker: u64 = std::env::var("WARDEN_WORKER_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
 
@@ -119,7 +154,12 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
         msg["socket"] = p.display().to_string().into();
     }
     report(msg);
-    println!("serving {} on {}:{port}", site.root.display(), site.cfg.host);
+    let how = match site.open_mode.load(Ordering::Relaxed) {
+        OPEN_CACHED => "openat2, cache-first",
+        OPEN_BENEATH => "openat2",
+        _ => "realpath check",
+    };
+    println!("serving {} on {}:{port} (files opened with {how})", site.root.display(), site.cfg.host);
 
     let beat_ms: u64 = std::env::var("WARDEN_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     if beat_ms > 0 {
@@ -211,6 +251,29 @@ impl Conn {
         }
     }
 
+    /// Response headers that a sendfile body follows: on TCP, MSG_MORE lets
+    /// the kernel put them in the same packet as the first body bytes.
+    async fn write_head_more(&mut self, b: &[u8]) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(w) => {
+                let sock: &tokio::net::TcpStream = w.as_ref();
+                let mut off = 0;
+                while off < b.len() {
+                    sock.writable().await?;
+                    match sock.try_io(tokio::io::Interest::WRITABLE, || crate::sys::send(sock.as_fd(), &b[off..], true))
+                    {
+                        Ok(n) => off += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            Conn::Unix(w) => w.write_all(b).await,
+        }
+    }
+
     /// Send `count` bytes of `file` from `offset`.
     async fn send_file(&mut self, file: std::fs::File, offset: u64, count: u64) -> std::io::Result<u64> {
         match self {
@@ -235,7 +298,6 @@ async fn sendfile_all(
     offset: u64,
     count: u64,
 ) -> std::io::Result<u64> {
-    use std::os::fd::AsFd;
     let mut off = offset as i64;
     let mut left = count;
     while left > 0 {
@@ -258,9 +320,12 @@ async fn sendfile_all(
     Ok(count)
 }
 
-/// Files up to this size are sent with the headers in one write (fewer
-/// syscalls and packets than headers + sendfile).
-const SMALL_FILE: u64 = 64 * 1024;
+/// Files up to this size are copied into the response and sent with the
+/// headers in one write; larger ones go headers (MSG_MORE) + sendfile.
+/// Measured (bench/static.ts, 48 KB file): 55k req/s copied vs 62–68k with
+/// sendfile; a 1.5 KB page is the same either way. 16 KB is past the point
+/// where the copy costs more than the extra syscall.
+const SMALL_FILE: u64 = 16 * 1024;
 
 struct Request {
     method: String,
@@ -390,14 +455,15 @@ fn reason(code: u16) -> &'static str {
     }
 }
 
-/// URL path → a file under root, or why not. Never leaves root.
-pub fn resolve(root: &Path, url_path: &str, dotfiles: bool) -> Result<PathBuf, u16> {
+/// URL path → a path relative to the root ("" for the root itself), or
+/// why not. Rejects `..`, NUL, and (unless enabled) dotfiles.
+pub fn relative(url_path: &str, dotfiles: bool) -> Result<String, u16> {
     let path = url_path.split(['?', '#']).next().unwrap_or("/");
     let decoded = percent_decode(path).ok_or(400u16)?;
     if decoded.contains('\0') || !decoded.starts_with('/') {
         return Err(400);
     }
-    let mut out = root.to_path_buf();
+    let mut out = String::with_capacity(decoded.len());
     for seg in decoded.split('/') {
         match seg {
             "" | "." => {}
@@ -407,11 +473,152 @@ pub fn resolve(root: &Path, url_path: &str, dotfiles: bool) -> Result<PathBuf, u
                 if Path::new(s).components().any(|c| !matches!(c, Component::Normal(_))) {
                     return Err(400);
                 }
-                out.push(s);
+                if !out.is_empty() {
+                    out.push('/');
+                }
+                out.push_str(s);
             }
         }
     }
     Ok(out)
+}
+
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") }
+}
+
+// How files are opened. Starts at OPEN_CACHED and steps down if the kernel
+// or filesystem can't do better.
+/// openat2(RESOLVE_BENEATH | RESOLVE_CACHED) inline: one syscall, the
+/// kernel keeps the lookup inside the root, and it never waits for the disk
+/// (a lookup not in the dentry cache goes to a thread instead).
+const OPEN_CACHED: u8 = 0;
+/// openat2(RESOLVE_BENEATH) inline (kernels 5.6–5.11, or filesystems whose
+/// lookups are never served from cache).
+const OPEN_BENEATH: u8 = 1;
+/// No openat2 (kernel before 5.6, or blocked by seccomp): realpath check
+/// then open, on a thread.
+const OPEN_LEGACY: u8 = 2;
+
+/// An open file (or directory) under the root and its metadata.
+struct Opened {
+    file: std::fs::File,
+    meta: std::fs::Metadata,
+}
+
+/// Flags for every open: O_NONBLOCK so a FIFO in the root can't hang the
+/// worker (regular-file reads ignore it); O_NOCTTY for devices.
+const OPEN_FLAGS: i32 = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY;
+
+fn opened(fd: OwnedFd) -> std::io::Result<Opened> {
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    Ok(Opened { file, meta })
+}
+
+/// Open `rel` under the root. Errors: NotFound (also for paths the kernel
+/// or the realpath check says leave the root), PermissionDenied, others.
+async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
+    use std::io::{Error, ErrorKind};
+    let mode = site.open_mode.load(Ordering::Relaxed);
+    if mode != OPEN_LEGACY {
+        let path = std::ffi::CString::new(if rel.is_empty() { "." } else { rel })
+            .map_err(|_| Error::from(ErrorKind::InvalidInput))?;
+        let beneath = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
+        let resolve = if mode == OPEN_CACHED { beneath | libc::RESOLVE_CACHED } else { beneath };
+        let mut result = crate::sys::openat2(site.dir.as_fd(), &path, OPEN_FLAGS, resolve);
+        if mode == OPEN_CACHED {
+            match &result {
+                Ok(_) => {
+                    site.cached_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                // Not all in the dentry cache: the lookup may wait for the
+                // disk, so it runs on a thread.
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    let misses = site.cached_misses.fetch_add(1, Ordering::Relaxed) + 1;
+                    if misses >= 256 && site.cached_hits.load(Ordering::Relaxed) == 0 {
+                        // This filesystem never answers from cache (e.g. it
+                        // revalidates every lookup): stop asking.
+                        site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
+                    }
+                    let dir = site.dir.clone();
+                    let p = path.clone();
+                    result =
+                        tokio::task::spawn_blocking(move || crate::sys::openat2(dir.as_fd(), &p, OPEN_FLAGS, beneath))
+                            .await
+                            .map_err(Error::other)?;
+                }
+                // RESOLVE_CACHED is newer (5.12) than openat2 (5.6).
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
+                    result = crate::sys::openat2(site.dir.as_fd(), &path, OPEN_FLAGS, beneath);
+                }
+                Err(_) => {}
+            }
+        }
+        match result {
+            Ok(fd) => return opened(fd),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOSYS | libc::EPERM) => {
+                    site.open_mode.store(OPEN_LEGACY, Ordering::Relaxed);
+                    eprintln!(
+                        "warden serve-static: openat2 is unavailable ({e}); checking paths with realpath instead"
+                    );
+                }
+                // The lookup left the root: `..` in a symlink, or an absolute
+                // symlink. Absolute symlinks that point back inside the root
+                // were always allowed, so the realpath check below decides.
+                Some(libc::EXDEV) => {}
+                _ => return Err(e),
+            },
+        }
+    }
+    let path = if rel.is_empty() { site.root.clone() } else { site.root.join(rel) };
+    let root = site.root.clone();
+    tokio::task::spawn_blocking(move || {
+        if !inside(&root, &path) {
+            return Err(Error::from(ErrorKind::NotFound));
+        }
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(&path)?;
+        let meta = file.metadata()?;
+        Ok(Opened { file, meta })
+    })
+    .await
+    .map_err(Error::other)?
+}
+
+/// Read `buf[from..]` from `file` at `offset`. Cached data is read inline
+/// (preadv2 RWF_NOWAIT never waits for the disk); anything else is read on
+/// a thread, so a cold file can't stall the other connections.
+async fn read_body(file: std::fs::File, mut buf: Vec<u8>, from: usize, offset: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+    let mut done = 0usize;
+    while from + done < buf.len() {
+        match crate::sys::pread_nowait(file.as_fd(), &mut buf[from + done..], offset + done as u64) {
+            Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "file truncated while reading")),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e)
+                if e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::Unsupported
+                    || e.raw_os_error() == Some(libc::EOPNOTSUPP) =>
+            {
+                return tokio::task::spawn_blocking(move || {
+                    file.read_exact_at(&mut buf[from + done..], offset + done as u64).map(|()| buf)
+                })
+                .await
+                .map_err(Error::other)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(buf)
+}
+
+/// Response status for a failed open.
+fn open_error_status(e: &std::io::Error) -> u16 {
+    if e.kind() == std::io::ErrorKind::PermissionDenied { 403 } else { 404 }
 }
 
 /// A resolved path is only served if, after following symlinks, it is still
@@ -457,12 +664,16 @@ async fn handle(req: &Request, site: &Site, w: &mut Conn, keep: bool) -> std::io
         }
     }
     let cfg = &site.cfg;
-    let path = match resolve(&site.root, &req.path, cfg.dotfiles) {
+    let rel = match relative(&req.path, cfg.dotfiles) {
         Ok(p) => p,
         Err(code) => return not_found_or(w, site, req, code, keep).await,
     };
-    let mut file = path.clone();
-    if file.is_dir() {
+    let found = match open(site, &rel).await {
+        Ok(o) => o,
+        Err(e) => return not_found_or(w, site, req, open_error_status(&e), keep).await,
+    };
+    if found.meta.is_dir() {
+        drop(found);
         let url_path = req.path.split(['?', '#']).next().unwrap_or("/");
         if !url_path.ends_with('/') {
             let loc = format!("{url_path}/");
@@ -474,19 +685,23 @@ async fn handle(req: &Request, site: &Site, w: &mut Conn, keep: bool) -> std::io
             w.flush().await?;
             return Ok((301, 0));
         }
-        let index = file.join(&cfg.index);
-        if index.is_file() {
-            file = index;
-        } else if cfg.listing && inside(&site.root, &file) {
-            return listing(w, &file, url_path, req.method == "HEAD", keep).await;
-        } else {
-            return not_found_or(w, site, req, 404, keep).await;
-        }
+        let index = join_rel(&rel, &cfg.index);
+        return match open(site, &index).await {
+            Ok(o) if o.meta.is_file() => send_file(w, site, req, &index, o, 200, keep).await,
+            _ => {
+                let dir = if rel.is_empty() { site.root.clone() } else { site.root.join(&rel) };
+                if cfg.listing && inside(&site.root, &dir) {
+                    listing(w, &dir, url_path, req.method == "HEAD", keep).await
+                } else {
+                    not_found_or(w, site, req, 404, keep).await
+                }
+            }
+        };
     }
-    if !file.is_file() || !inside(&site.root, &file) {
+    if !found.meta.is_file() {
         return not_found_or(w, site, req, 404, keep).await;
     }
-    send_file(w, site, req, &file, 200, keep).await
+    send_file(w, site, req, &rel, found, 200, keep).await
 }
 
 /// SPA fallback to index.html, then 404.html, then a plain 404.
@@ -495,14 +710,16 @@ async fn not_found_or(w: &mut Conn, site: &Site, req: &Request, code: u16, keep:
         let wants_page = req.header("accept").is_none_or(|a| a.contains("text/html") || a.contains("*/*"));
         let last = req.path.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("");
         if site.cfg.spa && wants_page && !last.contains('.') {
-            let index = site.root.join(&site.cfg.index);
-            if index.is_file() {
-                return send_file(w, site, req, &index, 200, keep).await;
+            if let Ok(o) = open(site, &site.cfg.index).await {
+                if o.meta.is_file() {
+                    return send_file(w, site, req, &site.cfg.index, o, 200, keep).await;
+                }
             }
         }
-        let page = site.root.join("404.html");
-        if page.is_file() {
-            return send_file(w, site, req, &page, 404, keep).await;
+        if let Ok(o) = open(site, "404.html").await {
+            if o.meta.is_file() {
+                return send_file(w, site, req, "404.html", o, 404, keep).await;
+            }
         }
     }
     respond_error(w, code, keep).await
@@ -542,38 +759,38 @@ async fn listing(w: &mut Conn, dir: &Path, url_path: &str, head_only: bool, keep
     Ok((200, body.len() as u64))
 }
 
+/// `rel` is the file's path under the root (its name picks the MIME type
+/// and cache policy); `found` is that file, already open.
 async fn send_file(
     w: &mut Conn,
     site: &Site,
     req: &Request,
-    file: &Path,
+    rel: &str,
+    found: Opened,
     status: u16,
     keep: bool,
 ) -> std::io::Result<(u16, u64)> {
     let cfg = &site.cfg;
-    let ext = file.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let name = Path::new(rel);
+    let ext = name.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     // Precompressed sibling the client accepts.
     let accept = req.header("accept-encoding").unwrap_or("");
-    let mut body_path = file.to_path_buf();
+    let mut body = found;
     let mut encoding = None;
     if cfg.precompressed && status == 200 && req.header("range").is_none() {
         for (enc, suffix) in [("br", "br"), ("gzip", "gz")] {
             if accept.split(',').any(|a| a.trim().split(';').next() == Some(enc)) {
-                let mut p = file.as_os_str().to_owned();
-                p.push(format!(".{suffix}"));
-                let p = PathBuf::from(p);
-                if p.is_file() && inside(&site.root, &p) {
-                    body_path = p;
-                    encoding = Some(enc);
-                    break;
+                if let Ok(o) = open(site, &format!("{rel}.{suffix}")).await {
+                    if o.meta.is_file() {
+                        body = o;
+                        encoding = Some(enc);
+                        break;
+                    }
                 }
             }
         }
     }
-    let meta = match tokio::fs::metadata(&body_path).await {
-        Ok(m) => m,
-        Err(_) => return respond_error(w, 404, keep).await,
-    };
+    let meta = &body.meta;
     let len = meta.len();
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
     let etag = format!("W/\"{len:x}-{mtime:x}{}\"", encoding.map(|e| format!("-{e}")).unwrap_or_default());
@@ -588,7 +805,7 @@ async fn send_file(
     let html = matches!(ext.as_str(), "html" | "htm");
     let cache = if html || status != 200 {
         "no-cache".to_string()
-    } else if fingerprinted(file) {
+    } else if fingerprinted(name) {
         "public, max-age=31536000, immutable".to_string()
     } else {
         format!("public, max-age={}", cfg.cache_max_age)
@@ -655,19 +872,13 @@ async fn send_file(
         let mut buf = head.into_bytes();
         let body_start = buf.len();
         buf.resize(body_start + count as usize, 0);
-        let mut f = tokio::fs::File::open(&body_path).await?;
-        if start > 0 {
-            use tokio::io::AsyncSeekExt;
-            f.seek(std::io::SeekFrom::Start(start)).await?;
-        }
-        f.read_exact(&mut buf[body_start..]).await?;
+        let buf = read_body(body.file, buf, body_start, start).await?;
         w.write_all(&buf).await?;
         w.flush().await?;
         return Ok((code, count));
     }
-    w.write_all(head.as_bytes()).await?;
-    let file = tokio::fs::File::open(&body_path).await?.into_std().await;
-    let sent = w.send_file(file, start, count).await?;
+    w.write_head_more(head.as_bytes()).await?;
+    let sent = w.send_file(body.file, start, count).await?;
     w.flush().await?;
     Ok((code, sent))
 }
@@ -809,17 +1020,20 @@ mod tests {
 
     #[test]
     fn paths_stay_inside_root() {
-        let root = Path::new("/srv/site");
-        assert_eq!(resolve(root, "/a/b.js?v=1", false), Ok(PathBuf::from("/srv/site/a/b.js")));
-        assert_eq!(resolve(root, "/a%20b.txt", false), Ok(PathBuf::from("/srv/site/a b.txt")));
-        assert_eq!(resolve(root, "/../etc/passwd", false), Err(403));
-        assert_eq!(resolve(root, "/a/%2e%2e/%2e%2e/etc/passwd", false), Err(403));
-        assert_eq!(resolve(root, "/.env", false), Err(404));
-        assert!(resolve(root, "/.env", true).is_ok());
-        assert!(resolve(root, "/.well-known/security.txt", false).is_ok());
-        assert_eq!(resolve(root, "/a%00b", false), Err(400));
-        assert_eq!(resolve(root, "/%zz", false), Err(400));
-        assert_eq!(resolve(root, "noslash", false), Err(400));
+        assert_eq!(relative("/a/b.js?v=1", false), Ok("a/b.js".into()));
+        assert_eq!(relative("/a%20b.txt", false), Ok("a b.txt".into()));
+        assert_eq!(relative("/", false), Ok("".into()));
+        assert_eq!(relative("//a//./b/", false), Ok("a/b".into()));
+        assert_eq!(relative("/../etc/passwd", false), Err(403));
+        assert_eq!(relative("/a/%2e%2e/%2e%2e/etc/passwd", false), Err(403));
+        assert_eq!(relative("/.env", false), Err(404));
+        assert!(relative("/.env", true).is_ok());
+        assert!(relative("/.well-known/security.txt", false).is_ok());
+        assert_eq!(relative("/a%00b", false), Err(400));
+        assert_eq!(relative("/%zz", false), Err(400));
+        assert_eq!(relative("noslash", false), Err(400));
+        assert_eq!(join_rel("", "index.html"), "index.html");
+        assert_eq!(join_rel("docs", "index.html"), "docs/index.html");
     }
 
     #[test]

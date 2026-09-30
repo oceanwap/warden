@@ -5,6 +5,7 @@
   "devDependencies": {
     "@platformatic/node": "3.71.0",
     "pm2": "6.0.14",
+    "serve": "14.2.6",
     "wattpm": "3.71.0"
   }
 }

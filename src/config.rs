@@ -307,6 +307,10 @@ pub struct Logging {
     pub per_worker_files: bool,
     /// Prefix out/err lines with a timestamp (PM2's `time`).
     pub file_timestamps: bool,
+    /// Most worker output lines kept per second per worker and stream;
+    /// above it lines are dropped and counted, so one runaway worker can't
+    /// eat the host's CPU and disk. 0 = keep everything (as PM2 does).
+    pub max_lines_per_sec: u32,
 }
 
 /// Log rotation, built in (no pm2-logrotate module needed).
@@ -518,6 +522,7 @@ impl Default for Logging {
             err_file: None,
             per_worker_files: false,
             file_timestamps: false,
+            max_lines_per_sec: 10_000,
         }
     }
 }

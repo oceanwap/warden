@@ -49,7 +49,75 @@ pub type Line = Arc<str>;
 /// the bounds are enforced with counters before a line is queued.
 enum Queued {
     Event(Level, Line),
-    Output(Line),
+    Output(Batch),
+}
+
+/// Worker output lines from one read of one worker's pipe: same worker,
+/// stream and timestamp, so they travel (and are counted, stored and
+/// written) together instead of one queue message and lock per line.
+struct Batch {
+    worker: Arc<str>,
+    stream: &'static str,
+    /// Where the app's text starts in each line (the prefix is shared).
+    text_at: usize,
+    lines: Vec<Line>,
+    bytes: usize,
+}
+
+/// Builds a [`Batch`]: `OutputBatch::new`, `push` each line, then
+/// [`worker_output_batch`].
+pub struct OutputBatch {
+    prefix: String,
+    batch: Batch,
+}
+
+impl OutputBatch {
+    /// Lines `worker` wrote to `stream` ("stdout"/"stderr") just now.
+    pub fn new(worker: &str, stream: &'static str) -> Self {
+        let mut prefix = String::with_capacity(TS_LEN + 24 + worker.len());
+        push_timestamp_now(&mut prefix);
+        for part in [" OUT   worker=", worker, " ", stream, ": "] {
+            prefix.push_str(part);
+        }
+        let batch = Batch { worker: worker.into(), stream, text_at: prefix.len(), lines: Vec::new(), bytes: 0 };
+        OutputBatch { prefix, batch }
+    }
+
+    pub fn push(&mut self, text: &str) {
+        let mut line = String::with_capacity(self.prefix.len() + text.len());
+        line.push_str(&self.prefix);
+        line.push_str(text);
+        self.batch.bytes += line.len();
+        self.batch.lines.push(line.into());
+    }
+
+    pub fn len(&self) -> usize {
+        self.batch.lines.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.batch.bytes
+    }
+}
+
+/// For `max_lines_per_sec = 0` (keep everything): wait until the writer's
+/// queue has room for `lines`/`bytes`, at most `max`. Meanwhile the worker's
+/// pipe fills and its writes block, which slows a flooding app down to what
+/// the log sinks take instead of dropping lines. `max` bounds the wait so a
+/// stuck sink (stdout nobody reads) slows apps but can't freeze them.
+pub async fn room_for(lines: usize, bytes: usize, max: Duration) {
+    let l = logger();
+    if l.writer.is_none() {
+        return;
+    }
+    let t0 = Instant::now();
+    loop {
+        let (q, b) = (l.output_queued.load(Ordering::Relaxed), l.output_bytes.load(Ordering::Relaxed));
+        if q == 0 || (q + lines <= OUTPUT_QUEUE && b + bytes <= OUTPUT_QUEUE_BYTES) || t0.elapsed() >= max {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 struct Writer {
@@ -139,20 +207,19 @@ impl StreamFiles {
         self.base.with_file_name(name)
     }
 
-    fn write(&mut self, worker: &str, line: &[u8]) -> Result<(), String> {
-        let key = if self.per_worker { worker.to_string() } else { String::new() };
-        if !self.files.contains_key(&key) {
-            let f = FileSink::new(self.path_for(worker), self.policy.clone());
-            self.files.insert(key.clone(), f);
-        }
-        match self.files.get_mut(&key) {
-            Some(f) => f.write(line),
-            None => Ok(()),
-        }
+    /// The file for `worker`'s lines (the shared one unless per-worker).
+    fn sink(&mut self, worker: &str) -> &mut FileSink {
+        let key = if self.per_worker { worker } else { "" };
+        let path = self.path_for(worker);
+        let policy = &self.policy;
+        self.files.entry(key.to_string()).or_insert_with(|| FileSink::new(path, policy.clone()))
     }
 }
 
-/// `<ts> OUT   worker=<w> <stream>: <text>` → (w, stream, text).
+/// `<ts> OUT   worker=<w> <stream>: <text>` → (w, stream, text). The
+/// writer gets these from the batch; this is the format `warden logs`
+/// readers rely on.
+#[cfg(test)]
 fn split_output(line: &str) -> Option<(&str, &str, &str)> {
     let rest = line.get(TS_LEN..)?.strip_prefix("OUT   worker=")?;
     let (worker, rest) = rest.split_once(' ')?;
@@ -311,7 +378,7 @@ pub fn event(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)])
         return;
     }
     let mut line = String::with_capacity(TS_LEN + 96);
-    line.push_str(&timestamp_now());
+    push_timestamp_now(&mut line);
     let _ = write!(line, " {:<5} {msg}", level_name(level));
     for (k, v) in fields {
         let v = v.to_string();
@@ -324,11 +391,72 @@ pub fn event(level: Level, msg: &str, fields: &[(&str, &dyn std::fmt::Display)])
     emit(l, line.into(), Some(level));
 }
 
-/// A line of worker stdout/stderr.
-pub fn worker_output(worker: &str, stream: &str, text: &str) {
+/// Worker output lines: into memory (for `warden logs`), to followers,
+/// and queued for the writer thread, as far as the queue bounds allow
+/// (lines past them are counted as dropped, never waited for).
+pub fn worker_output_batch(b: OutputBatch) {
     let l = logger();
-    let line = format!("{} OUT   worker={worker} {stream}: {text}", timestamp_now());
-    emit(l, line.into(), None);
+    let mut batch = b.batch;
+    if batch.lines.is_empty() {
+        return;
+    }
+    {
+        let mut rings = l.rings.lock().unwrap_or_else(|e| e.into_inner());
+        for line in &batch.lines {
+            rings.seq += 1;
+            let seq = rings.seq;
+            rings.output.push(seq, line.clone());
+        }
+    }
+    if l.tx.receiver_count() > 0 {
+        for line in &batch.lines {
+            let _ = l.tx.send(line.clone());
+        }
+    }
+    let Some(w) = &l.writer else {
+        // Before `init` (CLI commands, tests): plain stdout.
+        let mut out = std::io::stdout().lock();
+        for line in &batch.lines {
+            let _ = out.write_all(line.as_bytes());
+            let _ = out.write_all(b"\n");
+        }
+        return;
+    };
+    // Keep the lines that fit under both bounds; count the rest. An empty
+    // queue takes the whole batch: one read (64 KB of short lines can be
+    // more than OUTPUT_QUEUE lines) is always small in bytes.
+    let (queued, qbytes) = (l.output_queued.load(Ordering::Relaxed), l.output_bytes.load(Ordering::Relaxed));
+    let (mut fit, mut bytes) = (0, 0);
+    if queued == 0 && batch.bytes <= OUTPUT_QUEUE_BYTES {
+        (fit, bytes) = (batch.lines.len(), batch.bytes);
+    } else {
+        for line in &batch.lines {
+            if queued + fit >= OUTPUT_QUEUE || qbytes + bytes + line.len() > OUTPUT_QUEUE_BYTES {
+                break;
+            }
+            fit += 1;
+            bytes += line.len();
+        }
+    }
+    let dropped = batch.lines.len() - fit;
+    if dropped > 0 {
+        l.dropped_output.fetch_add(dropped as u64, Ordering::Relaxed);
+        batch.lines.truncate(fit);
+        batch.bytes = bytes;
+    }
+    if fit == 0 {
+        return;
+    }
+    l.output_queued.fetch_add(fit, Ordering::Relaxed);
+    l.output_bytes.fetch_add(bytes, Ordering::Relaxed);
+    l.pending.fetch_add(fit, Ordering::Relaxed);
+    if w.tx.send(Queued::Output(batch)).is_err() {
+        // Writer thread gone (only if it panicked): count and move on.
+        l.output_queued.fetch_sub(fit, Ordering::Relaxed);
+        l.output_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        l.pending.fetch_sub(fit, Ordering::Relaxed);
+        l.dropped_output.fetch_add(fit as u64, Ordering::Relaxed);
+    }
 }
 
 fn emit(l: &Logger, line: Line, level: Option<Level>) {
@@ -347,24 +475,8 @@ fn emit(l: &Logger, line: Line, level: Option<Level>) {
                 }
             }
         }
-        (Some(w), None) => {
-            let len = line.len();
-            if l.output_bytes.load(Ordering::Relaxed) + len > OUTPUT_QUEUE_BYTES
-                || l.output_queued.load(Ordering::Relaxed) >= OUTPUT_QUEUE
-            {
-                l.dropped_output.fetch_add(1, Ordering::Relaxed);
-            } else {
-                l.output_queued.fetch_add(1, Ordering::Relaxed);
-                l.output_bytes.fetch_add(len, Ordering::Relaxed);
-                l.pending.fetch_add(1, Ordering::Relaxed);
-                if w.tx.send(Queued::Output(line.clone())).is_err() {
-                    l.output_queued.fetch_sub(1, Ordering::Relaxed);
-                    l.output_bytes.fetch_sub(len, Ordering::Relaxed);
-                    l.pending.fetch_sub(1, Ordering::Relaxed);
-                    l.dropped_output.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+        // Worker output goes through `worker_output_batch`.
+        (Some(_), None) => {}
         // Before `init` (CLI commands, tests): plain stdout.
         (None, _) => {
             let mut out = std::io::stdout().lock();
@@ -406,6 +518,11 @@ pub fn clear() {
 pub struct FileSink {
     path: PathBuf,
     file: Option<std::fs::File>,
+    /// Lines not yet written: one write(2) per batch instead of two per
+    /// line. `flush` empties it; the writer thread flushes after every
+    /// batch, and rotation and drop flush first.
+    buf: Vec<u8>,
+    /// Bytes in the file plus those in `buf`.
     size: u64,
     policy: RotatePolicy,
     next_rotation: Option<SystemTime>,
@@ -418,7 +535,16 @@ pub struct FileSink {
 impl FileSink {
     pub fn new(path: PathBuf, policy: RotatePolicy) -> Self {
         let next_rotation = policy.interval.as_ref().and_then(|c| c.next_after(SystemTime::now()));
-        FileSink { path, file: None, size: 0, policy, next_rotation, last_error: None, compressing: None }
+        FileSink {
+            path,
+            file: None,
+            buf: Vec::new(),
+            size: 0,
+            policy,
+            next_rotation,
+            last_error: None,
+            compressing: None,
+        }
     }
 
     fn open(&mut self) -> std::io::Result<()> {
@@ -439,6 +565,7 @@ impl FileSink {
     }
 
     fn rotate(&mut self) -> std::io::Result<()> {
+        self.write_buf()?;
         self.file = None;
         if let Some(h) = self.compressing.take() {
             let _ = h.join();
@@ -512,7 +639,12 @@ impl FileSink {
 
     /// Append one line; rotates first when the size or the schedule says so.
     pub fn write(&mut self, line: &[u8]) -> Result<(), String> {
-        let needed = line.len() as u64 + 1;
+        self.write_parts(&[line])
+    }
+
+    /// Append one line made of `parts`.
+    pub fn write_parts(&mut self, parts: &[&[u8]]) -> Result<(), String> {
+        let needed = parts.iter().map(|p| p.len() as u64).sum::<u64>() + 1;
         let res = (|| -> std::io::Result<()> {
             if self.file.is_none() {
                 self.open()?;
@@ -525,15 +657,21 @@ impl FileSink {
                 }
             } else if self.policy.max_size > 0 && self.size > 0 && self.size + needed > self.policy.max_size {
                 // `warden flush` may have truncated it: trust the file, not the count.
+                self.write_buf()?;
                 self.size = self.file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(self.size);
                 if self.size > 0 && self.size + needed > self.policy.max_size {
                     self.rotate()?;
                 }
             }
-            if let Some(f) = self.file.as_mut() {
-                f.write_all(line)?;
-                f.write_all(b"\n")?;
+            if self.file.is_some() {
+                for p in parts {
+                    self.buf.extend_from_slice(p);
+                }
+                self.buf.push(b'\n');
                 self.size += needed;
+                if self.buf.len() >= FILE_BUFFER {
+                    self.write_buf()?;
+                }
             }
             Ok(())
         })();
@@ -541,6 +679,31 @@ impl FileSink {
             self.file = None;
             format!("{}: {e}", self.path.display())
         })
+    }
+
+    /// Write out buffered lines.
+    pub fn flush(&mut self) -> Result<(), String> {
+        self.write_buf().map_err(|e| {
+            self.file = None;
+            format!("{}: {e}", self.path.display())
+        })
+    }
+
+    fn write_buf(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let res = match self.file.as_mut() {
+            Some(f) => f.write_all(&self.buf),
+            None => Ok(()),
+        };
+        // Written or not, these lines are done: a failing disk must not make
+        // the buffer grow without bound.
+        self.buf.clear();
+        if self.buf.capacity() > 4 * FILE_BUFFER {
+            self.buf.shrink_to(FILE_BUFFER);
+        }
+        res
     }
 
     fn should_report(&mut self) -> bool {
@@ -551,6 +714,15 @@ impl FileSink {
         due
     }
 }
+
+impl Drop for FileSink {
+    fn drop(&mut self) {
+        let _ = self.write_buf();
+    }
+}
+
+/// Buffered log bytes per file before a write(2), within one batch.
+const FILE_BUFFER: usize = 64 * 1024;
 
 /// `file` → `file.gz` (written to a temp name first), then `file` removed.
 fn gzip_file(path: &std::path::Path) -> std::io::Result<()> {
@@ -576,9 +748,15 @@ fn ignore_missing(e: std::io::Error) -> std::io::Result<()> {
 }
 
 /// Format for stdout: journald gets `<priority>` and no timestamp.
-fn stdout_form<'a>(sinks: &Sinks, level: Option<Level>, line: &'a str, buf: &'a mut String) -> &'a str {
+fn stdout_form<'a>(
+    journald: bool,
+    timestamps: bool,
+    level: Option<Level>,
+    line: &'a str,
+    buf: &'a mut String,
+) -> &'a str {
     let body = line.get(TS_LEN..).unwrap_or(line);
-    if sinks.journald {
+    if journald {
         match level {
             Some(lv) => {
                 buf.clear();
@@ -587,17 +765,45 @@ fn stdout_form<'a>(sinks: &Sinks, level: Option<Level>, line: &'a str, buf: &'a 
             }
             None => body,
         }
-    } else if sinks.timestamps {
+    } else if timestamps {
         line
     } else {
         body
     }
 }
 
+/// A line to stdout in its sink's form. A closed or failing stdout must
+/// not take Warden down; the line is still in memory for `warden logs`.
+fn to_stdout(out: &mut impl Write, form: (bool, bool), level: Option<Level>, line: &str, scratch: &mut String) {
+    let text = stdout_form(form.0, form.1, level, line, scratch);
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.write_all(b"\n");
+}
+
+/// A write error, kept for one report after the batch (at most one a
+/// minute per file).
+fn note_error(f: &mut FileSink, res: Result<(), String>, error: &mut Option<String>) {
+    if let Err(e) = res {
+        if f.should_report() {
+            *error = Some(e);
+        }
+    }
+}
+
 /// The writer thread: lines in the order they were logged, written in
 /// batches (one flush per burst). After a period of drops, one line says
 /// how many and why.
-fn write_loop(rx: Receiver<Queued>, mut sinks: Sinks) {
+fn write_loop(rx: Receiver<Queued>, sinks: Sinks) {
+    let Sinks {
+        stdout: use_stdout,
+        timestamps,
+        journald,
+        mut file,
+        out: mut out_files,
+        err: mut err_files,
+        stream_timestamps,
+    } = sinks;
+    let form = (journald, timestamps);
     let l = logger();
     let mut reported = (0u64, 0u64);
     let mut last_report = Instant::now();
@@ -605,66 +811,68 @@ fn write_loop(rx: Receiver<Queued>, mut sinks: Sinks) {
     let mut out = std::io::BufWriter::with_capacity(64 * 1024, stdout.lock());
     let mut scratch = String::new();
     let mut file_error: Option<String> = None;
-    let mut last_stream_error: Option<Instant> = None;
     loop {
         let first = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(q) => Some(q),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        // What is already queued is written before one flush (at most 1024
-        // lines, so drop reports still go out under a constant stream).
-        for q in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())).take(1024) {
-            let (level, line) = match &q {
-                Queued::Event(lv, line) => (Some(*lv), line),
-                Queued::Output(line) => (None, line),
-            };
-            if sinks.stdout {
-                let text = stdout_form(&sinks, level, line, &mut scratch);
-                // A closed or failing stdout must not take Warden down; the
-                // line is still in memory for `warden logs`.
-                let _ = out.write_all(text.as_bytes());
-                let _ = out.write_all(b"\n");
-            }
-            if let Some(f) = sinks.file.as_mut() {
-                if let Err(e) = f.write(line.as_bytes()) {
-                    if f.should_report() {
-                        file_error = Some(e);
+        // What is already queued is written before one flush (at most 256
+        // messages, so drop reports still go out under a constant stream).
+        for q in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())).take(256) {
+            match q {
+                Queued::Event(lv, line) => {
+                    if use_stdout {
+                        to_stdout(&mut out, form, Some(lv), &line, &mut scratch);
                     }
+                    if let Some(f) = file.as_mut() {
+                        let res = f.write(line.as_bytes());
+                        note_error(f, res, &mut file_error);
+                    }
+                    l.events_queued.fetch_sub(1, Ordering::Relaxed);
+                    l.pending.fetch_sub(1, Ordering::Relaxed);
                 }
-            }
-            if level.is_none() && (sinks.out.is_some() || sinks.err.is_some()) {
-                if let Some((worker, stream, text)) = split_output(line) {
-                    let ts = sinks.stream_timestamps;
-                    let target = if stream == "stderr" { sinks.err.as_mut() } else { sinks.out.as_mut() };
-                    if let Some(t) = target {
-                        let res = if ts {
-                            let stamped = format!("{}: {text}", line.get(..TS_LEN - 1).unwrap_or(""));
-                            t.write(worker, stamped.as_bytes())
-                        } else {
-                            t.write(worker, text.as_bytes())
-                        };
-                        if let Err(e) = res {
-                            if last_stream_error.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) {
-                                last_stream_error = Some(Instant::now());
-                                file_error = Some(e);
-                            }
+                Queued::Output(batch) => {
+                    // The out/err file for this worker, looked up once per batch.
+                    let files = if batch.stream == "stderr" { err_files.as_mut() } else { out_files.as_mut() };
+                    let mut target = files.map(|t| t.sink(&batch.worker));
+                    for line in &batch.lines {
+                        if use_stdout {
+                            to_stdout(&mut out, form, None, line, &mut scratch);
+                        }
+                        if let Some(f) = file.as_mut() {
+                            let res = f.write(line.as_bytes());
+                            note_error(f, res, &mut file_error);
+                        }
+                        if let Some(t) = target.as_deref_mut() {
+                            let text = line.get(batch.text_at..).unwrap_or("").as_bytes();
+                            let res = if stream_timestamps {
+                                let stamp = line.get(..TS_LEN - 1).unwrap_or("").as_bytes();
+                                t.write_parts(&[stamp, b": ", text])
+                            } else {
+                                t.write_parts(&[text])
+                            };
+                            note_error(t, res, &mut file_error);
                         }
                     }
+                    let n = batch.lines.len();
+                    l.output_queued.fetch_sub(n, Ordering::Relaxed);
+                    l.output_bytes.fetch_sub(batch.bytes, Ordering::Relaxed);
+                    l.pending.fetch_sub(n, Ordering::Relaxed);
                 }
             }
-            match q {
-                Queued::Event(..) => {
-                    l.events_queued.fetch_sub(1, Ordering::Relaxed);
-                }
-                Queued::Output(line) => {
-                    l.output_queued.fetch_sub(1, Ordering::Relaxed);
-                    l.output_bytes.fetch_sub(line.len(), Ordering::Relaxed);
-                }
-            }
-            l.pending.fetch_sub(1, Ordering::Relaxed);
         }
         let _ = out.flush();
+        if let Some(f) = file.as_mut() {
+            let res = f.flush();
+            note_error(f, res, &mut file_error);
+        }
+        for t in [out_files.as_mut(), err_files.as_mut()].into_iter().flatten() {
+            for f in t.files.values_mut() {
+                let res = f.flush();
+                note_error(f, res, &mut file_error);
+            }
+        }
         if let Some(e) = file_error.take() {
             event(
                 Level::Error,
@@ -755,16 +963,28 @@ fn syslog_priority(l: Level) -> u8 {
 }
 
 pub fn timestamp_now() -> String {
+    let mut s = String::with_capacity(TS_LEN);
+    push_timestamp_now(&mut s);
+    s
+}
+
+fn push_timestamp_now(out: &mut String) {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format_rfc3339(d.as_secs() as i64, d.subsec_millis())
+    push_rfc3339(out, d.as_secs() as i64, d.subsec_millis());
 }
 
 /// RFC 3339 UTC with milliseconds, without pulling in a date crate.
 pub fn format_rfc3339(secs: i64, millis: u32) -> String {
+    let mut s = String::with_capacity(TS_LEN);
+    push_rfc3339(&mut s, secs, millis);
+    s
+}
+
+fn push_rfc3339(out: &mut String, secs: i64, millis: u32) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+    let _ = write!(out, "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{millis:03}Z", rem / 3600, (rem % 3600) / 60, rem % 60);
 }
 
 // Howard Hinnant's days-to-civil algorithm.
@@ -847,6 +1067,7 @@ mod tests {
         for _ in 0..40 {
             f.write(&line).unwrap();
         }
+        f.flush().unwrap();
         let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         assert!(size(&path) <= 1024, "current file {} bytes", size(&path));
         assert!(size(&dir.join("app.log.1")) > 900 && size(&dir.join("app.log.2")) > 900);
@@ -854,6 +1075,7 @@ mod tests {
         // A truncated file (warden flush) is not rotated early.
         std::fs::OpenOptions::new().write(true).truncate(true).open(&path).unwrap();
         f.write(&line).unwrap();
+        f.flush().unwrap();
         assert_eq!(size(&path), 100);
         // An unwritable path reports an error instead of panicking.
         let mut bad = FileSink::new(PathBuf::from("/proc/warden-nope/app.log"), policy);
@@ -910,6 +1132,7 @@ mod tests {
         for _ in 0..12 {
             f.write(&line).unwrap();
         }
+        f.flush().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 6000);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -919,16 +1142,31 @@ mod tests {
         let line = "2026-09-30T12:00:01.123Z OUT   worker=2 stderr: boom: bad thing";
         assert_eq!(split_output(line), Some(("2", "stderr", "boom: bad thing")));
         assert_eq!(split_output("2026-09-30T12:00:01.123Z INFO  worker ready worker=1"), None);
+        // Batches build exactly that format, with the text where they say.
+        let mut b = OutputBatch::new("3", "stdout");
+        b.push("hello: world");
+        b.push("");
+        let batch = &b.batch;
+        assert_eq!(batch.lines.len(), 2);
+        assert_eq!(batch.bytes, batch.lines.iter().map(|l| l.len()).sum::<usize>());
+        for (line, text) in batch.lines.iter().zip(["hello: world", ""]) {
+            assert_eq!(split_output(line), Some(("3", "stdout", text)));
+            assert_eq!(&line[batch.text_at..], text);
+            assert_eq!(line.as_bytes()[TS_LEN - 1], b' ');
+        }
         let dir = std::env::temp_dir().join(format!("warden-streams-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut per = StreamFiles::new(dir.join("api-out.log"), true, RotatePolicy::default());
-        per.write("1", b"a").unwrap();
-        per.write("2", b"b").unwrap();
+        per.sink("1").write_parts(&[b"a"]).unwrap();
+        per.sink("2").write_parts(&[b"b"]).unwrap();
+        per.files.values_mut().for_each(|f| f.flush().unwrap());
         assert_eq!(std::fs::read_to_string(dir.join("api-out-1.log")).unwrap(), "a\n");
         assert_eq!(std::fs::read_to_string(dir.join("api-out-2.log")).unwrap(), "b\n");
         let mut merged = StreamFiles::new(dir.join("all.log"), false, RotatePolicy::default());
-        merged.write("1", b"a").unwrap();
-        merged.write("2", b"b").unwrap();
+        merged.sink("1").write_parts(&[b"a"]).unwrap();
+        merged.sink("2").write_parts(&[b"b".as_slice(), b"", b""]).unwrap();
+        assert_eq!(merged.files.len(), 1, "one shared file");
+        merged.files.values_mut().for_each(|f| f.flush().unwrap());
         assert_eq!(std::fs::read_to_string(dir.join("all.log")).unwrap(), "a\nb\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -937,21 +1175,10 @@ mod tests {
     fn journald_and_plain_forms() {
         let line = "2026-09-30T12:00:01.123Z WARN  thing happened";
         let mut buf = String::new();
-        let mut s = Sinks {
-            stdout: true,
-            timestamps: true,
-            journald: false,
-            file: None,
-            out: None,
-            err: None,
-            stream_timestamps: false,
-        };
-        assert_eq!(stdout_form(&s, Some(Level::Warn), line, &mut buf), line);
-        s.timestamps = false;
-        assert_eq!(stdout_form(&s, Some(Level::Warn), line, &mut buf), "WARN  thing happened");
-        s.journald = true;
-        assert_eq!(stdout_form(&s, Some(Level::Warn), line, &mut buf), "<4>WARN  thing happened");
-        assert_eq!(stdout_form(&s, None, line, &mut buf), "WARN  thing happened");
+        assert_eq!(stdout_form(false, true, Some(Level::Warn), line, &mut buf), line);
+        assert_eq!(stdout_form(false, false, Some(Level::Warn), line, &mut buf), "WARN  thing happened");
+        assert_eq!(stdout_form(true, false, Some(Level::Warn), line, &mut buf), "<4>WARN  thing happened");
+        assert_eq!(stdout_form(true, true, None, line, &mut buf), "WARN  thing happened");
     }
 
     #[test]

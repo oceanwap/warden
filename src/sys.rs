@@ -4,10 +4,16 @@
 //! many inputs.
 //!
 //! Policy: `unsafe` only for system calls the standard library does not
-//! expose (SO_REUSEPORT before bind, sendfile, process groups, pdeathsig),
-//! or where it measurably pays (sendfile: no userspace copy). No unsafe
-//! memory tricks (`transmute`, unchecked indexing, `from_utf8_unchecked`):
-//! Warden is not on the request path, so they would buy nothing.
+//! expose (SO_REUSEPORT before bind, process groups, pdeathsig, openat2) or
+//! where it measurably pays on a hot path: the static file server
+//! (sendfile, openat2 instead of a realpath walk, cache-only preadv2,
+//! MSG_MORE, TCP_DEFER_ACCEPT) and worker log capture (vectorised memchr).
+//! Each is a plain system or C library call on borrowed descriptors and
+//! slices. Tried and dropped for lack of a measured win: bigger worker pipe
+//! buffers (F_SETPIPE_SZ: same throughput at 64 KB, 256 KB and 1 MB).
+//! No unsafe memory tricks (`transmute`, unchecked indexing,
+//! `from_utf8_unchecked`): they would buy nanoseconds against microsecond
+//! syscalls, and a mistake there is silent corruption.
 //!
 //! Tools: Miri cannot execute these FFI calls and the sandbox has no nightly
 //! toolchain for sanitizers, so the test binary is also run under Valgrind
@@ -138,22 +144,10 @@ pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Resul
     // SAFETY: socket(2) just returned `raw`; the OwnedFd is its only owner,
     // so every early return below closes it (no leak on error paths).
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let on: libc::c_int = 1;
-    let setopt = |opt: libc::c_int| {
-        // SAFETY: `on` is a live c_int and the length matches it.
-        check(unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                opt,
-                &on as *const libc::c_int as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        })
-    };
-    setopt(libc::SO_REUSEADDR)?;
+    use std::os::fd::AsFd;
+    setsockopt_int(fd.as_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
     if reuse_port {
-        setopt(libc::SO_REUSEPORT)?;
+        setsockopt_int(fd.as_fd(), libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
     }
     match addr {
         SocketAddr::V4(a) => {
@@ -210,6 +204,112 @@ pub fn sendfile(out: BorrowedFd<'_>, input: BorrowedFd<'_>, offset: &mut i64, co
     }
     *offset = off as i64;
     Ok(n as usize)
+}
+
+/// The kernel's `struct open_how` (linux/openat2.h, version 0: 24 bytes).
+/// Our own definition because libc's is `#[non_exhaustive]`.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// openat2(2): open `path` relative to the directory `dir` with `resolve`
+/// restrictions (e.g. RESOLVE_BENEATH: the kernel refuses, with EXDEV, any
+/// resolution that leaves `dir`, including through `..` and symlinks; no
+/// window between a check and the open). One syscall instead of a
+/// userspace realpath walk. ENOSYS on kernels before 5.6, EPERM where a
+/// seccomp filter blocks it: callers fall back.
+pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: u64) -> io::Result<OwnedFd> {
+    let how = OpenHow { flags: (flags | libc::O_CLOEXEC) as u32 as u64, mode: 0, resolve };
+    // SAFETY: `path` is a NUL-terminated string that outlives the call;
+    // `how` is a live repr(C) struct of the size passed (the kernel's v0
+    // layout: three u64s); `dir` is borrowed, so it stays open for the call.
+    // The syscall touches no other memory.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dir.as_raw_fd() as libc::c_long,
+            path.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat2 returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
+/// pread that never waits for the disk: preadv2(RWF_NOWAIT) returns
+/// EAGAIN (`ErrorKind::WouldBlock`) when the data is not in the page cache,
+/// so a server can read cached files inline and hand the rest to a thread.
+/// `Unsupported` where the C library lacks preadv2.
+pub fn pread_nowait(fd: BorrowedFd<'_>, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    #[cfg(target_env = "gnu")]
+    {
+        let iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+        // SAFETY: `iov` describes exactly `buf`, which is exclusively
+        // borrowed for the call, so the kernel writes only inside it; one
+        // iovec; `fd` is borrowed and stays open.
+        let n = unsafe { libc::preadv2(fd.as_raw_fd(), &iov, 1, offset as libc::off_t, libc::RWF_NOWAIT) };
+        if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+    }
+    #[cfg(not(target_env = "gnu"))]
+    {
+        let _ = (fd, buf, offset);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// send(2) on a socket, never raising SIGPIPE; with `more`, MSG_MORE tells
+/// the kernel more data follows (response headers before a sendfile body),
+/// so headers and the first body bytes share a packet.
+pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
+    let flags = libc::MSG_NOSIGNAL | if more { libc::MSG_MORE } else { 0 };
+    // SAFETY: `buf` is a valid slice for its length and send only reads it;
+    // `sock` is borrowed and stays open for the call.
+    let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+fn setsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    // SAFETY: `value` is a live c_int and the length passed is its size.
+    check(unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            level,
+            name,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    })
+    .map(|_| ())
+}
+
+/// TCP_DEFER_ACCEPT on a listener: accept(2) wakes the server only once
+/// the client has sent data (its request), not on the bare handshake. The
+/// kernel still answers the handshake, so TCP health checks work.
+pub fn tcp_defer_accept(listener: BorrowedFd<'_>, secs: i32) -> io::Result<()> {
+    setsockopt_int(listener, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, secs)
+}
+
+/// Index of the first `byte` in `hay`: the C library's memchr, which is
+/// vectorised (glibc: SSE2/AVX2/EVEX), far faster than a byte loop on long
+/// log chunks.
+pub fn memchr(byte: u8, hay: &[u8]) -> Option<usize> {
+    if hay.is_empty() {
+        return None;
+    }
+    // SAFETY: memchr reads at most `hay.len()` bytes starting at
+    // `hay.as_ptr()`, all inside the borrowed slice; it returns null or a
+    // pointer into that same range, so the offset is in bounds.
+    unsafe {
+        let p = libc::memchr(hay.as_ptr() as *const libc::c_void, byte as libc::c_int, hay.len());
+        if p.is_null() { None } else { Some((p as *const u8).offset_from(hay.as_ptr()) as usize) }
+    }
 }
 
 // ------------------------------------------------ between fork and exec
@@ -647,5 +747,304 @@ mod tests {
         let mut msg = String::new();
         std::fs::File::from(r).read_to_string(&mut msg).unwrap();
         assert_eq!(msg, "ok\n");
+    }
+
+    // ------------------------------------------------------------ openat2
+
+    /// A scratch tree: root/{a.txt, sub/b.txt, in -> a.txt, abs -> <root>/a.txt,
+    /// up -> ../outside.txt, outdir -> <parent>, fifo}, outside.txt next to it.
+    fn tree() -> (std::path::PathBuf, std::fs::File) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "warden-tree-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "A").unwrap();
+        std::fs::write(root.join("sub/b.txt"), "B").unwrap();
+        std::fs::write(base.join("outside.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("in")).unwrap();
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../outside.txt", root.join("up")).unwrap();
+        std::os::unix::fs::symlink(&base, root.join("outdir")).unwrap();
+        let c = std::ffi::CString::new(root.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+        // SAFETY (test): mkfifo with a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let dir = std::fs::File::open(&root).unwrap();
+        (base, dir)
+    }
+
+    fn open_rel(dir: &std::fs::File, p: &str, resolve: u64) -> io::Result<OwnedFd> {
+        use std::os::fd::AsFd;
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY;
+        openat2(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags, resolve)
+    }
+
+    fn read_all(fd: OwnedFd) -> String {
+        let mut s = String::new();
+        std::fs::File::from(fd).read_to_string(&mut s).unwrap();
+        s
+    }
+
+    const BENEATH: u64 = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS;
+
+    #[test]
+    fn openat2_stays_beneath_the_directory() {
+        let (base, dir) = tree();
+        match open_rel(&dir, "a.txt", BENEATH) {
+            Ok(fd) => {
+                assert!(fd_flags(fd.as_raw_fd()).0, "CLOEXEC");
+                assert_eq!(read_all(fd), "A");
+            }
+            // Kernel before 5.6 or a seccomp filter: the caller's fallback.
+            Err(e) => {
+                assert!(matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)), "{e}");
+                return;
+            }
+        }
+        assert_eq!(read_all(open_rel(&dir, "sub/b.txt", BENEATH).unwrap()), "B");
+        assert_eq!(read_all(open_rel(&dir, "in", BENEATH).unwrap()), "A", "relative symlink inside");
+        assert_eq!(read_all(open_rel(&dir, "sub/../a.txt", BENEATH).unwrap()), "A", ".. that stays inside");
+        assert!(open_rel(&dir, ".", BENEATH).is_ok(), "the directory itself");
+        let exdev = |p: &str| open_rel(&dir, p, BENEATH).unwrap_err().raw_os_error();
+        assert_eq!(exdev("../outside.txt"), Some(libc::EXDEV));
+        assert_eq!(exdev("up"), Some(libc::EXDEV), "symlink escaping with ..");
+        assert_eq!(exdev("abs"), Some(libc::EXDEV), "absolute symlinks are refused (callers re-check)");
+        assert_eq!(exdev("outdir/outside.txt"), Some(libc::EXDEV), "directory symlink out");
+        assert_eq!(exdev("/etc/passwd"), Some(libc::EXDEV), "absolute path");
+        assert_eq!(open_rel(&dir, "missing", BENEATH).unwrap_err().raw_os_error(), Some(libc::ENOENT));
+        assert_eq!(open_rel(&dir, "a.txt/x", BENEATH).unwrap_err().raw_os_error(), Some(libc::ENOTDIR));
+        // A FIFO opens at once with O_NONBLOCK (no writer needed), so a
+        // server can see it is not a regular file instead of hanging.
+        let t0 = std::time::Instant::now();
+        let fifo = std::fs::File::from(open_rel(&dir, "fifo", BENEATH).unwrap());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!fifo.metadata().unwrap().is_file());
+        // Unknown resolve flags are rejected cleanly, not misread.
+        assert_eq!(open_rel(&dir, "a.txt", 1 << 40).unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn openat2_cached_lookups_answer_or_say_eagain() {
+        let (base, dir) = tree();
+        let cached = BENEATH | libc::RESOLVE_CACHED;
+        // Warm the dentry cache, then a cached lookup must succeed or, on
+        // kernels without RESOLVE_CACHED (< 5.12), fail with EINVAL; on
+        // filesystems that always revalidate, EAGAIN.
+        let _ = std::fs::metadata(base.join("root/sub/b.txt"));
+        match open_rel(&dir, "sub/b.txt", cached) {
+            Ok(fd) => assert_eq!(read_all(fd), "B"),
+            Err(e) => {
+                assert!(
+                    matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EAGAIN | libc::ENOSYS | libc::EPERM)),
+                    "{e}"
+                )
+            }
+        }
+        // Never-seen names can't come from the cache: EAGAIN or ENOENT
+        // (a negative dentry) — never a wrong file.
+        match open_rel(&dir, "never-created-name", cached) {
+            Ok(_) => panic!("a missing file opened"),
+            Err(e) => assert!(
+                matches!(
+                    e.raw_os_error(),
+                    Some(libc::EAGAIN | libc::ENOENT | libc::EINVAL | libc::ENOSYS | libc::EPERM)
+                ),
+                "{e}"
+            ),
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn openat2_does_not_leak_descriptors() {
+        run_isolated("openat2_leak_probe");
+    }
+
+    #[test]
+    fn openat2_leak_probe() {
+        if !in_probe() {
+            return;
+        }
+        let (base, dir) = tree();
+        let before = open_fds();
+        for _ in 0..1000 {
+            let _ = open_rel(&dir, "a.txt", BENEATH);
+            let _ = open_rel(&dir, "up", BENEATH);
+            let _ = open_rel(&dir, "missing", BENEATH);
+            let _ = open_rel(&dir, "fifo", BENEATH);
+        }
+        assert_eq!(open_fds(), before, "every descriptor closed, success or error");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    // ------------------------------------------------------- pread_nowait
+
+    #[test]
+    fn pread_nowait_reads_exact_ranges() {
+        use std::os::fd::AsFd;
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let (file, path) = temp_file(&data);
+        let _ = std::fs::read(&path); // in the page cache
+        for (off, len) in [(0usize, 0usize), (0, 1), (1, 4095), (4096, 4096), (12_345, 65_537), (199_999, 1)] {
+            let mut buf = vec![0u8; len];
+            let mut done = 0;
+            while done < len {
+                match pread_nowait(file.as_fd(), &mut buf[done..], (off + done) as u64) {
+                    Ok(0) => panic!("early EOF"),
+                    Ok(n) => done += n,
+                    // Data not cached (or no preadv2): the caller's thread fallback.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Unsupported => return,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert!(buf == data[off..off + len], "bytes differ at {off}+{len}");
+        }
+        // At and past EOF: 0 bytes, not garbage.
+        let mut buf = [9u8; 16];
+        assert_eq!(pread_nowait(file.as_fd(), &mut buf, 200_000).unwrap(), 0);
+        assert_eq!(pread_nowait(file.as_fd(), &mut buf, 1 << 40).unwrap(), 0);
+        assert_eq!(buf, [9u8; 16], "buffer untouched");
+        // Short read at the tail: exactly the remaining bytes.
+        assert_eq!(pread_nowait(file.as_fd(), &mut buf, 199_990).unwrap(), 10);
+        assert_eq!(buf[..10], data[199_990..]);
+        // Not a file: a clean error.
+        let (r, _w) = pipe_cloexec().unwrap();
+        assert_eq!(pread_nowait(r.as_fd(), &mut buf, 0).unwrap_err().raw_os_error(), Some(libc::ESPIPE));
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --------------------------------------------------------------- send
+
+    #[test]
+    fn send_with_more_delivers_everything_in_order() {
+        use std::os::fd::AsFd;
+        let (tx, mut rx) = socket_pair();
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            rx.read_to_end(&mut got).unwrap();
+            got
+        });
+        let mut want = Vec::new();
+        for i in 0..200u32 {
+            let chunk = format!("header-{i}\r\n").into_bytes();
+            let mut off = 0;
+            while off < chunk.len() {
+                off += send(tx.as_fd(), &chunk[off..], i % 2 == 0).unwrap();
+            }
+            want.extend_from_slice(&chunk);
+        }
+        // Data sent with MSG_MORE is still flushed by the last plain send / close.
+        assert_eq!(send(tx.as_fd(), b"end", false).unwrap(), 3);
+        want.extend_from_slice(b"end");
+        drop(tx);
+        assert_eq!(reader.join().unwrap(), want);
+        assert_eq!(
+            send(std::fs::File::open("/dev/null").unwrap().as_fd(), b"x", true).unwrap_err().raw_os_error(),
+            Some(libc::ENOTSOCK)
+        );
+    }
+
+    #[test]
+    fn send_to_a_closed_peer_fails_without_sigpipe() {
+        run_isolated("sigpipe_probe");
+    }
+
+    #[test]
+    fn sigpipe_probe() {
+        use std::os::fd::AsFd;
+        if !in_probe() {
+            return;
+        }
+        // Restore the default SIGPIPE action (which kills the process): only
+        // MSG_NOSIGNAL keeps this probe alive.
+        // SAFETY (test): signal() with a valid signal and SIG_DFL.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let (tx, rx) = socket_pair();
+        drop(rx);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut err = None;
+        for _ in 0..100 {
+            if let Err(e) = send(tx.as_fd(), &[0u8; 65536], true) {
+                err = Some(e);
+                break;
+            }
+        }
+        let e = err.expect("a closed peer must fail the send");
+        assert!(matches!(e.raw_os_error(), Some(libc::EPIPE) | Some(libc::ECONNRESET)), "{e}");
+    }
+
+    // ---------------------------------------------------- socket and pipe options
+
+    #[test]
+    fn defer_accept_is_set_and_connections_still_arrive() {
+        use std::os::fd::AsFd;
+        let l = listen_tcp("127.0.0.1:0".parse().unwrap(), false, 16).unwrap();
+        tcp_defer_accept(l.as_fd(), 5).unwrap();
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY (test): getsockopt into a live c_int with its size.
+        let rc = unsafe {
+            libc::getsockopt(
+                l.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                &mut v as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(v > 0, "TCP_DEFER_ACCEPT set ({v})");
+        // A client that sends its request is accepted right away.
+        let mut c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        l.set_nonblocking(false).unwrap();
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 3];
+        s.read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"GET");
+        // Not a socket: a clean error.
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(tcp_defer_accept(f.as_fd(), 5).unwrap_err().raw_os_error(), Some(libc::ENOTSOCK));
+    }
+
+    // ------------------------------------------------------------- memchr
+
+    #[test]
+    fn memchr_matches_a_plain_search() {
+        assert_eq!(memchr(b'\n', b""), None);
+        assert_eq!(memchr(b'\n', b"\n"), Some(0));
+        assert_eq!(memchr(b'\n', b"ab"), None);
+        assert_eq!(memchr(0, b"a\0b\0"), Some(1));
+        assert_eq!(memchr(0xff, &[0xfe, 0xff, 0xff]), Some(1));
+        // Every length and alignment up to a few vector widths, the needle
+        // at every position (first occurrence wins), and none at all.
+        let mut seed = 7u32;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8 % 10 + b'a'
+            })
+            .collect();
+        for start in 0..64 {
+            for len in 0..300 {
+                let hay = &data[start..start + len];
+                assert_eq!(memchr(b'\n', hay), None);
+                for needle in [b'a', b'e', b'j'] {
+                    assert_eq!(memchr(needle, hay), hay.iter().position(|&b| b == needle), "start {start} len {len}");
+                }
+                if len > 0 {
+                    let mut v = hay.to_vec();
+                    for pos in [0, len / 2, len - 1] {
+                        v[pos] = b'\n';
+                        assert_eq!(memchr(b'\n', &v), v.iter().position(|&b| b == b'\n'));
+                    }
+                }
+            }
+        }
     }
 }

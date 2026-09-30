@@ -26,6 +26,8 @@ pub struct Spec {
     /// Let the worker write straight to Warden's stdout/stderr (no prefix,
     /// no copying through Warden; `warden logs` won't show its output).
     pub inherit_output: bool,
+    /// Output lines kept per second per stream (0 = no limit).
+    pub max_lines_per_sec: u32,
 }
 
 /// Message written by the shim / worker-mode host on fd 3, one JSON object per line.
@@ -136,7 +138,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     };
     if let Some(out) = child.stdout.take() {
         let on_fail = reader_failed("stdout", ctl_tx.clone(), label.clone());
-        let fut = pump_output(out, label.clone(), "stdout");
+        let fut = pump_output(out, label.clone(), "stdout", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
             if let Err(m) = crate::guard::catch_unwind(fut).await {
                 on_fail(m);
@@ -145,7 +147,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     }
     if let Some(err) = child.stderr.take() {
         let on_fail = reader_failed("stderr", ctl_tx.clone(), label.clone());
-        let fut = pump_output(err, label.clone(), "stderr");
+        let fut = pump_output(err, label.clone(), "stderr", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
             if let Err(m) = crate::guard::catch_unwind(fut).await {
                 on_fail(m);
@@ -237,9 +239,6 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Forward a child stream line by line to the log, capping line length.
-/// Per-worker budget for output lines. Above it, lines are dropped (and
-/// counted) instead of letting one chatty worker eat Warden's CPU (CP6).
-const OUTPUT_LINES_PER_SEC: u32 = 10_000;
 /// Per-worker budget for fd-3 IPC messages (heartbeats are 1/s per Worker).
 const IPC_MSGS_PER_SEC: u32 = 1_000;
 /// Longest IPC line kept; Warden's shim sends a few hundred bytes at most.
@@ -266,18 +265,21 @@ impl RateLimit {
             last_bad_report: None,
         }
     }
+    /// Under budget there is no clock read at all; the window is only
+    /// checked once the budget is used up (then a new window starts if a
+    /// second has passed since the last one began).
     fn allow(&mut self) -> bool {
+        self.used = self.used.saturating_add(1);
+        if self.used <= self.limit {
+            return true;
+        }
         if self.window.elapsed() >= std::time::Duration::from_secs(1) {
             self.window = std::time::Instant::now();
-            self.used = 0;
+            self.used = 1;
+            return true;
         }
-        self.used += 1;
-        if self.used > self.limit {
-            self.dropped += 1;
-            false
-        } else {
-            true
-        }
+        self.dropped += 1;
+        false
     }
     /// Same cadence for a second kind of report (invalid input).
     fn report_bad(&mut self) -> bool {
@@ -301,11 +303,12 @@ impl RateLimit {
 }
 
 /// Forward a child stream line by line to the log, capping line length and rate.
-async fn pump_output<R: tokio::io::AsyncRead + Unpin>(mut r: R, label: String, stream: &'static str) {
+async fn pump_output<R: tokio::io::AsyncRead + Unpin>(mut r: R, label: String, stream: &'static str, limit: u32) {
     crate::guard::fault(stream);
-    let mut chunk = [0u8; 8192];
+    // On the heap: a 64 KB array would make every reader task's future 64 KB.
+    let mut chunk = vec![0u8; READ_CHUNK];
     let mut line: Vec<u8> = Vec::with_capacity(256);
-    let mut rate = RateLimit::new(OUTPUT_LINES_PER_SEC);
+    let mut rate = RateLimit::new(if limit == 0 { u32::MAX } else { limit });
     loop {
         let n = match r.read(&mut chunk).await {
             Ok(0) => break,
@@ -315,38 +318,73 @@ async fn pump_output<R: tokio::io::AsyncRead + Unpin>(mut r: R, label: String, s
             }
             Ok(n) => n,
         };
-        for &b in &chunk[..n] {
-            if b == b'\n' {
-                emit(&label, stream, &mut line, &mut rate);
-            } else {
-                line.push(b);
-                if line.len() >= MAX_LINE {
-                    emit(&label, stream, &mut line, &mut rate);
-                }
-            }
+        // Everything this read produced goes to the log as one batch.
+        let mut batch = crate::logging::OutputBatch::new(&label, stream);
+        split_lines(&chunk[..n], &mut line, &mut |l: &mut Vec<u8>| keep(&mut batch, l, &mut rate));
+        if limit == 0 {
+            crate::logging::room_for(batch.len(), batch.bytes(), KEEP_ALL_MAX_WAIT).await;
         }
+        crate::logging::worker_output_batch(batch);
         if let Some(n) = rate.report() {
             crate::warn!(
                 "worker writes too much output; lines dropped",
                 worker = label,
                 stream = stream,
                 dropped = n,
-                limit_per_s = OUTPUT_LINES_PER_SEC,
-                hint = "lower the app's log level, or set [logging] worker_output = \"inherit\" to bypass Warden",
+                limit_per_s = limit,
+                hint = "lower the app's log level, raise [logging] max_lines_per_sec (0 = no limit), or set [logging] worker_output = \"inherit\"",
             );
         }
     }
     if !line.is_empty() {
-        emit(&label, stream, &mut line, &mut rate);
+        let mut batch = crate::logging::OutputBatch::new(&label, stream);
+        keep(&mut batch, &mut line, &mut rate);
+        crate::logging::worker_output_batch(batch);
     }
 }
 
-fn emit(label: &str, stream: &str, line: &mut Vec<u8>, rate: &mut RateLimit) {
+/// Keep-all mode: longest a read waits for room in the log queue.
+const KEEP_ALL_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Bytes read from a worker's stdout/stderr per call.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Cut `data` into lines: each complete line (without its `\n`) is handed
+/// to `emit` in `line`; a line longer than MAX_LINE is emitted in MAX_LINE
+/// pieces; an unfinished tail stays in `line` for the next chunk. Newlines
+/// are found with the C library's vectorised memchr and copied in bulk
+/// (the old byte-at-a-time loop was the capture path's main CPU cost).
+fn split_lines(mut data: &[u8], line: &mut Vec<u8>, emit: &mut impl FnMut(&mut Vec<u8>)) {
+    loop {
+        let (seg, done) = match crate::sys::memchr(b'\n', data) {
+            Some(i) => (&data[..i], Some(i + 1)),
+            None => (data, None),
+        };
+        let mut seg = seg;
+        while line.len() + seg.len() >= MAX_LINE {
+            let take = MAX_LINE - line.len();
+            line.extend_from_slice(&seg[..take]);
+            emit(line);
+            seg = &seg[take..];
+        }
+        line.extend_from_slice(seg);
+        match done {
+            Some(next) => {
+                emit(line);
+                data = &data[next..];
+            }
+            None => return,
+        }
+    }
+}
+
+/// A complete line: into the batch if the rate budget allows; then cleared.
+fn keep(batch: &mut crate::logging::OutputBatch, line: &mut Vec<u8>, rate: &mut RateLimit) {
     if rate.allow() {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        crate::logging::worker_output(label, stream, &String::from_utf8_lossy(line));
+        batch.push(&String::from_utf8_lossy(line));
     }
     line.clear();
 }
@@ -382,7 +420,7 @@ async fn pump_ipc(
         };
         buf.extend_from_slice(&chunk[..n]);
         let mut start = 0;
-        while let Some(i) = buf[start..].iter().position(|&b| b == b'\n') {
+        while let Some(i) = crate::sys::memchr(b'\n', &buf[start..]) {
             let line = &buf[start..start + i];
             start += i + 1;
             if !rate.allow() {
@@ -441,6 +479,77 @@ mod tests {
         assert!(r.allow() && r.allow() && r.allow());
         assert!(!r.allow() && !r.allow());
         assert_eq!(r.dropped, 2);
+        // A second later a new window starts with the next line.
+        r.window -= std::time::Duration::from_millis(1100);
+        assert!(r.allow() && r.allow() && r.allow());
+        assert!(!r.allow());
+        assert_eq!(r.dropped, 3);
+        // A slow logger: lines spread over many seconds are never dropped,
+        // even though the budget is only checked once it runs out.
+        let mut slow = RateLimit::new(3);
+        for _ in 0..20 {
+            assert!(slow.allow());
+            slow.window -= std::time::Duration::from_secs(2); // time passes
+        }
+        assert_eq!(slow.dropped, 0);
+    }
+
+    /// The previous splitter, byte by byte: the reference for `split_lines`.
+    fn split_reference(data: &[u8], line: &mut Vec<u8>, out: &mut Vec<Vec<u8>>) {
+        for &b in data {
+            if b == b'\n' {
+                out.push(std::mem::take(line));
+            } else {
+                line.push(b);
+                if line.len() >= MAX_LINE {
+                    out.push(std::mem::take(line));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_lines_matches_the_byte_loop_for_any_chunking() {
+        let mut seed = 12_345u64;
+        let mut rnd = |n: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % n
+        };
+        for round in 0..200 {
+            // Lines of every kind: empty, short, CRLF, exactly MAX_LINE, longer.
+            let mut data = Vec::new();
+            for _ in 0..(1 + rnd(40)) {
+                let len = match rnd(6) {
+                    0 => 0,
+                    1 => rnd(10),
+                    2 => rnd(300),
+                    3 => MAX_LINE as u64 - 1 + rnd(3),
+                    4 => MAX_LINE as u64 * (1 + rnd(3)) + rnd(50),
+                    _ => rnd(2000),
+                };
+                data.extend((0..len).map(|i| b'a' + (i % 26) as u8));
+                if rnd(4) == 0 {
+                    data.push(b'\r');
+                }
+                data.push(b'\n');
+            }
+            if round % 3 == 0 {
+                data.extend_from_slice(b"unterminated tail");
+            }
+            let (mut want, mut ref_line) = (Vec::new(), Vec::new());
+            split_reference(&data, &mut ref_line, &mut want);
+            // Same data cut into random chunks.
+            let (mut got, mut line) = (Vec::new(), Vec::new());
+            let mut rest = &data[..];
+            while !rest.is_empty() {
+                let n = (1 + rnd(70_000) as usize).min(rest.len());
+                split_lines(&rest[..n], &mut line, &mut |l: &mut Vec<u8>| got.push(std::mem::take(l)));
+                rest = &rest[n..];
+            }
+            assert_eq!(got.len(), want.len(), "round {round}: line count");
+            assert!(got == want, "round {round}: lines differ");
+            assert_eq!(line, ref_line, "round {round}: unfinished tail");
+        }
     }
 
     #[test]
@@ -466,6 +575,7 @@ mod tests {
                     env: vec![],
                     label: "t".into(),
                     inherit_output: false,
+                    max_lines_per_sec: 0,
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -500,6 +610,7 @@ mod tests {
                     env: vec![],
                     label: "t".into(),
                     inherit_output: false,
+                    max_lines_per_sec: 0,
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);

@@ -461,6 +461,7 @@ impl Supervisor {
             env,
             label: self.label(slot_id),
             inherit_output: self.cfg.logging.worker_output == crate::config::WorkerOutput::Inherit,
+            max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
     }
 

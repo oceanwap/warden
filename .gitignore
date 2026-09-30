@@ -3,3 +3,4 @@ node_modules/
 bench/.run/
 *.sock
 bench/nest/dist/
+bench/results/*.json

@@ -60,6 +60,7 @@ max_lifetime = 0                             # s; recycle each worker after this
 [logging]
 level = "info"                               # debug | info | warn | error
 # timestamps = true                          # default: off under journald (it adds its own)
+# max_lines_per_sec = 10000                  # worker output kept per worker and stream; excess is counted and dropped (0 = keep all)
 
 [metrics]
 # listen = "127.0.0.1:9464"                  # Prometheus text at /metrics

@@ -213,7 +213,6 @@ fn allowed_resets() -> usize {
     }
 }
 
-
 #[test]
 fn process_mode_lifecycle() {
     if !have_bun() {
@@ -1380,6 +1379,56 @@ fn plain_processes_min_uptime_and_stop_exit_codes() {
     assert_eq!(w.status().unwrap()["workers"][0]["restarts"], 0, "not restarted");
 }
 
+/// Worker output under a flood: by default Warden keeps its line budget and
+/// counts the rest as dropped; with `max_lines_per_sec = 0` it keeps every
+/// line, in order, by slowing the writer down instead (backpressure).
+#[test]
+fn output_flood_budget_and_keep_all() {
+    const N: u32 = 300_000;
+    for keep_all in [false, true] {
+        let port = free_port();
+        let name = if keep_all { "flood-all" } else { "flood-budget" };
+        let dir = std::env::temp_dir().join(format!("warden-it-{name}-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out.log");
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"seq 1 {N}; exec sleep 300\"]\n\
+             [workers]\nmin_uptime = 100\n[logging]\nout_file = \"{}\"\n{}",
+            out.display(),
+            if keep_all { "max_lines_per_sec = 0\n" } else { "" }
+        );
+        let w = Warden::start(name, port, &cfg);
+        let lines = || std::fs::read_to_string(&out).map(|t| t.lines().count()).unwrap_or(0);
+        let t0 = Instant::now();
+        let mut last = (usize::MAX, Instant::now());
+        // Wait until the file stops growing.
+        while t0.elapsed() < T {
+            let n = lines();
+            if n == last.0 && last.1.elapsed() > Duration::from_millis(700) && n > 0 {
+                break;
+            }
+            if n != last.0 {
+                last = (n, Instant::now());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let text = std::fs::read_to_string(&out).unwrap();
+        let got: Vec<u32> = text.lines().map(|l| l.parse().unwrap()).collect();
+        if keep_all {
+            assert_eq!(got.len(), N as usize, "every line kept");
+            assert!(got.iter().enumerate().all(|(i, v)| *v == i as u32 + 1), "in order");
+        } else {
+            // At most the 10,000-line budget (less if the queue to the
+            // writer filled first); the rest counted as dropped.
+            assert!(got.len() > 1000 && got.len() <= 10_000, "budget applied: {} lines", got.len());
+            assert!(got.windows(2).all(|p| p[0] < p[1]), "kept lines stay in order");
+            w.wait_log("lines dropped", T);
+        }
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `warden start` runs anything PM2 would: a command line, a program on
 /// PATH, a script by extension, an executable.
 #[test]
@@ -1536,6 +1585,70 @@ fn get_close(port: u16, path: &str, extra: &str) -> (u16, std::collections::Hash
     http_raw(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{extra}\r\n"))
 }
 
+/// The static server opens files three ways (openat2 with RESOLVE_CACHED,
+/// openat2, realpath check on old kernels); each must keep the same root
+/// closed and serve the same bytes.
+#[test]
+fn static_open_modes_agree_and_keep_the_root_closed() {
+    let dir = std::env::temp_dir().join(format!("warden-it-open-modes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let site = dir.join("site");
+    std::fs::create_dir_all(site.join("sub")).unwrap();
+    std::fs::write(site.join("index.html"), "home").unwrap();
+    std::fs::write(site.join("sub/index.html"), "sub home").unwrap();
+    std::fs::write(site.join("a.css"), "a{}").unwrap();
+    std::fs::write(dir.join("outside.txt"), "secret").unwrap();
+    std::os::unix::fs::symlink(dir.join("outside.txt"), site.join("escape.txt")).unwrap();
+    std::os::unix::fs::symlink("../outside.txt", site.join("up.txt")).unwrap();
+    std::os::unix::fs::symlink(&dir, site.join("outdir")).unwrap();
+    std::os::unix::fs::symlink("a.css", site.join("alias.css")).unwrap();
+    std::os::unix::fs::symlink(site.join("a.css"), site.join("abs.css")).unwrap();
+    std::os::unix::fs::symlink(site.join("sub"), site.join("subabs")).unwrap();
+    let fifo = std::ffi::CString::new(site.join("pipe.txt").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let mid: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("mid.bin"), &mid).unwrap();
+    let big: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(site.join("big.bin"), &big).unwrap();
+
+    for mode in ["cached", "beneath", "legacy"] {
+        let port = free_port();
+        let toml = format!(
+            "[app]\nname = \"open-{mode}\"\nport = {port}\n[workers]\ncount = 1\n[static]\nroot = \"{}\"\n",
+            site.display()
+        );
+        let w = Warden::start_env(&format!("open-{mode}"), port, &toml, &[("WARDEN_STATIC_OPEN", mode)]);
+        w.wait_for("static worker ready", T, ready(1));
+        let how = match mode {
+            "cached" => "(files opened with openat2, cache-first)",
+            "beneath" => "(files opened with openat2)",
+            _ => "(files opened with realpath check)",
+        };
+        w.wait_log(how, T);
+        let get = |p: &str| get_close(port, p, "");
+        assert_eq!(get("/").2, b"home", "{mode}");
+        assert_eq!(get("/sub/").2, b"sub home", "{mode}");
+        assert_eq!(get("/alias.css").2, b"a{}", "{mode}: relative symlink inside");
+        assert_eq!(get("/abs.css").2, b"a{}", "{mode}: absolute symlink inside");
+        assert_eq!(get("/subabs/").2, b"sub home", "{mode}: absolute directory symlink inside");
+        for bad in ["/escape.txt", "/up.txt", "/outdir/outside.txt", "/pipe.txt", "/missing.txt"] {
+            assert_eq!(get(bad).0, 404, "{mode}: {bad}");
+        }
+        assert_eq!(get("/%2e%2e/outside.txt").0, 403, "{mode}");
+        assert!(get("/mid.bin").2 == mid, "{mode}: small body");
+        assert!(get("/big.bin").2 == big, "{mode}: sendfile body");
+        // Keep-alive after a refused path: the connection still works.
+        let (st, _, body) = http_raw(
+            port,
+            "GET /up.txt HTTP/1.1\r\nHost: x\r\n\r\nGET /a.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(st, 404);
+        assert!(String::from_utf8_lossy(&body).ends_with("a{}"), "{mode}: {}", String::from_utf8_lossy(&body));
+        drop(w);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `warden serve`: Warden's own static server, supervised like any app.
 #[test]
 fn serve_static_files() {
@@ -1560,6 +1673,17 @@ fn serve_static_files() {
     // A symlink pointing outside the root must not be served.
     std::fs::write(f.home.join("outside.txt"), "nope").unwrap();
     std::os::unix::fs::symlink(f.home.join("outside.txt"), site.join("escape.txt")).unwrap();
+    std::os::unix::fs::symlink("../outside.txt", site.join("up.txt")).unwrap();
+    std::os::unix::fs::symlink(&f.home, site.join("outdir")).unwrap();
+    // Symlinks that stay inside are served, relative or absolute.
+    std::os::unix::fs::symlink("style.css", site.join("alias.css")).unwrap();
+    std::os::unix::fs::symlink(site.join("style.css"), site.join("abs.css")).unwrap();
+    // A FIFO must not hang a worker.
+    let fifo = std::ffi::CString::new(site.join("pipe").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    // Just under the single-write limit: read into the response buffer.
+    let mid: Vec<u8> = (0..15_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(site.join("assets/mid.bin"), &mid).unwrap();
 
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
@@ -1604,6 +1728,19 @@ fn serve_static_files() {
     assert_eq!((st, body.as_slice()), (404, b"custom missing".as_slice()));
     assert_eq!(get_close(port, "/.env", "").0, 404);
     assert_eq!(get_close(port, "/escape.txt", "").0, 404);
+    assert_eq!(get_close(port, "/up.txt", "").0, 404);
+    assert_eq!(get_close(port, "/outdir/outside.txt", "").0, 404);
+    assert_eq!(get_close(port, "/alias.css", "").2, b"body{}");
+    assert_eq!(get_close(port, "/abs.css", "").2, b"body{}");
+    let t0 = std::time::Instant::now();
+    assert_eq!(get_close(port, "/pipe", "Accept: application/json\r\n").0, 404);
+    assert!(t0.elapsed() < Duration::from_secs(2), "a FIFO is refused at once");
+    let (st, _, body) = get_close(port, "/assets/mid.bin", "");
+    assert_eq!(st, 200);
+    assert!(body == mid, "15 KB body intact");
+    let (st, _, body) = get_close(port, "/assets/mid.bin", "Range: bytes=100-10099\r\n");
+    assert_eq!(st, 206);
+    assert!(body == mid[100..10_100], "small-file range intact");
     assert_eq!(get_close(port, "/../../etc/passwd", "").0, 403);
     assert_eq!(get_close(port, "/%2e%2e/%2e%2e/etc/passwd", "").0, 403);
     assert_eq!(get_close(port, "/docs", "").0, 301);

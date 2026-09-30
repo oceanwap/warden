@@ -23,27 +23,19 @@
 // (pm2, wattpm) and bench/nest.
 
 import { spawn, spawnSync, type Subprocess } from "bun";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  BIN, ROOT, SHIM, TMP, WARDEN, baseEnv, cpuSeconds, listenersOnPort, machine, mb, oha as ohaRaw,
+  parseArgs, pkgVersion, rss, saveResults, sleep, sum, table, uniq, version, waitFor,
+} from "./lib.ts";
 
-const ROOT = resolve(import.meta.dir, "..");
-const args = Object.fromEntries(
-  process.argv.slice(2).reduce<[string, string][]>((acc, a, i, all) => {
-    if (a.startsWith("--")) acc.push([a.slice(2), all[i + 1]]);
-    return acc;
-  }, []),
-);
+const args = parseArgs();
 const APP = args.app ?? "bun-http";
 const DURATION = Number(args.duration ?? 10);
 const CONNECTIONS = Number(args.connections ?? 64);
 const WORKERS = Number(args.workers ?? 4);
 const PORT = 3900;
-const WARDEN = join(ROOT, "target/release/warden");
-const SHIM = join(ROOT, "shim/warden-shim.mjs");
-const TMP = join(ROOT, "bench/.run");
-const BIN = join(ROOT, "bench/node_modules/.bin");
-const HZ = Number(spawnSync(["getconf", "CLK_TCK"]).stdout.toString().trim() || 100);
-const PAGE = Number(spawnSync(["getconf", "PAGESIZE"]).stdout.toString().trim() || 4096);
 
 interface AppDef {
   runtime: "bun" | "node";
@@ -96,61 +88,15 @@ if (!app) throw new Error(`unknown app ${APP}; one of ${Object.keys(apps).join("
 const SCENARIOS = (args.scenarios ?? app.scenarios.join(",")).split(",");
 const PATHS = ["/plaintext", "/json", "/cpu"];
 
-// Never let a shell's BUN_OPTIONS / NODE_OPTIONS change what we measure.
-const baseEnv: Record<string, string> = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) => k !== "BUN_OPTIONS" && k !== "NODE_OPTIONS") as [string, string][],
-);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// ---------------------------------------------------------------- /proc helpers
-
-function listenersOnPort(port: number): number {
-  const hex = port.toString(16).toUpperCase().padStart(4, "0");
-  let n = 0;
-  for (const t of ["/proc/net/tcp", "/proc/net/tcp6"]) {
-    if (!existsSync(t)) continue;
-    for (const line of readFileSync(t, "utf8").split("\n").slice(1)) {
-      const f = line.trim().split(/\s+/);
-      if (f.length > 3 && f[3] === "0A" && f[1].endsWith(":" + hex)) n++;
-    }
-  }
-  return n;
-}
-
-function rss(pid: number): number {
-  try {
-    return Number(readFileSync(`/proc/${pid}/statm`, "utf8").split(" ")[1]) * PAGE;
-  } catch {
-    return 0;
-  }
-}
-
-function cpuSeconds(pid: number): number {
-  try {
-    const s = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const f = s.slice(s.lastIndexOf(")") + 2).split(" ");
-    return (Number(f[11]) + Number(f[12])) / HZ;
-  } catch {
-    return 0;
-  }
-}
-
-const uniq = (pids: number[]) => [...new Set(pids.filter((p) => p > 0))];
-const sum = (pids: number[], f: (p: number) => number) => uniq(pids).reduce((a, p) => a + f(p), 0);
-const mb = (b: number) => Math.round((b / 1048576) * 10) / 10;
-
-async function waitFor(cond: () => boolean | Promise<boolean>, timeoutMs: number): Promise<number> {
-  const t0 = performance.now();
-  while (performance.now() - t0 < timeoutMs) {
-    if (await cond()) return performance.now() - t0;
-    await sleep(5);
-  }
-  throw new Error("timeout");
-}
-
+/** A request that takes longer than this counts as failed (a hang). */
+const REQUEST_TIMEOUT_MS = 2000;
 async function httpOk(path = "/health"): Promise<boolean> {
   try {
-    const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { headers: { connection: "close" }, keepalive: false });
+    const r = await fetch(`http://127.0.0.1:${PORT}${path}`, {
+      headers: { connection: "close" },
+      keepalive: false,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     await r.text();
     return r.ok;
   } catch {
@@ -158,13 +104,57 @@ async function httpOk(path = "/health"): Promise<boolean> {
   }
 }
 
+/** Which worker answered a fresh connection ("pid:threadId"), or null. */
+async function whoami(): Promise<string | null> {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/whoami`, {
+      headers: { connection: "close" },
+      keepalive: false,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    const t = await r.text();
+    return r.ok ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+// Every manager is timed the same way, from the outside: a worker counts as
+// ready when it has answered a request. Asking each manager for its own view
+// (pm2 jlist takes ~180 ms per call) would time the manager's CLI instead.
+
+/** Waits until `n` workers not in `old` have answered; returns the ms taken. */
+async function newWorkersServing(n: number, old: Set<string>, timeoutMs: number): Promise<number> {
+  const t0 = performance.now();
+  const seen = new Set<string>();
+  while (performance.now() - t0 < timeoutMs) {
+    const w = await whoami();
+    if (w === null) await sleep(2);
+    else if (!old.has(w)) {
+      seen.add(w);
+      if (seen.size >= n) return performance.now() - t0;
+    }
+  }
+  throw new Error(`timeout: ${seen.size} of ${n} new workers answered`);
+}
+
+/** The workers answering now (polls until `n` distinct ones have answered). */
+async function currentWorkers(n: number): Promise<Set<string>> {
+  const seen = new Set<string>();
+  const t0 = performance.now();
+  while (seen.size < n && performance.now() - t0 < 30_000) {
+    const w = await whoami();
+    if (w) seen.add(w);
+    else await sleep(2);
+  }
+  return seen;
+}
+
 // ------------------------------------------------------------------- scenarios
 
 interface Running {
   appPids: () => Promise<number[]>;
   managerPids: () => Promise<number[]>;
-  /** Workers ready to serve (for startup and crash-recovery timing). */
-  ready: () => Promise<number>;
   /** Does anything restart a crashed worker? */
   restarts: boolean;
   /** The manager's zero-downtime restart of every worker; resolves when done. */
@@ -180,7 +170,6 @@ function appArgs(): string[] {
   return app.runtime === "bun" ? [`--preload=${SHIM}`, app.entry] : [`--import=${SHIM}`, app.entry];
 }
 const appEnv = { ...baseEnv, PORT: String(PORT), WARDEN_REUSE_PORT: "1", WARDEN_DRAIN_MS: "0" };
-const listenerReady = async () => listenersOnPort(PORT);
 
 async function startBare(): Promise<Running> {
   const procs: Subprocess[] = [];
@@ -190,7 +179,6 @@ async function startBare(): Promise<Running> {
   return {
     appPids: async () => procs.filter((p) => p.exitCode === null).map((p) => p.pid),
     managerPids: async () => [],
-    ready: listenerReady,
     restarts: false,
     stop: async () => {
       procs.forEach((p) => p.kill("SIGKILL"));
@@ -232,11 +220,6 @@ async function startPm2(): Promise<Running> {
   return {
     appPids: async () => jlist().map((p) => p.pid),
     managerPids: async () => daemon(),
-    // Cluster workers own no listener (the daemon does): count online ones.
-    ready: async () =>
-      cluster
-        ? (await httpOk()) ? jlist().filter((p) => p.pm2_env?.status === "online" && p.pid > 0).length : 0
-        : listenersOnPort(PORT),
     restarts: true,
     // `pm2 reload`: graceful in cluster mode (one worker at a time); in fork
     // mode it is a restart.
@@ -278,7 +261,6 @@ async function startWatt(): Promise<Running> {
     // One process: the runtime and its worker threads.
     appPids: async () => [w.pid],
     managerPids: async () => [w.pid],
-    ready: listenerReady,
     restarts: true,
     rollingRestart: async () => {
       spawnSync([wattpm, "restart", String(w.pid), "app"], { cwd: dir, env: baseEnv, stdout: "ignore", stderr: "ignore" });
@@ -314,7 +296,6 @@ async function startWarden(mode: "process" | "worker"): Promise<Running> {
   return {
     appPids: async () => uniq((status()?.workers ?? []).map((x: any) => x.pid)),
     managerPids: async () => [w.pid],
-    ready: listenerReady,
     restarts: true,
     rollingRestart: async () => {
       spawnSync([WARDEN, "restart", "--socket", sock], { stdout: "ignore", stderr: "ignore" });
@@ -345,33 +326,13 @@ function start(name: string): Promise<Running> {
 
 // --------------------------------------------------------------------- measure
 
-function oha(path: string, seconds: number) {
-  const r = spawnSync(
-    ["oha", "-z", `${seconds}s`, "-c", String(CONNECTIONS), "--no-tui", "--output-format", "json", `http://127.0.0.1:${PORT}${path}`],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  const j = JSON.parse(r.stdout.toString());
-  const ok = j.statusCodeDistribution?.["200"] ?? 0;
-  // oha cancels the requests still in flight when -z expires; those are not errors.
-  const errors = Object.entries<number>(j.errorDistribution ?? {})
-    .filter(([k]) => k !== "aborted due to deadline")
-    .reduce((a, [, n]) => a + n, 0);
-  const lat = j.latencyPercentiles;
-  return {
-    rps: Math.round(j.summary.requestsPerSec),
-    p50_ms: +(lat.p50 * 1000).toFixed(2),
-    p95_ms: +(lat.p95 * 1000).toFixed(2),
-    p99_ms: +(lat.p99 * 1000).toFixed(2),
-    ok,
-    errors,
-  };
-}
+const oha = (path: string, seconds: number) => ohaRaw(`http://127.0.0.1:${PORT}${path}`, seconds, CONNECTIONS);
 
 async function runScenario(name: string) {
   if (listenersOnPort(PORT) !== 0) throw new Error(`port ${PORT} busy`);
   const t0 = performance.now();
   const run = await start(name);
-  await waitFor(async () => (await run.ready()) >= WORKERS && (await httpOk()), 120_000);
+  await newWorkersServing(WORKERS, new Set(), 120_000);
   const startup_ms = Math.round(performance.now() - t0);
   await sleep(1500);
   const appPids = await run.appPids();
@@ -393,9 +354,8 @@ async function runScenario(name: string) {
   await sleep(5000);
   const manager_idle_cpu_pct = +(((sum(mgrPids, cpuSeconds) - m1) / 5) * 100).toFixed(2);
 
-  // Rolling restart under load: 8 clients, a fresh connection per request.
-  let rolling: any = "n/a";
-  if (run.rollingRestart) {
+  // Load for the disruption tests: 8 clients, a fresh connection per request.
+  const underLoad = async (disrupt: () => Promise<void>) => {
     let ok = 0,
       failed = 0,
       stopClients = false;
@@ -407,14 +367,30 @@ async function runScenario(name: string) {
     };
     const clients = Array.from({ length: 8 }, client);
     await sleep(300);
-    const tr = performance.now();
-    await run.rollingRestart();
-    await waitFor(async () => (await run.ready()) >= WORKERS && (await httpOk()), 60_000).catch(() => {});
-    const took = Math.round(performance.now() - tr);
+    await disrupt();
     await sleep(300);
     stopClients = true;
     await Promise.all(clients);
-    rolling = { ok, failed, ms: took };
+    return { ok, failed };
+  };
+
+  // Rolling restart under load. Done when the command has returned and N
+  // replacement workers answered.
+  let rolling: any = "n/a";
+  if (run.rollingRestart) {
+    const old = await currentWorkers(WORKERS);
+    let took = 0,
+      replaced = false;
+    const counts = await underLoad(async () => {
+      const tr = performance.now();
+      await run.rollingRestart!();
+      replaced = await newWorkersServing(WORKERS, old, 60_000).then(
+        () => true,
+        () => false,
+      );
+      took = Math.round(performance.now() - tr);
+    });
+    rolling = { ...counts, ms: took, replaced_all: replaced };
   }
 
   // CLI latency: the manager's status command, median of 10.
@@ -430,88 +406,81 @@ async function runScenario(name: string) {
     cli_ms = +times[5].toFixed(1);
   }
 
-  // Crash recovery: one worker exits (GET /crash); time until N are ready again.
+  // Crash recovery under load: one worker exits (GET /crash); time until a
+  // replacement worker answers, and requests that failed meanwhile.
   let recovery: any = "n/a (nothing restarts it)";
+  let crash: any = "n/a";
   if (run.restarts) {
-    const tk = performance.now();
-    await fetch(`http://127.0.0.1:${PORT}/crash`, { headers: { connection: "close" } }).catch(() => {});
-    await waitFor(async () => (await run.ready()) < WORKERS, 3000).catch(() => 0);
-    try {
-      await waitFor(async () => (await run.ready()) >= WORKERS && (await httpOk()), 60_000);
-      recovery = Math.round(performance.now() - tk);
-    } catch {
-      recovery = "did not recover within 60 s";
-    }
+    const old = await currentWorkers(WORKERS);
+    crash = await underLoad(async () => {
+      const tk = performance.now();
+      await fetch(`http://127.0.0.1:${PORT}/crash`, {
+        headers: { connection: "close" },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }).catch(() => {});
+      try {
+        await newWorkersServing(1, old, 60_000);
+        recovery = Math.round(performance.now() - tk);
+      } catch {
+        recovery = "did not recover within 60 s";
+      }
+    });
   }
   await run.stop();
   await waitFor(() => listenersOnPort(PORT) === 0, 15_000).catch(() => {});
-  return { name, startup_ms, idle, loaded, manager_idle_cpu_pct, endpoints, recovery_ms: recovery, rolling, cli_ms };
+  return { name, startup_ms, idle, loaded, manager_idle_cpu_pct, endpoints, recovery_ms: recovery, crash, rolling, cli_ms };
 }
 
 // ------------------------------------------------------------------------ main
 
 mkdirSync(TMP, { recursive: true });
 app.build?.();
-const version = (cmd: string[]) => spawnSync(cmd).stdout.toString().trim().split("\n")[0];
-const pkgVersion = (name: string) => {
-  try {
-    return JSON.parse(readFileSync(join(ROOT, "bench/node_modules", name, "package.json"), "utf8")).version;
-  } catch {
-    return "not installed";
-  }
-};
 const meta = {
-  date: new Date().toISOString(),
+  ...machine(),
   app: APP,
   workers: WORKERS,
   duration_s: DURATION,
   connections: CONNECTIONS,
   bun: version(["bun", "--version"]),
   node: version(["node", "--version"]),
-  // `pm2 --version` would start a daemon: read package versions instead.
   pm2: pkgVersion("pm2"),
   wattpm: pkgVersion("wattpm"),
-  warden: version([WARDEN, "version"]),
-  kernel: version(["uname", "-rm"]),
-  cpus: navigator.hardwareConcurrency,
-  cpu_model: (readFileSync("/proc/cpuinfo", "utf8").match(/model name\s*:\s*(.*)/) ?? [])[1] ?? "unknown",
-  tcp_migrate_req: existsSync("/proc/sys/net/ipv4/tcp_migrate_req")
-    ? readFileSync("/proc/sys/net/ipv4/tcp_migrate_req", "utf8").trim()
-    : "n/a",
 };
 console.error(JSON.stringify(meta));
-const results = [];
+const results: any[] = [];
 for (const s of SCENARIOS) {
   console.error(`--- ${s}`);
   const r = await runScenario(s);
   console.error(JSON.stringify(r));
   results.push(r);
 }
-const out = join(ROOT, "bench/results", `${meta.date.slice(0, 19).replace(/:/g, "")}-${APP}.json`);
-mkdirSync(join(ROOT, "bench/results"), { recursive: true });
-writeFileSync(out, JSON.stringify({ meta, results }, null, 2));
+const out = saveResults(APP, { meta, results });
 
-const row = (label: string, f: (r: any) => string | number) => `| ${label} | ${results.map((r) => f(r)).join(" | ")} |`;
 const lines = [
-  `**${APP}**, ${WORKERS} workers, ${meta.cpus} CPUs (${meta.cpu_model}), bun ${meta.bun}, node ${meta.node}, pm2 ${meta.pm2}, wattpm ${meta.wattpm}, ${meta.warden}`,
+  `**${APP}**: ${WORKERS} workers, ${meta.cpus} CPUs (${meta.cpu_model}), bun ${meta.bun}, node ${meta.node}, pm2 ${meta.pm2}, wattpm ${meta.wattpm}, ${meta.warden}`,
   "",
-  `| | ${results.map((r) => r.name).join(" | ")} |`,
-  `|---|${results.map(() => "---").join("|")}|`,
-  row("total RAM idle (MB)", (r) => r.idle.total_rss_mb),
-  row("total RAM after load (MB)", (r) => r.loaded.total_rss_mb),
-  row("manager RAM (MB)", (r) => (r.name === "watt" ? "(in total)" : r.loaded.manager_rss_mb)),
-  row("manager idle CPU (%)", (r) => r.manager_idle_cpu_pct),
-  row(`startup to ${WORKERS} ready (ms)`, (r) => r.startup_ms),
-  row("crash recovery (ms)", (r) => r.recovery_ms),
-  row("rolling restart under load: failed / total", (r) =>
-    typeof r.rolling === "string" ? r.rolling : `${r.rolling.failed} / ${r.rolling.ok + r.rolling.failed} (${r.rolling.ms} ms)`,
-  ),
-  row("status command (ms)", (r) => r.cli_ms),
+  table(results, (r) => r.name, [
+    ["total RAM idle (MB)", (r) => r.idle.total_rss_mb],
+    ["total RAM after load (MB)", (r) => r.loaded.total_rss_mb],
+    ["manager RAM (MB)", (r) => (r.name === "watt" ? "(in total)" : r.loaded.manager_rss_mb)],
+    ["manager idle CPU (%)", (r) => r.manager_idle_cpu_pct],
+    [`startup to ${WORKERS} serving (ms)`, (r) => r.startup_ms],
+    ["crash recovery (ms)", (r) => r.recovery_ms],
+    ["requests failed during a crash", (r) => (typeof r.crash === "string" ? r.crash : `${r.crash.failed} of ${r.crash.ok + r.crash.failed}`)],
+    [
+      "rolling restart under load: failed",
+      (r) =>
+        typeof r.rolling === "string"
+          ? r.rolling
+          : `${r.rolling.failed} of ${r.rolling.ok + r.rolling.failed} (${r.rolling.ms} ms${r.rolling.replaced_all ? "" : ", not all replaced"})`,
+    ],
+    ["status command (ms)", (r) => r.cli_ms],
+    ...PATHS.flatMap((p): [string, (r: any) => string | number][] => [
+      [`${p} req/s`, (r) => r.endpoints[p].rps],
+      [`${p} p50 / p99 (ms)`, (r) => `${r.endpoints[p].p50_ms} / ${r.endpoints[p].p99_ms}`],
+      [`${p} errors`, (r) => r.endpoints[p].errors],
+    ]),
+  ]),
 ];
-for (const p of PATHS) {
-  lines.push(row(`${p} req/s`, (r) => r.endpoints[p].rps));
-  lines.push(row(`${p} p50 / p99 (ms)`, (r) => `${r.endpoints[p].p50_ms} / ${r.endpoints[p].p99_ms}`));
-  lines.push(row(`${p} errors`, (r) => r.endpoints[p].errors));
-}
 console.log(lines.join("\n"));
 console.error(`results: ${out}`);
