@@ -1,12 +1,16 @@
 //! Control socket: the CLI talks to a running supervisor over a Unix socket
 //! (mode 0600), one JSON request line and one JSON response line.
-//! `logs` is answered here directly from the log ring buffer.
+//! `logs` is answered here directly from the log ring buffer, and
+//! `subscribe` streams events from the in-process bus (`events`).
 
+use crate::events::Event;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -360,10 +364,11 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
                 }
             }
         }
-        Request::Subscribe { .. } => {
-            // Implemented by the event stream work (docs/protocol.md); until
-            // then clients fall back to polling `status`.
-            reply(&mut w, &Response::err("subscribe is not supported by this Warden version")).await
+        Request::Subscribe { interval_ms, logs } => {
+            // Anything the client sent after its request line is ignored; the
+            // raw read half only tells us when it hangs up.
+            let r = reader.into_inner().into_inner();
+            subscribe(r, w, tx, interval_ms, logs).await
         }
         Request::Flush => {
             crate::logging::clear();
@@ -401,6 +406,153 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>) -> st
             };
             reply(&mut w, &resp).await
         }
+    }
+}
+
+/// `subscribe` (docs/protocol.md): `hello`, a `status` snapshot, then bus
+/// events, a `status` every interval and (with `logs`) every log line, until
+/// the client hangs up, stops reading for `REQUEST_TIMEOUT`, or the
+/// supervisor says `bye`. Every write is bounded, and the supervisor only
+/// ever hands this task events through the bounded bus: a stuck client costs
+/// it nothing but lost events (`lagged`).
+async fn subscribe(
+    mut r: OwnedReadHalf,
+    mut w: OwnedWriteHalf,
+    tx: mpsc::UnboundedSender<ControlMsg>,
+    interval_ms: Option<u64>,
+    logs: bool,
+) -> std::io::Result<()> {
+    // Subscribe first so nothing is lost between the snapshot and the stream.
+    let mut bus = crate::events::subscribe();
+    let mut lines = logs.then(crate::logging::subscribe);
+    let Some(status) = fetch_status(&tx).await else {
+        return reply(&mut w, &Response::err("Warden is shutting down")).await;
+    };
+    let app = status.app.clone();
+    let hello = Event::Hello {
+        protocol: crate::events::PROTOCOL,
+        app: Some(app.clone()),
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let mut out = Subscriber { w, app: app.clone() };
+    if !out.send(&hello).await? || !out.send(&Event::Status { app: app.clone(), status: Box::new(status) }).await? {
+        return Ok(());
+    }
+    let mut tick = tokio::time::interval(crate::events::interval(interval_ms));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // the first tick is immediate: the snapshot above
+    let mut scratch = [0u8; 512];
+    loop {
+        let ev = tokio::select! {
+            ev = bus.recv() => match ev {
+                Ok(ev) => {
+                    if matches!(&ev, Event::Bye { app: Some(a), .. } if *a == app) {
+                        // Log lines already queued (the supervisor's last words) go first.
+                        while let Some(Ok(line)) = lines.as_mut().map(|l| l.try_recv()) {
+                            if !out.send(&Event::Log { app: app.clone(), line: line.to_string() }).await? {
+                                return Ok(());
+                            }
+                        }
+                        out.send(&ev).await?;
+                        return Ok(());
+                    }
+                    ev
+                }
+                Err(RecvError::Lagged(n)) => Event::Lagged { app: Some(app.clone()), dropped: n },
+                // The bus sender is a static that is never dropped.
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            line = next_line(&mut lines) => match line {
+                Ok(line) => Event::Log { app: app.clone(), line: line.to_string() },
+                Err(RecvError::Lagged(n)) => Event::Lagged { app: Some(app.clone()), dropped: n },
+                Err(RecvError::Closed) => {
+                    lines = None;
+                    continue;
+                }
+            },
+            _ = tick.tick() => match fetch_status(&tx).await {
+                Some(s) => Event::Status { app: app.clone(), status: Box::new(s) },
+                // Exiting: `bye` (or EOF) follows.
+                None => continue,
+            },
+            n = r.read(&mut scratch) => match n {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(_) => continue,
+            },
+        };
+        if !out.send(&ev).await? {
+            return Ok(());
+        }
+    }
+}
+
+/// The writing end of one subscription.
+struct Subscriber {
+    w: OwnedWriteHalf,
+    app: String,
+}
+
+impl Subscriber {
+    /// Write one event line. `Ok(false)`: the client did not read it within
+    /// `REQUEST_TIMEOUT` and is dropped (it can reconnect).
+    async fn send(&mut self, ev: &Event) -> std::io::Result<bool> {
+        let mut s = match serde_json::to_string(ev) {
+            Ok(s) => s,
+            // Not expected for these types; skip the event rather than the client.
+            Err(e) => {
+                crate::debug!("event could not be encoded; skipped", error = e);
+                return Ok(true);
+            }
+        };
+        s.push('\n');
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.w.write_all(s.as_bytes())).await {
+            Ok(r) => r.map(|_| true),
+            Err(_) => {
+                crate::debug!(
+                    "event subscriber stopped reading; disconnected it",
+                    app = self.app,
+                    timeout_s = REQUEST_TIMEOUT.as_secs(),
+                    hint = "the client (`warden events`, wardend, a GUI) is stuck or too slow; it can reconnect",
+                );
+                Ok(false)
+            }
+        }
+    }
+}
+
+async fn next_line(
+    lines: &mut Option<tokio::sync::broadcast::Receiver<crate::logging::Line>>,
+) -> Result<crate::logging::Line, RecvError> {
+    match lines {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A status from the supervisor's event loop, as `warden status` gets it.
+async fn fetch_status(tx: &mpsc::UnboundedSender<ControlMsg>) -> Option<Status> {
+    let (rtx, rrx) = oneshot::channel();
+    tx.send((Request::Status, rtx)).ok()?;
+    tokio::time::timeout(REQUEST_TIMEOUT, rrx).await.ok()?.ok()?.status
+}
+
+/// Longest the supervisor waits for subscribers to take its `bye` before exiting.
+pub const BYE_FLUSH: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The supervisor exits on purpose: tell every subscriber `bye`, then give
+/// their tasks up to `max` to write it (at least `min`, so replies already
+/// sent to other control clients go out too). A client that does not take it
+/// in time sees EOF without `bye`, as for a crash.
+pub async fn say_bye(app: &str, reason: &str, min: std::time::Duration, max: std::time::Duration) {
+    let t0 = tokio::time::Instant::now();
+    crate::events::emit(Event::Bye { app: Some(app.to_string()), reason: reason.to_string() });
+    loop {
+        let waited = t0.elapsed();
+        if waited >= max || (waited >= min && !crate::events::active()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -520,6 +672,164 @@ mod tests {
         assert!(!log_filter(out, Some("12"), false), "what the app printed doesn't count");
         assert!(!log_filter(other, Some("1"), false));
         assert!(!log_filter(out, Some("1"), true));
+    }
+
+    fn status_of(app: &str) -> Status {
+        Status {
+            app: app.into(),
+            namespace: "default".into(),
+            mode: "process".into(),
+            config_path: None,
+            unit: None,
+            launched: "terminal".into(),
+            stopped: false,
+            log_file: None,
+            version: "test".into(),
+            pid: 1,
+            uptime_secs: 0,
+            workers_configured: 1,
+            workers_ready: 1,
+            healthy: None,
+            supervisor_rss_bytes: None,
+            host: None,
+            reloading: false,
+            shutting_down: false,
+            health_suspended: false,
+            log_lines_dropped: 0,
+            rollout: None,
+            last_rollout: None,
+            workers: vec![],
+        }
+    }
+
+    /// A stand-in for the supervisor's event loop: answers `status`.
+    fn fake_supervisor(app: &'static str) -> mpsc::UnboundedSender<ControlMsg> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<ControlMsg>();
+        tokio::spawn(async move {
+            while let Some((req, reply)) = rx.recv().await {
+                let resp = match req {
+                    Request::Status => Response { status: Some(status_of(app)), ..Response::ok("") },
+                    _ => Response::err("not in this test"),
+                };
+                let _ = reply.send(resp);
+            }
+        });
+        tx
+    }
+
+    type Lines = tokio::io::Lines<BufReader<OwnedReadHalf>>;
+
+    /// Connect and subscribe; the server side runs `handle` as the socket does.
+    async fn subscribed(
+        app: &'static str,
+        req: &str,
+    ) -> (Lines, OwnedWriteHalf, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle(server, fake_supervisor(app)));
+        let (r, mut w) = client.into_split();
+        w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+        (BufReader::new(r).lines(), w, server)
+    }
+
+    /// The next event, or None at EOF.
+    async fn next(lines: &mut Lines) -> Option<Event> {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("no event within 5 s")
+            .unwrap()?;
+        Some(serde_json::from_str(&line).unwrap_or_else(|e| panic!("bad event {line}: {e}")))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_streams_hello_status_events_and_bye() {
+        const APP: &str = "unit-sub";
+        let (mut lines, _w, server) = subscribed(APP, r#"{"cmd":"subscribe","interval_ms":250}"#).await;
+        match next(&mut lines).await {
+            Some(Event::Hello { protocol, app, pid, .. }) => {
+                assert_eq!((protocol, app.as_deref(), pid), (crate::events::PROTOCOL, Some(APP), std::process::id()));
+            }
+            other => panic!("expected hello, got {other:?}"),
+        }
+        assert!(matches!(next(&mut lines).await, Some(Event::Status { app, .. }) if app == APP));
+
+        // Bus events are forwarded (other tests may emit on the same bus).
+        crate::events::worker(APP, 3, crate::events::WorkerEvent::Ready, Some(7), Some("startup_ms=1".into()));
+        let mut periodic = 0;
+        loop {
+            match next(&mut lines).await {
+                Some(Event::Worker { app, worker: 3, event, pid, .. }) if app == APP => {
+                    assert_eq!((event, pid), (crate::events::WorkerEvent::Ready, Some(7)));
+                    break;
+                }
+                Some(Event::Status { .. }) => periodic += 1,
+                Some(_) => {}
+                None => panic!("EOF before the worker event"),
+            }
+        }
+        // A status every interval_ms.
+        let t0 = std::time::Instant::now();
+        while periodic < 2 {
+            if let Some(Event::Status { app, .. }) = next(&mut lines).await {
+                assert_eq!(app, APP);
+                periodic += 1;
+            }
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2), "{:?}", t0.elapsed());
+
+        // Another app's bye (not possible in a supervisor, but on a shared test bus) is just forwarded.
+        crate::events::emit(Event::Bye { app: Some("someone-else".into()), reason: "x".into() });
+        crate::events::emit(Event::Bye { app: Some(APP.into()), reason: "shutdown request".into() });
+        loop {
+            match next(&mut lines).await {
+                Some(Event::Bye { app: Some(app), reason }) if app == APP => {
+                    assert_eq!(reason, "shutdown request");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("EOF before bye"),
+            }
+        }
+        assert!(next(&mut lines).await.is_none(), "EOF right after bye");
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscriber_hanging_up_is_noticed_at_once() {
+        let (mut lines, w, server) = subscribed("unit-hangup", r#"{"cmd":"subscribe","interval_ms":60000}"#).await;
+        assert!(matches!(next(&mut lines).await, Some(Event::Hello { .. })));
+        assert!(matches!(next(&mut lines).await, Some(Event::Status { .. })));
+        drop((lines, w));
+        // No event is due for a minute: only the read side can notice.
+        let done = tokio::time::timeout(std::time::Duration::from_secs(2), server).await;
+        assert!(done.is_ok(), "the subscription outlived its client");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_with_logs_sends_log_lines() {
+        let (mut lines, _w, _server) = subscribed("unit-logs", r#"{"cmd":"subscribe","logs":true}"#).await;
+        assert!(matches!(next(&mut lines).await, Some(Event::Hello { .. })));
+        assert!(matches!(next(&mut lines).await, Some(Event::Status { .. })));
+        crate::info!("unit-logs marker line", n = 1);
+        loop {
+            match next(&mut lines).await {
+                Some(Event::Log { app, line }) if line.contains("unit-logs marker line") => {
+                    assert_eq!(app, "unit-logs");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("EOF before the log line"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bye_waits_for_subscribers_but_never_long() {
+        // A subscriber that never takes its `bye`: exit is delayed by `max`, no more.
+        let _stuck = crate::events::subscribe();
+        let t0 = std::time::Instant::now();
+        say_bye("unit-bye", "test", std::time::Duration::from_millis(50), BYE_FLUSH).await;
+        let took = t0.elapsed();
+        assert!(took >= BYE_FLUSH && took < BYE_FLUSH * 3, "{took:?}");
     }
 
     #[test]

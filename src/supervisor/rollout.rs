@@ -108,6 +108,18 @@ struct Verify {
     canary: bool,
 }
 
+/// A rollout's phase for change detection (see `rollout_phase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PhaseKey {
+    seq: u64,
+    done: usize,
+    step: u8,
+    /// The instance the step works on.
+    inst: u64,
+    /// Verifying: health passes, or verify_command running, or soaking.
+    detail: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cmd {
     Skip,
@@ -210,11 +222,15 @@ impl Supervisor {
             prev,
             _ticker: cancel_tx,
         });
+        if preflight.is_some() {
+            if let Some(r) = &mut self.roll {
+                r.step = Step::Preflight;
+            }
+        }
+        // Subscribers hear of the rollout before any worker is touched.
+        self.publish_rollout();
         match preflight {
             Some(cmd) => {
-                if let Some(r) = &mut self.roll {
-                    r.step = Step::Preflight;
-                }
                 info!("running preflight", command = cmd);
                 let env = vec![("WARDEN_APP".to_string(), self.cfg.app.name.clone())];
                 let fut = run_shell(
@@ -865,6 +881,11 @@ impl Supervisor {
     }
 
     fn finish_rollout(&mut self, ok: bool, message: Option<String>) {
+        // The phase it failed in, if not published yet (it cannot be after
+        // `rollout_done`). Idle: all done, or failed before a step began.
+        if self.roll.as_ref().is_some_and(|r| !matches!(r.step, Step::Idle)) {
+            self.publish_rollout();
+        }
         let Some(roll) = self.roll.take() else { return };
         let secs = roll.started.elapsed().as_secs_f64();
         let message = message.unwrap_or_else(|| match roll.kind {
@@ -886,13 +907,44 @@ impl Supervisor {
                 "READY=1\nSTATUS=last rollout failed"
             });
         }
-        self.last_rollout = Some(RolloutOutcome {
+        let outcome = RolloutOutcome {
             seq: roll.seq,
             kind: roll.kind.name().into(),
             ok,
             message,
             duration_secs: (secs * 10.0).round() / 10.0,
-        });
+        };
+        if crate::events::active() {
+            crate::events::emit(crate::events::Event::RolloutDone {
+                app: self.cfg.app.name.clone(),
+                outcome: outcome.clone(),
+            });
+        }
+        self.last_rollout = Some(outcome);
+    }
+
+    /// What `rollout_status().phase` says, without its countdowns (soak time
+    /// left): when this changes, a `rollout` event is published.
+    pub(super) fn rollout_phase(&self) -> Option<PhaseKey> {
+        let r = self.roll.as_ref()?;
+        let (step, inst, detail) = match &r.step {
+            Step::Idle => (0, 0, 0),
+            Step::Preflight => (1, 0, 0),
+            Step::Pausing => (2, 0, 0),
+            Step::Starting { new, .. } => (3, *new, 0),
+            Step::Draining { old, .. } => (4, *old, 0),
+            Step::Verifying(v) => {
+                let detail = if v.soak_until.is_some() {
+                    u32::MAX
+                } else if v.cmd == Cmd::Running {
+                    u32::MAX - 1
+                } else {
+                    v.passes
+                };
+                (5, v.new, detail)
+            }
+        };
+        Some(PhaseKey { seq: r.seq, done: r.done, step, inst, detail })
     }
 
     pub(super) fn rollout_status(&self) -> Option<RolloutStatus> {
@@ -900,6 +952,8 @@ impl Supervisor {
         let pid = |i: &u64| self.insts.get(i).map(|x| x.handle.pid).unwrap_or(0);
         let now = Instant::now();
         let phase = match &r.step {
+            // Only seen at the start (the `rollout` event announcing it).
+            Step::Idle if r.done == 0 => "starting".to_string(),
             Step::Idle => "next worker".to_string(),
             Step::Preflight => "running preflight".to_string(),
             Step::Pausing => format!("pausing {}s between workers", self.cfg.reload.pause),

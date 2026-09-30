@@ -12,6 +12,7 @@
 use crate::control::{Request, RolloutOutcome, RolloutStatus, Status};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast;
 
 /// Wire protocol version; goes up only for incompatible changes.
@@ -212,14 +213,33 @@ fn bus() -> &'static broadcast::Sender<Event> {
     BUS.get_or_init(|| broadcast::channel(CAPACITY).0)
 }
 
+/// Set by `subscribe`, cleared by `active` once the last receiver is gone, so
+/// that `active` without subscribers is one atomic load (tokio's
+/// `receiver_count` takes the channel's lock).
+static MAYBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Receive every event emitted from now on.
 pub fn subscribe() -> broadcast::Receiver<Event> {
-    bus().subscribe()
+    let rx = bus().subscribe();
+    MAYBE_ACTIVE.store(true, Ordering::SeqCst);
+    rx
 }
 
 /// Is anyone listening? Check before building an expensive event.
 pub fn active() -> bool {
-    bus().receiver_count() > 0
+    if !MAYBE_ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    if bus().receiver_count() > 0 {
+        return true;
+    }
+    MAYBE_ACTIVE.store(false, Ordering::SeqCst);
+    // A subscriber that came in meanwhile must not be missed.
+    let again = bus().receiver_count() > 0;
+    if again {
+        MAYBE_ACTIVE.store(true, Ordering::SeqCst);
+    }
+    again
 }
 
 /// Hand an event to every subscriber (none: dropped at once).
@@ -286,6 +306,7 @@ mod tests {
     async fn emit_reaches_subscribers_and_costs_nothing_without_them() {
         // Other tests may subscribe concurrently; only check our own receiver.
         let mut rx = subscribe();
+        assert!(active());
         worker("bus-test", 1, WorkerEvent::Ready, Some(1), None);
         loop {
             match rx.recv().await.unwrap() {

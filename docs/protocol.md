@@ -61,6 +61,17 @@ The answer is a stream of events, one JSON object per line:
 4. `bye` just before the supervisor exits on purpose (`shutdown`, SIGTERM).
    EOF without `bye` means it died.
 
+The supervisor subscribes to its event bus before it takes the snapshot, so
+nothing is lost in between (an event may also show in the snapshot). After
+the request line the client sends nothing (anything it sends is ignored);
+closing the connection, or only its write side, ends the subscription at
+once. If the supervisor is already exiting, the answer is one
+`control::Response` error line instead.
+
+`bye.reason` is `shutdown request`, `SIGTERM` or `SIGINT`. The supervisor
+waits up to 200 ms for its subscribers to take `bye` before it exits, never
+longer: a client that is not reading then sees EOF without `bye`.
+
 A subscription counts against the socket's 64-connection limit.
 
 ## Events
@@ -85,6 +96,32 @@ Every event has a `type`. Times (`at_ms`) are Unix milliseconds.
 `exited` (clean exit), `restarting`, `failed` (too many restarts),
 `stopping`, `stopped`. `detail` carries the reason in words
 (`exit code 1`, `signal SIGKILL`, `startup_ms=120`, …).
+
+What a supervisor sends, one event per transition (next to its log line):
+
+| `event` | When | `detail` |
+|---|---|---|
+| `starting` | a process was spawned | `role=replacement` for a rollout's new process |
+| `ready` | it listens (or reported ready) | `startup_ms=120`, plus ` role=replacement` |
+| `unhealthy` | it failed `failure_threshold` health checks in a row | `failed 3 health checks: …` |
+| `hung` | no heartbeat for `watchdog.timeout` | `no heartbeat for 10s` |
+| `crashed` | it exited unasked (also a rollout's new process, a Worker thread, a failed spawn) | the exit reason: `signal 9 (SIGKILL)`, `exit code 1`, `not ready in time`, … |
+| `exited` | it exited with one of `restart.stop_exit_codes` | `exit code 0` |
+| `restarting` | it will be started again | `in_ms=50` (backoff), or why (`FAILED; reset on request`) |
+| `failed` | restarts given up | `too many restarts (…)` |
+| `stopping` | Warden asked it to stop | `SIGTERM grace_s=30`, `SIGKILL` |
+| `stopped` | it exited after that, or stays down (`warden stop`, scaled down) | the exit reason |
+
+`worker` is the worker number of `status.workers`. During a rollout two
+processes share a number: `pid` tells them apart. In worker mode, `worker` 0
+is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
+1..=count its Worker threads (`ready` when one listens, `crashed`, `hung`).
+
+`rollout` is sent when a rollout starts, before any worker is touched
+(`done` 0, `phase` `starting` or `running preflight`), and whenever its
+`phase` changes, except the soak countdown; `rollout_done` follows when it
+ends (`status.last_rollout` from then on). A supervisor's `lagged` names its
+app.
 
 `supervisor.event` (from `wardend` only):
 

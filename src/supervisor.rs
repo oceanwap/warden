@@ -12,6 +12,7 @@ mod upkeep;
 
 use crate::config::{Config, Mode, OnHealthFailure, PortStrategy};
 use crate::control::{self, ControlMsg, HostStatus, Request, Response, Status, WorkerStatus};
+use crate::events::{self, WorkerEvent};
 use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
@@ -98,6 +99,10 @@ pub struct Supervisor {
     schedule_token: u64,
     /// This binary, for `[static]` apps (their workers run `warden serve-static`).
     exe: PathBuf,
+    /// Why we are shutting down, for the `bye` event.
+    shutdown_reason: String,
+    /// Rollout phase last published as a `rollout` event.
+    rollout_published: Option<rollout::PhaseKey>,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -203,6 +208,8 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         watchdog_enabled: systemd::watchdog_requested(),
         schedule_token: 0,
         exe: own_exe(),
+        shutdown_reason: "shutdown".into(),
+        rollout_published: None,
         cfg,
         cfg_path,
     };
@@ -251,14 +258,19 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
                 let _ = reply.send(resp);
             }
         }
+        sup.publish_rollout();
         if sup.shutting_down && sup.insts.is_empty() {
             break;
         }
     }
     info!("stopped", app = sup.cfg.app.name);
-    // Let control tasks deliver replies already sent (e.g. to the `shutdown`
-    // that ended us) before the runtime goes away.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // From now on control requests are answered "shutting down" at once: a
+    // subscriber waiting for a status must not hold up its `bye`.
+    drop(ctl_rx);
+    // Subscribers learn we exit on purpose (EOF without `bye` means a crash),
+    // and control tasks deliver replies already sent (e.g. to the `shutdown`
+    // that ended us) before the runtime goes away. Bounded: 50-200 ms.
+    control::say_bye(&sup.cfg.app.name, &sup.shutdown_reason, Duration::from_millis(50), control::BYE_FLUSH).await;
     // Best effort: a leftover socket is detected and replaced at the next start.
     let _ = std::fs::remove_file(&socket);
     Ok(())
@@ -335,6 +347,33 @@ impl Supervisor {
         if self.is_worker_mode() { "host".into() } else { slot.to_string() }
     }
 
+    /// `worker` in events: the slot in process mode; in worker mode 0 is the
+    /// host process (its Workers are 1..=count, as in `status`).
+    fn event_worker(&self, slot: usize) -> usize {
+        if self.is_worker_mode() { 0 } else { slot }
+    }
+
+    /// A worker event for `slot` (see `emit`).
+    fn emit_worker(&self, slot: usize, event: WorkerEvent, pid: Option<u32>, detail: impl FnOnce() -> Option<String>) {
+        emit(&self.cfg.app.name, self.event_worker(slot), event, pid, detail);
+    }
+
+    /// A `rollout` event when a rollout started or its phase changed since
+    /// the last one. Without subscribers: one atomic load.
+    fn publish_rollout(&mut self) {
+        if !events::active() {
+            return;
+        }
+        let phase = self.rollout_phase();
+        if phase == self.rollout_published {
+            return;
+        }
+        self.rollout_published = phase;
+        if let Some(rollout) = self.rollout_status() {
+            events::emit(events::Event::Rollout { app: self.cfg.app.name.clone(), rollout });
+        }
+    }
+
     fn send_later(&self, after: Duration, ev: Event) {
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
@@ -375,6 +414,7 @@ impl Supervisor {
                     command = self.cfg.app.command,
                     error = e
                 );
+                self.emit_worker(slot_id, WorkerEvent::Crashed, None, || Some(format!("spawn failed: {e}")));
                 if let Some(s) = self.slots.get_mut(&slot_id) {
                     s.last_exit = Some(format!("spawn failed: {e}"));
                 }
@@ -400,6 +440,9 @@ impl Supervisor {
         } else {
             info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
         }
+        self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || {
+            (role != Role::Current).then(|| format!("role={}", role_name(role)))
+        });
         self.watch_readiness(inst_id, pid, slot_id);
         Ok(inst_id)
     }
@@ -598,8 +641,16 @@ impl Supervisor {
                     inst.sockets.insert(worker, PathBuf::from(sock));
                 }
                 let ready = if worker_mode {
-                    inst.threads.entry(worker).or_default().listening = true;
+                    let t = inst.threads.entry(worker).or_default();
+                    let newly = !t.listening;
+                    t.listening = true;
                     debug!("worker listening", worker = worker, port = msg.port.unwrap_or(0), pid = inst.handle.pid);
+                    if newly {
+                        let ms = inst.started.elapsed().as_millis();
+                        emit(&self.cfg.app.name, worker, WorkerEvent::Ready, Some(inst.handle.pid), || {
+                            Some(format!("startup_ms={ms}"))
+                        });
+                    }
                     inst.threads_listening() >= expected
                 } else {
                     inst.listening.insert(msg.port.unwrap_or(0));
@@ -628,6 +679,7 @@ impl Supervisor {
                     t.crashes += 1;
                     let (slot, role, pid) = (inst.slot, inst.role, inst.handle.pid);
                     warn!("worker thread crashed", worker = worker, reason = why, host_pid = pid);
+                    emit(&self.cfg.app.name, worker, WorkerEvent::Crashed, Some(pid), || Some(why.clone()));
                     if role == Role::Current && !self.shutting_down && !self.stopped {
                         self.on_thread_crash(slot, false);
                     } else if role == Role::Replacement && self.rollout_new_instance(slot) == Some(inst_id) {
@@ -667,9 +719,13 @@ impl Supervisor {
                 } else {
                     info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
                 }
+                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || Some(format!("startup_ms={ms}")));
             }
             Role::Replacement => {
                 info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
+                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || {
+                    Some(format!("startup_ms={ms} role=replacement"))
+                });
             }
             Role::Retiring => {}
         }
@@ -710,6 +766,9 @@ impl Supervisor {
             // A bad release, not a crash of this slot: restart right away on the
             // restored config, without counting it towards the restart limit.
             warn!("worker that failed its rollout gates stopped; restarting", worker = label, pid = inst.handle.pid);
+            self.emit_worker(slot_id, WorkerEvent::Restarting, Some(inst.handle.pid), || {
+                Some("failed its rollout gates; restarting now".into())
+            });
             if let Some(s) = self.slots.get_mut(&slot_id) {
                 s.current = None;
                 s.state = State::Restarting;
@@ -720,6 +779,7 @@ impl Supervisor {
             self.spawn_current(slot_id);
         } else if inst.stopping || inst.role == Role::Retiring {
             info!("worker stopped", worker = label, pid = inst.handle.pid, reason = why);
+            self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(why.clone()));
             if is_current {
                 let mut remove = false;
                 if let Some(s) = self.slots.get_mut(&slot_id) {
@@ -734,6 +794,9 @@ impl Supervisor {
             }
         } else if inst.role == Role::Replacement {
             error!("replacement exited before taking over", worker = label, pid = inst.handle.pid, reason = reason);
+            self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || {
+                Some(format!("{reason} (replacement, before taking over)"))
+            });
         } else if is_current
             && signal.is_none()
             && code.is_some_and(|c| self.cfg.restart.stop_exit_codes.contains(&c))
@@ -746,6 +809,7 @@ impl Supervisor {
                 reason = why,
                 hint = "this exit code is listed in restart.stop_exit_codes; `warden restart` starts it again",
             );
+            self.emit_worker(slot_id, WorkerEvent::Exited, Some(inst.handle.pid), || Some(why.clone()));
             if let Some(s) = self.slots.get_mut(&slot_id) {
                 s.current = None;
                 s.state = State::Stopped;
@@ -761,6 +825,7 @@ impl Supervisor {
             }
             if self.shutting_down || self.stopped {
                 info!("worker exited", worker = label, pid = inst.handle.pid, reason = reason);
+                self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(reason.clone()));
             } else {
                 warn!(
                     "worker crashed",
@@ -769,6 +834,7 @@ impl Supervisor {
                     reason = reason,
                     uptime_s = uptime.as_secs()
                 );
+                self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || Some(reason.clone()));
                 self.on_slot_crash(slot_id, uptime);
             }
         }
@@ -833,6 +899,7 @@ impl Supervisor {
             return;
         }
         let label = self.label(slot_id);
+        let wid = self.event_worker(slot_id);
         let policy = self.policy.clone();
         let cooldown = self.cfg.restart.failed_cooldown;
         let Some(s) = self.slots.get_mut(&slot_id) else { return };
@@ -847,6 +914,9 @@ impl Supervisor {
                     in_ms = d.as_millis(),
                     attempt = s.tracker.restarts_in_window()
                 );
+                emit(&self.cfg.app.name, wid, WorkerEvent::Restarting, None, || {
+                    Some(format!("in_ms={}", d.as_millis()))
+                });
                 if d.is_zero() {
                     self.on_restart_due(slot, token);
                 } else {
@@ -870,8 +940,16 @@ impl Supervisor {
                             format!("fix the cause, then run `warden restart {slot_id}`")
                         },
                     );
+                    emit(&self.cfg.app.name, wid, WorkerEvent::Failed, None, || {
+                        Some(format!(
+                            "too many restarts ({} in {}s); {retry}",
+                            policy.max_restarts,
+                            policy.window.as_secs()
+                        ))
+                    });
                 } else {
                     error!("worker exited and restarts are disabled", worker = label);
+                    emit(&self.cfg.app.name, wid, WorkerEvent::Failed, None, || Some("restarts are disabled".into()));
                 }
             }
         }
@@ -907,12 +985,17 @@ impl Supervisor {
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
         let stop_signal = self.cfg.stop_signal();
+        let worker_mode = self.is_worker_mode();
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
         if i.stopping {
             return;
         }
         i.stopping = true;
         i.handle.signal_group(stop_signal);
+        let wid = if worker_mode { 0 } else { i.slot };
+        emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || {
+            Some(format!("{} grace_s={}", crate::signals::name(stop_signal), grace.as_secs()))
+        });
         if let Some(s) = self.slots.get_mut(&i.slot) {
             if s.current == Some(inst_id) {
                 s.state = State::Stopping;
@@ -922,18 +1005,29 @@ impl Supervisor {
     }
 
     fn kill_instance(&mut self, inst_id: u64) {
+        let worker_mode = self.is_worker_mode();
         if let Some(i) = self.insts.get_mut(&inst_id) {
             i.stopping = true;
             i.handle.signal(libc::SIGKILL);
+            let wid = if worker_mode { 0 } else { i.slot };
+            emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || Some("SIGKILL".into()));
         }
     }
 
     fn stop_all(&mut self) {
         self.abort_rollout("workers are being stopped");
         self.pending_replace.clear();
+        let worker_mode = self.is_worker_mode();
         for s in self.slots.values_mut() {
             s.token += 1;
             if s.current.is_none() && s.state != State::Failed {
+                // Waiting to restart (or crashed): nothing to stop, it just stays down.
+                if s.state != State::Stopped {
+                    let wid = if worker_mode { 0 } else { s.id };
+                    emit(&self.cfg.app.name, wid, WorkerEvent::Stopped, None, || {
+                        Some("stopped before its restart".into())
+                    });
+                }
                 s.state = State::Stopped;
             }
         }
@@ -957,6 +1051,7 @@ impl Supervisor {
         info!("shutting down", reason = why, workers = self.insts.len(), grace_s = self.cfg.shutdown.grace_period);
         systemd::notify("STOPPING=1");
         self.shutting_down = true;
+        self.shutdown_reason = why.to_string();
         self.start_after_stop = false;
         self.stop_all();
     }
@@ -1021,6 +1116,7 @@ impl Supervisor {
     fn on_worker_health(&mut self, inst_id: u64, result: Result<(), String>) {
         let threshold = self.cfg.health.failure_threshold;
         let on_failure = self.cfg.health.on_failure;
+        let worker_mode = self.is_worker_mode();
         let Some(inst) = self.insts.get_mut(&inst_id) else { return };
         inst.health_inflight = false;
         if inst.stopping || inst.role != Role::Current {
@@ -1072,6 +1168,10 @@ impl Supervisor {
                             error = e,
                             action = action,
                         );
+                        let (wid, fails) = (if worker_mode { 0 } else { slot }, inst.health_fails);
+                        emit(&self.cfg.app.name, wid, WorkerEvent::Unhealthy, Some(pid), || {
+                            Some(format!("failed {fails} health checks: {e}"))
+                        });
                     }
                     inst.healthy = Some(false);
                     // Re-trigger every `threshold` failures in case a replacement failed.
@@ -1223,7 +1323,7 @@ impl Supervisor {
                 Response::ok("stopping workers; `warden restart` starts them again")
             }
             Request::Shutdown => {
-                self.begin_shutdown("control request");
+                self.begin_shutdown("shutdown request");
                 Response::ok("shutting down")
             }
             Request::Restart { worker: None, hard } => {
@@ -1305,6 +1405,7 @@ impl Supervisor {
         }
         info!("counters reset on request", workers = ids.len(), failed_retried = retried.len());
         for (id, token) in &retried {
+            self.emit_worker(*id, WorkerEvent::Restarting, None, || Some("FAILED; reset on request".into()));
             self.on_restart_due(*id, *token);
         }
         let what = match worker {
@@ -1415,10 +1516,13 @@ impl Supervisor {
             let Some(s) = self.slots.get_mut(&id) else { continue };
             s.removing = true;
             s.token += 1;
-            let current = s.current;
+            let (current, state) = (s.current, s.state);
             match current {
                 Some(inst) => self.stop_instance(inst),
                 None => {
+                    if state != State::Stopped {
+                        self.emit_worker(id, WorkerEvent::Stopped, None, || Some("scaled down".into()));
+                    }
                     self.slots.remove(&id);
                 }
             }
@@ -1596,6 +1700,15 @@ fn with_preload(command: &str, args: &[String], shim: Option<&Path>) -> Vec<Stri
     match args.first().map(String::as_str) {
         Some("run") => [&args[..1], &flag, &args[1..]].concat(),
         _ => [&flag[..], args].concat(),
+    }
+}
+
+/// Emit a worker event next to the log line of the same transition. `detail`
+/// is only built when someone is subscribed: without subscribers this costs
+/// one atomic load.
+fn emit(app: &str, worker: usize, event: WorkerEvent, pid: Option<u32>, detail: impl FnOnce() -> Option<String>) {
+    if events::active() {
+        events::worker(app, worker, event, pid, detail());
     }
 }
 
