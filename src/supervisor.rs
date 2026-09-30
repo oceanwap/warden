@@ -111,6 +111,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
 }
 
 async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
+    // While our launcher is still our parent (see `own_unit`).
+    let _ = systemd::own_unit();
     let socket = cfg.socket_path();
     let listener = control::bind(&socket).await?;
     let runtime_dir = socket.parent().unwrap_or(Path::new(".")).to_path_buf();

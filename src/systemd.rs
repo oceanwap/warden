@@ -46,7 +46,16 @@ pub fn reloading() {
 /// `INVOCATION_ID` alone is inherited by everything a service starts (a CI
 /// runner, a shell in some service), and taking that service for our own
 /// would make `warden kill` try to stop it.
+///
+/// Decided once, the first time it is asked (the supervisor asks at start):
+/// later our parent may have exited and pid 1 adopted us, which must not
+/// make us look started by systemd.
 pub fn own_unit() -> Option<String> {
+    static UNIT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    UNIT.get_or_init(detect_own_unit).clone()
+}
+
+fn detect_own_unit() -> Option<String> {
     std::env::var_os("INVOCATION_ID")?;
     let exec_pid = std::env::var("SYSTEMD_EXEC_PID").ok();
     if !started_by_systemd(exec_pid.as_deref(), std::process::id(), parent_is_systemd) {

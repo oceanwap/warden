@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -35,7 +35,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -51,20 +51,31 @@ jobs:
       - run: cargo test --bin warden
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: cargo test --test integration
+        run: |
+          set -o pipefail
+          cargo test --test integration 2>&1 | tee integration.log
+      # Job logs need a login to read; annotations don't: name the failing
+      # tests and their panic messages there.
+      - name: annotate failing tests
+        if: failure()
+        run: |
+          grep -E "^test .* FAILED$|panicked at|^---- " integration.log | head -30 |
+            while IFS= read -r line; do echo "::error title=integration::${line}"; done
+          awk '/^---- .* stdout ----/{p=1} p' integration.log | grep -vE "^\s*$" | head -60 |
+            while IFS= read -r line; do echo "::error title=output::${line}"; done
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -76,13 +87,24 @@ jobs:
       - run: cargo test --bin warden
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
-        run: cargo test --test integration
+        run: |
+          set -o pipefail
+          cargo test --test integration 2>&1 | tee integration.log
+      # Job logs need a login to read; annotations don't: name the failing
+      # tests and their panic messages there.
+      - name: annotate failing tests
+        if: failure()
+        run: |
+          grep -E "^test .* FAILED$|panicked at|^---- " integration.log | head -30 |
+            while IFS= read -r line; do echo "::error title=integration::${line}"; done
+          awk '/^---- .* stdout ----/{p=1} p' integration.log | grep -vE "^\s*$" | head -60 |
+            while IFS= read -r line; do echo "::error title=output::${line}"; done
 
   macos:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}

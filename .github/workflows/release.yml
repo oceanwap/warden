@@ -39,7 +39,7 @@ jobs:
       publish: ${{ steps.version.outputs.publish }}
       gui: ${{ steps.gui.outputs.present == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: version
         name: Version (the tag must match Cargo.toml)
         run: |
@@ -80,7 +80,7 @@ jobs:
       NAME: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
       BIN: target/${{ matrix.target }}/release/warden
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -161,7 +161,7 @@ jobs:
       NAME: warden-gui-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
       CLI: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -240,7 +240,7 @@ jobs:
     if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           pattern: "{cli,gui}-*"
@@ -276,7 +276,7 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       URL: http://127.0.0.1:8765
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - if: runner.os == 'Linux'
         run: shellcheck install.sh
       - uses: actions/download-artifact@v4
