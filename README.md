@@ -46,7 +46,14 @@ has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
   binary, this README and `contrib/` (systemd units, sysctl file). The Linux
   binaries need glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10+).
 - **GUI + CLI**: `warden-gui-<version>-<os>-<arch>` (`.tar.gz` on Linux, a
-  zipped `Warden.app` on macOS), once the GUI ships.
+  zipped `Warden.app` on macOS) with `warden-gui` next to `warden` (see
+  [GUI](#gui)). On Linux the GUI links only glibc (2.35+: built on Ubuntu
+  22.04) and loads the display libraries at run time, which every desktop
+  has: `libxkbcommon`, then on Wayland `libwayland-client` and
+  `libwayland-cursor`, on X11 `libX11`, `libX11-xcb`, `libXcursor`, `libXi`
+  and `libxkbcommon-x11`. It draws on the CPU
+  (tiny-skia): no GPU, Vulkan or OpenGL driver is needed. macOS: the app
+  is not signed yet, so open it with right-click → Open the first time.
 
 `install.sh` installs the CLI: it picks the archive for your OS and CPU,
 checks it against the release's `SHA256SUMS`, and puts `warden` in
@@ -273,8 +280,8 @@ crash, with the service manager the host has:
 ### wardend: one socket for every app
 
 `warden daemon` (started by `warden start`, or by the units above) watches
-every supervisor on the host and pushes what happens to `warden events` and,
-later, the GUI:
+every supervisor on the host and pushes what happens to `warden events` and
+the [GUI](#gui):
 
 ```
 $ warden events
@@ -292,6 +299,24 @@ nothing else would (systemd restarts its own units; one run in a terminal is
 yours); a hung one is reported, never killed, because its workers are still
 serving. The protocol, for scripts and other clients:
 [`docs/protocol.md`](docs/protocol.md).
+
+## GUI
+
+`warden-gui` is a native window (Rust, [iced](https://iced.rs)) on wardend:
+every app with its state, workers, CPU and memory, pushed live; each app's
+workers, rollout progress, events and logs; and the CLI's actions (reload,
+safe reload, rolling or hard restart, restart one worker, scale, stop,
+start, reset), adding an app (`warden start …`) and editing its config
+(checked with `warden check` before it is saved). It is a separate process:
+closing or killing it touches nothing, and apps never depend on it.
+
+```sh
+warden-gui                                   # this machine's wardend (`Start wardend` if it is not running)
+warden-gui --ssh deploy@web-1                # a remote host, through an SSH tunnel (your agent and keys)
+```
+
+It idles at about 21 MB resident and 0.1% CPU with 10 apps. Details, the SSH
+setup and the measurements: [`gui/README.md`](gui/README.md).
 
 ## Benchmarks
 
@@ -517,10 +542,18 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 ```sh
 cargo test                  # unit + integration tests (integration tests need `bun` and `node` on PATH)
 cargo clippy --all-targets
+cargo test --workspace --bins --tests          # also protocol/ and gui/ (the GUI's own tests)
+cargo clippy --workspace --all-targets
+cargo run -p warden-gui     # the GUI
 cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
 ```
 
-All `unsafe` code is in [`src/sys.rs`](src/sys.rs): system calls the standard
+The workspace: `warden` (this directory), `protocol/` (the wire types, serde
+only, shared by `warden` and the GUI), `gui/` (`warden-gui`) and `xtask/`.
+Plain `cargo build` and `cargo test` here mean `warden` only.
+
+All `unsafe` code is in [`src/sys.rs`](src/sys.rs) (`protocol/` and `gui/`
+have none: `#![forbid(unsafe_code)]`): system calls the standard
 library doesn't expose, and the few that measurably pay on a hot path (the
 static server and log capture), each with a SAFETY note and tests. The rest
 of the crate is `#![deny(unsafe_code)]`.

@@ -1,6 +1,8 @@
 # Release builds. Two products, published side by side:
 #   warden-<version>-<os>-<arch>.tar.gz      the CLI: warden, README.md, contrib/
-#   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI (once gui/ exists)
+#   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI: warden-gui, warden,
+#                                            README.md, README-GUI.md, contrib/ (.tar.gz on
+#                                            Linux, a zipped Warden.app on macOS)
 # plus install.sh and SHA256SUMS covering every file.
 #
 # A tag v<version> (matching Cargo.toml) publishes a GitHub Release. Pushes to
@@ -138,8 +140,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # The GUI and the CLI in one download. Skipped until gui/ (a workspace
-  # member) exists; its binary name is read from gui/Cargo.toml.
+  # The GUI and the CLI in one download (skipped if gui/ is ever removed);
+  # the binary name is read from gui/Cargo.toml.
   gui:
     needs: [meta, cli]
     if: needs.meta.outputs.gui == 'true'
@@ -173,8 +175,9 @@ jobs:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
       - name: The CLI from the cli job
         run: tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version || true
-      # TODO(gui): install the toolkit's build dependencies on Linux here
-      # (e.g. apt-get install libgtk-3-dev / libwebkit2gtk-4.1-dev).
+      # No build dependencies: iced (tiny-skia renderer) links only glibc and
+      # libgcc; winit and softbuffer load X11, Wayland and xkbcommon at run
+      # time (README.md, Install, lists what a desktop needs).
       - name: Build the GUI
         id: build
         run: |
@@ -183,14 +186,41 @@ jobs:
           [ -n "$pkg" ] && [ -n "$bin" ] || { echo "::error::gui/Cargo.toml has no binary target"; exit 1; }
           cargo build --release --locked -p "$pkg" --bin "$bin" --target "${{ matrix.target }}"
           echo "bin=$bin" >> "$GITHUB_OUTPUT"
+          ls -l "target/${{ matrix.target }}/release/$bin"
+      - name: Check the GUI binary
+        run: |
+          gui="target/${{ matrix.target }}/release/${{ steps.build.outputs.bin }}"
+          file "$gui"
+          if [ "${{ matrix.os }}" = linux ]; then
+            echo "linked libraries:"; ldd "$gui"
+            newest=$(objdump -T "$gui" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+            echo "newest glibc symbol version: $newest"
+            if ldd "$gui" | grep -qiE 'libvulkan|libGL|libEGL|libX11|libwayland|libxkbcommon'; then
+              echo "::error::$gui links a display library at build time; the release must start without it (they are loaded at run time)"; exit 1
+            fi
+          else
+            otool -L "$gui"
+          fi
+          run="$gui"
+          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then run="arch -x86_64 $gui"; else
+              echo "::notice::no Rosetta on this runner: the x86_64 macOS GUI was built but not run"; exit 0
+            fi
+          fi
+          # --version answers without a display.
+          got=$($run --version)
+          echo "$got"
+          [ "$got" = "warden-gui $VERSION" ] || { echo "::error::$gui --version says '$got', expected 'warden-gui $VERSION'"; exit 1; }
       - name: Package (Linux, .tar.gz)
         if: matrix.os == 'linux'
         run: |
           bin=${{ steps.build.outputs.bin }}
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/$bin" "$CLI/warden" "$CLI/README.md" "dist/$NAME/"
+          cp gui/README.md "dist/$NAME/README-GUI.md"
           cp -R "$CLI/contrib" "dist/$NAME/"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          tar -tzvf "$NAME.tar.gz"
           echo "FILE=$NAME.tar.gz" >> "$GITHUB_ENV"
       - name: Package (macOS, Warden.app zipped)
         if: matrix.os == 'macos'
@@ -201,6 +231,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/$bin" "$app/Contents/MacOS/"
           cp "$CLI/warden" "$app/Contents/MacOS/warden"
           cp -R "$CLI/contrib" "$CLI/README.md" "$app/Contents/Resources/"
+          cp gui/README.md "$app/Contents/Resources/README-GUI.md"
           cat > "$app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -214,6 +245,7 @@ jobs:
             <key>CFBundleShortVersionString</key><string>$VERSION</string>
             <key>CFBundleVersion</key><string>$VERSION</string>
             <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
             <key>NSHighResolutionCapable</key><true/>
           </dict>
           </plist>
@@ -226,6 +258,7 @@ jobs:
           #   xcrun notarytool submit <zip> --apple-id … --team-id … --password … --wait
           #   xcrun stapler staple "$app"   (and zip again after stapling)
           ditto -c -k --keepParent "$app" "$NAME.zip"
+          unzip -l "$NAME.zip"
           echo "FILE=$NAME.zip" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:

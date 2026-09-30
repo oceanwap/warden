@@ -1,5 +1,8 @@
 # Linux x86_64 and ARM64 are the production targets: everything runs there,
 # integration tests included. macOS is for development: build, lint, unit tests.
+# The workspace also has protocol/ (the wire types) and gui/ (warden-gui):
+# every job builds and lints all of it; the GUI's tests run on linux-x86_64
+# (unit, headless rendering with iced_test, and against a real wardend).
 name: CI
 
 on:
@@ -25,7 +28,7 @@ env:
 jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -45,10 +48,26 @@ jobs:
       - name: npm ci (bench/)
         working-directory: bench
         run: npm ci --no-audit --no-fund
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
       - run: shellcheck install.sh
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --bin warden
+      # The GUI's integration test drives target/debug/warden.
+      - name: GUI and protocol tests
+        run: |
+          set -o pipefail
+          cargo build --bin warden
+          cargo test -p warden-protocol -p warden-gui 2>&1 | tee gui.log
+        env:
+          WARDEN_GUI_SNAPSHOT_DIR: ${{ github.workspace }}/gui-snapshots
+      - name: Upload the GUI's headless screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-snapshots
+          path: gui-snapshots/*.png
+          if-no-files-found: warn
+          retention-days: 7
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
         run: |
@@ -59,19 +78,23 @@ jobs:
       - name: annotate failing tests
         if: failure()
         run: |
-          grep -E "^test .* FAILED$|panicked at|^---- " integration.log | head -30 |
-            while IFS= read -r line; do echo "::error title=integration::${line}"; done
-          awk '/^---- .* stdout ----/{p=1} p' integration.log | grep -vE "^\s*$" | head -60 |
-            while IFS= read -r line; do echo "::error title=output::${line}"; done
+          for log in gui.log integration.log; do
+            [ -f "$log" ] || continue
+            grep -E "^test .* FAILED$|panicked at|^---- |^error(\[|:)" "$log" | head -30 |
+              while IFS= read -r line; do echo "::error title=${log%.log}::${line}"; done
+            awk '/^---- .* stdout ----/{p=1} p' "$log" | grep -vE "^\s*$" | head -60 |
+              while IFS= read -r line; do echo "::error title=${log%.log} output::${line}"; done
+          done
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
@@ -83,8 +106,10 @@ jobs:
       - name: npm ci (bench/)
         working-directory: bench
         run: npm ci --no-audit --no-fund
-      - run: cargo build --all-targets
+      - run: cargo build --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --bin warden
+      - run: cargo test -p warden-protocol
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
         run: |
@@ -102,13 +127,14 @@ jobs:
 
   macos:
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - run: cargo build
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --bin warden
+      - run: cargo test -p warden-protocol

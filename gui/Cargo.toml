@@ -1,0 +1,33 @@
+[package]
+name = "warden-gui"
+version = "0.1.0"
+edition = "2024"
+# iced 0.14 needs 1.88.
+rust-version = "1.88"
+description = "Warden's native GUI: every app on a host and its live monitoring, from wardend."
+publish = false
+
+[[bin]]
+name = "warden-gui"
+path = "src/main.rs"
+
+[features]
+# tiny-skia: a CPU renderer. No GPU driver is loaded, which keeps the resident
+# memory low (see README.md). `--features wgpu` adds the GPU renderer, used
+# first when a GPU is found (ICED_BACKEND=tiny-skia forces the CPU one).
+default = []
+wgpu = ["iced/wgpu"]
+
+[dependencies]
+warden-protocol = { path = "../protocol" }
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "x11", "wayland", "tokio", "crisp"] }
+tokio = { version = "1.53.1", features = ["net", "io-util", "time", "process", "sync", "rt", "fs", "macros"] }
+serde_json = "1.0.151"
+# The user ids that pick the runtime directory, without `unsafe` (already in
+# iced's tree on Linux).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process"] }
+# Local wall-clock times for the event feed, as `warden events` prints them.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+iced_test = "0.14.0"

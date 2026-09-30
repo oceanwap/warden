@@ -38,7 +38,7 @@ use watcher::WatchMsg;
 
 /// wardend's socket, in the runtime directory next to the apps' directories.
 pub fn socket_path() -> PathBuf {
-    config::runtime_dir().join("wardend.sock")
+    warden_protocol::paths::wardend_socket(&config::runtime_dir())
 }
 
 /// Where `warden daemon --background` logs.

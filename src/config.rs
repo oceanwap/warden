@@ -280,15 +280,8 @@ pub struct Limits {
     pub max_lifetime: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(u8)]
-pub enum Level {
-    Debug = 0,
-    Info = 1,
-    Warn = 2,
-    Error = 3,
-}
+/// On the wire too (`log-level`), so it lives in the protocol crate.
+pub use warden_protocol::Level;
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1015,25 +1008,11 @@ pub fn is_node(command: &str) -> bool {
 
 /// Directory for the control socket and the embedded JS files.
 /// Where every app's runtime directory lives (sockets, shim).
+/// `$WARDEN_RUNTIME_DIR`, else `/run/warden` for root, else
+/// `$XDG_RUNTIME_DIR/warden`, else `/tmp/warden-<uid>` (the protocol crate
+/// has the logic, shared with the GUI).
 pub fn runtime_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("WARDEN_RUNTIME_DIR") {
-        return PathBuf::from(d);
-    }
-    if crate::sys::is_root() {
-        // macOS has no /run (and a read-only /): /var/run is its place for this.
-        return PathBuf::from(if cfg!(target_os = "linux") { "/run/warden" } else { "/var/run/warden" });
-    }
-    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(d).join("warden");
-    }
-    let uid = crate::sys::uid();
-    #[cfg(target_os = "linux")]
-    let tmp = std::env::temp_dir();
-    // Not Linux: macOS's per-user $TMPDIR (/var/folders/…/T/) leaves too
-    // little of the ~104-byte socket path for the workers' health sockets.
-    #[cfg(not(target_os = "linux"))]
-    let tmp = PathBuf::from("/tmp");
-    tmp.join(format!("warden-{uid}"))
+    warden_protocol::paths::runtime_dir(crate::sys::euid(), crate::sys::uid())
 }
 
 /// One app's runtime directory: matches systemd's `RuntimeDirectory=warden/%i`.

@@ -6,9 +6,12 @@ description = "A small, boring supervisor for Bun/Node HTTP workers: SO_REUSEPOR
 rust-version = "1.85"
 
 [workspace]
+# protocol: the wire types (docs/protocol.md), shared by warden and the GUI.
+# gui: the native GUI (warden-gui), a client of wardend.
 # xtask: `cargo xtask bench` (see .cargo/config.toml). Plain `cargo build`,
-# `cargo test` and `cargo install` in this directory still mean Warden only.
-members = ["xtask"]
+# `cargo test` and `cargo install` in this directory still mean Warden only;
+# `--workspace` (or `-p warden-gui`) takes in the rest.
+members = ["protocol", "gui", "xtask"]
 
 [dependencies]
 libc = "0.2.189"
@@ -17,6 +20,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt", "macros", "process", "signal", "net", "time", "io-util", "sync", "fs"] }
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde"] }
+warden-protocol = { path = "protocol" }
 
 [dev-dependencies]
 libc = "0.2.189"
