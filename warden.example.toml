@@ -3,20 +3,28 @@
 # Validate with: warden check -c warden.toml
 
 [app]
-name = "travelerwe-api"                      # example; [A-Za-z0-9._-]
-command = "bun"                              # process mode: the app; worker mode: the Bun binary
+name = "travelerwe-api"                      # example; [A-Za-z0-9._-], not "all"
+command = "bun"                              # process mode: the app (bun, node, python3, any program);
+                                             # worker mode: the Bun binary that hosts the Workers
 args = ["run", "dist/main.js"]               # example (process mode)
 # entry = "dist/main.js"                     # worker mode: module each Worker imports
 working_directory = "/srv/apps/travelerwe/api/current"   # example; relative = relative to this file
 port = 3000                                  # example; sets PORT and enables readiness detection
 env = { NODE_ENV = "production" }            # example
-# shim = true                                # default: true when command is bun
+# shim = true                                # default: true when command is bun or node (reusePort,
+                                             # readiness, drain, health socket); false for anything else
+# namespace = "backend"                      # example; a group for `warden restart backend` (default "default")
+instance_var = "NODE_APP_INSTANCE"           # env var with the worker's 0-based index (PM2's instance_var); "" = none
 
 [workers]
-count = 4                                    # example (default 1)
+count = 4                                    # example (default 1); also "max" (one per CPU) or "max-1"
 mode = "process"                             # "process" (production) | "worker" (experimental, Bun Workers)
 port_strategy = "shared"                     # "shared" (SO_REUSEPORT) | "offset" (PORT = port + i - 1)
 ready_timeout = 30                           # s to start listening, else killed and counted as a crash
+wait_ready = false                           # ready on process.send('ready') instead of listening (PM2's wait_ready)
+min_uptime = 1000                            # ms an app without a port must stay up to count as ready
+# overlap = true                             # start the new worker before stopping the old one in rolling
+                                             # restarts (default: yes when the port can be shared)
 
 [restart]
 enabled = true
@@ -26,18 +34,26 @@ backoff_initial = 100                        # ms before the 2nd crash-in-a-row 
                                              # immediate), doubling per further crash
 backoff_max = 10000                          # ms
 failed_cooldown = 300                        # s before a FAILED worker is retried (0 = never)
+# schedule = "0 3 * * *"                     # example; rolling restart on a cron schedule, local time (PM2's cron_restart)
+stop_exit_codes = []                         # exit codes that mean "done, don't restart" (PM2's stop_exit_codes)
 
 [shutdown]
-grace_period = 30                            # s to exit after SIGTERM before SIGKILL
+grace_period = 30                            # s to exit after the stop signal before SIGKILL
 drain_ms = 500                               # ms the shim keeps answering with Connection: close
+signal = "SIGTERM"                           # or "SIGINT" for apps written for PM2 (its default)
 
 [health]
 enabled = true                               # example (default false): periodic per-worker checks
 path = "/health"                             # example; checked on each worker's private socket
+# live_path = "/live"                        # example; "is this process OK": periodic checks (default: path)
+# ready_path = "/ready"                      # example; "can it serve": rollout gates (default: path)
 # url = "http://127.0.0.1:3000/health"       # optional app-level check through the shared port
 interval = 5                                 # s
 timeout = 2                                  # s
 failure_threshold = 3                        # consecutive failures
+initial_delay = 10                           # s after a worker is ready before periodic checks start
+outage_threshold = 0.5                       # this share of workers failing at once = a dependency is down:
+                                             # replacements are held (1.0 = off)
 on_failure = "replace"                       # "replace" the worker gracefully | "log" | "reload" (app-level)
 
 [reload]                                     # gates for every replacement (reload, safe-reload, restart N, recycling)
@@ -60,10 +76,41 @@ max_lifetime = 0                             # s; recycle each worker after this
 [logging]
 level = "info"                               # debug | info | warn | error
 # timestamps = true                          # default: off under journald (it adds its own)
-# max_lines_per_sec = 10000                  # worker output kept per worker and stream; excess is counted and dropped (0 = keep all)
+worker_output = "capture"                    # "capture" (through Warden: prefixed, in `warden logs`, in files)
+                                             # | "inherit" (workers write straight to Warden's stdout)
+max_lines_per_sec = 10000                    # worker output kept per worker and stream; the excess is counted
+                                             # and dropped. 0 = keep every line (a flooding app is slowed instead)
+# file = "/var/log/warden/api.log"           # example; everything, as `warden logs` shows it
+# out_file = "/var/log/warden/api-out.log"   # example; worker stdout as written (PM2's out_file)
+# err_file = "/var/log/warden/api-err.log"   # example; worker stderr as written (PM2's error_file)
+per_worker_files = false                     # api-out-1.log, api-out-2.log… (PM2 without merge_logs)
+file_timestamps = false                      # prefix out/err lines with a timestamp (PM2's `time`)
+
+[logging.rotate]                             # every log file above; built in, no logrotate needed
+max_size = "10M"                             # rotate at this size ("500K", "1G"; 0 = only on interval)
+keep = 5                                     # rotated files kept per log file
+# interval = "0 0 * * *"                     # example; also rotate on a cron schedule (local time)
+compress = false                             # gzip rotated files (read back by `warden logs --history`)
+date_suffix = false                          # api.log.2026-09-30T00-00-00 instead of api.log.1
+max_age_days = 0                             # also delete rotated files older than this (0 = off)
 
 [metrics]
 # listen = "127.0.0.1:9464"                  # Prometheus text at /metrics
 
 [control]
 socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory=warden/%i in the unit
+
+# A static site instead of an app (what `warden serve <dir> <port>` writes).
+# Workers are Warden's own file server: no command needed, process mode.
+# [static]
+# root = "/srv/site/current/dist"            # example; a `current` symlink is resolved per worker start
+# host = "0.0.0.0"
+# spa = false                                # unknown paths get index.html (single-page apps)
+# index = "index.html"
+# cache_max_age = 3600                       # s; HTML is always revalidated, fingerprinted names cached a year
+# listing = false                            # HTML listing for directories without an index
+# dotfiles = false                           # serve dotfiles (.well-known is always served)
+# precompressed = true                       # serve file.br / file.gz when the client accepts them
+# basic_auth = "user:password"               # example; keep the config file private (0600)
+# headers = { "X-Frame-Options" = "DENY" }   # example; extra response headers
+# access_log = false                         # one stdout line per request

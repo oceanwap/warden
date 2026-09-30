@@ -22,34 +22,47 @@ claim an optimisation the data doesn't show).
 
 ## What the data says
 
+Numbers from the README run (2 CPUs, 4 workers).
+
 - **Warden adds nothing on the request path.** In process mode the workers
-  own the port (SO_REUSEPORT); req/s and latency match running the same
-  processes bare. PM2's cluster mode passes every connection through its
-  daemon: lower req/s and a longer p99 tail.
-- **Manager cost.** Warden's supervisor: ~5.5 MB RSS, 0 % idle CPU. PM2's
-  daemon: ~65 MB and a little idle CPU. Watt runs the app inside its own
-  runtime (one process, worker threads): more memory in total and ~4 % idle
-  CPU on 2 CPUs.
+  own the port (SO_REUSEPORT); req/s and latency match the same processes
+  run bare (node:http: 64.1k vs 65.8k req/s, within noise). PM2's cluster
+  mode passes every connection through its daemon: 51.6k req/s and a p99
+  twice as long (8.0 vs 4.1 ms). Watt: 54.2k req/s, p99 7.3 ms.
+- **Manager cost.** Warden's supervisor: ~6 MB RSS, under 1 MB PSS per app
+  (10 apps: 7.3 MB PSS in all), 0 % idle CPU. PM2's daemon: ~66 MB RSS
+  (36 MB PSS), 0.2–0.7 % idle CPU. Watt runs the app inside its own runtime:
+  twice the memory of 4 processes for the Node app (PSS 474 vs 97 MB) and
+  2–3 % idle CPU.
 - **Startup and CLI.** Warden starts 4 workers as fast as starting them bare;
-  PM2 needs ~0.9 s (daemon), Watt ~3.4 s. `warden status` answers in ~2 ms;
-  `pm2 jlist` ~170 ms, `wattpm ps` ~500 ms (each is a Node process). With 10
-  apps: `warden list` 2.5 ms, `pm2 list` 170 ms.
-- **Recovery.** A crashed worker is back (answering requests) in ~100 ms
-  under Warden, ~250–370 ms under PM2, ~1 s under Watt. The first crash after
-  a healthy run restarts with no backoff.
-- **Rolling restarts lose nothing** under Warden or PM2 (`pm2 reload`) with
-  `tcp_migrate_req = 1`; Warden finishes faster (health-gated, one worker at
-  a time, the next one starts as soon as the previous is ready).
-- **Worker (thread) mode** (Bun only today): about half the memory of 4
-  processes, same throughput; for NestJS a worse p99 (16–18 ms vs 10–12 ms in
-  earlier runs), and one crash takes all workers down. **Use process mode in
-  production** unless memory is the binding constraint.
-- **Static files.** `warden serve` matches nginx on small files, beats it on
-  large ones (sendfile without userspace buffering) and on new connections,
-  and serves 5–60× what `pm2 serve` and `serve` do.
-- **Logs.** Warden reads a flooding worker at ~1 GB/s (PM2 ~150 MB/s) for a
-  tenth of PM2's CPU per GB; with `max_lines_per_sec = 0` it keeps every line
-  at ~2× PM2's throughput.
+  PM2 needs ~0.9 s more (its daemon), Watt 3–5 s. `warden status` answers in
+  ~2 ms, `pm2 jlist` in ~160 ms, `wattpm ps` in ~510 ms. With 10 apps:
+  `warden list` 2.6 ms, `pm2 list` 168 ms; starting 10 apps 0.6 s vs 2.2 s.
+- **Recovery.** A crashed worker answers again 2–3× sooner under Warden than
+  under PM2: node:http 139 vs 352 ms, NestJS on Node 729 vs 1,636 ms, Bun
+  57 vs 176 ms; Watt 1.5–2.1 s. The first crash after a healthy run
+  restarts with no backoff.
+- **Rolling restarts.** Warden lost no request in any run, and finished
+  sooner (node:http 533 ms vs PM2 794 ms, Watt 3.6 s). PM2's `reload` is
+  graceful only in cluster mode (Node): for Bun apps it runs fork mode,
+  where reload is a restart, and NestJS on Bun lost 2,406 of 6,090
+  requests during it.
+- **Worker (thread) mode** (Bun only): by RSS it looks like half the memory
+  of 4 processes, but most of that difference is shared pages. By PSS it
+  saves 20–25 % idle (NestJS 158 vs 203 MB) and nothing after load (324 vs
+  287 MB), with a worse p99 for NestJS (19.8 vs 12.1 ms), and one crash
+  takes all workers down. **Use process mode in production.** For Node,
+  threads don't save memory at all: 4 `node:http` processes use 96 MB PSS,
+  one process with 4 worker threads 104 MB; so Warden has no Node thread mode.
+- **Static files.** `warden serve` is within ~7 % of nginx at every size:
+  86,994 vs 88,526 req/s for a 1.5 KB page, 67.5k vs 72.7k for 48 KB, ahead
+  on the 1 MB file (4.75 vs 4.42 GB/s) and on a new connection per request
+  (28.6k vs 27.7k), in 40 % less memory (PSS 7.6 vs 12.9 MB). That is
+  2–40× what `pm2 serve` and `serve` deliver.
+- **Logs.** Warden reads a flooding worker at ~850 MB/s (PM2 155 MB/s) for a
+  ninth of PM2's CPU per GB; with `max_lines_per_sec = 0` it keeps every
+  line at ~2× PM2's throughput. Steady logging (20k lines/s) costs it a
+  quarter of PM2's CPU.
 
 ## Findings about the other managers
 
@@ -77,14 +90,22 @@ claim an optimisation the data doesn't show).
 | Logs: per-read batches, one `write(2)` per batch (was 2 per line), one allocation per line | 20k lines/s for 5 s | 0.37 s CPU | 0.17 s CPU (PM2: 0.87 s) |
 | same | keep-all flood (`max_lines_per_sec = 0`) | 60 MB/s, 24 CPU s/GB, 14 % of lines lost | 318 MB/s, 4 CPU s/GB, none lost |
 | `warden start --no-wait` | starting 10 apps | 10.8 s (each waits for readiness) | 0.5 s (PM2: 2.2 s) |
+| The shim loads `node:http` only if the app does (in Bun it costs ~6 MB) | one Bun.serve worker, RSS over bare | +10 MB | +4 MB |
+| Private health socket only when a health path or `verify_command` uses it | a second server per worker | always | only when used |
+| Output readers share one read buffer per thread | supervisor with 16 workers | 7.4 MB RSS | 5.5 MB RSS |
 
 Tried and dropped (no measurable win, so no code):
 
 - Bigger worker pipe buffers (`F_SETPIPE_SZ`, 256 KB and 1 MB): the same
   flood throughput as the default 64 KB.
+- A worker-thread mode for Node (like Watt's): 4 threads in one process use
+  more memory (104 MB PSS) than 4 processes (96 MB), and lose isolation.
 
 Fixed in the harness (the numbers were wrong, not the software):
 
+- The timed `pm2 jlist` ran without `PM2_HOME`, so it queried (and started)
+  an empty default daemon instead of the one running the app; it now gets
+  the scenario's environment and must succeed.
 - PM2's crash recovery first measured 3.2 s: the harness polled `pm2 jlist`
   (~180 ms per call) and waited for a readiness drop that `jlist` never
   shows. Every manager is now timed from the outside by which worker answers.

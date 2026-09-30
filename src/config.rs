@@ -1024,6 +1024,28 @@ mod tests {
     }
 
     #[test]
+    fn example_config_parses_and_documents_the_defaults() {
+        let text = include_str!("../warden.example.toml");
+        let c = Config::parse(text).unwrap();
+        assert_eq!(c.workers.count, 4);
+        assert_eq!(c.logging.max_lines_per_sec, Logging::default().max_lines_per_sec);
+        assert_eq!(c.logging.rotate, Rotate::default());
+        // The commented [static] block is valid too.
+        let uncommented: String = text
+            .split("# [static]")
+            .nth(1)
+            .unwrap()
+            .lines()
+            .map(|l| l.strip_prefix("# ").unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let site = format!("[app]\nname = \"site\"\nport = 8080\n[static]{uncommented}\n");
+        let c = Config::parse(&site).unwrap();
+        let st = c.static_files.unwrap();
+        assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
+    }
+
+    #[test]
     fn private_sockets_only_when_something_uses_them() {
         let c = Config::parse(MIN).unwrap();
         assert!(c.health_sockets() && !c.private_sockets(), "no health path, no verify_command: no socket");

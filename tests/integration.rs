@@ -137,7 +137,9 @@ impl Warden {
         let t0 = Instant::now();
         let mut s = std::os::unix::net::UnixStream::connect(self.socket()).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        writeln!(s, "{req}").unwrap();
+        // A server that refuses the connection may close it before the
+        // request is written (EPIPE); its answer is still there to read.
+        let _ = writeln!(s, "{req}");
         let mut out = String::new();
         let _ = s.read_to_string(&mut out);
         (t0.elapsed(), out)
@@ -1655,6 +1657,32 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
         drop(w);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `warden doctor` names each problem with a fix, and fails only on real ones.
+#[test]
+fn doctor_reports_problems_with_fixes() {
+    let f = Fleet::new("doctor");
+    // Nothing configured: warnings at most, exit 0.
+    let (code, out) = f.cli(&["doctor"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("kernel") && out.contains("runtime dir"), "{out}");
+    // A config that doesn't parse, and a stopped app whose port is taken.
+    std::fs::write(f.home.join("broken.toml"), "[app\nname = ").unwrap();
+    let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    std::fs::write(f.home.join("api.toml"), format!("[app]\nname = \"api\"\ncommand = \"sleep\"\nport = {port}\n"))
+        .unwrap();
+    let (code, out) = f.cli(&["doctor"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("FAIL  app broken"), "{out}");
+    assert!(out.contains(&format!("port {port} is taken")) && out.contains(&format!("sport = :{port}")), "{out}");
+    let (_, json) = f.cli(&["doctor", "--json"]);
+    let v: Value = serde_json::from_str(&json).unwrap();
+    let fails: Vec<&Value> = v.as_array().unwrap().iter().filter(|x| x["level"] == "fail").collect();
+    assert_eq!(fails.len(), 2, "{json}");
+    assert!(fails.iter().all(|x| x["fix"].is_string()), "every failure has a fix: {json}");
+    drop(taken);
 }
 
 /// `warden serve`: Warden's own static server, supervised like any app.

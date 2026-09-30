@@ -161,6 +161,9 @@ interface Running {
   rollingRestart?: () => Promise<void>;
   /** Its status command, timed for CLI latency. */
   statusCmd?: string[];
+  /** The environment it needs (PM2_HOME: without it `pm2` talks to, or
+   *  starts, the default daemon instead of this one). */
+  statusEnv?: Record<string, string>;
   stop: () => Promise<void>;
 }
 
@@ -227,6 +230,7 @@ async function startPm2(): Promise<Running> {
       spawnSync([pm2, "reload", "bench"], { env, stdout: "ignore", stderr: "ignore" });
     },
     statusCmd: [pm2, "jlist"],
+    statusEnv: env,
     stop: async () => {
       spawnSync([pm2, "kill"], { env, stdout: "ignore", stderr: "ignore" });
     },
@@ -399,7 +403,8 @@ async function runScenario(name: string) {
     const times: number[] = [];
     for (let i = 0; i < 10; i++) {
       const tc = performance.now();
-      spawnSync(run.statusCmd, { stdout: "ignore", stderr: "ignore" });
+      const r = spawnSync(run.statusCmd, { env: run.statusEnv ?? baseEnv, stdout: "ignore", stderr: "ignore" });
+      if (r.exitCode !== 0) throw new Error(`${run.statusCmd.join(" ")} exited ${r.exitCode}`);
       times.push(performance.now() - tc);
     }
     times.sort((a, b) => a - b);

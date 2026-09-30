@@ -5,7 +5,7 @@ machine and the same apps: PM2, Platformatic Watt (`wattpm`), nginx and the
 `serve` package. The results in the main README come from one command:
 
 ```sh
-cargo xtask bench              # every suite (~25 min on 2 CPUs); updates README.md
+cargo xtask bench              # every suite (~20 min on 2 CPUs); updates README.md
 cargo bench-all                # the same, shorter to type
 cargo xtask bench --quick      # 3 s per measurement: a smoke test, not results to publish
 cargo xtask bench --only static,logs --no-readme

@@ -45,6 +45,18 @@ pub fn is_root() -> bool {
     euid() == 0
 }
 
+/// (soft, hard) limit on open files for this process.
+pub fn nofile_limit() -> (u64, u64) {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `r` is a live, exclusively borrowed rlimit for getrlimit to
+    // fill; RLIMIT_NOFILE always exists.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return (0, 0);
+    }
+    #[allow(clippy::unnecessary_cast)] // rlim_t is not u64 on every target
+    (r.rlim_cur as u64, r.rlim_max as u64)
+}
+
 /// Is this descriptor a terminal? (false for pipes, files, closed fds)
 pub fn isatty(fd: RawFd) -> bool {
     // SAFETY: isatty only inspects the descriptor number; an invalid one
@@ -389,6 +401,17 @@ mod tests {
             .collect();
         assert_eq!((uid(), euid()), (uids[0], uids[1]));
         assert_eq!(is_root(), uids[1] == 0);
+    }
+
+    #[test]
+    fn nofile_limit_matches_proc() {
+        let (soft, hard) = nofile_limit();
+        let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+        let line = limits.lines().find(|l| l.starts_with("Max open files")).unwrap();
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let parse = |s: &str| if s == "unlimited" { u64::MAX } else { s.parse().unwrap() };
+        assert_eq!((soft, hard), (parse(f[3]), parse(f[4])));
+        assert!(soft > 0 && soft <= hard);
     }
 
     #[test]

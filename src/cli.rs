@@ -58,6 +58,8 @@ SUPERVISOR:
     config <app>     Effective config as JSON (values hidden unless --show-secrets)
     log-level [target] [debug|info|warn|error]   Show or change it at runtime
     check            Validate the config file and exit
+    doctor           Check this host for the problems Warden knows about, with a fix
+                     for each  [--json]
     version          Print the version
 
 OPTIONS:
@@ -116,6 +118,7 @@ pub enum Command {
     Unstartup,
     Kill,
     Top,
+    Doctor,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -520,6 +523,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             too_many(1)?;
             target = one(&rest);
             Command::Kill
+        }
+        "doctor" => {
+            too_many(0)?;
+            Command::Doctor
         }
         "top" | "monit" => {
             too_many(1)?;

@@ -8,6 +8,7 @@
 mod cli;
 mod config;
 mod control;
+mod doctor;
 mod fleet;
 mod guard;
 mod health;
@@ -94,6 +95,7 @@ fn main() {
         Command::Unstartup => rt.block_on(fleet::unstartup(&args)),
         Command::Kill => rt.block_on(fleet::kill(&args)),
         Command::Top => rt.block_on(fleet::top(&args)),
+        Command::Doctor => rt.block_on(doctor::run(&args)),
     };
     std::process::exit(code);
 }

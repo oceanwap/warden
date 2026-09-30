@@ -797,7 +797,7 @@ fn unit_dir() -> PathBuf {
     std::env::var_os("WARDEN_UNIT_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/etc/systemd/system"))
 }
 
-fn unit_installed() -> bool {
+pub fn unit_installed() -> bool {
     unit_dir().join("warden@.service").exists()
         || Path::new("/lib/systemd/system/warden@.service").exists()
         || Path::new("/usr/lib/systemd/system/warden@.service").exists()
@@ -1482,6 +1482,11 @@ struct Dump {
     version: u32,
     saved_at: String,
     apps: Vec<Saved>,
+}
+
+/// Names of the apps `warden save` remembered.
+pub fn saved_names() -> Vec<String> {
+    read_dump().ok().flatten().map(|d| d.apps.into_iter().map(|a| a.name).collect()).unwrap_or_default()
 }
 
 fn read_dump() -> Result<Option<Dump>, String> {
