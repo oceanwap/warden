@@ -1865,12 +1865,10 @@ impl Supervisor {
             .worker_env(slot, inst, None)
             .into_iter()
             .map(|(k, val, from)| {
-                // Warden's own values are never secret; the app's are hidden.
-                let val = if show_secrets || from == "warden" || is_plain_env(&k) {
-                    val
-                } else {
-                    format!("(hidden, {} chars)", val.len())
-                };
+                // Warden's own values are not secret, except the [static]
+                // section (its basic_auth); the app's are hidden.
+                let secret = if from == "warden" { k == "WARDEN_STATIC" } else { !is_plain_env(&k) };
+                let val = if show_secrets || !secret { val } else { format!("(hidden, {} chars)", val.len()) };
                 serde_json::json!({"name": k, "value": val, "from": from})
             })
             .collect();
@@ -2278,5 +2276,10 @@ mod tests {
         assert_eq!(val("NODE_APP_INSTANCE"), Some("1".into()), "Warden's values are never hidden");
         assert_eq!(s.info(true, None)["worker_env"][0]["value"], "secret");
         assert_eq!(s.info(false, Some(99))["worker_env_of"], "2", "clamped to the workers there are");
+        // A static site's section carries its basic_auth: hidden too.
+        let s = sup("[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\nbasic_auth = \"u:pw\"\n");
+        let env = s.info(false, None)["worker_env"].to_string();
+        assert!(env.contains("WARDEN_STATIC") && !env.contains("pw"), "{env}");
+        assert!(s.info(true, None)["worker_env"].to_string().contains("u:pw"));
     }
 }
