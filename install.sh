@@ -8,6 +8,10 @@
 # Installs to /usr/local/bin as root, else ~/.local/bin (WARDEN_INSTALL_DIR
 # overrides). WARDEN_DOWNLOAD_URL points at a directory holding the release
 # files instead of GitHub (a mirror, or CI testing unreleased builds).
+#
+# NOTE: GitHub Releases are not published yet. Until the first release exists,
+# this script will fail when it cannot download SHA256SUMS. Prefer building
+# from source: `cargo build --release` (see README Development).
 set -eu
 
 REPO="oceanwap/warden"
@@ -93,7 +97,7 @@ trap 'rm -rf "$tmp"' EXIT
 trap 'exit 1' INT TERM
 
 fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" ||
-    fail "cannot download $base/SHA256SUMS${version:+ (is v$version a Warden release?)}"
+    fail "cannot download $base/SHA256SUMS${version:+ (is v$version a Warden release?)}. No published release assets yet? Build from source: git clone https://github.com/$REPO && cargo build --release (see README)"
 
 # The CLI archive for this platform ("warden-gui-…" is the GUI bundle).
 if [ -n "$version" ]; then

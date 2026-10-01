@@ -438,17 +438,36 @@ but costs fault isolation and (for NestJS) p99 latency.
 
 ## 6. Open questions / next steps
 
+### Done (no longer open)
+
+- **Resource history / charts**: wardend keeps the last 24 h of app and host
+  series (`src/daemon/history.rs`); the GUI charts them (`gui/src/history.rs`,
+  `gui/src/charts.rs`); scripts use `{"cmd":"history"}`
+  ([Resource history](protocol.md#resource-history)).
+- **Alerts**: wardend delivers webhook/command alerts from `wardend.toml`
+  (`src/daemon/alerts.rs`; [Alerts](protocol.md#alerts)).
+- **Per-app release pinning**: `[app] pin_release` (default on) pins workers
+  to the resolved release directory across crash restarts
+  (`src/supervisor/release.rs`).
+
+### Still open
+
 - NestJS inside Bun Workers works for a minimal app (F10); the real app's
   dependencies (Prisma/pg drivers, native modules) must be tested in Workers.
+- Worker-mode graduation: harden fault isolation and document when process
+  mode remains the production default (Benchmarks: worker mode halves memory
+  with equal throughput, but costs isolation and, for NestJS, p99).
 - `surge = "all"` is blue/green for one batch, but a deploy is still not
   reversible once a batch has been promoted: keeping the old workers stopped
   but restartable (or SIGSTOPped) until the whole rollout passed would be.
 - Error-rate gates need request metrics Warden doesn't see (it isn't a proxy);
   `verify_command` is the hook for app-specific smoke tests today.
-- The native GUI ([`gui/`](../gui/README.md), iced) runs as a separate process
-  on `wardend.sock`, locally or through an SSH tunnel, and shares the
-  `warden-protocol` crate with the daemon. Next: a resource history (charts),
-  alerts, several hosts in one window.
-- wardend features beyond this round: alerts (webhook/command), in-memory
-  resource history, port registry, start order, fleet deploys with release
-  pinning, audit log (peer uid), self-upgrade by re-exec.
+- **Port registry** (host-wide claimed listen ports, conflict detection before
+  start).
+- **Start order** / dependency-aware boot across apps on one host.
+- **Fleet deploys** coordinated across apps (beyond per-app `pin_release` and
+  reload/safe-reload).
+- **Audit log** of control-plane actions (peer uid on the Unix socket).
+- **Self-upgrade** of wardend / the CLI by re-exec after replacing the binary.
+- **Multi-host GUI**: one window over several hosts (today: local wardend, or
+  a single remote via `warden-gui --ssh`; not a fleet of hosts in one UI).
