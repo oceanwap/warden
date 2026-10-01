@@ -187,13 +187,33 @@ pub fn context(args: &Args) -> Ctx {
 pub struct Sel {
     pub app: App,
     pub worker: Option<usize>,
+    /// `app:standby` (every hot standby) or `app:s2` (one, as `warden
+    /// status` lists them): only `warden logs` takes these.
+    pub standby: Option<String>,
+}
+
+/// What follows `app:` in a target: a worker number, or a hot standby.
+fn parse_worker(t: &str, w: &str) -> Result<(Option<usize>, Option<String>), String> {
+    if let Ok(n) = w.parse::<usize>() {
+        return Ok((Some(n), None));
+    }
+    if control::is_standby(w) {
+        return Ok((None, Some(w.to_string())));
+    }
+    Err(format!(
+        "{t:?}: the part after ':' must be a worker number, `standby` (the hot standbys) or one standby's `s1`, `s2`… \
+         (as `warden status` lists them)"
+    ))
 }
 
 /// `all`, an app name, a namespace, `app:N`; in a single-app context also
-/// `N` or `:N` for a worker. `need`: a mutating command must name its target
-/// when there are several apps.
+/// `N` or `:N` for a worker. Hot standbys: `app:standby`, `app:s1` (`warden
+/// logs` only). `need`: a mutating command must name its target when there
+/// are several apps.
 pub fn resolve(ctx: &Ctx, target: Option<&str>, need: bool) -> Result<Vec<Sel>, String> {
-    let all = |w: Option<usize>| ctx.apps.iter().map(|a| Sel { app: a.clone(), worker: w }).collect::<Vec<_>>();
+    let all = |w: Option<usize>| {
+        ctx.apps.iter().map(|a| Sel { app: a.clone(), worker: w, standby: None }).collect::<Vec<_>>()
+    };
     let Some(t) = target else {
         if ctx.single || !need || ctx.apps.len() == 1 && ctx.apps[0].config.is_none() {
             return Ok(all(None));
@@ -206,30 +226,37 @@ pub fn resolve(ctx: &Ctx, target: Option<&str>, need: bool) -> Result<Vec<Sel>, 
     if t == "all" {
         return Ok(all(None));
     }
-    let (name, worker) = match t.rsplit_once(':') {
+    let (name, worker, standby) = match t.rsplit_once(':') {
         Some((n, w)) => {
-            let w: usize = w.parse().map_err(|_| format!("{t:?}: the part after ':' must be a worker number"))?;
-            (n, Some(w))
+            let (w, sb) = parse_worker(t, w)?;
+            (n, w, sb)
         }
-        None => (t, None),
+        None => (t, None, None),
     };
     if ctx.single {
         let app = &ctx.apps[0];
         if name.is_empty() || name == app.name {
-            return Ok(vec![Sel { app: app.clone(), worker }]);
+            return Ok(vec![Sel { app: app.clone(), worker, standby }]);
         }
         if let Ok(n) = name.parse::<usize>() {
-            return Ok(vec![Sel { app: app.clone(), worker: Some(n) }]);
+            return Ok(vec![Sel { app: app.clone(), worker: Some(n), standby: None }]);
+        }
+        if control::is_standby(name) {
+            return Ok(vec![Sel { app: app.clone(), worker: None, standby: Some(name.to_string()) }]);
         }
         return Err(format!("{name:?} is not this app ({}); the config names one app", app.name));
     }
     if let Some(app) = ctx.apps.iter().find(|a| a.name == name) {
-        return Ok(vec![Sel { app: app.clone(), worker }]);
+        return Ok(vec![Sel { app: app.clone(), worker, standby }]);
     }
-    let in_ns: Vec<Sel> =
-        ctx.apps.iter().filter(|a| a.namespace == name).map(|a| Sel { app: a.clone(), worker: None }).collect();
+    let in_ns: Vec<Sel> = ctx
+        .apps
+        .iter()
+        .filter(|a| a.namespace == name)
+        .map(|a| Sel { app: a.clone(), worker: None, standby: None })
+        .collect();
     if !in_ns.is_empty() {
-        if worker.is_some() {
+        if worker.is_some() || standby.is_some() {
             return Err(format!("{t:?}: a worker number needs an app, not a namespace"));
         }
         return Ok(in_ns);
@@ -502,6 +529,15 @@ async fn one_op(ctx: &Ctx, app: &App, req: Request, args: &Args) -> i32 {
 async fn ops(ctx: &Ctx, sels: &[Sel], action: &Action, args: &Args) -> i32 {
     let mut worst = 0;
     for s in sels {
+        if let Some(sb) = &s.standby {
+            let app = &s.app.name;
+            eprintln!(
+                "warden: {app}:{sb} - a hot standby takes no commands of its own: Warden replaces a failing one, a \
+                 deploy replaces them all, `warden reset {app}` retries FAILED ones. Its log: `warden logs {app} \
+                 --worker {sb}`"
+            );
+            return 2;
+        }
         let w = s.worker;
         let req = match action {
             Action::Stop | Action::Shutdown | Action::Flush | Action::Reload { .. } if w.is_some() => {
@@ -563,10 +599,10 @@ async fn logs(
     let lines = lines.unwrap_or(15);
     // Text / time / level filters run here; ask for more so N survive them.
     let fetch = if query.is_filtering() { 4000 } else { lines };
-    let req = |w: Option<usize>, n: usize, follow: bool| Request::Logs {
+    let req = |s: &Sel, n: usize, follow: bool| Request::Logs {
         lines: n,
         follow,
-        worker: w.map(|n| n.to_string()).or_else(|| query.worker.clone()),
+        worker: s.standby.clone().or_else(|| s.worker.map(|n| n.to_string())).or_else(|| query.worker.clone()),
         events: query.events || query.level.is_some(),
         stream: query.stream.clone(),
     };
@@ -590,7 +626,7 @@ async fn logs(
             continue;
         }
         let mut buf: Vec<u8> = Vec::new();
-        match control::call(&s.app.socket, &req(s.worker, fetch, false), &mut buf).await {
+        match control::call(&s.app.socket, &req(s, fetch, false), &mut buf).await {
             Ok(_) => {
                 let text = String::from_utf8_lossy(&buf).to_string();
                 let kept: Vec<&str> = text.lines().filter(|l| query.matches(l)).collect();
@@ -618,7 +654,7 @@ async fn logs(
     }
     let mut set = tokio::task::JoinSet::new();
     for s in live {
-        let r = req(s.worker, 0, true);
+        let r = req(&s, 0, true);
         let (q, app) = (query.clone(), s.app.name.clone());
         let prefix = if multi { format!("{app:<width$} | ") } else { String::new() };
         set.spawn(async move {
@@ -641,8 +677,8 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
     for s in sels {
         let app = &s.app;
         let mut q = query.clone();
-        if let Some(w) = s.worker {
-            q.worker = Some(w.to_string());
+        if let Some(w) = s.standby.clone().or_else(|| s.worker.map(|n| n.to_string())) {
+            q.worker = Some(w);
         }
         // Where this app logs: from the running supervisor, else its config.
         let (cfg, unit) = match call_with(app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await {
@@ -1896,6 +1932,13 @@ mod tests {
         assert!(resolve(&c, Some("nope"), true).unwrap_err().contains("no app or namespace"));
         assert!(resolve(&c, Some("backend:1"), true).unwrap_err().contains("needs an app"));
         assert!(resolve(&c, Some("api:x"), true).is_err());
+        // Hot standbys, as the standby hints name them.
+        let standby =
+            |t: &str| resolve(&c, Some(t), false).map(|v| (v[0].app.name.clone(), v[0].worker, v[0].standby.clone()));
+        assert_eq!(standby("api:standby"), Ok(("api".into(), None, Some("standby".into()))));
+        assert_eq!(standby("api:s2"), Ok(("api".into(), None, Some("s2".into()))));
+        assert!(standby("api:s0").unwrap_err().contains("`standby`"));
+        assert!(standby("backend:standby").unwrap_err().contains("needs an app"));
     }
 
     #[cfg(target_os = "linux")]
@@ -1929,6 +1972,12 @@ mod tests {
         assert_eq!(one(Some(":2")), Ok(Some(2)));
         assert_eq!(one(Some("api:3")), Ok(Some(3)));
         assert!(one(Some("web")).is_err());
+        // `warden logs -c app.toml --worker standby` is the target ":standby".
+        let standby = |t: &str| resolve(&c, Some(t), false).map(|v| (v[0].worker, v[0].standby.clone()));
+        assert_eq!(standby(":standby"), Ok((None, Some("standby".into()))));
+        assert_eq!(standby("api:s1"), Ok((None, Some("s1".into()))));
+        assert_eq!(standby("s3"), Ok((None, Some("s3".into()))));
+        assert!(standby(":sx").is_err());
     }
 
     #[test]

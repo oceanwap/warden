@@ -4980,7 +4980,14 @@ fn oom_kill_is_told_apart_from_a_kill_9() {
     kill_worker(&w, 0);
     let s = w.status().unwrap();
     assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
-    w.wait_log("OOM killer was ruled out", T);
+    w.wait_log("Probably not the kernel's OOM killer", T);
+    // It moved, but 3 s before the kill -9 (a helper process the app ran,
+    // OOM-killed long ago): not this worker's death.
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 4\noom_kill 5\noom_group_kill 0\n").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)", "{}", w.log());
     let _ = std::fs::remove_file(&events);
 }
 
@@ -5265,7 +5272,7 @@ fn standby_nestjs_on_bun_and_node() {
             // the standby's output carries the slot it took.
             let line = format!("worker=1 stdout: nest bench listening on :{port} ({standby}:");
             w.wait_log(&line, T);
-            assert!(!w.log().contains("worker=standby stdout: nest bench listening"), "{}", w.log());
+            assert!(!w.log().contains("worker=s1 stdout: nest bench listening"), "{}", w.log());
         }
     }
 }
@@ -5555,4 +5562,128 @@ fn standby_zero_changes_nothing() {
     let s = w.status().unwrap();
     assert_eq!(s["workers"].as_array().unwrap().len(), 1);
     assert_eq!(s["workers"][0]["restarts"], 1);
+}
+
+/// Every `warden logs` command a standby hint names works and shows the
+/// standbys' lines: their output (`worker=s1`), their own lines (`standby
+/// crashed worker=s1`) and the pool's (`worker=standby`). So does the
+/// `--worker standby` of the docs, with -c.
+#[test]
+fn standby_hints_name_log_commands_that_work() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = standby_config("sb-hints", port, 1, "env = { FIXTURE_STANDBY_EXIT = \"200\" }").replace(
+        "[restart]\nbackoff_initial = 50\n",
+        "[restart]\nbackoff_initial = 50\nmax_restarts = 1\nfailed_cooldown = 0\n",
+    );
+    let w = Warden::start("sb-hints", port, &cfg);
+    let log = w.wait_log("standbys failed: too many standby crashes", T);
+    let mut commands: Vec<String> = log
+        .lines()
+        .filter(|l| l.contains("standby") && l.contains("hint="))
+        .filter_map(|l| l.split("hint=").nth(1))
+        .flat_map(|h| h.split('`').skip(1).step_by(2).map(str::to_string).collect::<Vec<_>>())
+        .filter(|c| c.starts_with("warden logs "))
+        .collect();
+    commands.sort();
+    commands.dedup();
+    assert_eq!(
+        commands,
+        ["warden logs sb-hints --worker s1", "warden logs sb-hints --worker standby"],
+        "the hints:\n{log}"
+    );
+    let output = "OUT   worker=s1 stdout: fixture: standby exiting";
+    for c in &commands {
+        let args: Vec<&str> = c.split_whitespace().skip(1).chain(["--nostream", "-n", "100"]).collect();
+        let (code, out) = w.cli(&args);
+        assert_eq!(code, 0, "`{c}`: {out}");
+        assert!(out.contains(output), "`{c}` shows the standby's output:\n{out}");
+        assert!(out.contains("WARN  standby crashed worker=s1 pid="), "`{c}`:\n{out}");
+        assert!(!out.contains("worker ready worker=1"), "`{c}` shows only standbys:\n{out}");
+        if c.ends_with("standby") {
+            assert!(out.contains("restart the normal way meanwhile worker=standby max_restarts=1"), "`{c}`:\n{out}");
+        }
+    }
+    let (code, out) = w.cli(&["logs", "--worker", "standby", "--nostream", "-n", "100"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(output) && out.contains("standby starting worker=s1"), "{out}");
+    let (code, out) = w.cli(&["logs", "--worker", "s2", "--nostream"]);
+    assert_eq!((code, out.contains("worker=s1")), (0, false), "{out}");
+    let (code, out) = w.cli(&["logs", "--worker", "stand", "--nostream"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("`standby`"), "{out}");
+    let (code, out) = w.cli(&["restart", "--worker", "standby"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("takes no commands of its own"), "{out}");
+}
+
+/// Wait until `pid` is gone; returns how long that took from `t0`.
+fn gone_within(pid: u64, t0: Instant, limit: Duration, what: &str, w: &Warden) -> Duration {
+    while alive(pid) {
+        assert!(t0.elapsed() < limit, "{what}: pid {pid} still running after {limit:?}\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    t0.elapsed()
+}
+
+/// A standby never holds up a stop, on Node and Bun: its shim reads
+/// Warden's commands without blocking its exit (a Node standby's read of
+/// fd 3 sat on a thread Node joins at exit, so every stop waited for the
+/// grace period's SIGKILL), and Warden ends that read when it stops one.
+/// The standby's own stop signal (fd 3 still open), `warden stop` and
+/// `warden kill` each take well under the 20 s grace period.
+#[test]
+fn a_standby_never_holds_up_a_stop() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    for (name, app) in [
+        ("sbstop-node", format!("command = \"node\"\nargs = [\"{}\"]", fixture("node_app.mjs"))),
+        ("sbstop-bun", format!("args = [\"{}\"]", fixture("app.ts"))),
+    ] {
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\n{app}\nport = {port}\n[workers]\ncount = 1\nstandby = 1\n\
+             [restart]\nbackoff_initial = 50\n[shutdown]\ngrace_period = 20\ndrain_ms = 100\n"
+        );
+        let mut w = Warden::start(name, port, &cfg);
+        let limit = Duration::from_secs(2);
+        let up = |w: &Warden| w.wait_for("a worker and a standby", T, |s| ready(1)(s) && ready_standby(s).is_some());
+
+        // Its own SIGTERM, from outside Warden: the shim drains and exits.
+        let standby = ready_standby(&up(&w)).unwrap();
+        let t0 = Instant::now();
+        unsafe { libc::kill(standby as i32, libc::SIGTERM) };
+        let took = gone_within(standby, t0, limit, &format!("{name}: SIGTERM to the standby"), &w);
+        eprintln!("{name}: a standby's own SIGTERM: gone after {}", ms(took));
+
+        // `warden stop`: the workers and the standby.
+        let s = w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && ready(1)(s));
+        let (worker, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+        let t0 = Instant::now();
+        let (code, out) = w.cli(&["stop"]);
+        assert_eq!(code, 0, "{out}");
+        gone_within(worker, t0, limit, &format!("{name}: warden stop (worker)"), &w);
+        let took = gone_within(standby, t0, limit, &format!("{name}: warden stop (standby)"), &w);
+        eprintln!("{name}: warden stop: the standby was gone after {}", ms(took));
+
+        // `warden kill`: the supervisor exits once its workers and standby have.
+        let (code, out) = w.cli(&["start", name]);
+        assert_eq!(code, 0, "{out}");
+        let standby = ready_standby(&up(&w)).unwrap();
+        let t0 = Instant::now();
+        let (code, out) = w.cli(&["kill", "--yes"]);
+        assert_eq!(code, 0, "{out}");
+        while w.child.try_wait().unwrap().is_none() {
+            assert!(t0.elapsed() < limit, "{name}: warden kill took over {limit:?}\n{}", w.log());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("{name}: warden kill: Warden exited after {}", ms(t0.elapsed()));
+        assert!(!alive(standby), "{name}: the standby outlived Warden");
+        let log = w.log();
+        assert!(!log.contains("did not exit within grace period"), "{name}:\n{log}");
+        assert!(log.contains("standby stopped"), "{name}:\n{log}");
+    }
 }

@@ -1,11 +1,13 @@
 //! Why a worker died, for `last_exit` and the log line of its death.
 //!
 //! The wait status alone says "signal 9". With what Warden knows, the reason
-//! says who: the kernel's OOM killer (the cgroup's `oom_kill` counter went
-//! up), Warden itself (its waiter delivered that signal), another process,
-//! or the program crashing (SIGSEGV, SIGABRT…).
+//! says who: Warden itself (its waiter delivered that signal), the kernel's
+//! OOM killer (the cgroup's `oom_kill` counter went up just before), another
+//! process, or the program crashing (SIGSEGV, SIGABRT…).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Signals Warden delivered to a process (or its group) while it was alive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,12 +48,13 @@ pub enum Reason {
 }
 
 /// What the wait status and Warden's own records say about one death.
-/// `oom`: the OOM kill counter rose by one not yet accounted for (only
-/// asked for SIGKILL deaths, see `OomCounter::took_one`).
+/// `oom`: the OOM kill counter rose just before, by one no other death took
+/// (see `OomCounter::oom_killed`). A SIGKILL Warden sent is Warden's, even
+/// if the counter moved meanwhile (a helper process, another worker).
 pub fn classify(code: Option<i32>, signal: Option<i32>, sent: Sent, stop: i32, oom: bool) -> Reason {
     match (code, signal) {
-        (_, Some(libc::SIGKILL)) if oom => Reason::Oom,
         (_, Some(libc::SIGKILL)) if sent.has(libc::SIGKILL) => Reason::KilledByWarden,
+        (_, Some(libc::SIGKILL)) if oom => Reason::Oom,
         (_, Some(s)) if s == stop && sent.has(stop) => Reason::AfterStop { stop, code: None },
         (_, Some(s)) if sent.has(s) => Reason::SignalFromWarden(s),
         (_, Some(s)) if crash_signal(s).is_some() => Reason::Crashed(s),
@@ -84,13 +87,15 @@ impl Reason {
 
     /// How to fix or investigate it, for the log line of the death.
     /// `oom_detection`: Warden can read the cgroup's OOM kill counter, so a
-    /// SIGKILL that did not raise it was not the OOM killer.
+    /// SIGKILL that did not raise it just before was probably not the OOM
+    /// killer (the counter is read once a second and at each death).
     pub fn hint(self, oom_detection: bool) -> Option<&'static str> {
         Some(match self {
             Reason::Oom => OOM_HINT,
             Reason::Killed(libc::SIGKILL) if oom_detection => {
                 "something outside Warden sent SIGKILL (kill -9 by a person or script, a container runtime); \
-                 Warden restarts it. The kernel's OOM killer was ruled out (the cgroup's oom_kill count did not change)"
+                 Warden restarts it. Probably not the kernel's OOM killer: the cgroup's oom_kill count did not rise \
+                 in the 2 s before this death (`journalctl -k | grep -i oom` to be sure)"
             }
             Reason::Killed(libc::SIGKILL) => {
                 "something outside Warden sent SIGKILL (kill -9, a script, a container runtime), or the kernel's \
@@ -151,20 +156,34 @@ fn crash_signal(s: i32) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// How recent an OOM kill must be to explain a SIGKILL death. The kernel
+/// counts the kill as it sends the SIGKILL, and Warden reads the counter
+/// every second (the supervisor's tick) and at each death, so a worker's
+/// own OOM kill is seen within this; an older one was something else's in
+/// the same cgroup (a helper process the app spawned, a verify_command).
+pub const OOM_WINDOW: Duration = Duration::from_secs(2);
+
+/// Kills remembered at most (a burst in a big cgroup must not grow this).
+const MAX_FRESH: usize = 1024;
+
 /// The kernel's count of OOM kills in the cgroup Warden and its workers run
 /// in (systemd gives each unit one): cgroup v2 `memory.events`, or v1
-/// `memory.oom_control`. Workers share it, so each SIGKILL death takes at
-/// most one kill the counter shows beyond those already accounted for.
+/// `memory.oom_control`. Everything in the cgroup shares it, so a SIGKILL
+/// death takes at most one kill seen within `OOM_WINDOW` before it that no
+/// other death took.
 pub struct OomCounter {
     path: Option<PathBuf>,
+    /// The count at the last read.
     seen: u64,
+    /// When each kill no death has taken yet was first seen, oldest first.
+    fresh: VecDeque<Instant>,
 }
 
 impl OomCounter {
     pub fn new() -> OomCounter {
         let path = counter_path();
         let seen = path.as_deref().and_then(read_counter).unwrap_or(0);
-        OomCounter { path, seen }
+        OomCounter { path, seen, fresh: VecDeque::new() }
     }
 
     /// Whether Warden can tell OOM kills apart here.
@@ -176,17 +195,47 @@ impl OomCounter {
         self.path.as_deref()
     }
 
-    /// Asked when a worker died of SIGKILL: did the OOM killer kill a
-    /// process here since the last time, that no other death accounted for?
-    pub fn took_one(&mut self) -> bool {
-        let Some(now) = self.path.as_deref().and_then(read_counter) else { return false };
-        if now > self.seen {
-            self.seen += 1;
-            true
-        } else {
-            self.seen = now; // a new cgroup started over at 0
-            false
+    /// Read the counter (the supervisor's 1 s tick, and each death): kills
+    /// since the last read are stamped `now`.
+    pub fn sample(&mut self, now: Instant) {
+        if let Some(n) = self.path.as_deref().and_then(read_counter) {
+            self.note(n, now);
         }
+    }
+
+    /// The counter read `n` at `now`.
+    fn note(&mut self, n: u64, now: Instant) {
+        if n < self.seen {
+            self.fresh.clear(); // a new cgroup started over at 0
+        } else {
+            let new = usize::try_from(n - self.seen).unwrap_or(MAX_FRESH).min(MAX_FRESH);
+            self.fresh.extend(std::iter::repeat_n(now, new));
+            while self.fresh.len() > MAX_FRESH {
+                self.fresh.pop_front();
+            }
+        }
+        self.seen = n;
+        self.forget_old(now);
+    }
+
+    fn forget_old(&mut self, now: Instant) {
+        while self.fresh.front().is_some_and(|t| now.saturating_duration_since(*t) > OOM_WINDOW) {
+            self.fresh.pop_front();
+        }
+    }
+
+    /// A worker died of `signal` at `now`: was it the OOM killer? Only for a
+    /// SIGKILL Warden did not send (its own is Warden's, and leaves the kill
+    /// to another death), and only a kill seen within `OOM_WINDOW` that no
+    /// other death took.
+    pub fn oom_killed(&mut self, signal: Option<i32>, sent: Sent, now: Instant) -> bool {
+        signal == Some(libc::SIGKILL) && !sent.has(libc::SIGKILL) && self.took_one(now)
+    }
+
+    fn took_one(&mut self, now: Instant) -> bool {
+        self.sample(now);
+        self.forget_old(now);
+        self.fresh.pop_front().is_some()
     }
 }
 
@@ -286,8 +335,13 @@ mod tests {
         let none = Sent::default();
         let k = Some(libc::SIGKILL);
         assert_eq!(classify(Some(1), None, none, TERM, false), Code(1));
-        assert_eq!(classify(None, k, none, TERM, true), Oom, "the counter rose: OOM, whoever else signalled");
-        assert_eq!(classify(None, k, sent(&[libc::SIGKILL]), TERM, true), Oom);
+        assert_eq!(classify(None, k, none, TERM, true), Oom, "the counter rose: OOM");
+        assert_eq!(classify(None, k, sent(&[TERM]), TERM, true), Oom, "killed while draining");
+        assert_eq!(
+            classify(None, k, sent(&[libc::SIGKILL]), TERM, true),
+            KilledByWarden,
+            "Warden's own SIGKILL wins over a counter that moved meanwhile"
+        );
         assert_eq!(classify(None, k, sent(&[TERM, libc::SIGKILL]), TERM, false), KilledByWarden);
         assert_eq!(classify(None, k, sent(&[TERM]), TERM, false), Killed(libc::SIGKILL));
         assert_eq!(classify(None, k, none, TERM, false), Killed(libc::SIGKILL));
@@ -318,7 +372,9 @@ mod tests {
         assert!(Reason::Oom.short().contains("OOM killer"));
         assert!(Reason::Oom.hint(true).unwrap().contains("memory.max / MemoryMax="));
         assert!(Reason::Oom.hint(true).unwrap().contains("[limits] max_memory"));
-        assert!(Reason::Killed(libc::SIGKILL).hint(true).unwrap().contains("ruled out"));
+        assert!(Reason::Oom.short() == "killed by the kernel OOM killer (out of memory)", "alerts match it");
+        let kill9 = Reason::Killed(libc::SIGKILL).hint(true).unwrap();
+        assert!(kill9.contains("Probably not the kernel's OOM killer") && !kill9.contains("ruled out"), "{kill9}");
         assert!(Reason::Killed(libc::SIGKILL).hint(false).unwrap().contains("journalctl -k"));
         assert!(Reason::Killed(TERM).hint(true).unwrap().contains("KillMode=mixed"));
         assert!(Reason::Crashed(libc::SIGSEGV).hint(true).unwrap().contains("coredumpctl"));
@@ -395,25 +451,76 @@ mod tests {
         assert!(counter_candidates("garbage\n", "junk without separator\n").is_empty());
     }
 
+    const KILL: Option<i32> = Some(libc::SIGKILL);
+
+    fn counter(path: Option<PathBuf>, seen: u64) -> OomCounter {
+        OomCounter { path, seen, fresh: VecDeque::new() }
+    }
+
     #[test]
     fn counter_takes_one_kill_per_death() {
         let dir = std::env::temp_dir().join(format!("warden-oom-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("memory.events");
         std::fs::write(&f, "oom_kill 4\n").unwrap();
-        let mut c = OomCounter { path: Some(f.clone()), seen: 4 };
-        assert!(!c.took_one(), "no change");
+        let mut c = counter(Some(f.clone()), 4);
+        let (none, now) = (Sent::default(), Instant::now());
+        assert!(!c.oom_killed(KILL, none, now), "no change");
         std::fs::write(&f, "oom_kill 6\n").unwrap();
-        assert!(c.took_one() && c.took_one(), "two workers killed at once: one each");
-        assert!(!c.took_one());
+        assert!(c.oom_killed(KILL, none, now) && c.oom_killed(KILL, none, now), "two killed at once: one each");
+        assert!(!c.oom_killed(KILL, none, now));
         std::fs::write(&f, "oom_kill 1\n").unwrap();
-        assert!(!c.took_one(), "a new cgroup starts over");
+        assert!(!c.oom_killed(KILL, none, now), "a new cgroup starts over");
         std::fs::write(&f, "oom_kill 2\n").unwrap();
-        assert!(c.took_one());
+        assert!(!c.oom_killed(Some(libc::SIGTERM), none, now), "only SIGKILL deaths ask");
+        assert!(c.oom_killed(KILL, none, now));
         std::fs::remove_file(&f).unwrap();
-        assert!(!c.took_one(), "unreadable: not an OOM kill");
-        let none = OomCounter { path: None, seen: 0 };
-        assert!(!none.available());
+        assert!(!c.oom_killed(KILL, none, now), "unreadable: not an OOM kill");
+        assert!(!counter(None, 0).available());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Only a kill seen within OOM_WINDOW before a death is charged to it:
+    /// one from long before (a helper process, a verify_command in the same
+    /// cgroup) used to be charged to the next SIGKILL death, however late.
+    #[test]
+    fn an_old_oom_kill_is_not_charged_to_a_later_death() {
+        let (none, t0) = (Sent::default(), Instant::now());
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut c = counter(None, 4);
+        c.note(5, t0); // the tick sees a kill
+        assert!(!c.oom_killed(KILL, none, at(60)), "a minute later: someone else's kill");
+        c.note(5, at(61));
+        assert!(!c.oom_killed(KILL, none, at(61)), "and it stays forgotten");
+        // Seen by the tick 1 s before the death, or at the death itself.
+        c.note(6, at(100));
+        assert!(c.oom_killed(KILL, none, at(101)));
+        c.note(7, at(110));
+        assert!(c.oom_killed(KILL, none, at(110)) && !c.oom_killed(KILL, none, at(110)), "one kill, one death");
+        assert_eq!(OOM_WINDOW, Duration::from_secs(2), "the hint says 2 s");
+    }
+
+    /// Warden's own SIGKILL (grace period over, hung, not ready in time) is
+    /// Warden's even if the counter moved meanwhile, and leaves that kill to
+    /// the death it belongs to.
+    #[test]
+    fn wardens_own_kill_is_never_an_oom_kill() {
+        let (t0, warden) = (Instant::now(), {
+            let mut s = Sent::default();
+            s.add(libc::SIGTERM);
+            s.add(libc::SIGKILL);
+            s
+        });
+        let mut c = counter(None, 0);
+        c.note(1, t0);
+        let oom = c.oom_killed(KILL, warden, t0);
+        assert!(!oom);
+        assert_eq!(classify(None, KILL, warden, TERM, oom), Reason::KilledByWarden);
+        // The other worker the OOM killer took at the same time gets it.
+        let oom = c.oom_killed(KILL, Sent::default(), t0);
+        assert_eq!(classify(None, KILL, Sent::default(), TERM, oom), Reason::Oom);
+        // A burst is bounded.
+        c.note(1 << 40, t0);
+        assert_eq!(c.fresh.len(), MAX_FRESH);
     }
 }

@@ -18,6 +18,9 @@ impl Supervisor {
     pub(super) fn on_tick(&mut self) {
         crate::guard::fault("tick");
         self.ticks += 1;
+        // OOM kills are charged only to deaths right after them: stamp new
+        // ones now (also while stopped: a kill seen late must not look fresh).
+        self.oom.sample(Instant::now());
         let gap = self.systemd_watchdog();
         if self.shutting_down || self.stopped {
             return;
@@ -123,12 +126,17 @@ impl Supervisor {
             .collect();
         for (id, worker, silent) in hung {
             let worker_mode = self.is_worker_mode();
+            // Worker mode: the silent Worker thread; else the process (`s1`: a standby).
+            let who = match self.insts.get(&id) {
+                Some(i) if !worker_mode => self.inst_label(i),
+                _ => worker.to_string(),
+            };
             let Some(i) = self.insts.get_mut(&id) else { continue };
             i.hung = true;
             let (slot, role, pid) = (i.slot, i.role, i.handle.pid);
             error!(
                 "worker hung: no heartbeat from its event loop",
-                worker = worker,
+                worker = who,
                 pid = pid,
                 silent_s = silent.as_secs(),
                 hint = "its event loop is blocked (an endless loop, a synchronous call that never returns) or the \

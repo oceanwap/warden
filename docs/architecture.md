@@ -36,7 +36,7 @@ below comes from running them, not from documentation.
 | F12 | Inherited fds / Worker env | A Bun process can write JSON lines to an inherited fd 3. `new Worker(url, { env })` gives each Worker its own `process.env`. |
 | F13 | Can one Bun process serve the same app on a second, private Unix socket? | **Yes**, for `Bun.serve` fetch apps, plain `node:http` and NestJS: calling the original `Bun.serve` with the app's own options object plus `unix: <path>` gives a second listener with the same handler. This is how Warden health-checks one specific worker. |
 | F14 | Worker‑mode reload under load | 9–15 resets per ~100 k requests with `tcp_migrate_req = 0`, **0** with `1` (3 runs). Same for fresh-connection clients in process mode (~1 reset per replaced worker → 0). |
-| F15 | Can an app start completely but listen later (hot standby)? | **Yes, from the shim.** `Bun.serve`: start the app's options on a private Unix socket or an ephemeral 127.0.0.1 port (a stand-in) and hand the app a Proxy whose target becomes the real server later; WebSocket `publish`, `subscriberCount`, `stop()` through the app's reference reach the real server. Bun's `node:http` **rejects a Proxy** ("The "server" argument must be of type bun.Server"): it gets the stand-in itself, keeps it under `Symbol(::bunternal::)` and emits `listening` through `EventEmitter.prototype.emit`, where the shim finds it; swapping the symbol to the real server makes `address()` and `close()` act on it. Node: `listen()` is recorded and replayed. Measured promote → port answering: Bun.serve 0.7–1.5 ms, node:http on Bun 1.4 ms, NestJS on Bun 2 ms, node:http on Node **9–13 ms** (first `listen` compiles and loads its path) → **2–3 ms** with a warm-up listen on an ephemeral port during standby, NestJS on Node 2–3 ms. `fs.read` on fd 3 (a blocking socket) runs on the thread pool in both runtimes; the event loop keeps running (49 timer ticks during a 500 ms read). |
+| F15 | Can an app start completely but listen later (hot standby)? | **Yes, from the shim.** `Bun.serve`: start the app's options on a private Unix socket or an ephemeral 127.0.0.1 port (a stand-in) and hand the app a Proxy whose target becomes the real server later; WebSocket `publish`, `subscriberCount`, `stop()` through the app's reference reach the real server. Bun's `node:http` **rejects a Proxy** ("The "server" argument must be of type bun.Server"): it gets the stand-in itself, keeps it under `Symbol(::bunternal::)` and emits `listening` through `EventEmitter.prototype.emit`, where the shim finds it; swapping the symbol to the real server makes `address()` and `close()` act on it. Node: `listen()` is recorded and replayed. Measured promote → port answering: Bun.serve 0.7–1.5 ms, node:http on Bun 1.4 ms, NestJS on Bun 2 ms, node:http on Node **9–13 ms** (first `listen` compiles and loads its path) → **2–3 ms** with a warm-up listen on an ephemeral port during standby, NestJS on Node 2–3 ms. `fs.read` on fd 3 (a blocking socket) runs on the thread pool in both runtimes; the event loop keeps running (49 timer ticks during a 500 ms read). But Node joins its pool's threads at exit, so a standby's `process.exit()` waited for that read until SIGKILL: Node reads fd 3 through a `net.Socket` (the event loop) instead; Bun keeps `fs.read` (its `net.Socket` can't take an fd, and its exit doesn't wait). Warden also shuts down its end when it stops a standby (EOF). |
 
 Note: the sandbox these probes first ran in exported `BUN_OPTIONS=--smol`;
 F5/F6 were re-measured without it (numbers above). The benchmark harness
@@ -163,12 +163,16 @@ Every death gets a reason (`last_exit`, the `crashed` event's detail, and the
 log line, with a `hint=`), not just the wait status. The task that owns each
 worker records the signals it delivered, so a SIGKILL is either *Warden's*
 (grace period over, hung, not ready in time) or *another process's*; an exit
-after Warden's stop signal is a normal stop. A SIGKILL is the kernel's *OOM
-killer* when the `oom_kill` counter of Warden's cgroup (cgroup v2
-`memory.events`, or v1 `memory.oom_control`, found through
-`/proc/self/cgroup` and `/proc/self/mountinfo`) rose since the last death it
-accounted for: workers share the cgroup, so each SIGKILL death takes at most
-one count. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
+after Warden's stop signal is a normal stop. A SIGKILL Warden did not send
+is the kernel's *OOM killer* when the `oom_kill` counter of Warden's cgroup
+(cgroup v2 `memory.events`, or v1 `memory.oom_control`, found through
+`/proc/self/cgroup` and `/proc/self/mountinfo`) rose in the 2 s before the
+death: Warden reads it every second (the tick) and at each death, stamping
+each rise with when it was seen. Everything in the cgroup shares the
+counter, so each SIGKILL death takes at most one recent rise; an older one
+was something else's (a helper process, a `verify_command`) and is
+forgotten. A SIGKILL Warden sent stays Warden's even if the counter moved
+meanwhile. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
 Without a readable counter (macOS, no memory controller) an OOM kill reads as
 another process's SIGKILL, and the hint says it may be either.
 
@@ -198,7 +202,11 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   once no worker is starting (they would compete for the CPU). `status`
   lists them in `standbys` (`WARMING`, `STANDBY`; additive, so older
   clients just don't show them), the GUI counts their memory and CPU, and
-  Prometheus gets `warden_standbys_*`. A Bun standby's stand-in server
+  Prometheus gets `warden_standbys_*`. Standbys are numbered 1..=N (a new
+  one takes the lowest number no live one has): `s1`, `s2`… in `warden
+  status`, `worker=s1` on their log lines and output, so `warden logs
+  --worker s1` follows one and `--worker standby` all of them with the
+  pool's own lines (`worker=standby`). A Bun standby's stand-in server
   serves on its private health socket when there is one, else on an
   ephemeral 127.0.0.1 port: no socket path of its own, so no length limit.
 - **Gates.** Promotable only after `standby_ready` (initialized: the app
@@ -217,7 +225,7 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   `NODE_APP_INSTANCE`, `process.emit("warden:promote")`), Warden relabels its
   output `worker=k` and gives it `PROMOTE_TIMEOUT` (5 s) to listen. Events:
   `starting` and `ready` of worker k with detail `promoted from standby`; log
-  `worker promoted from standby worker=k pid=… promote_ms=…`. A new standby
+  `worker promoted from standby worker=k pid=… standby=sN promote_ms=…`. A new standby
   starts once the promoted one listens.
 - **Crash loops.** Standby exits (and failed gates) share one restart
   tracker with the slots' policy: backoff, then FAILED (a `FAILED` row) until
@@ -230,7 +238,10 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   version. Recycling (`Kind::Replace`: memory, lifetime, health, hang) keeps
   the code, so an available standby is the replacement: it listens next to
   the old worker, passes the remaining gates, then the old one drains.
-  `scale` changes only the slots. With `[reload] surge` a batch of new
+  A standby's instance number (`instance_var`) is past the workers' and no
+  other standby's; `scale` up replaces a standby whose number a new worker
+  takes (it would run instance-specific code twice until promoted), and
+  otherwise changes only the slots. With `[reload] surge` a batch of new
   workers starts next to the old ones; the standbys stay out of it (they
   are paused, and kept if the batch rolls back), so a surge's peak memory
   is 2 × batch + standbys.

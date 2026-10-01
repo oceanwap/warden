@@ -26,7 +26,9 @@ if (process.env.FIXTURE_THROW_AFTER) {
 if (process.env.FIXTURE_IGNORE_TERM) process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
 if (process.env.FIXTURE_STANDBY_EXIT) {
   setTimeout(() => {
-    if (process.env.WARDEN_STANDBY === "1") process.exit(4);
+    if (process.env.WARDEN_STANDBY !== "1") return;
+    console.log("fixture: standby exiting");
+    process.exit(4);
   }, Number(process.env.FIXTURE_STANDBY_EXIT));
 }
 

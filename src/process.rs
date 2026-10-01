@@ -149,6 +149,17 @@ impl Handle {
         }
     }
 
+    /// Nothing more for the worker: shut down Warden's sending side of fd 3,
+    /// so a read the worker has pending there returns (EOF) instead of
+    /// waiting forever (a Node standby's read on a thread-pool thread held
+    /// up its exit). Its messages to Warden still arrive.
+    pub fn close_input(&self) {
+        if let Some(ipc) = self.ipc.as_ref() {
+            // NotConnected: the worker is gone already; nothing to end.
+            let _ = ipc.shutdown(std::net::Shutdown::Write);
+        }
+    }
+
     /// From now on, label this process's captured output `label`.
     pub fn relabel(&self, label: &str) {
         *self.label.0.borrow_mut() = label.into();
@@ -513,7 +524,9 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
                 stream = stream,
                 dropped = n,
                 limit_per_s = limit,
-                hint = "lower the app's log level, raise [logging] max_lines_per_sec (0 = no limit), or set [logging] worker_output = \"inherit\"",
+                hint = "lower the app's log level, raise [logging] max_lines_per_sec (0 = no limit), or set [logging] \
+                        worker_output = \"inherit\" (straight to Warden's stdout, not in `warden logs`) or \"direct\" \
+                        (into out_file, no budget)",
             );
         }
     }
@@ -919,6 +932,57 @@ mod tests {
                 }
                 // The worker is gone: sending fails cleanly instead of blocking.
                 assert!(h.send(b"again\n").is_err());
+            })
+            .await;
+    }
+
+    /// `close_input`: a worker blocked reading fd 3 (and deaf to SIGTERM)
+    /// gets EOF at once, and can still report to Warden afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_input_ends_a_pending_read_on_fd3() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let spec = Spec {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        r#"trap '' TERM; echo '{"ev":"reading"}' >&3; read -r l <&3; echo "{\"ev\":\"eof $?\"}" >&3"#
+                            .into(),
+                    ],
+                    cwd: None,
+                    env: vec![],
+                    label: "t".into(),
+                    output: Output::Capture,
+                    max_lines_per_sec: 0,
+                };
+                let h = spawn(spec, 3, tx).unwrap();
+                async fn next(rx: &mut mpsc::UnboundedReceiver<ProcEvent>) -> ProcEvent {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("the worker is still blocked in its read")
+                        .unwrap()
+                }
+                match next(&mut rx).await {
+                    ProcEvent::Ipc { msg, .. } => assert_eq!(msg.ev, "reading"),
+                    e => panic!("unexpected {e:?}"),
+                }
+                h.signal(libc::SIGTERM); // ignored: only the EOF ends the read
+                h.close_input();
+                let (mut got_eof, mut got_exit) = (false, false);
+                while !(got_eof && got_exit) {
+                    match next(&mut rx).await {
+                        ProcEvent::Ipc { msg, .. } => {
+                            assert_eq!(msg.ev, "eof 1", "read(1) saw the end of input");
+                            got_eof = true;
+                        }
+                        ProcEvent::Exited { code, .. } => {
+                            assert_eq!(code, Some(0));
+                            got_exit = true;
+                        }
+                    }
+                }
             })
             .await;
     }
