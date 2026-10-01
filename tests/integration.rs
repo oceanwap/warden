@@ -383,6 +383,27 @@ fn stuck_worker_is_killed_after_grace_period() {
     assert!(w.log().contains("SIGKILL"));
 }
 
+/// The shim's Response and ReadableStream wrappers (Bun, for SSE drains)
+/// pass for the native constructors: `constructor`, `toString`, `name`,
+/// `length`, statics, `Symbol.hasInstance`, subclasses, the TypeError
+/// without `new` (tests/fixtures/shim_response.ts lists every check).
+#[test]
+fn shim_response_wrapper_passes_for_the_native_one() {
+    if !have_bun() {
+        return;
+    }
+    let shim = format!("{}/shim/warden-shim.mjs", env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bun").args(["--preload", &shim, &fixture("shim_response.ts")]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    let checks: Value =
+        serde_json::from_str(text.lines().last().unwrap_or("")).unwrap_or_else(|e| panic!("{e}: {text}"));
+    assert_eq!(checks["hooked"], true, "the wrappers are not installed: {checks:#}");
+    let failed: Vec<&String> =
+        checks.as_object().unwrap().iter().filter(|(_, v)| **v != true).map(|(k, _)| k).collect();
+    assert!(failed.is_empty(), "the wrapper shows through: {failed:?}\n{checks:#}");
+}
+
 #[test]
 fn shim_lets_node_http_share_the_port() {
     if !have_bun() {

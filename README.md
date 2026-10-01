@@ -722,6 +722,15 @@ Limitations:
 - Worker mode needs Bun and the shim.
 - Node apps share the port through Warden's shim (`--import`, Node ≥ 22.12
   for `reusePort`); older Node needs `port_strategy = "offset"`.
+- On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
+  bodies in a drain (about 20 ns per `new Response`). The wrappers pass for
+  Bun's own: `instanceof` (also for `fetch()` responses), `constructor`,
+  `name`, `length`, the statics, subclassing, the error without `new`, and
+  the source text (`Function.prototype.toString` is wrapped for that: one
+  lookup per call). What still differs: they are other function objects,
+  `Bun.inspect(Response)` shows `[Function: Response]` rather than
+  `[class Response]`, and their own property names list `prototype` before
+  the statics. `[shutdown] long_lived_timeout = 0` leaves both untouched.
 - If Warden is SIGKILLed, workers are signalled via `PR_SET_PDEATHSIG` (direct
   children only). Under systemd the cgroup takes care of the rest.
 - Don't run Warden as PID 1 in a container; use `tini`, or `docker run --init`, to reap orphans.
