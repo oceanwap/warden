@@ -39,8 +39,26 @@ are in [`docs/architecture.md`](docs/architecture.md) (findings F1–F14) and
 
 ## Install
 
-Every release on [GitHub Releases](https://github.com/oceanwap/warden/releases)
-has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
+Prebuilt archives are attached to each
+[GitHub Release](https://github.com/oceanwap/warden/releases). Where no
+release has been published yet (or to run the latest `main`), build from
+source (see [Quick start](#quick-start) and [Development](#development)):
+
+```sh
+git clone https://github.com/oceanwap/warden.git
+cd warden
+cargo build --release                       # → target/release/warden
+```
+
+`install.sh` picks the release archive for your OS and CPU, checks it against
+the release's `SHA256SUMS`, and puts `warden` in `/usr/local/bin` (as root) or
+`~/.local/bin`. With no release published it stops with a message saying the
+release files are missing. `WARDEN_DOWNLOAD_URL` points it
+at a directory that already holds the release files (a mirror, or CI testing
+an unreleased build).
+
+Each release has two products for Linux
+(x86_64, arm64) and macOS (arm64, x86_64):
 
 - **CLI only**: `warden-<version>-<os>-<arch>.tar.gz` with the `warden`
   binary, this README and `contrib/` (systemd units, sysctl file, nginx site). The Linux
@@ -59,9 +77,7 @@ has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
   `xattr -dr com.apple.quarantine /Applications/Warden.app`. The CLI
   installed by `install.sh` is not affected.
 
-`install.sh` installs the CLI: it picks the archive for your OS and CPU,
-checks it against the release's `SHA256SUMS`, and puts `warden` in
-`/usr/local/bin` (as root) or `~/.local/bin`:
+After a Release exists:
 
 ```sh
 curl -fsSLO https://github.com/oceanwap/warden/releases/latest/download/install.sh
@@ -803,7 +819,14 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 
 ## Development
 
+**Toolchain.** CI builds with Rust `1.95.0` (pinned in the workflows, because a
+new release brings new clippy lints and `-D warnings` turns them into
+failures; bump it on purpose). The crates declare the lowest versions they are
+meant to build with: `warden` and `warden-protocol` 1.85, `warden-gui` 1.88
+(iced 0.14). Newer stable toolchains work, but only the pinned one is tested.
+
 ```sh
+rustup toolchain install 1.95.0
 cargo test                  # unit + integration tests (integration tests need `bun` and `node` on PATH)
 cargo clippy --all-targets
 cargo test --workspace --bins --tests          # also protocol/ and gui/ (the GUI's own tests)
