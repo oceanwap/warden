@@ -608,6 +608,28 @@ fn safe_reload_rolls_back_a_bad_canary() {
     let (code, out) = w.cli(&["safe-reload"]);
     assert_eq!(code, 0, "{out}");
     assert!(pid_set(&w.status().unwrap()).is_disjoint(&before));
+    every_warning_has_a_hint(&w.log());
+}
+
+/// Found by `cargo xtask chaos` (overlap): a rollout cut short by
+/// `restart --hard` logged `ERROR aborted: …` with no hint, like every
+/// failed rollout's line.
+#[test]
+fn an_aborted_rollout_says_what_to_do() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("abort", port, &gated("abort", port, 2, "").replace("canary_soak = 1", "canary_soak = 5"));
+    w.wait_for("ready", T, ready(2));
+    let (code, out) = w.cli(&["safe-reload", "--no-wait"]);
+    assert_eq!(code, 0, "{out}");
+    w.wait_for("the canary soaking", T, |s| !s["rollout"].is_null());
+    let (code, out) = w.cli(&["restart", "--hard"]);
+    assert_eq!(code, 0, "{out}");
+    let log = w.wait_log("aborted: workers are being stopped", T);
+    w.wait_for("ready again", T, |s| s["workers_ready"] == 2 && s["rollout"].is_null());
+    every_warning_has_a_hint(&log);
 }
 
 #[test]
