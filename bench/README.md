@@ -13,7 +13,9 @@ cargo xtask bench --only longlived --no-readme   # WebSockets and SSE through a 
 ```
 
 `cargo xtask` is a cargo alias (`.cargo/config.toml`) for the `xtask` crate
-in this repository; it is not part of `cargo build`. It checks the tools
+in this repository; it is not part of `cargo build`. (The same crate releases
+Warden: `cargo xtask release`, alias `cargo release`; see
+[`docs/releasing.md`](../docs/releasing.md).) It checks the tools
 below, installs the npm packages on first run (`npm ci` here and in
 `bench/nest`), builds Warden in release mode, runs every suite, writes
 `bench/results/latest.md` and `bench/results/latest/<suite>.json`, and
