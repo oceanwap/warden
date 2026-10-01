@@ -3344,3 +3344,417 @@ fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
     assert!(out.contains("wardend: stopped wardend.service"), "{out}");
     assert!(fakes.take().contains("stop wardend.service"));
 }
+
+// ---- long-lived connections
+//
+// WebSocket and SSE clients held through `warden reload`: the old workers
+// must end them cleanly (close 1001, a terminated chunked stream) within
+// shutdown.long_lived_timeout, and the clients reconnect to new workers.
+
+/// How a long-lived connection ended, as its client saw it.
+#[derive(Debug, Clone, PartialEq)]
+enum Ended {
+    /// Still open when the test stopped watching (after the reload).
+    Open,
+    /// A WebSocket close frame with this code, answered, then FIN.
+    WsClose(u16),
+    /// The chunked SSE stream terminated; `complete`: after a whole event.
+    SseEnd { complete: bool },
+    /// Anything else: EOF without a close frame (WebSocket 1006) or without
+    /// the last chunk, a reset, an error.
+    Broken(String),
+}
+
+#[derive(Debug)]
+struct Session {
+    /// "<pid>:<thread>" (Bun) or "<pid>" (Node), from the first message / event.
+    who: String,
+    ended: Ended,
+}
+
+impl Session {
+    fn pid(&self) -> u64 {
+        self.who.split(':').next().and_then(|p| p.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// Reads into `buf` until `parse` takes what it needs from it. `Ok(None)`:
+/// `stop` was set first. `Err`: EOF, a reset or another error.
+fn read_for<T>(
+    s: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    stop: Option<&AtomicBool>,
+    deadline: Instant,
+    mut parse: impl FnMut(&mut Vec<u8>) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some(t) = parse(buf) {
+            return Ok(Some(t));
+        }
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Ok(None);
+        }
+        if Instant::now() > deadline {
+            return Err("timed out".into());
+        }
+        match s.read(&mut tmp) {
+            Ok(0) => return Err("EOF".into()),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err("connection reset".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+fn http_head(b: &mut Vec<u8>) -> Option<String> {
+    let i = b.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&b[..i]).to_string();
+    b.drain(..i + 4);
+    Some(head)
+}
+
+/// One server frame (unmasked) off the front of `buf`: (opcode, payload).
+fn ws_frame(b: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+    if b.len() < 2 {
+        return None;
+    }
+    let (len, off) = match b[1] & 0x7f {
+        126 if b.len() >= 4 => (u16::from_be_bytes([b[2], b[3]]) as usize, 4),
+        127 if b.len() >= 10 => (u64::from_be_bytes(b[2..10].try_into().unwrap()) as usize, 10),
+        126 | 127 => return None,
+        n => (n as usize, 2),
+    };
+    if b.len() < off + len {
+        return None;
+    }
+    let frame = (b[0] & 0x0f, b[off..off + len].to_vec());
+    b.drain(..off + len);
+    Some(frame)
+}
+
+/// A client frame (masked, short payload).
+fn ws_client_frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [0x37, 0xfa, 0x21, 0x3d];
+    let mut f = vec![0x80 | op, 0x80 | payload.len() as u8, mask[0], mask[1], mask[2], mask[3]];
+    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    f
+}
+
+fn connect_long_lived(port: u16, request: &str) -> Result<TcpStream, String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    s.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    Ok(s)
+}
+
+/// A WebSocket on /ws until the server closes it (answered like a browser
+/// does) or `stop` is set. `hello` runs once the server's first message is in.
+fn ws_session(port: u16, stop: &AtomicBool, hello: &dyn Fn()) -> Result<Session, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut s = connect_long_lived(
+        port,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )?;
+    let mut buf = Vec::new();
+    let head = read_for(&mut s, &mut buf, None, deadline, http_head)?.unwrap_or_default();
+    if !head.starts_with("HTTP/1.1 101") {
+        return Err(format!("no upgrade: {head}"));
+    }
+    let who = match read_for(&mut s, &mut buf, None, deadline, ws_frame)? {
+        Some((1, p)) => String::from_utf8_lossy(&p).to_string(),
+        other => return Err(format!("expected the server's hello, got {other:?}")),
+    };
+    hello();
+    let ended = loop {
+        match read_for(&mut s, &mut buf, Some(stop), deadline, ws_frame) {
+            Ok(None) => break Ended::Open,
+            Ok(Some((8, p))) => {
+                let code = if p.len() >= 2 { u16::from_be_bytes([p[0], p[1]]) } else { 1005 };
+                let _ = s.write_all(&ws_client_frame(8, &p[..p.len().min(2)]));
+                break match read_for(&mut s, &mut buf, None, deadline, |_| None::<()>) {
+                    Err(e) if e == "EOF" => Ended::WsClose(code),
+                    Err(e) => Ended::Broken(format!("close {code}, then {e}")),
+                    Ok(_) => Ended::Broken("unreachable".into()),
+                };
+            }
+            Ok(Some(_)) => {}
+            Err(e) => break Ended::Broken(format!("{e} without a close frame (a browser reports 1006)")),
+        }
+    };
+    Ok(Session { who, ended })
+}
+
+/// One chunk of a chunked body off the front of `buf` (empty: the last one).
+fn http_chunk(b: &mut Vec<u8>) -> Option<Result<Vec<u8>, String>> {
+    let i = b.windows(2).position(|w| w == b"\r\n")?;
+    let line = String::from_utf8_lossy(&b[..i]).to_string();
+    let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16) else {
+        return Some(Err(format!("bad chunk size line {line:?}")));
+    };
+    if b.len() < i + 2 + size + 2 {
+        return None;
+    }
+    let data = b[i + 2..i + 2 + size].to_vec();
+    b.drain(..i + 2 + size + 2);
+    Some(Ok(data))
+}
+
+/// An SSE stream (an EventSource's request) until the server ends it or
+/// `stop` is set. `hello` runs once the first event is in.
+fn sse_session(port: u16, path: &str, stop: &AtomicBool, hello: &dyn Fn()) -> Result<Session, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut s = connect_long_lived(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
+        ),
+    )?;
+    let mut buf = Vec::new();
+    let head = read_for(&mut s, &mut buf, None, deadline, http_head)?.unwrap_or_default();
+    let lower = head.to_ascii_lowercase();
+    if !head.starts_with("HTTP/1.1 200")
+        || !lower.contains("content-type: text/event-stream")
+        || !lower.contains("transfer-encoding: chunked")
+    {
+        return Err(format!("not a chunked event stream: {head}"));
+    }
+    let mut body = String::new();
+    let mut who: Option<String> = None;
+    let ended = loop {
+        match read_for(&mut s, &mut buf, who.as_ref().map(|_| stop), deadline, http_chunk) {
+            Ok(None) => break Ended::Open,
+            Ok(Some(Err(e))) => break Ended::Broken(e),
+            Ok(Some(Ok(data))) if data.is_empty() => break Ended::SseEnd { complete: body.ends_with("\n\n") },
+            Ok(Some(Ok(data))) => {
+                body.push_str(&String::from_utf8_lossy(&data));
+                if who.is_none() {
+                    // "id: 0\ndata: <who> 0\n\n"
+                    if let Some(w) = body.lines().find_map(|l| l.strip_prefix("data: ")) {
+                        who = w.split(' ').next().map(str::to_string);
+                        hello();
+                    }
+                }
+            }
+            Err(e) => break Ended::Broken(format!("{e} before the stream's last chunk")),
+        }
+    };
+    Ok(Session { who: who.unwrap_or_default(), ended })
+}
+
+/// A client that reconnects at once whenever its connection ends, until it
+/// sits on a connection still open when `stop` is set.
+fn hold(
+    port: u16,
+    path: &'static str,
+    stop: Arc<AtomicBool>,
+    connected: Arc<AtomicUsize>,
+) -> std::thread::JoinHandle<Vec<Result<Session, String>>> {
+    std::thread::spawn(move || {
+        let mut sessions = Vec::new();
+        let first = AtomicBool::new(true);
+        let hello = || {
+            if first.swap(false, Ordering::Relaxed) {
+                connected.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        while sessions.len() < 20 {
+            let r =
+                if path == "/ws" { ws_session(port, &stop, &hello) } else { sse_session(port, path, &stop, &hello) };
+            let open = matches!(&r, Ok(s) if s.ended == Ended::Open);
+            if r.is_err() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            sessions.push(r);
+            if open || stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        sessions
+    })
+}
+
+struct LongLivedRun {
+    before: HashSet<u64>,
+    after: HashSet<u64>,
+    took: Duration,
+    clients: Vec<(&'static str, Vec<Result<Session, String>>)>,
+    ok: usize,
+    fail: usize,
+}
+
+/// One client per path (`/ws` or an SSE path) plus a plain-request loop,
+/// held through `warden reload`.
+fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
+    let port = w.port;
+    let before = pid_set(&w.wait_for("ready", T, ready(workers)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = paths.iter().map(|p| (*p, hold(port, p, stop.clone(), connected.clone()))).collect();
+    let t0 = Instant::now();
+    while connected.load(Ordering::Relaxed) < paths.len() {
+        assert!(t0.elapsed() < T, "long-lived clients did not connect\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let plain_stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let plain = {
+        let (stop, ok, fail) = (plain_stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match get(port, "/whoami") {
+                    Some(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    None => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    let (code, out) = w.cli(&["reload"]);
+    let took = t0.elapsed();
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let after = pid_set(&w.status().unwrap());
+    // Give the last reconnects a moment to land, then stop watching.
+    std::thread::sleep(Duration::from_millis(300));
+    plain_stop.store(true, Ordering::Relaxed);
+    plain.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let clients = handles.into_iter().map(|(p, h)| (p, h.join().unwrap())).collect();
+    LongLivedRun { before, after, took, clients, ok: ok.load(Ordering::Relaxed), fail: fail.load(Ordering::Relaxed) }
+}
+
+/// Every client was ended cleanly by an old worker, reconnected, and ends up
+/// on a new one; plain requests didn't fail; the reload didn't wait for
+/// grace_period.
+fn assert_clean_handover(w: &Warden, run: &LongLivedRun, max_took: Duration) {
+    let log = w.log();
+    eprintln!("reload took {:?}; plain requests: {} ok, {} failed", run.took, run.ok, run.fail);
+    assert!(run.before.is_disjoint(&run.after), "every worker replaced: {:?} -> {:?}", run.before, run.after);
+    for (path, sessions) in &run.clients {
+        eprintln!("{path}: {sessions:?}");
+        let sessions: Vec<&Session> = sessions
+            .iter()
+            .map(|s| s.as_ref().unwrap_or_else(|e| panic!("{path}: a connection failed: {e}\n{log}")))
+            .collect();
+        assert!(sessions.len() >= 2, "{path}: never handed over: {sessions:?}\n{log}");
+        let (last, ended) = sessions.split_last().unwrap();
+        for s in ended {
+            let clean = if *path == "/ws" { Ended::WsClose(1001) } else { Ended::SseEnd { complete: true } };
+            assert_eq!(s.ended, clean, "{path}: {s:?}\n{log}");
+            assert!(run.before.contains(&s.pid()), "{path}: only old workers end connections: {s:?}");
+        }
+        assert_eq!(last.ended, Ended::Open, "{path}: {last:?}");
+        assert!(run.after.contains(&last.pid()), "{path}: reconnected to a new worker: {last:?}, new {:?}", run.after);
+    }
+    assert!(run.ok > 20, "plain requests kept being served: {} ok", run.ok);
+    assert!(run.fail <= allowed_resets(), "plain requests failed during the reload: {}", run.fail);
+    assert!(log.contains("closed long-lived connections so their clients reconnect to new workers"), "{log}");
+    assert!(!log.contains("did not exit within grace period"), "{log}");
+    assert!(run.took < max_took, "reload took {:?} (limit {max_took:?})\n{log}", run.took);
+}
+
+fn long_lived_config(name: &str, port: u16, app: &str, extra: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nport = {port}\n{app}\n[restart]\nbackoff_initial = 50\n\
+         [shutdown]\ngrace_period = 30\ndrain_ms = 100\nlong_lived_timeout = 1\n{extra}"
+    )
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_a_bun_reload() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 2", fixture("longlived.ts"));
+    let w = Warden::start("ll-bun", port, &long_lived_config("ll-bun", port, &app, ""));
+    // Every kind of SSE body: a ReadableStream, a `type: "direct"` one, an async generator.
+    let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-direct", "/sse-gen"]);
+    // Two workers, each: start (~0.3 s), then at most long_lived_timeout (1 s)
+    // + the closing handshakes. Without the shim ending them: grace_period (30 s) each.
+    assert_clean_handover(&w, &run, Duration::from_secs(10));
+    let log = w.log();
+    assert!(log.contains("websockets=1") && log.contains("sse="), "{log}");
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_a_node_reload() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("command = \"node\"\nargs = [\"{}\"]\n[workers]\ncount = 2", fixture("longlived_node.mjs"));
+    let w = Warden::start("ll-node", port, &long_lived_config("ll-node", port, &app, ""));
+    let run = reload_holding(&w, 2, &["/ws", "/sse"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(10));
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_bun_worker_mode() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("entry = \"{}\"\n[workers]\ncount = 2\nmode = \"worker\"", fixture("longlived.ts"));
+    let w = Warden::start("ll-threads", port, &long_lived_config("ll-threads", port, &app, ""));
+    // The host is replaced as a whole: its Workers drain in parallel.
+    let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-gen"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(8));
+}
+
+/// Without long-lived connections a drain is what it was: no wait for
+/// long_lived_timeout, nothing closed, and normal requests in flight —
+/// streamed downloads included — run to their end even past
+/// long_lived_timeout (only grace_period bounds them).
+#[test]
+fn drain_without_long_lived_connections_is_unchanged() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"ll-none\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+         [shutdown]\ngrace_period = 30\ndrain_ms = 100\nlong_lived_timeout = 3\n",
+        fixture("longlived.ts")
+    );
+    let w = Warden::start("ll-none", port, &cfg);
+    let run = reload_holding(&w, 2, &[]);
+    eprintln!("reload took {:?}; plain requests: {} ok, {} failed", run.took, run.ok, run.fail);
+    assert!(run.before.is_disjoint(&run.after));
+    assert!(run.fail <= allowed_resets(), "plain requests failed: {}", run.fail);
+    // Waiting for long_lived_timeout would take >= 2 x 3 s.
+    assert!(run.took < Duration::from_secs(5), "reload took {:?}\n{}", run.took, w.log());
+
+    // A download and a slow request in flight through a reload, both longer
+    // than long_lived_timeout: they finish, complete.
+    let download = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "GET /download?ms=4000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        let r = s.read_to_end(&mut out);
+        (r.map_err(|e| e.to_string()), String::from_utf8_lossy(&out).to_string())
+    });
+    let slow = std::thread::spawn(move || {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "GET /slow?ms=4000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let r = s.read_to_string(&mut out);
+        (r.map_err(|e| e.to_string()), out)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let (r, body) = download.join().unwrap();
+    assert!(r.is_ok(), "download: {r:?}");
+    assert!(body.contains("line 9\nend\n") && body.ends_with("0\r\n\r\n"), "download cut short: {body:?}");
+    let (r, body) = slow.join().unwrap();
+    assert!(r.is_ok() && body.starts_with("HTTP/1.1 200"), "slow request: {r:?} {body:?}");
+    let log = w.log();
+    assert!(!log.contains("closed long-lived connections"), "{log}");
+}

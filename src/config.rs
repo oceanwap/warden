@@ -196,7 +196,17 @@ pub struct Shutdown {
     /// Signal that asks a worker to stop: SIGTERM, or SIGINT for apps written
     /// for PM2 (its default). SIGKILL follows after `grace_period`.
     pub signal: String,
+    /// Seconds (fractions allowed) a draining worker lets WebSockets and SSE
+    /// streams end by themselves; then the shim closes WebSockets with 1001
+    /// (Going Away) and ends SSE responses cleanly, so clients reconnect to
+    /// the new workers. Must be below `grace_period`. 0 = leave them alone
+    /// (they hold the worker until `grace_period`). Default: 2, or half of
+    /// `grace_period` when that is shorter (`long_lived_timeout()`).
+    pub long_lived_timeout: Option<f64>,
 }
+
+/// `long_lived_timeout` when it isn't set.
+pub const DEFAULT_LONG_LIVED_TIMEOUT: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -472,7 +482,7 @@ impl Default for Restart {
 
 impl Default for Shutdown {
     fn default() -> Self {
-        Self { grace_period: 30, drain_ms: 500, signal: "SIGTERM".into() }
+        Self { grace_period: 30, drain_ms: 500, signal: "SIGTERM".into(), long_lived_timeout: None }
     }
 }
 
@@ -617,6 +627,20 @@ impl Config {
                 "shutdown.signal = {:?} is not a signal name (use SIGTERM or SIGINT)",
                 self.shutdown.signal
             ));
+        }
+        if let Some(t) = self.shutdown.long_lived_timeout {
+            let grace = self.shutdown.grace_period;
+            if !t.is_finite() || t < 0.0 {
+                return Err(format!("shutdown.long_lived_timeout = {t} must be a number of seconds >= 0"));
+            }
+            if t > 0.0 && t >= grace as f64 {
+                return Err(format!(
+                    "shutdown.long_lived_timeout = {t} must be below shutdown.grace_period = {grace}: \
+                     WebSockets and SSE streams are closed at long_lived_timeout, and the worker needs the \
+                     rest of the grace period to finish (or it is SIGKILLed and clients see resets). \
+                     Lower long_lived_timeout or raise grace_period"
+                ));
+            }
         }
         if let Some(expr) = &self.restart.schedule {
             crate::schedule::Cron::parse(expr).map_err(|e| format!("restart.schedule = {expr:?}: {e}"))?;
@@ -874,6 +898,16 @@ impl Config {
         Duration::from_secs(self.shutdown.grace_period)
     }
 
+    /// When a draining worker closes its WebSockets and SSE streams (zero:
+    /// never). Unset: 2 s, or half the grace period when that is shorter, so
+    /// a short `grace_period` doesn't make the default invalid.
+    pub fn long_lived_timeout(&self) -> Duration {
+        let s = &self.shutdown;
+        let secs = s.long_lived_timeout.unwrap_or_else(|| DEFAULT_LONG_LIVED_TIMEOUT.min(s.grace_period as f64 / 2.0));
+        // Validated finite and >= 0 at load; clamp anyway (a Duration panics on NaN).
+        Duration::from_secs_f64(if secs.is_finite() { secs.clamp(0.0, 3600.0) } else { 0.0 })
+    }
+
     /// HTTP path for per-worker checks: `health.path`, else the path of `health.url`.
     pub fn health_path(&self) -> Option<String> {
         if let Some(p) = &self.health.path {
@@ -1056,6 +1090,7 @@ mod tests {
             ("restart", "failed_cooldown"),
             ("shutdown", "grace_period"),
             ("shutdown", "drain_ms"),
+            ("shutdown", "long_lived_timeout"),
             ("health", "interval"),
             ("health", "timeout"),
             ("health", "failure_threshold"),
@@ -1100,6 +1135,7 @@ mod tests {
                         ] {
                             let _ = now + std::time::Duration::from_secs(secs);
                         }
+                        let _ = now + c.long_lived_timeout();
                     }
                 }
             }
@@ -1107,6 +1143,26 @@ mod tests {
         let e = Config::parse(&format!("{MIN}[reload]\ntimeout = 18446744073709551615\n")).unwrap_err();
         assert!(e.contains("reload.timeout") && e.contains("out of range"), "{e}");
         assert!(Config::parse(&format!("{MIN}[health]\noutage_threshold = 1.5\n")).is_err());
+    }
+
+    #[test]
+    fn long_lived_timeout_default_and_bounds() {
+        let ll = |extra: &str| Config::parse(&format!("{MIN}[shutdown]\n{extra}"));
+        assert_eq!(Config::parse(MIN).unwrap().long_lived_timeout(), Duration::from_secs(2));
+        // Unset with a short grace period: half of it, so the config stays valid.
+        assert_eq!(ll("grace_period = 1\n").unwrap().long_lived_timeout(), Duration::from_millis(500));
+        assert_eq!(ll("grace_period = 0\n").unwrap().long_lived_timeout(), Duration::ZERO);
+        assert_eq!(ll("long_lived_timeout = 0.25\n").unwrap().long_lived_timeout(), Duration::from_millis(250));
+        assert_eq!(ll("long_lived_timeout = 5\n").unwrap().long_lived_timeout(), Duration::from_secs(5));
+        // 0: leave them alone, whatever the grace period.
+        assert_eq!(ll("grace_period = 0\nlong_lived_timeout = 0\n").unwrap().long_lived_timeout(), Duration::ZERO);
+        let e = ll("grace_period = 5\nlong_lived_timeout = 5\n").unwrap_err();
+        assert!(e.contains("must be below shutdown.grace_period = 5") && e.contains("raise grace_period"), "{e}");
+        for bad in ["-1", "nan", "inf", "-inf"] {
+            let e = ll(&format!("long_lived_timeout = {bad}\n")).unwrap_err();
+            assert!(e.contains("long_lived_timeout"), "{bad}: {e}");
+        }
+        assert!(ll("long_lived_timeout = \"2s\"\n").is_err());
     }
 
     #[test]
@@ -1137,6 +1193,7 @@ mod tests {
         assert_eq!(c.workers.count, 4);
         assert_eq!(c.logging.max_lines_per_sec, Logging::default().max_lines_per_sec);
         assert_eq!(c.logging.rotate, Rotate::default());
+        assert_eq!(c.shutdown.long_lived_timeout, Some(DEFAULT_LONG_LIVED_TIMEOUT));
         // The commented [static] block is valid too.
         let uncommented: String = text
             .split("# [static]")

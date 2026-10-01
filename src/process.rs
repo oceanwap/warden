@@ -76,6 +76,11 @@ pub struct IpcMsg {
     /// Private per-worker health socket opened by the shim.
     #[serde(default)]
     pub socket: Option<String>,
+    /// `long_lived_closed`: WebSockets closed with 1001, SSE streams ended.
+    #[serde(default)]
+    pub ws: Option<u64>,
+    #[serde(default)]
+    pub sse: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -774,6 +779,8 @@ mod tests {
         assert_eq!(m.worker, Some(2));
         let m: IpcMsg = serde_json::from_str(r#"{"ev":"exit","worker":1,"code":1,"expected":false}"#).unwrap();
         assert_eq!(m.expected, Some(false));
+        let m: IpcMsg = serde_json::from_str(r#"{"ev":"long_lived_closed","ws":3,"sse":2,"worker":1}"#).unwrap();
+        assert_eq!((m.ws, m.sse), (Some(3), Some(2)));
     }
 
     #[tokio::test(flavor = "current_thread")]

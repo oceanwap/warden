@@ -21,6 +21,10 @@
 //  5. In Workers, closes listeners from an exit hook: Bun does not close the
 //     listening socket of a Worker that dies, which would black-hole 1/N of
 //     new connections.
+//  6. Ends long-lived connections during a drain (WARDEN_LONG_LIVED_MS after
+//     it starts): WebSockets get a 1001 close frame, SSE responses a clean end
+//     of the chunked stream, so clients reconnect to the new workers instead of
+//     holding the old one until SIGKILL. See "long-lived connections" below.
 
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -44,6 +48,10 @@ const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);
 const stopSignal = env.WARDEN_STOP_SIGNAL || "SIGTERM";
+// How long a drain lets WebSockets and SSE streams end by themselves before
+// closing them (0 = leave them alone). Only meaningful when there is a drain.
+const longLivedMs = Number(env.WARDEN_LONG_LIVED_MS ?? 2000);
+const longLived = longLivedMs > 0 && (inWorker || drainMs > 0);
 // The app's own port. Other servers the app starts (metrics, admin) are
 // neither readiness signals nor health-check targets.
 const appPort = env.PORT ? Number(env.PORT) : null;
@@ -119,9 +127,13 @@ function wardenServe(options, ...rest) {
         });
       };
     }
+    if (longLived && opts.websocket && typeof opts.websocket === "object") o.websocket = trackBunWebSockets(opts.websocket);
     opts = o;
   }
-  if (options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function") appUsesNodeHttp = true;
+  if (options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function") {
+    appUsesNodeHttp = true;
+    if (longLived) watchBunNodeServer();
+  }
   const server = originalServe.call(this, opts, ...rest);
   servers.add(server);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
@@ -190,6 +202,7 @@ function trackNodeServer(server) {
   servers.add(server);
   if (isHttpServer(server)) {
     appUsesNodeHttp = true;
+    if (longLived) trackNodeUpgrades(server);
     server.on("connection", (sock) => {
       sock.__warden = { served: false, busy: false };
       nodeConns.add(sock);
@@ -256,6 +269,400 @@ if (!isBun) {
     return origListen.apply(this, args);
   };
 }
+
+// ------------------------------------------------- long-lived connections
+//
+// WebSockets and SSE streams never finish by themselves: a drain that waits
+// for in-flight requests would hold the old worker until Warden's SIGKILL,
+// and the client would see a reset (WebSocket 1006, a broken EventSource).
+// They may end by themselves for WARDEN_LONG_LIVED_MS after the drain
+// starts; then the shim ends the rest the way a server going away should:
+//   - WebSockets get a close frame with 1001 (Going Away). Bun.serve: ws.close()
+//     on each ServerWebSocket, tracked by wrapping the app's open/close
+//     handlers (Bun's node:http `ws` goes through them too). Node: the frame is
+//     written to each socket taken over through the server's 'upgrade' event
+//     (the `ws` library uses it), and the socket ended after a short grace.
+//   - SSE responses (text/event-stream) end after their last complete chunk
+//     (the chunked stream terminates; EventSource reconnects by itself).
+//     Bun.serve: the body goes through a stream the shim can close, set up by
+//     a Response constructor wrapper (see installBunStreamHooks). node:http,
+//     on Node and Bun: res.end() on each connection's current response.
+// Other streamed responses (downloads, proxied bodies) are left alone: a
+// clean end would make a truncated file look complete. They are in-flight
+// requests like any other, bounded by grace_period.
+// Then up to WS_CLOSE_WAIT_MS for clients to answer the close frames, so the
+// sockets end with FIN rather than RST.
+//
+// Cost: per request, nothing on Node and one call frame per `new Response()`
+// in Bun; a Set entry per open WebSocket / SSE stream, removed when it ends.
+
+const CLOSE_REASON = "server restarting";
+const WS_CLOSE_WAIT_MS = 1000;
+const WS_END_GRACE_MS = 200;
+const noop = () => {};
+const bunWs = new Set(); // Bun ServerWebSockets we have not closed
+const nodeWs = new Set(); // Node sockets upgraded to WebSocket we have not closed
+const wsClosing = new Set(); // closed by us, waiting for the closing handshake
+const sseOpen = new Set(); // Bun SSE bodies being served: { end() }
+const longLivedClosed = { ws: 0, sse: 0 };
+let longLivedAt = 0; // when the deadline passed (0: not yet)
+
+// Server close frame (unmasked): FIN + opcode 8, status 1001, reason.
+const WS_CLOSE_FRAME = (() => {
+  const reason = Buffer.from(CLOSE_REASON);
+  return Buffer.concat([Buffer.from([0x88, 2 + reason.length, 0x03, 0xe9]), reason]);
+})();
+
+function settle(fn, arg) {
+  try {
+    const r = fn(arg);
+    if (r && typeof r.catch === "function") r.catch(noop);
+  } catch {}
+}
+
+// Bun.serve's websocket handlers, with the open/close of every socket seen.
+function trackBunWebSockets(handlers) {
+  const w = Object.create(handlers);
+  const { open, close } = handlers;
+  w.open = function (ws) {
+    bunWs.add(ws);
+    if (typeof open === "function") return open.apply(this, arguments);
+  };
+  w.close = function (ws) {
+    bunWs.delete(ws);
+    wsClosing.delete(ws);
+    if (typeof close === "function") return close.apply(this, arguments);
+  };
+  return w;
+}
+
+// Node: sockets the app takes over as WebSockets. Our listener is there only
+// while the app has one of its own: with none, Node answers an upgrade
+// request as a normal request, and an extra listener would change that.
+function trackNodeUpgrades(server) {
+  let hooked = false;
+  const onUpgrade = (req, sock) => {
+    if (!/^websocket$/i.test(String((req.headers && req.headers.upgrade) || ""))) return;
+    nodeWs.add(sock);
+    sock.once("close", () => {
+      nodeWs.delete(sock);
+      wsClosing.delete(sock);
+    });
+  };
+  const sync = () => {
+    const apps = server.listenerCount("upgrade") - (hooked ? 1 : 0);
+    if (apps > 0 && !hooked) {
+      hooked = true;
+      server.prependListener("upgrade", onUpgrade);
+    } else if (apps === 0 && hooked) {
+      hooked = false;
+      server.removeListener("upgrade", onUpgrade);
+    }
+  };
+  server.on("newListener", (ev) => ev === "upgrade" && process.nextTick(sync));
+  server.on("removeListener", (ev) => ev === "upgrade" && process.nextTick(sync));
+  sync();
+}
+
+// Bun's node:http server calls Bun.serve from http.Server#listen and emits
+// 'listening' right after. One hooked emit catches that server (to see its
+// connections, hence their responses); then emit is put back, so requests
+// never pass through the hook. The timer puts it back if listen fails.
+let bunNodeServersDue = 0;
+function watchBunNodeServer() {
+  let proto;
+  try {
+    proto = http().Server.prototype;
+  } catch {
+    return;
+  }
+  if (bunNodeServersDue++ > 0) return;
+  const own = Object.prototype.hasOwnProperty.call(proto, "emit");
+  const emit = proto.emit;
+  const restore = () => {
+    bunNodeServersDue = 0;
+    if (own) proto.emit = emit;
+    else delete proto.emit;
+  };
+  const t = setTimeout(restore, 2000);
+  if (t && typeof t.unref === "function") t.unref();
+  proto.emit = function (ev) {
+    if (ev === "listening" && bunNodeServersDue > 0) {
+      this.on("connection", (sock) => {
+        nodeConns.add(sock);
+        sock.once("close", () => nodeConns.delete(sock));
+      });
+      if (--bunNodeServersDue === 0) {
+        clearTimeout(t);
+        restore();
+      }
+    }
+    return emit.apply(this, arguments);
+  };
+}
+
+// `writeHead(200, { "content-type": … })` alone leaves getHeader() empty in
+// Node; the header block it sent (`_header`) has it.
+function isEventStreamResponse(res) {
+  let type;
+  try {
+    type = typeof res.getHeader === "function" ? res.getHeader("content-type") : undefined;
+  } catch {}
+  if (type == null && typeof res._header === "string") {
+    const m = /\r\ncontent-type:[ \t]*([^\r\n]*)/i.exec(res._header);
+    type = m ? m[1] : undefined;
+  }
+  return typeof type === "string" && /^\s*text\/event-stream/i.test(type);
+}
+
+function isEventStreamInit(init) {
+  const h = init != null && typeof init === "object" ? init.headers : undefined;
+  if (h == null || typeof h !== "object") return false;
+  let type;
+  try {
+    type = (h instanceof Headers ? h : new Headers(h)).get("content-type");
+  } catch {
+    return false;
+  }
+  return typeof type === "string" && /^\s*text\/event-stream/i.test(type);
+}
+
+// Closes every long-lived connection still open (each once). Called every
+// drain round after the deadline, which also catches ones opened late on a
+// kept-alive connection.
+function closeLongLived() {
+  for (const ws of bunWs) {
+    bunWs.delete(ws);
+    wsClosing.add(ws); // before close(): its handler may run at once
+    try {
+      ws.close(1001, CLOSE_REASON);
+      longLivedClosed.ws++;
+    } catch {
+      wsClosing.delete(ws);
+    }
+  }
+  for (const sock of nodeWs) {
+    if (!sock.bytesWritten) continue; // the app hasn't answered the handshake yet
+    nodeWs.delete(sock);
+    if (sock.destroyed || !sock.writable) continue;
+    wsClosing.add(sock);
+    longLivedClosed.ws++;
+    try {
+      sock.write(WS_CLOSE_FRAME);
+    } catch {}
+    // The app's WebSocket code answers the client's close frame and ends the
+    // socket itself; if nothing does, end it.
+    const t = setTimeout(() => {
+      try {
+        sock.end();
+      } catch {}
+    }, WS_END_GRACE_MS);
+    if (t && typeof t.unref === "function") t.unref();
+  }
+  for (const entry of sseOpen) if (entry.end()) longLivedClosed.sse++;
+  for (const sock of nodeConns) {
+    const res = sock._httpMessage;
+    if (!res || res.writableEnded || !isEventStreamResponse(res)) continue;
+    try {
+      // A handler that writes once more must not crash the worker.
+      res.on("error", noop);
+      res.end();
+      longLivedClosed.sse++;
+    } catch {}
+  }
+}
+
+// One drain round. Returns whether the drain must keep going for them.
+function longLivedStep(elapsed) {
+  // Before the deadline they may end by themselves. SSE responses are in
+  // pending(); WebSockets are not.
+  if (elapsed < longLivedMs) return bunWs.size + nodeWs.size > 0;
+  if (!longLivedAt) longLivedAt = Date.now();
+  closeLongLived();
+  // Bun keeps the connection of an ended SSE response alive: close it once
+  // idle, so the client's reconnect opens a new one (to a new worker). Node:
+  // closeServedIdle() does it.
+  if (isBun && longLivedClosed.sse > 0) {
+    for (const s of servers) {
+      try {
+        if (typeof s.closeIdleConnections === "function") s.closeIdleConnections();
+      } catch {}
+    }
+  }
+  return wsClosing.size > 0 && Date.now() - longLivedAt < WS_CLOSE_WAIT_MS;
+}
+
+function reportLongLived() {
+  const { ws, sse } = longLivedClosed;
+  if (ws + sse > 0) report({ ev: "long_lived_closed", ws, sse });
+}
+
+// Bun.serve SSE bodies. Recognising one costs nothing per request only where
+// the body is handed over: in `new Response(body, init)` (reading `.body` of
+// a returned Response would change a string body's content-type; reading its
+// headers costs ~0.4 µs per request). So Response is wrapped: a stream or
+// async-iterable body with `content-type: text/event-stream` goes through a
+// stream the shim can end. ReadableStream is wrapped too, only to recognise
+// `type: "direct"` streams: reading one through a reader breaks it (Bun 1.3
+// calls its pull() again for every read), so those are ended through the
+// controller Bun gives their pull() instead. Everything else is constructed
+// natively, so instanceof, subclasses and statics behave as before.
+function installBunStreamHooks() {
+  const NativeResponse = globalThis.Response;
+  const NativeStream = globalThis.ReadableStream;
+  if (typeof NativeResponse !== "function" || typeof NativeStream !== "function") return;
+  const direct = new WeakMap(); // direct stream -> { sse }
+  const ours = new WeakSet(); // streams made by closableBody
+
+  // The app's body behind a stream the shim can end. Chunks pass through one
+  // at a time, as Bun asks for them (highWaterMark 0: nothing is buffered).
+  // Ending it cancels the app's source, as a client disconnecting would.
+  function closableBody(body) {
+    if (ours.has(body)) return body;
+    const d = direct.get(body);
+    if (d) {
+      d.sse = true;
+      return body;
+    }
+    let next, cancel;
+    if (body instanceof NativeStream) {
+      if (body.locked) return body;
+      const reader = body.getReader();
+      next = () => reader.read();
+      cancel = (why) => reader.cancel(why);
+    } else {
+      const it = body[Symbol.asyncIterator]();
+      next = () => it.next();
+      cancel = (why) => (typeof it.return === "function" ? it.return(why) : undefined);
+    }
+    let ctl = null;
+    let state = 0; // 0: not served yet, 1: being served (in sseOpen), 2: over
+    const over = () => {
+      if (state === 1) sseOpen.delete(entry);
+      state = 2;
+    };
+    const entry = {
+      end() {
+        if (state !== 1) return false;
+        over();
+        try {
+          ctl.close();
+        } catch {}
+        settle(cancel, CLOSE_REASON);
+        return true;
+      },
+    };
+    const out = new NativeStream(
+      {
+        start(c) {
+          ctl = c;
+        },
+        pull(c) {
+          if (state === 0) {
+            state = 1;
+            sseOpen.add(entry);
+          }
+          if (state === 2) return;
+          let p;
+          try {
+            p = Promise.resolve(next());
+          } catch (e) {
+            over();
+            c.error(e);
+            return;
+          }
+          return p.then(
+            (r) => {
+              if (state === 2) return;
+              if (!r || r.done) {
+                over();
+                c.close();
+              } else c.enqueue(r.value);
+            },
+            (e) => {
+              if (state === 2) return;
+              over();
+              c.error(e);
+            },
+          );
+        },
+        cancel(why) {
+          over();
+          settle(cancel, why);
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    ours.add(out);
+    return out;
+  }
+
+  function Response(body, init) {
+    if (new.target === undefined) throw new TypeError("Class constructor Response cannot be invoked without 'new'");
+    if (
+      body !== null &&
+      typeof body === "object" &&
+      (body instanceof NativeStream || typeof body[Symbol.asyncIterator] === "function") &&
+      isEventStreamInit(init)
+    ) {
+      body = closableBody(body);
+    }
+    return new.target === Response
+      ? new NativeResponse(body, init)
+      : Reflect.construct(NativeResponse, [body, init], new.target);
+  }
+  Response.prototype = NativeResponse.prototype;
+  Object.setPrototypeOf(Response, NativeResponse);
+
+  function ReadableStream(source, strategy) {
+    if (new.target === undefined) {
+      throw new TypeError("Class constructor ReadableStream cannot be invoked without 'new'");
+    }
+    const target = new.target === ReadableStream ? NativeStream : new.target;
+    if (source == null || typeof source !== "object" || source.type !== "direct" || typeof source.pull !== "function") {
+      return target === NativeStream ? new NativeStream(source, strategy) : Reflect.construct(NativeStream, [source, strategy], target);
+    }
+    const info = { sse: false, canceled: false };
+    const src = Object.create(source);
+    src.pull = function (c) {
+      const r = source.pull.apply(source, arguments);
+      // A direct stream ends when its (async) pull() settles. Until then it
+      // stays here even if the client left (Bun cancels it, but writes then
+      // return 0 and the request stays pending while the app's loop runs):
+      // closing it at the deadline makes such a loop's next write throw.
+      if (info.sse && r && typeof r.then === "function") {
+        const entry = {
+          end() {
+            if (!sseOpen.delete(entry)) return false;
+            const open = !info.canceled; // close() makes Bun call cancel()
+            try {
+              c.close();
+            } catch {}
+            return open;
+          },
+        };
+        sseOpen.add(entry);
+        const off = () => sseOpen.delete(entry);
+        r.then(off, off);
+      }
+      return r;
+    };
+    src.cancel = function () {
+      info.canceled = true;
+      if (typeof source.cancel === "function") return source.cancel.apply(source, arguments);
+    };
+    const s = Reflect.construct(NativeStream, [src, strategy], target);
+    direct.set(s, info);
+    return s;
+  }
+  ReadableStream.prototype = NativeStream.prototype;
+  Object.setPrototypeOf(ReadableStream, NativeStream);
+
+  globalThis.Response = Response;
+  globalThis.ReadableStream = ReadableStream;
+}
+
+if (isBun && longLived) installBunStreamHooks();
 
 // ---------------------------------------------------------------- common
 
@@ -363,10 +770,16 @@ async function drain() {
   await markNodeResponsesClose();
   for (const s of servers) stopAccepting(s);
   const t0 = Date.now();
-  while (Date.now() - t0 < drainMs || pending() > 0) {
+  for (;;) {
+    const elapsed = Date.now() - t0;
+    // Every round: WebSockets aren't in pending(), and at the long-lived
+    // deadline this closes WebSockets and ends SSE responses.
+    const longLivedBusy = longLived && longLivedStep(elapsed);
+    if (elapsed >= drainMs && pending() === 0 && !longLivedBusy) break;
     if (!isBun) closeServedIdle();
     await sleep(20);
   }
+  if (longLived) reportLongLived();
   for (const s of servers) stopAll(s);
   closePrivateSocket();
   drainDone = true;

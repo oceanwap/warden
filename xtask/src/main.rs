@@ -72,6 +72,13 @@ const SUITES: &[Suite] = &[
         script: "bench/fleet.ts",
         args: &[],
     },
+    Suite {
+        name: "longlived",
+        title: "WebSockets and SSE through a rolling restart",
+        about: "50 WebSocket and 50 SSE clients stay connected while all 4 workers are replaced (`pm2 reload`: cluster mode for Node, fork mode for Bun; `warden restart` with the default `long_lived_timeout` of 2 s). Each client reconnects at once. Clean: a WebSocket close frame or the SSE stream's last chunk; abnormal: cut without one (a browser reports 1006, EventSource an error).",
+        script: "bench/longlived.ts",
+        args: &[],
+    },
 ];
 
 const USAGE: &str = "\
@@ -82,7 +89,7 @@ Runs every benchmark suite and updates README.md and bench/results/latest.md.
 OPTIONS:
     --quick            Short runs (3 s per measurement): a smoke test, not results to publish
     --only SUITES      Comma-separated subset of: node-http, nest-node, bun-http, nest-bun,
-                       static, logs, fleet
+                       static, logs, fleet, longlived
     --duration S       Seconds per load measurement (default 10)
     --no-readme        Leave README.md alone (still writes bench/results/latest.md)
     -h, --help         This help
@@ -272,7 +279,8 @@ fn bench(args: &[String]) -> Result<(), String> {
     for s in &suites {
         let mut cmd = Command::new("bun");
         cmd.arg(s.script).args(s.args).current_dir(&root).stdout(Stdio::piped()).stderr(Stdio::inherit());
-        if s.script != "bench/fleet.ts" {
+        // fleet and longlived measure events, not a load over time.
+        if s.script != "bench/fleet.ts" && s.script != "bench/longlived.ts" {
             let d = o.duration.clone().unwrap_or_else(|| if o.quick { "3".into() } else { "10".into() });
             if s.script == "bench/logs.ts" {
                 cmd.args(["--seconds", &d]);
@@ -282,6 +290,9 @@ fn bench(args: &[String]) -> Result<(), String> {
         }
         if o.quick && s.script == "bench/logs.ts" {
             cmd.args(["--mb", "100"]);
+        }
+        if o.quick && s.script == "bench/longlived.ts" {
+            cmd.args(["--clients", "10"]);
         }
         eprintln!("\nxtask: === {} ({} {}) ===", s.name, s.script, s.args.join(" "));
         let since = SystemTime::now() - std::time::Duration::from_secs(1);
@@ -373,6 +384,7 @@ mod tests {
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
         assert!(parse(&a("--quick")).unwrap().quick);
         assert_eq!(parse(&a("--only static,logs")).unwrap().only.unwrap(), vec!["static", "logs"]);
+        assert_eq!(parse(&a("--only longlived")).unwrap().only.unwrap(), vec!["longlived"]);
         assert!(parse(&a("--only nope")).unwrap_err().contains("unknown suite"));
         assert!(parse(&a("--duration x")).is_err());
         assert!(!parse(&a("--no-readme")).unwrap().readme);
