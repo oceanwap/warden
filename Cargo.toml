@@ -34,3 +34,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 lto = true
 codegen-units = 1
 strip = true
+
+# `cargo xtask profile`: the release build with its symbols (and line tables),
+# so perf can name Warden's own functions. Not for shipping.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

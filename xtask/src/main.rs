@@ -1,7 +1,9 @@
 //! Project tasks, run through the cargo aliases in `.cargo/config.toml`:
 //!
 //!   cargo xtask bench [--quick] [--only SUITES] [--duration S] [--no-readme]
+//!                     [--app-cpus L] [--loadgen-cpus L] [--loadgen oha|wrk] [--rounds N]
 //!   cargo bench-all                       (the same as `cargo xtask bench`)
+//!   cargo xtask profile [bench/profile.ts options] (per-request cost, perf top symbols)
 //!   cargo xtask chaos [--minutes N] [--seed S] (a chaos soak; see chaos/mod.rs)
 //!   cargo xtask release VERSION [OPTIONS] (also `cargo release`; see release.rs)
 //!
@@ -91,6 +93,8 @@ cargo xtask TASK [OPTIONS]
 
 TASKS:
     bench      Run every benchmark suite, update README.md (also: cargo bench-all)
+    profile    What one request costs a server (CPU time, syscalls) and where the time
+               goes (perf record, top symbols); Warden built with symbols
     chaos      A chaos soak: a fleet under load, random faults, invariants checked
                (docs/chaos.md)
     release    Release a version: checks, version bump, tag, push, then follow the
@@ -110,16 +114,50 @@ OPTIONS:
                        static, logs, fleet, longlived
     --duration S       Seconds per load measurement (default 10)
     --no-readme        Leave README.md alone (still writes bench/results/latest.md)
+    --app-cpus L       Pin the apps and their managers to these CPUs (taskset list: 0-3,6)
+    --loadgen-cpus L   Pin the load generator to these CPUs
+    --loadgen G        oha (default) or wrk (lighter: more CPU left to the apps)
+    --rounds N         Static files: run the servers N times, interleaved, and report
+                       medians (an A/B a noisy machine moves less)
     -h, --help         This help
 
-NEEDS: Linux, bun, node >= 22.12, oha (`cargo install oha`), npm (installs the
-managers compared with into bench/node_modules on first run); nginx is optional.
+NEEDS: Linux, bun, node >= 22.12, oha (`cargo install oha`; or wrk with --loadgen
+wrk), npm (installs the managers compared with into bench/node_modules on first
+run); nginx is optional; taskset (util-linux) with --app-cpus / --loadgen-cpus.
+";
+
+const PROFILE_USAGE: &str = "\
+cargo xtask profile [OPTIONS]
+
+Builds Warden with symbols (the `profiling` profile: release, not stripped) and runs
+bench/profile.ts with --perf: per target, req/s, server CPU time and context switches
+per request, and where the CPU time goes (perf record -e cpu-clock, top symbols).
+Every option is bench/profile.ts's:
+
+    --targets a,b      warden, warden-nocache, nginx, bun, bun-shim, node, node-shim;
+                       warden@/path/bin, bun-shim@/path/shim.mjs, warden:key=value,...
+    --path P           URL path (static: /index.html, /assets/app.3f9a2c1b.js, /media/video.bin)
+    --requests N       Requests per measurement (default 200000)
+    --rounds N         Interleaved rounds, medians reported
+    --strace           Also count syscalls per request
+    --call-graph       perf record -g
+    --app-cpus L, --loadgen-cpus L, --loadgen oha|wrk
+
+Example: cargo xtask profile --targets warden,nginx --path /assets/app.3f9a2c1b.js --strace
+NEEDS: Linux, bun, oha, perf (linux-tools), strace with --strace; nginx for its target.
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("bench") => match bench(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("profile") => match profile(&args[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("xtask: {e}");
@@ -157,15 +195,62 @@ struct Options {
     only: Option<Vec<String>>,
     duration: Option<String>,
     readme: bool,
+    /// `--app-cpus L`, `--loadgen-cpus L`, `--loadgen G`: passed to every suite.
+    pinning: Vec<String>,
+    loadgen: String,
+    rounds: Option<String>,
+}
+
+/// A taskset CPU list: `0`, `0-3`, `0,2,4-7`.
+fn cpu_list(v: &str) -> bool {
+    !v.is_empty()
+        && v.split(',').all(|part| {
+            let mut ends = part.splitn(2, '-');
+            let ok = |s: Option<&str>| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            match (ends.next(), ends.next()) {
+                (a, None) => ok(a),
+                (a, b) => ok(a) && ok(b),
+            }
+        })
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
-    let mut o = Options { quick: false, only: None, duration: None, readme: true };
+    let mut o = Options {
+        quick: false,
+        only: None,
+        duration: None,
+        readme: true,
+        pinning: Vec::new(),
+        loadgen: "oha".into(),
+        rounds: None,
+    };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--quick" => o.quick = true,
             "--no-readme" => o.readme = false,
+            "--app-cpus" | "--loadgen-cpus" => {
+                let v = it.next().ok_or(format!("{a} needs a CPU list (taskset -c syntax, e.g. 0-3)"))?;
+                if !cpu_list(v) {
+                    return Err(format!("{a} {v:?} is not a CPU list (taskset -c syntax, e.g. 0-3 or 0,2)"));
+                }
+                o.pinning.extend([a.clone(), v.clone()]);
+            }
+            "--loadgen" => {
+                let v = it.next().ok_or("--loadgen needs oha or wrk")?;
+                if v != "oha" && v != "wrk" {
+                    return Err(format!("--loadgen {v:?}: oha or wrk"));
+                }
+                o.loadgen = v.clone();
+                o.pinning.extend([a.clone(), v.clone()]);
+            }
+            "--rounds" => {
+                let v = it.next().ok_or("--rounds needs a number")?;
+                if !v.parse::<u32>().is_ok_and(|n| n >= 1) {
+                    return Err(format!("--rounds {v:?} is not a number of rounds (1 or more)"));
+                }
+                o.rounds = Some(v.clone());
+            }
             "--only" => {
                 let v = it.next().ok_or("--only needs a list of suites")?;
                 let names: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
@@ -213,7 +298,7 @@ fn run(cmd: &mut Command, what: &str) -> Result<(), String> {
 }
 
 /// Everything the suites need, installing the npm packages if missing.
-fn check_prerequisites(root: &Path) -> Result<Vec<String>, String> {
+fn check_prerequisites(root: &Path, o: &Options) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     if !cfg!(target_os = "linux") {
         return Err("the benchmarks read /proc and use SO_REUSEPORT balancing: run them on Linux".into());
@@ -225,7 +310,17 @@ fn check_prerequisites(root: &Path) -> Result<Vec<String>, String> {
     if v.len() < 2 || (v[0], v[1]) < (22, 12) {
         return Err(format!("node {node} is too old: the Node apps listen with reusePort, which needs 22.12+"));
     }
-    tool_version("oha", &["--version"]).ok_or("oha (the load generator) is not installed: cargo install oha")?;
+    if o.loadgen == "wrk" {
+        tool_version("wrk", &["--version"])
+            .or_else(|| Command::new("wrk").arg("--version").output().ok().map(|_| "wrk".into()))
+            .ok_or("wrk (--loadgen wrk) is not installed: apt install wrk, or leave out --loadgen")?;
+    } else {
+        tool_version("oha", &["--version"]).ok_or("oha (the load generator) is not installed: cargo install oha")?;
+    }
+    if o.pinning.iter().any(|a| a.ends_with("-cpus")) {
+        tool_version("taskset", &["--version"])
+            .ok_or("--app-cpus / --loadgen-cpus need taskset (util-linux) on PATH")?;
+    }
     let bench = root.join("bench");
     let need = ["pm2", "wattpm", "serve", "@platformatic/node"];
     if need.iter().any(|p| !bench.join("node_modules").join(p).join("package.json").exists()) {
@@ -290,7 +385,7 @@ fn machine() -> String {
 fn bench(args: &[String]) -> Result<(), String> {
     let o = parse(args)?;
     let root = root();
-    let notes = check_prerequisites(&root)?;
+    let notes = check_prerequisites(&root, &o)?;
     for n in &notes {
         eprintln!("xtask: note: {n}");
     }
@@ -326,6 +421,10 @@ fn bench(args: &[String]) -> Result<(), String> {
         if o.quick && s.script == "bench/longlived.ts" {
             cmd.args(["--clients", "10"]);
         }
+        cmd.args(&o.pinning);
+        if let (Some(n), "bench/static.ts") = (&o.rounds, s.script) {
+            cmd.args(["--rounds", n]);
+        }
         eprintln!("\nxtask: === {} ({} {}) ===", s.name, s.script, s.args.join(" "));
         let since = SystemTime::now() - std::time::Duration::from_secs(1);
         let t0 = Instant::now();
@@ -344,13 +443,25 @@ fn bench(args: &[String]) -> Result<(), String> {
     }
 
     let date = tool_version("date", &["-u", "+%Y-%m-%d"]).unwrap_or_default();
+    let pinned = |flag: &str| o.pinning.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone());
+    let placement = match (pinned("--app-cpus"), pinned("--loadgen-cpus")) {
+        (None, None) => {
+            "runs on the same CPUs as the apps, so compare columns with each other, not with other machines".to_string()
+        }
+        (apps, loadgen) => format!(
+            "runs on CPUs {}, the apps and their managers on CPUs {} (taskset); compare columns with each other",
+            loadgen.as_deref().unwrap_or("any"),
+            apps.as_deref().unwrap_or("any")
+        ),
+    };
     let mut md = format!(
         "<!-- Generated by `cargo xtask bench`{}; edit xtask/src/main.rs or bench/*.ts, not this text. -->\n\n\
-         Measured {date} on {}{}. The load generator (oha, 64 connections) runs on the same CPUs as the apps, \
-         so compare columns with each other, not with other machines. Raw numbers: `bench/results/latest/`.\n\n",
+         Measured {date} on {}{}. The load generator ({}, 64 connections) {placement}. \
+         Raw numbers: `bench/results/latest/`.\n\n",
         if o.quick { " --quick (short smoke-test runs)" } else { "" },
         machine(),
         if o.quick { ", **quick run**" } else { "" },
+        o.loadgen,
     );
     if !notes.is_empty() {
         md += &notes.iter().map(|n| format!("> Note: {n}\n")).collect::<String>();
@@ -372,6 +483,33 @@ fn bench(args: &[String]) -> Result<(), String> {
         eprintln!("xtask: README.md left as it was (only a subset ran, or a suite failed)");
     }
     if failed.is_empty() { Ok(()) } else { Err(format!("suites failed: {}", failed.join(", "))) }
+}
+
+/// `cargo xtask profile`: Warden with symbols, then bench/profile.ts --perf.
+fn profile(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{PROFILE_USAGE}");
+        return Ok(());
+    }
+    if !cfg!(target_os = "linux") {
+        return Err("profiling reads /proc and runs perf: run it on Linux".into());
+    }
+    tool_version("bun", &["--version"]).ok_or("bun is not installed: https://bun.sh")?;
+    let root = root();
+    eprintln!("xtask: building Warden with symbols (cargo build --profile profiling)");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    run(
+        Command::new(&cargo).args(["build", "--profile", "profiling", "--package", "warden"]).current_dir(&root),
+        "cargo build --profile profiling",
+    )?;
+    let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("target"));
+    let bin = target.join("profiling/warden");
+    let mut cmd = Command::new("bun");
+    cmd.arg("bench/profile.ts").arg("--warden").arg(&bin).current_dir(&root);
+    if !args.iter().any(|a| a == "--perf") {
+        cmd.arg("--perf");
+    }
+    run(cmd.args(args), "bun bench/profile.ts")
 }
 
 const START: &str = "<!-- bench:start -->";
@@ -420,5 +558,12 @@ mod tests {
         assert!(parse(&a("--only nope")).unwrap_err().contains("unknown suite"));
         assert!(parse(&a("--duration x")).is_err());
         assert!(!parse(&a("--no-readme")).unwrap().readme);
+        let o = parse(&a("--app-cpus 0-3 --loadgen-cpus 4,5 --loadgen wrk --rounds 3")).unwrap();
+        assert_eq!(o.pinning, ["--app-cpus", "0-3", "--loadgen-cpus", "4,5", "--loadgen", "wrk"]);
+        assert_eq!((o.loadgen.as_str(), o.rounds.as_deref()), ("wrk", Some("3")));
+        assert!(parse(&a("--app-cpus x")).unwrap_err().contains("CPU list"));
+        assert!(parse(&a("--app-cpus 1-")).is_err());
+        assert!(parse(&a("--loadgen ab")).unwrap_err().contains("oha or wrk"));
+        assert!(parse(&a("--rounds 0")).is_err());
     }
 }
