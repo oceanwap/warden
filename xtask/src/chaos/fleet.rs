@@ -328,16 +328,22 @@ pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) 
     }
     // The apps' output goes to the log directory (a tmpfs: the disk-full
     // fault fills it); Warden's own lines go to the supervisor's stdout,
-    // the background log in state/logs (on disk, never rotated), which the
-    // report reads.
+    // the background log in state/logs (on disk), which the report reads.
+    // The rotation settings apply to that log too: big enough that it does
+    // not rotate during a run (the report must see every line), with a line
+    // budget that keeps a flood's share small. Direct output never passes
+    // through Warden, so that app's files rotate small (the log-flood fault
+    // checks they stay within the bound).
     let mut logging = vec![format!("out_file = {}", q(&logs.join(format!("{}-out.log", spec.name))))];
     if spec.direct {
         logging.extend(["worker_output = \"direct\"".into(), "per_worker_files = true".into()]);
+    } else {
+        logging.push("max_lines_per_sec = 2000".into());
     }
     s.insert("logging", logging);
     s.insert(
         "logging.rotate",
-        vec![format!("max_size = \"{}\"", if spec.direct { "256K" } else { "512K" }), "keep = 1".into()],
+        vec![format!("max_size = \"{}\"", if spec.direct { "256K" } else { "64M" }), "keep = 1".into()],
     );
     let mut text = "# chaos soak app (cargo xtask chaos); written by xtask/src/chaos/fleet.rs\n".to_string();
     // [app] first, the rest in a stable order.

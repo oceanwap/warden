@@ -117,6 +117,8 @@ pub struct Trend {
     pub fds: (usize, usize),
     pub rss_kb: (u64, u64),
     pub verdict: Result<&'static str, String>,
+    /// The quiet samples: (seconds into the run, fds, RSS KB).
+    pub series: Vec<(f64, usize, u64)>,
 }
 
 /// Per process, from samples taken while the fleet was quiet: the lowest
@@ -145,7 +147,8 @@ pub fn trends(samples: &[ProcSample]) -> Vec<Trend> {
         } else {
             Ok("flat")
         };
-        out.push(Trend { name, role, pid, samples: v.len(), span_s: span, fds, rss_kb: rss, verdict });
+        let series = v.iter().map(|s| ((s.t * 10.0).round() / 10.0, s.fds, s.rss_kb)).collect();
+        out.push(Trend { name, role, pid, samples: v.len(), span_s: span, fds, rss_kb: rss, verdict, series });
     }
     out
 }
@@ -178,6 +181,8 @@ pub struct LogFindings {
     pub panics: Vec<String>,
     pub lines: usize,
     pub warn_error: usize,
+    /// Logs that rotated during the run: lines rotated out were not read.
+    pub rotated: Vec<String>,
 }
 
 /// A Warden log line: (timestamp, level, the rest).
@@ -206,12 +211,16 @@ fn message_of(rest: &str) -> String {
 
 /// Read every supervisor's and wardend's log in `dir`.
 pub fn scan_logs(dir: &Path) -> LogFindings {
-    let mut out = LogFindings { no_hint: BTreeMap::new(), panics: Vec::new(), lines: 0, warn_error: 0 };
+    let mut out =
+        LogFindings { no_hint: BTreeMap::new(), panics: Vec::new(), lines: 0, warn_error: 0, rotated: Vec::new() };
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
     let mut files: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     files.sort();
     for p in files {
         let file = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        if !file.ends_with(".log") {
+            out.rotated.push(file.clone());
+        }
         let Ok(bytes) = std::fs::read(&p) else { continue };
         let text = String::from_utf8_lossy(&bytes);
         for l in text.lines() {
@@ -594,7 +603,8 @@ pub fn build(i: Inputs) -> Report {
             verdict.clone(),
         ]);
         tr_json.push(json!({"process": format!("{} {}", t.role, t.name), "pid": t.pid, "samples": t.samples,
-            "span_s": t.span_s, "fds": [t.fds.0, t.fds.1], "rss_kb": [t.rss_kb.0, t.rss_kb.1], "verdict": verdict}));
+            "span_s": t.span_s, "fds": [t.fds.0, t.fds.1], "rss_kb": [t.rss_kb.0, t.rss_kb.1], "verdict": verdict,
+            "quiet_samples_t_fds_rss_kb": t.series}));
     }
     text += &table(&rows);
 
@@ -625,6 +635,12 @@ pub fn build(i: Inputs) -> Report {
         "\n  logs read: {} lines, {} WARN/ERROR; zombies seen (all reaped in time unless listed): {}; alerts delivered: {:?}\n",
         logs.lines, logs.warn_error, mon.zombies_seen, i.alerts
     );
+    if !logs.rotated.is_empty() {
+        text += &format!(
+            "  note: logs rotated during the run, lines rotated out were not checked: {}\n",
+            logs.rotated.join(", ")
+        );
+    }
 
     let faults_json: Vec<Value> = i
         .faults
