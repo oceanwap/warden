@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests scripts/dist-macos.sh without a Mac: macOS-only tools (uname, codesign,
+# Tests scripts/dist-macos.sh without a Mac (it runs on Linux, with GNU tools): macOS-only tools (uname, codesign,
 # plutil, ditto, arch, sw_vers), rustup, cargo and gh are stubs that record
 # what they were asked to do. What this proves: the control flow, the file
 # names and contents, the checks that stop a bad release, and the exact gh
@@ -66,6 +66,7 @@ case "$1" in
       shift
     done
     version=$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\(.*\)".*/\1/p;}' Cargo.toml | head -1)
+    [ -n "${FAKE_MOVE_HEAD:-}" ] && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m moved
     mkdir -p "$CARGO_TARGET_DIR/$target/release"
     printf '#!/bin/sh\necho "%s %s"\n' "$name" "$version" >"$CARGO_TARGET_DIR/$target/release/$name"
     chmod +x "$CARGO_TARGET_DIR/$target/release/$name"
@@ -88,9 +89,18 @@ cat >"$bin/plutil" <<'EOF'
 EOF
 cat >"$bin/ditto" <<'EOF'
 #!/bin/sh
-# ditto -c -k --keepParent SRC DST
-src=$4; dst=$5
+# ditto -c -k --keepParent --norsrc SRC DST
+echo "ditto $*" >>"$FAKE_LOG"
+src=$5; dst=$6
 (cd "$(dirname "$src")" && zip -qr "$dst" "$(basename "$src")")
+EOF
+cat >"$bin/xattr" <<'EOF'
+#!/bin/sh
+echo "xattr $*" >>"$FAKE_LOG"
+EOF
+cat >"$bin/sysctl" <<'EOF'
+#!/bin/sh
+echo "${FAKE_TRANSLATED:-0}"
 EOF
 cat >"$bin/shasum" <<'EOF'
 #!/bin/sh
@@ -101,10 +111,14 @@ cat >"$bin/gh" <<'EOF'
 #!/bin/sh
 echo "gh $*" >>"$FAKE_LOG"
 case "$1 $2" in
-  "auth status") exit 0 ;;
+  "api user") [ "${FAKE_GH_LOGIN:-ok}" = ok ]; exit $? ;;
   "repo view") echo oceanwap/warden; exit 0 ;;
   "release view")
-    case "${FAKE_GH:-none}" in
+    n=$(cat "$FAKE_LOG.views" 2>/dev/null || echo 0); n=$((n + 1)); echo $n >"$FAKE_LOG.views"
+    mode=${FAKE_GH:-none}
+    # draft-then-published: published by someone while the build ran.
+    [ "$mode" = draft-then-published ] && { if [ $n -le 1 ]; then mode=draft; else mode=published; fi; }
+    case "$mode" in
       none) echo "release not found" >&2; exit 1 ;;
       draft) echo true ;;
       published) echo false ;;
@@ -126,6 +140,7 @@ run() { # repo log extra-env… -- args…: run dist-macos.sh in the copy with t
     local repo=$1 log=$2
     shift 2
     : >"$log"
+    rm -f "$log.views"
     local envs=()
     while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
     shift
@@ -221,6 +236,73 @@ sed -i 's/^version = ".*"/version = "9.9.9"/' "$R8/gui/Cargo.toml"
 run "$R8" "$T/log8" -- --no-upload >"$T/out8" 2>&1
 check "versions out of step are refused" test $? -ne 0
 check "…and the manifest is named" grep -q "gui/Cargo.toml is version 9.9.9" "$T/out8"
+
+# ------------------------------------------------ 9. the info file vouches for each archive
+run "$R1" "$T/log9" -- --no-upload >"$T/out9" 2>&1
+for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip; do
+    want=$(sha256sum "$R1/target/dist-macos/$f" | cut -d' ' -f1)
+    check "the build info lists $f with its checksum" grep -qx "sha256 $want $f" "$R1/target/dist-macos/macos-build-info.txt"
+done
+check "the app's attributes are cleared before signing" sh -c "grep -q '^xattr -cr ' '$T/log9' && grep -q '^ditto .*--norsrc' '$T/log9'"
+
+# ------------------------------------------------ 10. part of a release is never uploaded
+run "$R1" "$T/log10" -- --arch arm64 >"$T/out10" 2>&1
+check "--arch without --no-upload is refused" test $? -ne 0
+check "…before building anything" sh -c "! grep -q ' build ' '$T/log10'"
+run "$R1" "$T/log10b" -- --no-gui >"$T/out10b" 2>&1
+check "--no-gui without --no-upload is refused" test $? -ne 0
+check "…and says why" grep -q "needs all four archives" "$T/out10b"
+
+# ------------------------------------------------ 11. --out never empties anything outside target/
+run "$R1" "$T/log11" -- --no-upload --out src >"$T/out11" 2>&1
+check "--out outside target/ is refused" test $? -ne 0
+check "…and src/ is still there" test -d "$R1/src"
+run "$R1" "$T/log11b" -- --no-upload --out target >"$T/out11b" 2>&1
+check "--out target itself is refused" test $? -ne 0
+run "$R1" "$T/log11c" -- --no-upload --out target/elsewhere >"$T/out11c" 2>&1
+check "--out inside target/ works" test -s "$R1/target/elsewhere/macos-build-info.txt"
+
+# ------------------------------------------------ 12. --check
+run "$R1" "$T/log12" -- --check >"$T/out12" 2>&1
+check "--check passes when everything is in place" test $? -eq 0
+check "…and builds and uploads nothing" sh -c "! grep -q ' build ' '$T/log12' && ! grep -q '^gh release' '$T/log12'"
+echo stray >"$R1/stray.txt"
+run "$R1" "$T/log12b" -- --check >"$T/out12b" 2>&1
+check "--check does not mind a dirty tree (a release is about to edit it)" test $? -eq 0
+rm -f "$R1/stray.txt"
+run "$R1" "$T/log12c" FAKE_GH_LOGIN=no -- --check >"$T/out12c" 2>&1
+check "--check fails when gh is not logged in" test $? -ne 0
+check "…and says how to log in" grep -q "gh auth login" "$T/out12c"
+run "$R1" "$T/log12d" FAKE_OS=Linux -- --check >"$T/out12d" 2>&1
+check "--check fails off a Mac" test $? -ne 0
+
+# ------------------------------------------------ 13. replacing a draft: the old info file goes first
+run "$R1" "$T/log13" FAKE_GH=draft -- >"$T/out13" 2>&1
+d=$(grep -n "^gh release delete-asset v$version macos-build-info.txt" "$T/log13" | head -1 | cut -d: -f1)
+u=$(grep -n "^gh release upload .*warden-$version-macos-arm64.tar.gz" "$T/log13" | head -1 | cut -d: -f1)
+check "replacing a draft deletes the old info file before the archives" sh -c "[ -n '$d' ] && [ -n '$u' ] && [ '${d:-0}' -lt '${u:-0}' ]"
+
+# ------------------------------------------------ 14. published, or HEAD moved, during the build
+run "$R1" "$T/log14" FAKE_GH=draft-then-published -- >"$T/out14" 2>&1
+check "a release published during the build is not touched" test $? -ne 0
+check "…and says so" grep -q "was published while this was building" "$T/out14"
+check "…nothing was uploaded" sh -c "! grep -q '^gh release \\(upload\\|create\\)' '$T/log14'"
+run "$R1" "$T/log14b" FAKE_MOVE_HEAD=1 -- >"$T/out14b" 2>&1
+check "a commit made during the build stops the upload" test $? -ne 0
+check "…and says so" grep -q "HEAD moved during the build" "$T/out14b"
+check "…nothing was uploaded" sh -c "! grep -q '^gh release \\(upload\\|create\\)' '$T/log14b'"
+
+# ------------------------------------------------ 15. a tag on another commit
+R15=$T/r15
+mkrepo "$R15"
+(cd "$R15" && git tag "v$version" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m later)
+run "$R15" "$T/log15" -- --no-upload >"$T/out15" 2>&1
+check "HEAD is not the commit the tag names: refused" test $? -ne 0
+check "…and says what to check out" grep -q "check out the commit the tag names" "$T/out15"
+
+# ------------------------------------------------ 16. a Rosetta shell is an arm64 Mac
+run "$R1" "$T/log16" FAKE_ARCH=x86_64 FAKE_TRANSLATED=1 -- --no-upload >"$T/out16" 2>&1
+check "under Rosetta the arm64 archive is the one installed" grep -q "install.sh on this Mac (the archive for arm64)" "$T/out16"
 
 echo
 if [ "$fails" -gt 0 ]; then

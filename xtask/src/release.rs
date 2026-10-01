@@ -930,6 +930,19 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     r.step("Preconditions");
     let git_version = git.out(&["--version"]).map_err(|_| "git is not installed (or not on PATH)".to_string())?;
     r.ok(&git_version);
+    // The Mac side of a release, before anything is pushed: a missing gh
+    // login or cargo-about would otherwise show only once the tag is on origin.
+    // (Read-only, so a dry run runs it too.)
+    if o.macos && env.mac && root.join(MACOS_SCRIPT).is_file() {
+        match dist_macos(&["--check".to_string()], root) {
+            Ok(()) => r.ok(&format!("this Mac can build the macOS archives ({MACOS_SCRIPT} --check)")),
+            Err(e) => r.fail(
+                &format!("the macOS archives can't be built here ({e})"),
+                "fix what is shown above; or release with --no-macos and build them on a Mac\n\
+                 while the workflow waits for them (cargo xtask dist-macos)",
+            )?,
+        }
+    }
     if !o.dry_run && !o.yes && !env.interactive {
         r.fail(
             "stdin is not a terminal, so nobody can answer the confirmation",
@@ -2206,18 +2219,25 @@ version = \"0.2.0\"
             release(&o, &self.work, &Env { interactive: false, token: None, cargo: cargo_bin(), mac })
         }
 
-        /// A scripts/dist-macos.sh that records when it ran and what origin had
-        /// by then, then exits with `code`; committed and pushed.
-        fn fake_dist_script(&self, code: i32) {
+        /// A scripts/dist-macos.sh that records each call and what origin had
+        /// by then, then exits with `check` for --check and `build` otherwise;
+        /// committed and pushed.
+        fn fake_dist_script(&self, check: i32, build: i32) {
             let script = format!(
-                "#!/bin/sh\necho \"$@\" > ../dist-ran.txt\n\
-                 git ls-remote --tags origin >> ../dist-ran.txt\nexit {code}\n"
+                "#!/bin/sh\necho \"call: $@\" >> ../dist-ran.txt\n\
+                 git ls-remote --tags origin | sed 's/^/origin: /' >> ../dist-ran.txt\n\
+                 [ \"$1\" = --check ] && exit {check}\nexit {build}\n"
             );
             std::fs::create_dir_all(self.work.join("scripts")).unwrap();
             std::fs::write(self.work.join(MACOS_SCRIPT), script).unwrap();
             sh(&self.work, "git", &["add", "-A"]);
             sh(&self.work, "git", &["commit", "--quiet", "-m", "fake dist script"]);
             sh(&self.work, "git", &["push", "--quiet", "origin", "main"]);
+        }
+
+        /// What fake_dist_script recorded ("" if it never ran).
+        fn dist_ran(&self) -> String {
+            std::fs::read_to_string(self.base.join("dist-ran.txt")).unwrap_or_default()
         }
 
         /// Every ref here and on origin, the status, and the version files.
@@ -2339,36 +2359,58 @@ version = \"0.2.0\"
     }
 
     #[test]
-    fn the_macos_archives_are_built_after_the_push_on_a_mac() {
+    fn the_macos_archives_are_checked_first_and_built_after_the_push_on_a_mac() {
         let t = TempRepo::new("macos");
-        t.fake_dist_script(0);
+        t.fake_dist_script(0, 0);
         t.release_on(&["0.2.0", "--yes"], true).unwrap();
-        // The script ran with the branch, and origin already had the tag.
-        let ran = std::fs::read_to_string(t.base.join("dist-ran.txt")).unwrap();
-        assert!(ran.starts_with("--branch main\n"), "{ran}");
-        assert!(ran.contains("refs/tags/v0.2.0"), "the tag was not on origin yet: {ran}");
+        let ran = t.dist_ran();
+        let (checked, built) = ran.split_once("call: --branch main\n").unwrap_or_else(|| panic!("never built: {ran}"));
+        // --check first, before the push: origin had no tag yet. The build
+        // came after it: origin already had the tag.
+        assert!(checked.starts_with("call: --check\n"), "{ran}");
+        assert!(!checked.contains("refs/tags/v0.2.0"), "the tag was pushed before the check: {ran}");
+        assert!(built.contains("refs/tags/v0.2.0"), "the tag was not on origin when the build ran: {ran}");
     }
 
     #[test]
     fn the_macos_archives_are_not_built_elsewhere_or_when_declined_or_in_a_dry_run() {
         for (args, mac) in [(vec!["0.2.0", "--yes"], false), (vec!["0.2.0", "--yes", "--no-macos"], true)] {
             let t = TempRepo::new("macos-skip");
-            t.fake_dist_script(0);
+            t.fake_dist_script(0, 0);
             t.release_on(&args, mac).unwrap();
-            assert!(!t.base.join("dist-ran.txt").exists(), "{args:?} on a Mac: {mac}");
+            assert_eq!(t.dist_ran(), "", "{args:?} on a Mac: {mac}");
             assert_eq!(t.git(&["tag", "--list"]), "v0.2.0");
         }
+        // A dry run only checks (read-only): nothing is built, tagged or pushed.
         let t = TempRepo::new("macos-dry");
-        t.fake_dist_script(0);
+        t.fake_dist_script(0, 0);
         t.release_on(&["0.2.0", "--dry-run"], true).unwrap();
-        assert!(!t.base.join("dist-ran.txt").exists());
+        let ran = t.dist_ran();
+        assert!(ran.starts_with("call: --check\n") && !ran.contains("--branch"), "{ran}");
         assert_eq!(t.git(&["tag", "--list"]), "");
+    }
+
+    #[test]
+    fn a_mac_that_cannot_build_the_archives_stops_the_release_before_the_push() {
+        let t = TempRepo::new("macos-check");
+        t.fake_dist_script(1, 0);
+        let origin_refs = sh(&t.origin, "git", &["show-ref"]);
+        let e = t.release_on(&["0.2.0", "--yes"], true).unwrap_err();
+        assert!(e.contains("stopped at step 1/9"), "{e}");
+        assert!(e.contains("macOS archives can't be built here"), "{e}");
+        // Nothing was edited, committed, tagged or pushed.
+        assert_eq!(sh(&t.origin, "git", &["show-ref"]), origin_refs);
+        assert_eq!(t.git(&["tag", "--list"]), "");
+        assert_eq!(t.git(&["status", "--porcelain"]), "");
+        // --no-macos releases anyway.
+        t.release_on(&["0.2.0", "--yes", "--no-macos"], true).unwrap();
+        assert_eq!(sh(&t.origin, "git", &["tag", "--list"]), "v0.2.0");
     }
 
     #[test]
     fn a_failed_macos_build_leaves_the_pushed_release_and_says_what_to_do() {
         let t = TempRepo::new("macos-fail");
-        t.fake_dist_script(1);
+        t.fake_dist_script(0, 1);
         let e = t.release_on(&["0.2.0", "--yes"], true).unwrap_err();
         assert!(e.contains("stopped at step 8/9"), "{e}");
         assert!(e.contains("macOS archives were not built or uploaded"), "{e}");

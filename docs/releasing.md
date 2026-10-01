@@ -60,7 +60,10 @@ commit, a failure undoes the version edit, so the tree is as it was.
    `git fetch origin` works and the branch is neither ahead of nor behind
    origin; the tag `v<version>` exists neither here nor on origin
    (`git ls-remote --tags origin`); the version is valid semver, newer than
-   every `v*` tag and not older than `Cargo.toml`. Without `--yes`, stdin
+   every `v*` tag and not older than `Cargo.toml`. On a Mac, also
+   `scripts/dist-macos.sh --check` (the tools and the `gh` login the macOS
+   archives need), so that a missing one stops the release before anything
+   is pushed. Without `--yes`, stdin
    must be a terminal (someone answers the confirmation).
 2. **CI status** of the commit being released (`--no-ci-check` skips it).
    The GitHub API (`GET /repos/<owner>/<repo>/actions/runs?head_sha=…`,
@@ -138,20 +141,24 @@ hour, enough to follow a release at a slower pace.
   `--version`), then packages it.
 - **gui**: `warden-gui` with the CLI, for Linux x86_64 and arm64 (a `.tar.gz`).
 - **macos** (a real release only): waits, up to an hour, for the macOS
-  archives in the draft release for the tag, built on a Mac. It takes them
-  only when `macos-build-info.txt` names this very commit and a clean tree,
-  and checks that each archive holds Mach-O binaries of the architecture in
-  its name and the version in its `Info.plist`. It prints what is missing
-  every few minutes (an annotation on the run).
+  archives in the draft release for the tag, built on a Mac. It takes the four
+  archives only when `macos-build-info.txt` names this very commit and a clean
+  tree and every archive matches the checksum listed there (a half-finished or
+  stale upload is waited out, never taken), and checks that each holds
+  Mach-O binaries of the architecture in its name and the version in its
+  `Info.plist`. It retries API errors, and prints what is missing every few
+  minutes (an annotation on the run).
 - **checksums**: `SHA256SUMS` over every archive (macOS ones included) and
   `install.sh`.
 - **install-test**: `install.sh` against those very files on Linux x86_64 and
   Linux arm64, as a user and as root; a tampered archive must be refused. (The
   macOS install is tested on the Mac by `scripts/dist-macos.sh`.)
-- **publish**: adds the Linux archives, `SHA256SUMS` and `install.sh` to the
-  draft, writes generated notes and publishes it (the tag is created there,
-  in a run started by hand); a version with a `-` (`0.2.0-rc.1`) is marked as
-  a pre-release.
+- **publish**: uploads every file to the draft (the macOS ones replaced by the
+  very bytes `SHA256SUMS` lists), writes generated notes and publishes it (the
+  tag is created there, in a run started by hand); a version with a `-`
+  (`0.2.0-rc.1`) is marked as a pre-release. It does nothing to a release that
+  is already published (a re-run). A last step downloads what was published and
+  checks it against `SHA256SUMS`, file for file.
 
 Nothing is published unless every build, the macOS check and the install
 tests passed. Manual runs without the box ticked do everything but the macOS
@@ -178,10 +185,16 @@ is run through Rosetta, if installed); packages; runs `install.sh` on the
 archive for this Mac (checksum checked, a tampered archive refused); and
 uploads everything to a **draft** release for `v<version>` (created at the
 branch if there is none), `macos-build-info.txt` last. That file records the
-commit, the date, the macOS and Rust versions; the workflow takes the archives
-only when its commit is the one being released, so files from another commit
-are never published. Nothing is published from the Mac: the workflow does it.
-It refuses a version that already has a published release.
+commit, the date, the macOS and Rust versions and the checksum of every
+archive; the workflow takes the archives only when its commit is the one being
+released and each archive matches, so files from another commit, or a mix of
+two builds, are never published. When it replaces a draft's files it deletes
+the old info file first, and it refuses to upload part of a release (`--arch`
+and `--no-gui` need `--no-upload`). It refuses a dirty tree, a HEAD that is not
+the commit the tag names (here or on origin), a HEAD that moved during the
+build, and a version that already has a published release (also one published
+while it was building). Nothing is published from the Mac: the workflow does it.
+`cargo dist-macos --check` only checks that this Mac has what a release needs.
 
 `scripts/test-dist-macos.sh` tests the script's logic on Linux, with stubs for
 the Mac tools (CI runs it); only a run on a Mac tests the real compilers and

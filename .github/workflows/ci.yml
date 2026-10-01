@@ -23,7 +23,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never on main: a docs-only push right after a code push would cancel the
+  # code commit's run, and its own docs-only diff skips macOS and ARM64.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always

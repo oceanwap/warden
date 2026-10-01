@@ -45,7 +45,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # By mode too: a dry run on main must not cancel a real release waiting there.
+  group: release-${{ github.ref }}-${{ inputs.release && 'publish' || 'dry' }}
   # A release in progress is never cancelled by another run.
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release }}
 
@@ -320,41 +321,56 @@ jobs:
     steps:
       - name: Wait for the archives built on a Mac
         run: |
-          set -euo pipefail
+          set -uo pipefail
           archives=(
             "warden-$VERSION-macos-arm64.tar.gz" "warden-$VERSION-macos-x86_64.tar.gz"
             "warden-gui-$VERSION-macos-arm64.zip" "warden-gui-$VERSION-macos-x86_64.zip"
           )
           mkdir -p macos
+          why=""
+          # A transient API error must not end an hour-long wait: retry, and
+          # on failure report it and poll again.
+          fetch() { # dest cmd… : the command's output into dest, three tries
+            local dest=$1
+            shift
+            for _ in 1 2 3; do
+              if "$@" > "$dest.part"; then mv "$dest.part" "$dest"; return 0; fi
+              sleep 5
+            done
+            rm -f "$dest.part"
+            return 1
+          }
+          asset() { # name release-json: the asset's id
+            jq -r --arg f "$1" '[.assets[] | select(.name == $f and .state == "uploaded")][0].id // empty' <<<"$2"
+          }
+          # 0 when macos/ holds the archives that were built from this commit,
+          # each matching the checksum in macos-build-info.txt; else 1 with $why.
+          poll() {
+            local rel f id built want got missing=""
+            fetch macos/.list gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" || { why="GitHub's API did not answer"; return 1; }
+            rel=$(jq -c --arg tag "$TAG" '[.[] | select(.draft and .tag_name == $tag)][0] // empty' macos/.list) || { why="unreadable answer from GitHub"; return 1; }
+            [ -n "$rel" ] || { why="there is no draft release $TAG yet"; return 1; }
+            for f in "${archives[@]}" macos-build-info.txt; do
+              [ -n "$(asset "$f" "$rel")" ] || missing="$missing $f"
+            done
+            [ -z "$missing" ] || { why="the draft release $TAG lacks:$missing"; return 1; }
+            id=$(asset macos-build-info.txt "$rel")
+            fetch macos/macos-build-info.txt gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" || { why="could not download macos-build-info.txt"; return 1; }
+            built=$(sed -n 's/^commit: //p' macos/macos-build-info.txt | head -1)
+            [ "$built" = "$GITHUB_SHA" ] || { why="the archives were built from ${built:-an unknown commit}, but this release is $GITHUB_SHA"; return 1; }
+            grep -qx 'dirty: no' macos/macos-build-info.txt || { why="the archives were built from a tree with uncommitted changes"; return 1; }
+            for f in "${archives[@]}"; do
+              id=$(asset "$f" "$rel")
+              fetch "macos/$f" gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" || { why="could not download $f"; return 1; }
+              want=$(awk -v f="$f" '$1 == "sha256" && $3 == f { print $2 }' macos/macos-build-info.txt)
+              got=$(sha256sum "macos/$f" | awk '{ print $1 }')
+              [ -n "$want" ] && [ "$got" = "$want" ] || { why="$f does not match the checksum in macos-build-info.txt (an upload may be in progress)"; return 1; }
+            done
+            return 0
+          }
           deadline=$((SECONDS + 60 * 60))
           last_said=-1000
-          while :; do
-            rel=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-              jq -c --arg tag "$TAG" '[.[] | select(.draft and .tag_name == $tag)][0] // empty')
-            why=""
-            if [ -z "$rel" ]; then
-              why="there is no draft release $TAG yet"
-            else
-              missing=""
-              for f in "${archives[@]}" macos-build-info.txt; do
-                id=$(jq -r --arg f "$f" '[.assets[] | select(.name == $f and .state == "uploaded")][0].id // empty' <<<"$rel")
-                [ -n "$id" ] || missing="$missing $f"
-              done
-              if [ -n "$missing" ]; then
-                why="the draft release $TAG lacks:$missing"
-              else
-                id=$(jq -r '[.assets[] | select(.name == "macos-build-info.txt")][0].id' <<<"$rel")
-                gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > macos/macos-build-info.txt
-                built=$(sed -n 's/^commit: //p' macos/macos-build-info.txt | head -1)
-                if [ "$built" != "$GITHUB_SHA" ]; then
-                  why="the archives were built from ${built:-an unknown commit}, but this release is $GITHUB_SHA"
-                elif grep -qx 'dirty: yes' macos/macos-build-info.txt; then
-                  why="the archives were built from a tree with uncommitted changes"
-                else
-                  break
-                fi
-              fi
-            fi
+          until poll; do
             if [ "$SECONDS" -ge "$deadline" ]; then
               echo "::error title=No macOS archives::gave up after an hour: $why. On a Mac with this commit checked out ($GITHUB_SHA), run: scripts/dist-macos.sh (needs gh logged in), then re-run this workflow (Re-run all jobs). Nothing was published."
               exit 1
@@ -366,11 +382,8 @@ jobs:
             fi
             sleep 30
           done
+          rm -f macos/.list
           cat macos/macos-build-info.txt
-          for f in "${archives[@]}"; do
-            id=$(jq -r --arg f "$f" '[.assets[] | select(.name == $f)][0].id' <<<"$rel")
-            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "macos/$f"
-          done
           ls -l macos
       # Each archive must hold a Mach-O binary of the architecture in its name:
       # the wrong target, or a Linux build, must not go out as a macOS one.
@@ -502,16 +515,17 @@ jobs:
       - name: GitHub Release
         run: |
           set -euo pipefail
+          # A re-run after the release went out must not touch it.
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          if [ "$draft" != true ]; then
+            echo "::notice::$TAG is already published: nothing to do here (the next step verifies it)"
+            exit 0
+          fi
           ls -l dist
-          # What the draft doesn't hold yet (the macOS files are in it).
-          rest=()
-          for f in dist/*; do
-            case "$(basename "$f")" in
-              *-macos-*|macos-build-info.txt) ;;
-              *) rest+=("$f") ;;
-            esac
-          done
-          gh release upload "$TAG" "${rest[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          # Everything, the macOS files too (the draft's copies are replaced by
+          # the very bytes SHA256SUMS lists): what is published is what was
+          # checksummed, whatever happened to the draft meanwhile.
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           notes_args=(-f tag_name="$TAG")
           flags=(--draft=false --title "Warden $VERSION")
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
@@ -523,10 +537,19 @@ jobs:
           flags+=(--notes-file notes.md)
           if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease=true); else flags+=(--prerelease=false); fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
-      - name: What was published
+      # What users download must be what SHA256SUMS lists, file for file.
+      - name: Verify what was published
         run: |
           set -euo pipefail
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,url,assets \
             --jq '"draft: \(.isDraft)\n\(.url)\n" + ([.assets[] | "  \(.name) \(.size)"] | join("\n"))'
           draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
           [ "$draft" = false ] || { echo "::error::$TAG is still a draft"; exit 1; }
+          mkdir verify
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir verify
+          cd verify
+          sha256sum -c SHA256SUMS || { echo "::error::the published files do not match SHA256SUMS"; exit 1; }
+          listed=$(wc -l < SHA256SUMS | tr -d ' ')
+          files=$(find . -maxdepth 1 -type f ! -name SHA256SUMS | wc -l | tr -d ' ')
+          [ "$listed" = "$files" ] || { echo "::error::SHA256SUMS lists $listed files, the release holds $files besides it"; exit 1; }
+          echo "all $files published files match SHA256SUMS"

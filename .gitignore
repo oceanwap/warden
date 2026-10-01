@@ -4,3 +4,4 @@ bench/.run/
 *.sock
 bench/nest/dist/
 bench/results/*.json
+.DS_Store

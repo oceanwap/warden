@@ -28,7 +28,8 @@ permissions:
 
 concurrency:
   group: service-managers-${{ github.ref }}
-  cancel-in-progress: true
+  # Never on main (see ci.yml): a docs-only push must not cancel a code commit's run.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
