@@ -1,7 +1,8 @@
-//! Project tasks, run through the cargo alias in `.cargo/config.toml`:
+//! Project tasks, run through the cargo aliases in `.cargo/config.toml`:
 //!
 //!   cargo xtask bench [--quick] [--only SUITES] [--duration S] [--no-readme]
 //!   cargo bench-all                       (the same as `cargo xtask bench`)
+//!   cargo xtask release VERSION [OPTIONS] (also `cargo release`; see release.rs)
 //!
 //! `bench` checks the tools the benchmarks need, builds Warden in release
 //! mode, runs every suite in `bench/` against PM2, Watt (wattpm), nginx and
@@ -9,6 +10,8 @@
 //! JSON to `bench/results/latest/`, and replaces the README's benchmark
 //! tables (between `<!-- bench:start -->` and `<!-- bench:end -->`).
 //! Nothing here is part of `cargo build`.
+
+mod release;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -82,6 +85,17 @@ const SUITES: &[Suite] = &[
 ];
 
 const USAGE: &str = "\
+cargo xtask TASK [OPTIONS]
+
+TASKS:
+    bench      Run every benchmark suite, update README.md (also: cargo bench-all)
+    release    Release a version: checks, version bump, tag, push, then follow the
+               Release workflow to the GitHub Release (also: cargo release)
+
+`cargo xtask TASK --help` lists a task's options.
+";
+
+const BENCH_USAGE: &str = "\
 cargo xtask bench [OPTIONS]      (also: cargo bench-all)
 
 Runs every benchmark suite and updates README.md and bench/results/latest.md.
@@ -102,6 +116,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("bench") => match bench(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("release") => match release::main(&args[1..], &root()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("xtask: {e}");
@@ -151,10 +172,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 o.duration = Some(v.clone());
             }
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{BENCH_USAGE}");
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown option {other:?}\n\n{USAGE}")),
+            other => return Err(format!("unknown option {other:?}\n\n{BENCH_USAGE}")),
         }
     }
     Ok(o)

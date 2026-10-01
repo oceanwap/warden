@@ -1,7 +1,10 @@
-# Project commands (a cargo alias, not part of any build):
+# Project commands (cargo aliases, not part of any build):
 #   cargo xtask bench        run every benchmark, update README and bench/results/latest.md
 #   cargo bench-all          the same
 #   cargo xtask bench --help
+#   cargo release 0.2.0      release: checks, version bump, tag, push, follow the Release
+#                            workflow (cargo xtask release --help; docs/releasing.md)
 [alias]
 xtask = "run --quiet --package xtask --"
 bench-all = "run --quiet --package xtask -- bench"
+release = "run --quiet --package xtask -- release"

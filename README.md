@@ -649,6 +649,7 @@ cargo test --workspace --bins --tests          # also protocol/ and gui/ (the GU
 cargo clippy --workspace --all-targets
 cargo run -p warden-gui     # the GUI
 cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
+cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
 ```
 
 The workspace: `warden` (this directory), `protocol/` (the wire types, serde
@@ -682,6 +683,26 @@ Limitations:
   `warden_log_lines_dropped_total` in the metrics). With
   `[logging] max_lines_per_sec = 0` Warden keeps every line by slowing a
   flooding app down instead (for at most a second per read).
+
+### Releasing
+
+```sh
+cargo release 0.2.0 --dry-run   # every step printed, nothing changed
+cargo release 0.2.0             # or: patch | minor | major
+```
+
+`cargo release` (`cargo xtask release`) checks that `main` is clean and in
+sync with origin, that the tag is new and CI passed for the commit, sets the
+version in `Cargo.toml`, `protocol/` and `gui/` (and `Cargo.lock`), runs fmt,
+clippy and the tests, then commits `Release v<version>`, tags
+`v<version>` and pushes both. The tag starts the Release workflow, which
+builds the CLI and the GUI for Linux and macOS, checksums them, tests
+`install.sh` and publishes the
+[GitHub Release](https://github.com/oceanwap/warden/releases); the command
+follows it to the end and prints the release's files. Pushing the tag needs
+the right to push tags to the repository. macOS notarization is still a
+TODO. Every step, the options and what to do when one fails:
+[`docs/releasing.md`](docs/releasing.md).
 
 ## License
 

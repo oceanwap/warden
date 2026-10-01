@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/oceanwap/warden"
 publish = false
-description = "Project tasks for Warden: `cargo xtask bench` runs the benchmark suite."
+description = "Project tasks for Warden: `cargo xtask bench` runs the benchmark suite, `cargo xtask release` releases."
 
 [dependencies]
+# Reading the GitHub API's answers in `release` (already in the lockfile:
+# warden and the protocol use it). curl does the HTTP: no TLS stack here.
+serde_json = "1.0.151"
