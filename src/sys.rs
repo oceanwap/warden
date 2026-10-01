@@ -85,6 +85,20 @@ pub fn isatty(fd: RawFd) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
+/// Try to take an exclusive advisory lock on an open file without waiting:
+/// `Ok(true)` taken (held until the file is closed), `Ok(false)` another
+/// process holds it. Used for the small CLI state files (`ids.rs`).
+pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
+    // SAFETY: flock only takes the descriptor number of a file that is open
+    // for the whole call (borrowed here) and a flag word; it touches no memory.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
+}
+
 /// Memory page size in bytes (cached).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // for /proc metrics
 pub fn page_size() -> u64 {
@@ -639,6 +653,21 @@ pub fn child_new_session() -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// flock is per open file description: a second open of the same file
+    /// waits (here: reports `false`) until the first is closed.
+    #[test]
+    fn try_lock_exclusive_excludes_a_second_open_until_the_first_closes() {
+        let path = std::env::temp_dir().join(format!("warden-flock-{}", std::process::id()));
+        let open = || std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).unwrap();
+        let (a, b) = (open(), open());
+        assert!(try_lock_exclusive(&a).unwrap());
+        assert!(!try_lock_exclusive(&b).unwrap(), "held by the first");
+        assert!(try_lock_exclusive(&a).unwrap(), "taking it again is fine");
+        drop(a);
+        assert!(try_lock_exclusive(&b).unwrap(), "free once the first is closed");
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn open_fds() -> usize {
         #[cfg(target_os = "linux")]

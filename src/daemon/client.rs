@@ -322,18 +322,17 @@ pub fn events(
 
 async fn events_main(target: Option<String>, json: bool, logs: bool, interval: Option<u64>) -> i32 {
     let apps = fleet::discover();
-    // An app or a namespace; nothing (or `all`): every app.
+    // Apps by name, id, namespace or a list of them (`0,api`); nothing (or
+    // `all`): every app.
     let names: Vec<String> = match target.as_deref() {
         None | Some("all") => Vec::new(),
-        Some(t) => {
-            let v: Vec<String> =
-                apps.iter().filter(|a| a.name == t || a.namespace == t).map(|a| a.name.clone()).collect();
-            if v.is_empty() {
-                eprintln!("warden: no app or namespace named {t:?}; `warden list` shows what is on this host");
+        Some(t) => match fleet::resolve_names(t) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warden: {e}");
                 return 2;
             }
-            v
-        }
+        },
     };
     let mut out = Printer::new(json);
     if let Ok(s) = UnixStream::connect(socket_path()).await {

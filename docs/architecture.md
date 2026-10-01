@@ -564,6 +564,19 @@ one place to watch and drive every app. Both are specified in
 [`protocol.md`](protocol.md), with the wire types in the `warden-protocol`
 crate (`protocol/`, re-exported from `src/control.rs` and `src/events.rs`).
 
+App ids (`src/ids.rs`) exist only in the CLI: the number in the first column
+of `warden list`, so `warden start 0,1,2` works as in PM2. A supervisor, a
+worker and the wire protocol never see one. An app gets its id the first time
+the CLI meets its config (the lowest number not taken, in config order), and
+`ids.json` in the state directory remembers it: it is rewritten atomically
+under a lock (two commands that both meet a new app cannot give it the same
+number), a command that finds nothing new only reads it, and one that cannot
+write it (a read-only directory) still shows the right numbers and says they
+may change. Only `warden delete` frees a number; an app whose config just
+disappeared keeps its number reserved, so putting the file back brings the
+same id back. A name wins over a number when an app is called `3`. Scripts
+should use names.
+
 ### 4.11 Security
 
 Warden needs no privileges and performs none: workers inherit Warden's user,

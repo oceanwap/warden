@@ -1316,16 +1316,22 @@ fn pm2_style_fleet_workflow() {
     assert!(out.contains("already exists"), "{out}");
     assert!(get(p1, "/whoami").is_some() && get(p2, "/whoami").is_some());
 
-    // list: one row per worker, both apps.
+    // list: a boxed table like PM2's, one row per worker, ids first (the
+    // apps are numbered in the order they were created: api 0, web 1).
     let out = f.ok(&["list"]);
-    assert_eq!(out.lines().filter(|l| l.starts_with("api ") && l.contains("RUNNING")).count(), 2, "{out}");
-    assert_eq!(out.lines().filter(|l| l.starts_with("web ") && l.contains("RUNNING")).count(), 1, "{out}");
+    assert!(out.starts_with('┌') && out.lines().nth(1).is_some_and(|l| l.starts_with("│ id │ name")), "{out}");
+    let rows = |id: &str, name: &str| {
+        out.lines().filter(|l| l.starts_with(&format!("│ {id} ")) && l.contains(name) && l.contains("RUNNING")).count()
+    };
+    assert_eq!((rows("0", " api "), rows("1", " web ")), (2, 1), "{out}");
     assert_eq!(f.list().len(), 2);
+    let ids: Vec<_> = f.list().iter().map(|a| (a["app"].as_str().unwrap().to_string(), a["id"].as_u64())).collect();
+    assert_eq!(ids, [("api".to_string(), Some(0)), ("web".to_string(), Some(1))], "--json carries the ids");
 
-    // PM2 numeric ids are explained, not guessed.
-    let (code, out) = f.cli(&["restart", "0"]);
+    // An id nobody has is an error that says which ones exist, and nothing is done.
+    let (code, out) = f.cli(&["restart", "0,7"]);
     assert_eq!(code, 2);
-    assert!(out.contains("names apps, not numeric ids"), "{out}");
+    assert!(out.contains("no app has the id 7 (the ids on this host: 0,1)"), "{out}");
     let (code, out) = f.cli(&["restart"]);
     assert_eq!(code, 2);
     assert!(out.contains("which app?"), "{out}");
@@ -1354,6 +1360,24 @@ fn pm2_style_fleet_workflow() {
     let out = f.ok(&["start", "api"]);
     assert!(out.contains("online (2/2"), "{out}");
 
+    // Ids and lists work for every command, as PM2's `start 0 1`: api is up
+    // already, web comes up; then web goes down again by its id.
+    let out = f.ok(&["start", "0,1"]);
+    assert!(out.contains("web: online"), "{out}");
+    f.ok(&["restart", "0", "1"]);
+    f.ok(&["stop", "1"]);
+    f.wait("web stopped by id", |f| f.app("web")["status"]["stopped"] == true);
+    // A wrong item anywhere acts on nothing: api is untouched by this refusal.
+    let pids_before = f.pids("api");
+    let (code, out) = f.cli(&["stop", "0", "1:2"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("works on whole apps"), "{out}");
+    assert_eq!(f.pids("api"), pids_before, "api kept running");
+    assert_eq!(f.app("api")["status"]["stopped"], false);
+    let (code, out) = f.cli(&["start", "9"]);
+    assert_eq!(code, 2, "an unknown id is an error, not a script to try: {out}");
+    assert!(out.contains("no app has the id 9"), "{out}");
+
     // Scale relative to now, save, kill everything, resurrect.
     f.ok(&["scale", "api", "+1"]);
     f.wait("3 api workers", |f| f.app("api")["status"]["workers_ready"] == 3);
@@ -1368,7 +1392,7 @@ fn pm2_style_fleet_workflow() {
 
     // describe / env: secrets hidden unless asked.
     let out = f.ok(&["describe", "api"]);
-    assert!(out.contains("namespace backend") && out.contains("restart") && out.contains("Worker"), "{out}");
+    assert!(out.contains("namespace backend") && out.contains("restart") && out.contains("worker"), "{out}");
     assert!(!out.contains("s3cret") && out.contains("NODE_ENV=production"), "{out}");
     let out = f.ok(&["env", "api"]);
     assert!(out.contains("API_TOKEN=(hidden") && !out.contains("s3cret"), "{out}");
@@ -1602,7 +1626,7 @@ fn start_runs_any_command() {
     f.ok(&["start", sh.to_str().unwrap(), "--name", "looper", "-o", f.home.join("looper-out.log").to_str().unwrap()]);
     let list = f.ok(&["list"]);
     for app in ["sleeper", "files", "ticker", "looper"] {
-        assert!(list.lines().any(|l| l.starts_with(app) && l.contains("RUNNING")), "{app}:\n{list}");
+        assert!(list.lines().any(|l| l.contains(&format!(" {app} ")) && l.contains("RUNNING")), "{app}:\n{list}");
     }
     let cfg = std::fs::read_to_string(f.home.join("ticker.toml")).unwrap();
     assert!(cfg.contains("command = \"python3\"") && cfg.contains("signal = \"SIGINT\""), "{cfg}");
@@ -4031,7 +4055,7 @@ fn event_loop_delay_is_reported() {
     assert!(quiet < 20.0, "an idle loop runs on time: p50 {quiet} ms\n{s:#}");
     assert!((40.0..2000.0).contains(&busy), "150 ms blocks: max {busy} ms\n{s:#}");
     let (_, list) = w.cli(&["status"]);
-    assert!(list.contains("Loop p99"), "{list}");
+    assert!(list.contains("loop p99"), "{list}");
     // One WARN once it stays high for 10 heartbeats, naming the worker.
     let log = w.wait_log("worker event loop delay is high", T);
     let line = log.lines().find(|l| l.contains("worker event loop delay is high")).unwrap();
@@ -4112,7 +4136,7 @@ fn start_fails_fast_when_every_worker_crashes() {
     // One app: `list` shows its detail view; the crash, not the stop, is the last exit.
     let list = f.ok(&["list"]);
     assert!(list.contains("State:       errored: its last start failed"), "{list}");
-    assert!(list.lines().filter(|l| l.contains("STOPPED") && l.ends_with("exit code 3")).count() == 2, "{list}");
+    assert!(list.lines().filter(|l| l.contains("STOPPED") && l.contains("exit code 3")).count() == 2, "{list}");
     // Warden's own log says it once, with a hint.
     let events = f.ok(&["logs", "broken", "--events", "--nostream", "-n", "200"]);
     assert_eq!(events.matches("app cannot start: every worker crashed before it was ready").count(), 1, "{events}");
@@ -6210,7 +6234,10 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
         assert!(who.starts_with(&format!("{victim}:")), "{who}");
     }
     let (_, out) = w.cli(&["status"]);
-    assert!(out.contains("Standby:     1/1 ready") && out.contains("\ns1       STANDBY"), "{out}");
+    assert!(
+        out.contains("Standby:     1/1 ready") && out.lines().any(|l| l.starts_with("│ s1 ") && l.contains("STANDBY")),
+        "{out}"
+    );
     assert_eq!(s["workers"].as_array().map(Vec::len), Some(1), "standbys are not workers");
 
     let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);

@@ -14,6 +14,7 @@ mod events;
 mod fleet;
 mod guard;
 mod health;
+mod ids;
 mod logging;
 mod logview;
 mod metrics;

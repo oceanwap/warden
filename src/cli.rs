@@ -13,16 +13,18 @@ warden - a fast, crash-safe supervisor for Bun and Node apps
 USAGE:
     warden <COMMAND> [TARGET] [OPTIONS]
 
-    TARGET is an app name, a namespace, `all`, or `app:N` for one worker.
-    With -c <config>, commands act on that one app and TARGET may be a
-    worker number.
+    TARGET is an app name, its id (the first column of `warden list`), a
+    namespace, `all`, or `app:N` for one worker. Several at once, with commas
+    or spaces; ids can be ranges: `warden start 0,1,2`, `warden stop 0-3`,
+    `warden restart api web:2`. With -c <config>, commands act on that one app
+    and TARGET may be a worker number (`0,1`, `0-2`).
 
 APPS (familiar from PM2):
-    start <app|config.toml|script>   Start an app. A script gets a config written for
+    start <app|id|config.toml|script>   Start an app. A script gets a config written for
                      it: `warden start server.js --name api -i 4 --port 3000`.
                      Waits for it; if every worker crashes first, exits 1 with the
                      app's errors and leaves it stopped (errored)
-    list             Every app and worker (also: ls, ps, status)  [--json]
+    list             Every app and worker as a table with ids (also: ls, ps, status)  [--json]
     describe <app>   Config, paths, restart policy, workers, last rollout (also: show)
     restart <target> Replace the workers one at a time through the health gates (no
                      downtime); --hard stops them all, then starts them (like PM2)
@@ -432,10 +434,17 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
     };
     let one = |rest: &[String]| rest.first().cloned();
+    // Apps by id or name, as `warden stop 0 1` or `warden stop 0,1` (PM2 takes both).
+    let many = |rest: &[String]| (!rest.is_empty()).then(|| rest.join(","));
     let command = match cmd.as_str() {
         "start" => {
-            too_many(1)?;
-            match one(&rest) {
+            // Several words are apps (ids or names); a command line goes in quotes.
+            if rest.len() > 1 && rest.iter().any(|w| w.contains(char::is_whitespace)) {
+                return Err("start takes one script or command line, or several app names or ids: \
+                            `warden start 0 1`, `warden start \"node server.js\" --name api`"
+                    .into());
+            }
+            match many(&rest) {
                 None => Command::Run,
                 Some(what) => Command::Start { what, opts: Box::new(so.clone()) },
             }
@@ -457,72 +466,59 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         "version" => Command::Version,
         "help" => Command::Help,
         "list" | "ls" | "ps" | "l" | "status" | "jlist" | "prettylist" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             if cmd == "jlist" {
                 json = true;
             }
             Command::Act(Action::List)
         }
         "workers" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             table_only = true;
             Command::Act(Action::List)
         }
         "describe" | "show" | "info" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Describe)
         }
         "reload" | "gracefulReload" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Reload { safe: false })
         }
         "safe-reload" | "deploy" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Reload { safe: true })
         }
         "restart" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Restart { hard })
         }
         "stop" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Stop)
         }
         "shutdown" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Shutdown)
         }
         "reset" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Reset)
         }
         "flush" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Flush)
         }
         "env" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Env { show_secrets })
         }
         "config" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Config { show_secrets })
         }
         "delete" | "del" | "rm" => {
-            too_many(1)?;
-            Command::Delete { target: one(&rest).ok_or("delete needs an app name (or `all`)")? }
+            Command::Delete { target: many(&rest).ok_or("delete needs an app name or id (or `all`)")? }
         }
         "scale" => {
             too_many(2)?;
@@ -540,8 +536,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             Command::Act(Action::Scale(arg))
         }
         "logs" | "log" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Act(Action::Logs { lines, follow, history, query: q.clone() })
         }
         "search" | "grep" => {
@@ -594,8 +589,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             Command::Unstartup(scope)
         }
         "kill" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Kill
         }
         "doctor" => {
@@ -603,8 +597,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             Command::Doctor
         }
         "top" | "monit" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Top
         }
         "daemon" | "wardend" => {
@@ -621,8 +614,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             })
         }
         "events" => {
-            too_many(1)?;
-            target = one(&rest);
+            target = many(&rest);
             Command::Events { logs: with_logs, interval_ms }
         }
         other => return Err(format!("unknown command {other:?} (see `warden --help`)")),
@@ -641,7 +633,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         return Err("--user and --system only apply to `warden startup` and `warden unstartup`".into());
     }
     if let Some(w) = worker {
-        target = Some(format!("{}:{w}", target.unwrap_or_default()));
+        let t = target.unwrap_or_default();
+        if t.contains(',') {
+            return Err("--worker takes one app: `warden restart api --worker 2` (or `api:2`)".into());
+        }
+        target = Some(format!("{t}:{w}"));
     }
     if matches!(command, Command::Check | Command::Version | Command::Help | Command::Save | Command::Resurrect)
         && !rest.is_empty()
@@ -729,6 +725,11 @@ pub async fn wait_for_rollout(socket: &std::path::Path, seq: u64) -> i32 {
 }
 
 pub fn render_status(s: &Status, table_only: bool) -> String {
+    render_status_with(s, table_only, false)
+}
+
+/// `warden status` for one app; `color`: styled cells (a terminal).
+pub fn render_status_with(s: &Status, table_only: bool, color: bool) -> String {
     let mut o = String::new();
     if !table_only {
         o += &format!("Application: {}\n", s.app);
@@ -782,33 +783,35 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         }
         o += "\n";
     }
-    o += &format!(
-        "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
-        "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Loop p99", "Health", "Last exit"
-    );
     // Workers by number, old processes still draining after a rollout
     // (`2 (old)`), then hot standbys as `s1`, `s2`…
-    let rows = s
+    let workers = s
         .workers
         .iter()
         .map(|w| (w.id.to_string(), w))
         .chain(s.draining.iter().map(|w| (draining_name(s, w), w)))
         .chain(s.standbys.iter().map(|w| (standby_name(w), w)));
-    for (name, w) in rows {
-        o += &format!(
-            "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
-            name,
-            w.state,
-            w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
-            w.restarts,
-            w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
-            w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
-            loop_p99(w),
-            health_word(w.healthy),
-            w.last_exit.as_deref().unwrap_or("-"),
-        );
-    }
+    let rows: Vec<Vec<Cell>> = workers
+        .map(|(name, w)| {
+            vec![
+                Cell::styled(name, NAME),
+                Cell::state(&w.state),
+                Cell::plain(w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::plain(w.uptime_secs.map(duration).unwrap_or_else(|| "-".into())),
+                Cell::plain(w.restarts.to_string()),
+                Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
+                Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
+                Cell::plain(loop_p99(w)),
+                Cell::health(w.healthy),
+                Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
+            ]
+        })
+        .collect();
+    o += &boxed(
+        &["worker", "status", "pid", "uptime", "↺", "cpu", "mem", "loop p99", "health", "last exit"],
+        &rows,
+        color,
+    );
     o
 }
 
@@ -888,29 +891,144 @@ pub(crate) fn table(rows: &[Vec<String>]) -> String {
     o
 }
 
-/// `warden list`: one row per worker, like `pm2 list`.
-pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> String {
-    let mut rows = vec![
-        [
-            "App",
-            "Namespace",
-            "Worker",
-            "Status",
-            "PID",
-            "Uptime",
-            "Restarts",
-            "CPU",
-            "Memory",
-            "Loop p99",
-            "Health",
-            "Last exit",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>(),
-    ];
+// ------------------------------------------------------------ boxed tables
+
+/// SGR codes for styled cells (only used when `color` is on).
+const HEAD: &str = "1;35";
+const ID: &str = "1;36";
+const NAME: &str = "1";
+const DIM: &str = "2";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const RED: &str = "31";
+
+/// The Last exit column is cut here, so one long reason cannot make the
+/// table wider than a terminal (`warden describe` has the whole text).
+const LAST_EXIT_MAX: usize = 40;
+
+/// One table cell: its text and, with colors on, how to paint it.
+pub(crate) struct Cell {
+    text: String,
+    style: &'static str,
+}
+
+impl Cell {
+    pub(crate) fn plain(text: impl Into<String>) -> Cell {
+        Cell { text: text.into(), style: "" }
+    }
+
+    pub(crate) fn styled(text: impl Into<String>, style: &'static str) -> Cell {
+        Cell { text: text.into(), style }
+    }
+
+    /// A worker or app state: green when it serves, yellow while it changes
+    /// or is stopped, red when it failed, dim when there is nothing to run.
+    fn state(state: &str) -> Cell {
+        let style = match state {
+            "RUNNING" => GREEN,
+            "STARTING" | "STOPPING" | "STANDBY" | "STOPPED" | "stopped" | "DRAINING" => YELLOW,
+            "FAILED" | "CRASHED" | "errored" | "unreachable" => RED,
+            "offline" => DIM,
+            _ => "",
+        };
+        Cell::styled(state, style)
+    }
+
+    fn health(h: Option<bool>) -> Cell {
+        Cell::styled(
+            health_word(h),
+            match h {
+                Some(true) => GREEN,
+                Some(false) => RED,
+                None => "",
+            },
+        )
+    }
+}
+
+/// `text` cut to `max` characters, ending in `…` when it was longer.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut s: String = text.chars().take(max.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+/// Should this descriptor get colors? A terminal, unless NO_COLOR is set
+/// (no-color.org) or TERM is `dumb`.
+pub fn use_color(fd: std::os::fd::RawFd) -> bool {
+    crate::sys::isatty(fd)
+        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
+}
+
+/// A box-drawn table like `pm2 list`: a header row, a rule, the rows. Cells
+/// are left-aligned with a space on each side; widths come from the text
+/// (never from the colors).
+pub(crate) fn boxed(header: &[&str], rows: &[Vec<Cell>], color: bool) -> String {
+    let clean = |t: &str| t.replace(['\n', '\r', '\t'], " ");
+    let head: Vec<String> = header.iter().map(|h| clean(h)).collect();
+    let body: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|c| clean(&c.text)).collect()).collect();
+    let widths: Vec<usize> = (0..head.len())
+        .map(|c| {
+            body.iter()
+                .filter_map(|r| r.get(c))
+                .map(|t| t.chars().count())
+                .chain([head[c].chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let rule = |l: &str, m: &str, r: &str| {
+        let mut o = String::from(l);
+        for (i, w) in widths.iter().enumerate() {
+            o += &"─".repeat(w + 2);
+            o += if i + 1 == widths.len() { r } else { m };
+        }
+        o + "\n"
+    };
+    let paint = |text: &str, style: &str| {
+        if color && !style.is_empty() { format!("\x1b[{style}m{text}\x1b[0m") } else { text.to_string() }
+    };
+    let line = |cells: Vec<(String, &str)>| {
+        let mut o = String::from("│");
+        for (i, (text, style)) in cells.iter().enumerate() {
+            let pad = widths[i].saturating_sub(text.chars().count());
+            o += &format!(" {}{} │", paint(text, style), " ".repeat(pad));
+        }
+        o + "\n"
+    };
+    let mut o = rule("┌", "┬", "┐");
+    o += &line(head.iter().map(|h| (h.clone(), HEAD)).collect());
+    o += &rule("├", "┼", "┤");
+    for (r, texts) in rows.iter().zip(&body) {
+        o += &line(texts.iter().cloned().zip(r.iter().map(|c| c.style)).collect());
+    }
+    o += &rule("└", "┴", "┘");
+    o
+}
+
+/// `warden list`: a boxed table like `pm2 list` with each app's id (what
+/// `warden start 0,1` takes), one row per worker; painted when `color` is on
+/// (a terminal).
+pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], color: bool) -> String {
+    if all.is_empty() {
+        return "no apps yet: `warden start server.js --name api`, or `warden pm2-migrate` to bring PM2's over\n"
+            .into();
+    }
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut notes = Vec::new();
+    let mut offline: Vec<&crate::fleet::App> = Vec::new();
     for (app, st) in all {
+        let id = app.id.map(|i| i.to_string()).unwrap_or_else(|| "-".into());
+        // An app's later rows (more workers) repeat id and name, so every
+        // row stands alone for grep, but dimmed.
+        let lead = |first: bool, namespace: &str| {
+            let (a, b, c) = if first { (ID, NAME, "") } else { (DIM, DIM, DIM) };
+            vec![Cell::styled(id.clone(), a), Cell::styled(app.name.clone(), b), Cell::styled(namespace.to_string(), c)]
+        };
         match st {
             Ok(s) => {
                 let all = s
@@ -918,27 +1036,27 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                     .iter()
                     .map(|w| (w.id.to_string(), w))
                     .chain(s.draining.iter().map(|w| (draining_name(s, w), w)));
-                for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
+                for (n, (name, w)) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))).enumerate() {
                     // Stopped after a start that failed: PM2's `errored`.
                     let state = match (s.stopped && w.state == "STOPPED", &s.start_failed) {
                         (true, Some(_)) => "errored".to_string(),
                         (true, None) => "stopped".to_string(),
                         _ => w.state.clone(),
                     };
-                    rows.push(vec![
-                        app.name.clone(),
-                        s.namespace.clone(),
-                        name,
-                        state,
-                        w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                        w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
-                        w.restarts.to_string(),
-                        w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
-                        w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
-                        loop_p99(w),
-                        health_word(w.healthy).into(),
-                        w.last_exit.clone().unwrap_or_else(|| "-".into()),
+                    let mut row = lead(n == 0, &s.namespace);
+                    row.extend([
+                        Cell::plain(name),
+                        Cell::state(&state),
+                        Cell::plain(w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                        Cell::plain(w.uptime_secs.map(duration).unwrap_or_else(|| "-".into())),
+                        Cell::plain(w.restarts.to_string()),
+                        Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
+                        Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
+                        Cell::plain(loop_p99(w)),
+                        Cell::health(w.healthy),
+                        Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
                     ]);
+                    rows.push(row);
                 }
                 if let Some(r) = &s.rollout {
                     notes.push(format!("{}: {} in progress, {}/{}: {}", app.name, r.kind, r.done, r.total, r.phase));
@@ -955,22 +1073,13 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
             }
             Err(e) => {
                 let what = if e == "not running" { "offline" } else { "unreachable" };
-                rows.push(vec![
-                    app.name.clone(),
-                    app.namespace.clone(),
-                    "-".into(),
-                    what.into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                    "-".into(),
-                ]);
+                let mut row = lead(true, &app.namespace);
+                row.push(Cell::plain("-"));
+                row.push(Cell::state(what));
+                row.extend((0..8).map(|_| Cell::plain("-")));
+                rows.push(row);
                 if what == "offline" {
-                    notes.push(format!("{}: not running; `warden start {}` starts it", app.name, app.name));
+                    offline.push(app);
                 } else {
                     notes.push(format!("{}: {e}", app.name));
                 }
@@ -980,11 +1089,36 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
             notes.push(format!("{}: config problem: {p}", app.name));
         }
     }
-    if all.is_empty() {
-        return "no apps yet: `warden start server.js --name api`, or `warden pm2-migrate` to bring PM2's over\n"
-            .into();
+    if !offline.is_empty() {
+        // The exact command: ids as a list when every app has one.
+        let ids: Vec<u32> = offline.iter().filter_map(|a| a.id).collect();
+        let which = if ids.len() == offline.len() {
+            crate::ids::compact(&ids)
+        } else {
+            offline.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(",")
+        };
+        let (n, them) = (offline.len(), if offline.len() == 1 { "it" } else { "them" });
+        notes.insert(0, format!("{n} offline: `warden start {which}` starts {them}"));
     }
-    let mut o = table(&rows);
+    let mut o = boxed(
+        &[
+            "id",
+            "name",
+            "namespace",
+            "worker",
+            "status",
+            "pid",
+            "uptime",
+            "↺",
+            "cpu",
+            "mem",
+            "loop p99",
+            "health",
+            "last exit",
+        ],
+        &rows,
+        color,
+    );
     for n in notes {
         o += &format!("  {n}\n");
     }
@@ -1243,7 +1377,47 @@ mod tests {
         assert!(p("log-level -c x.toml loud").is_err());
         assert!(p("scale").is_err());
         assert!(p("scale x").is_err());
-        assert!(p("status a b").is_err());
+        // Several apps (or ids), as one comma list or as separate words (PM2 takes both).
+        assert_eq!(act("status a b"), (Action::List, Some("a,b".into())));
+        assert_eq!(act("restart 0,1,2"), (Action::Restart { hard: false }, Some("0,1,2".into())));
+        assert_eq!(act("stop 0 1 api:2"), (Action::Stop, Some("0,1,api:2".into())));
+        assert_eq!(act("reload 0-2,web"), (Action::Reload { safe: false }, Some("0-2,web".into())));
+        assert_eq!(
+            p("start 0,1,2").unwrap().command,
+            Command::Start { what: "0,1,2".into(), opts: Default::default() }
+        );
+        assert_eq!(p("start 3 4").unwrap().command, Command::Start { what: "3,4".into(), opts: Default::default() });
+        assert_eq!(p("delete 2 3").unwrap().command, Command::Delete { target: "2,3".into() });
+        assert!(p("delete").unwrap_err().contains("name or id"));
+        // Options that take a value still own it: `-n 5` is not an app.
+        assert_eq!(
+            act("logs 0 -n 5"),
+            (
+                Action::Logs { lines: Some(5), follow: None, history: false, query: Default::default() },
+                Some("0".into())
+            )
+        );
+        // --worker belongs to one app; several words for `start` are apps, not a command line.
+        assert!(p("restart api web --worker 1").is_err());
+        assert_eq!(act("restart api --worker 1"), (Action::Restart { hard: false }, Some("api:1".into())));
+        // (`p` splits on spaces, so build the argv with a real command-line word.)
+        let argv = |a: &[&str]| parse(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let e = argv(&["start", "node a.js", "b"]).unwrap_err();
+        assert!(e.contains("several app names or ids") && e.contains("node server.js"), "{e}");
+        assert_eq!(
+            argv(&["start", "node a.js", "--name", "x"]).unwrap().command,
+            Command::Start {
+                what: "node a.js".into(),
+                opts: Box::new(StartOpts { name: Some("x".into()), ..Default::default() })
+            }
+        );
+        assert_eq!(
+            p("start node server.js").unwrap().command,
+            Command::Start { what: "node,server.js".into(), opts: Default::default() }
+        );
+        // Commands whose extra words mean something else keep their shape.
+        assert!(p("scale a 3 4").is_err());
+        assert!(p("signal USR2 a b c").is_err());
         assert!(p("frobnicate").is_err());
         assert!(p("status --bogus").is_err());
         assert_eq!(p("").unwrap().command, Command::Help);
@@ -1358,12 +1532,14 @@ mod tests {
             config: None,
             socket: "/run/w/api/control.sock".into(),
             problem: None,
+            id: Some(3),
         };
-        let text = render_list(&[(app.clone(), Ok(st(true)))]);
-        assert!(text.contains("Loop p99") && text.contains("12.3ms"), "{text}");
-        assert!(text.lines().nth(1).is_some_and(|l| l.contains(" errored ")), "{text}");
+        let text = render_list_with(&[(app.clone(), Ok(st(true)))], false);
+        assert!(text.contains("loop p99") && text.contains("12.3ms"), "{text}");
+        // top rule, header, rule, then the app's row: its id first.
+        assert!(text.lines().nth(3).is_some_and(|l| l.starts_with("│ 3 ") && l.contains(" errored ")), "{text}");
         assert!(text.contains("api: errored: its last start failed"), "{text}");
-        let text = render_list(&[(app, Ok(st(false)))]);
+        let text = render_list_with(&[(app, Ok(st(false)))], false);
         assert!(text.contains(" RESTARTING ") && text.contains("api: not started: every worker crashed"), "{text}");
         assert!(render_status(&st(true), false).contains("State:       errored"));
     }
@@ -1414,18 +1590,104 @@ mod tests {
         s.standbys = vec![row(1, crate::control::STANDBY, 103)];
         let out = render_status(&s, false);
         assert!(out.contains("Draining:    2 old process(es)"), "{out}");
-        let names: Vec<&str> = out
-            .lines()
-            .skip_while(|l| !l.starts_with("Worker   Status"))
-            .skip(1)
-            .map(|l| l.split("  ").next().unwrap_or("").trim())
-            .collect();
-        assert_eq!(names, ["1", "2", "1 (old)", "2 (old)", "s1"], "{out}");
-        assert!(out.lines().any(|l| l.starts_with("2 (old)") && l.contains("DRAINING") && l.contains("92")), "{out}");
+        // The boxed table's rows: "│ 1 (old) │ DRAINING │ 91 │ …".
+        let first_cells = |text: &str| -> Vec<String> {
+            text.lines()
+                .skip_while(|l| !l.starts_with("│ worker"))
+                .skip(2)
+                .take_while(|l| l.starts_with('│'))
+                .map(|l| l.trim_start_matches('│').split('│').next().unwrap_or("").trim().to_string())
+                .collect()
+        };
+        assert_eq!(first_cells(&out), ["1", "2", "1 (old)", "2 (old)", "s1"], "{out}");
+        assert!(out.lines().any(|l| l.starts_with("│ 2 (old)") && l.contains("DRAINING") && l.contains("92")), "{out}");
         s.mode = "worker".into();
         s.draining = vec![row(0, crate::control::DRAINING, 90)];
-        assert!(render_status(&s, true).lines().any(|l| l.starts_with("host (old)") && l.contains("90")));
+        assert!(render_status(&s, true).lines().any(|l| l.starts_with("│ host (old)") && l.contains("90")));
         s.draining.clear();
         assert!(!render_status(&s, false).contains("Draining:"));
+    }
+
+    fn listed_app(name: &str, id: Option<u32>) -> crate::fleet::App {
+        crate::fleet::App {
+            name: name.into(),
+            namespace: "default".into(),
+            config: None,
+            socket: format!("/run/w/{name}/control.sock").into(),
+            problem: None,
+            id,
+        }
+    }
+
+    fn plain(s: &str) -> String {
+        // Drop SGR sequences (`ESC [ … m`).
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                for c in it.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The `warden list` table is boxed like PM2's, with ids first; colors add
+    /// escape codes and nothing else.
+    #[test]
+    fn list_is_a_pm2_style_box_with_ids() {
+        let off = |n: &str, id| (listed_app(n, id), Err::<Status, String>("not running".into()));
+        let all = vec![off("booking-manager", Some(0)), off("code-intel-mcp", Some(1)), off("themes", Some(2))];
+        let text = render_list_with(&all, false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'), "{text}");
+        assert!(lines[1].starts_with("│ id │ name ") && lines[1].contains("│ ↺ │"), "{text}");
+        assert!(lines[2].starts_with('├') && lines[2].ends_with('┤'), "{text}");
+        assert!(lines[3].starts_with("│ 0  │ booking-manager ") && lines[3].contains(" offline "), "{text}");
+        assert!(lines[5].starts_with("│ 2  │ themes "), "{text}");
+        assert!(lines[6].starts_with('└') && lines[6].ends_with('┘'), "{text}");
+        // One box: every line of it is as wide as the top rule.
+        let width = lines[0].chars().count();
+        assert!(lines[..7].iter().all(|l| l.chars().count() == width), "{text}");
+        // One line says how to start them all, with the ids as a range.
+        assert_eq!(lines[7], "  3 offline: `warden start 0-2` starts them", "{text}");
+
+        // Colors never change the layout.
+        let painted = render_list_with(&all, true);
+        assert!(painted.contains("\x1b[") && !text.contains('\x1b'));
+        assert_eq!(plain(&painted), text);
+
+        // An app without an id shows `-` and is started by name.
+        let mixed = render_list_with(&[off("a", Some(4)), off("b", None)], false);
+        assert!(mixed.contains("│ -  │ b ") && mixed.contains("2 offline: `warden start a,b` starts them"), "{mixed}");
+        assert!(render_list_with(&[], false).starts_with("no apps yet"));
+    }
+
+    #[test]
+    fn a_long_last_exit_is_cut_and_the_box_stays_whole() {
+        let mut s: Status = serde_json::from_value(serde_json::json!({
+            "app": "api", "mode": "process", "pid": 7, "uptime_secs": 9, "workers_configured": 2, "workers_ready": 0,
+            "healthy": null, "supervisor_rss_bytes": null, "host": null, "reloading": false, "shutting_down": false,
+            "workers": []
+        }))
+        .unwrap();
+        let mut w = row(1, "CRASHED", 0);
+        w.last_exit =
+            Some("killed by SIGKILL (the kernel's OOM killer: the cgroup's memory limit was reached)\nline 2".into());
+        s.workers = vec![w, row(2, "RUNNING", 5)];
+        let text = render_list_with(&[(listed_app("api", Some(9)), Ok(s))], false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[3].contains("killed by SIGKILL") && lines[3].contains('…') && !text.contains("line 2"), "{text}");
+        let width = lines[0].chars().count();
+        assert!(lines[..6].iter().all(|l| l.chars().count() == width), "{text}");
+        // Both workers carry the id and name, so each row stands alone.
+        assert!(lines[3].starts_with("│ 9  │ api ") && lines[4].starts_with("│ 9  │ api "), "{text}");
+        assert_eq!(clip("abc", 3), "abc");
+        assert_eq!(clip("abcd", 3), "ab…");
     }
 }

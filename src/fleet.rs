@@ -28,6 +28,10 @@ pub struct App {
     pub socket: PathBuf,
     /// Why the config could not be loaded, if it couldn't.
     pub problem: Option<String>,
+    /// The number `warden list` shows and `warden start 3` takes (`ids.rs`).
+    /// `None`: not one of this host's configured apps (a supervisor found
+    /// running from a config elsewhere, or an app given with `-c`).
+    pub id: Option<u32>,
 }
 
 /// The apps a command can act on.
@@ -38,6 +42,8 @@ pub struct Ctx {
     /// `--no-wait`: `start` returns once the supervisor answers, without
     /// waiting for the workers to be ready.
     pub no_wait: bool,
+    /// The app ids could not be kept (`ids::Ids::warning`); `list` says so.
+    pub ids_warning: Option<String>,
 }
 
 // ------------------------------------------------------------------ places
@@ -95,6 +101,7 @@ pub(crate) fn app_from_config(path: &Path) -> App {
             config: Some(path.to_path_buf()),
             socket: c.socket_path(),
             problem: None,
+            id: None,
         },
         Err(e) => {
             let socket = config::socket_path_lenient(path);
@@ -105,6 +112,7 @@ pub(crate) fn app_from_config(path: &Path) -> App {
                 namespace: "default".into(),
                 config: Some(path.to_path_buf()),
                 problem: Some(e),
+                id: None,
             }
         }
     }
@@ -142,6 +150,7 @@ pub fn discover() -> Vec<App> {
                     config: None,
                     socket: sock,
                     problem: None,
+                    id: None,
                 })
             })
             .collect();
@@ -166,19 +175,74 @@ pub fn context(args: &Args) -> Ctx {
             config: None,
             socket: sock.clone(),
             problem: None,
+            id: None,
         });
         app.socket = sock.clone();
-        return Ctx { apps: vec![app], single: true, no_wait: args.no_wait };
+        return single_ctx(app, args);
     }
     if let Some(c) = &args.config {
-        return Ctx { apps: vec![app_from_config(c)], single: true, no_wait: args.no_wait };
+        return single_ctx(app_from_config(c), args);
     }
-    let apps = discover();
+    let mut apps = discover();
     let local = Path::new("warden.toml");
     if apps.is_empty() && local.is_file() {
-        return Ctx { apps: vec![app_from_config(local)], single: true, no_wait: args.no_wait };
+        return single_ctx(app_from_config(local), args);
     }
-    Ctx { apps, single: false, no_wait: args.no_wait }
+    let ids_warning = number_apps(&mut apps);
+    Ctx { apps, single: false, no_wait: args.no_wait, ids_warning }
+}
+
+/// Number what is new, in the order the configs sort, and set every app's id.
+/// Only the config directory's apps get one: a supervisor found running from a
+/// config somewhere else is named, not numbered. Returns what is wrong with
+/// the saved ids, if anything (`list` says so).
+fn number_apps(apps: &mut [App]) -> Option<String> {
+    let dir = config_dir();
+    let names: Vec<&str> = apps
+        .iter()
+        .filter(|a| a.config.as_ref().is_some_and(|c| c.parent() == Some(dir.as_path())))
+        .map(|a| a.name.as_str())
+        .collect();
+    let ids = crate::ids::assign(&state_dir(), &names);
+    for a in apps.iter_mut() {
+        a.id = ids.get(&a.name);
+    }
+    ids.warning
+}
+
+/// The apps a TARGET names on this host (ids and lists as everywhere), as
+/// names: `warden events 0,api`.
+pub fn resolve_names(target: &str) -> Result<Vec<String>, String> {
+    let mut apps = discover();
+    number_apps(&mut apps);
+    let ctx = Ctx { apps, single: false, no_wait: false, ids_warning: None };
+    let mut names: Vec<String> = Vec::new();
+    for s in resolve(&ctx, Some(target), false)? {
+        if !names.contains(&s.app.name) {
+            names.push(s.app.name);
+        }
+    }
+    Ok(names)
+}
+
+/// The apps in a selection, once each (`0,0:1` or `-c x.toml 0,1` select one
+/// app several times).
+fn unique_apps(sels: &[Sel]) -> Vec<App> {
+    let mut apps: Vec<App> = Vec::new();
+    for s in sels {
+        if !apps.iter().any(|a| a.name == s.app.name) {
+            apps.push(s.app.clone());
+        }
+    }
+    apps
+}
+
+/// One app named by `-c`, a socket or `./warden.toml`: its number is shown
+/// when it has one, but nothing is numbered, and a number in a target means a
+/// worker.
+fn single_ctx(mut app: App, args: &Args) -> Ctx {
+    app.id = crate::ids::lookup(&state_dir(), &[app.name.as_str()]).get(&app.name).copied();
+    Ctx { apps: vec![app], single: true, no_wait: args.no_wait, ids_warning: None }
 }
 
 // ------------------------------------------------------------------ targets
@@ -206,25 +270,81 @@ fn parse_worker(t: &str, w: &str) -> Result<(Option<usize>, Option<String>), Str
     ))
 }
 
-/// `all`, an app name, a namespace, `app:N`; in a single-app context also
-/// `N` or `:N` for a worker. Hot standbys: `app:standby`, `app:s1` (`warden
-/// logs` only). `need`: a mutating command must name its target when there
-/// are several apps.
+/// What a command's TARGET can be, comma-separated (`warden start 0,1,2`,
+/// `warden restart api,web:1`); each item:
+/// - `all`;
+/// - an app name, a namespace, or an app's number (`warden list` shows them;
+///   a name wins over a number when an app is called `3`);
+/// - `app:N` (or `3:N`) for one worker of it;
+/// - a range of numbers, `0-2` (the apps that have one: a gap is skipped).
+///
+/// In a single-app context (`-c`) a number is a worker: `2`, `:2`, `0,1`, `0-2`.
+/// Hot standbys: `app:standby`, `app:s1` (`warden logs` only). `need`: a
+/// mutating command must name its target when there are several apps.
+/// Nothing is selected when any item is wrong: a typo never acts on half.
 pub fn resolve(ctx: &Ctx, target: Option<&str>, need: bool) -> Result<Vec<Sel>, String> {
-    let all = |w: Option<usize>| {
-        ctx.apps.iter().map(|a| Sel { app: a.clone(), worker: w, standby: None }).collect::<Vec<_>>()
-    };
     let Some(t) = target else {
         if ctx.single || !need || ctx.apps.len() == 1 && ctx.apps[0].config.is_none() {
-            return Ok(all(None));
+            return Ok(ctx.apps.iter().map(|a| Sel { app: a.clone(), worker: None, standby: None }).collect());
         }
         return Err(no_target_error(ctx));
     };
     if ctx.apps.is_empty() {
         return Err(no_apps_error());
     }
+    let items: Vec<&str> = t.split(',').map(str::trim).filter(|i| !i.is_empty()).collect();
+    if items.is_empty() {
+        return Err(format!("{t:?}: no app named; give a name, an id, `all`, or a list like 0,1,2"));
+    }
+    let mut out: Vec<Sel> = Vec::new();
+    for item in items {
+        for sel in resolve_item(ctx, item)? {
+            if !out.contains(&sel) {
+                out.push(sel);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `3-7` as (3, 7); `None` for anything else (a name like `v1-2` is not one).
+fn id_range(t: &str) -> Option<(u32, u32)> {
+    let (a, b) = t.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    (digits(a) && digits(b)).then_some(())?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Largest range `0-N` accepted: a typo like `0-99999999` is an error, not a
+/// long loop.
+const MAX_RANGE: u32 = 4096;
+
+fn resolve_item(ctx: &Ctx, t: &str) -> Result<Vec<Sel>, String> {
+    let all = |w: Option<usize>| {
+        ctx.apps.iter().map(|a| Sel { app: a.clone(), worker: w, standby: None }).collect::<Vec<_>>()
+    };
     if t == "all" {
         return Ok(all(None));
+    }
+    // A range, unless it is an app's name (`1-2` is a legal name).
+    if let Some((lo, hi)) = id_range(t).filter(|_| !ctx.apps.iter().any(|a| a.name == t)) {
+        if lo > hi {
+            return Err(format!("{t:?}: a range goes up, like {hi}-{lo}"));
+        }
+        if hi - lo >= MAX_RANGE {
+            return Err(format!("{t:?}: that range is too long (at most {MAX_RANGE} ids)"));
+        }
+        if ctx.single {
+            let app = &ctx.apps[0];
+            return Ok((lo..=hi).map(|w| Sel { app: app.clone(), worker: Some(w as usize), standby: None }).collect());
+        }
+        let mut in_range: Vec<&App> =
+            ctx.apps.iter().filter(|a| a.id.is_some_and(|i| (lo..=hi).contains(&i))).collect();
+        in_range.sort_by_key(|a| a.id);
+        if in_range.is_empty() {
+            return Err(no_such_id(ctx, t));
+        }
+        return Ok(in_range.into_iter().map(|a| Sel { app: a.clone(), worker: None, standby: None }).collect());
     }
     let (name, worker, standby) = match t.rsplit_once(':') {
         Some((n, w)) => {
@@ -261,13 +381,22 @@ pub fn resolve(ctx: &Ctx, target: Option<&str>, need: bool) -> Result<Vec<Sel>, 
         }
         return Ok(in_ns);
     }
-    if name.parse::<usize>().is_ok() {
-        return Err(format!(
-            "{t:?}: Warden names apps, not numeric ids like PM2. Use the app name (`warden restart api`) \
-             or one worker (`warden restart api:2`); `warden list` shows both"
-        ));
+    if let Ok(n) = name.parse::<u32>() {
+        return match ctx.apps.iter().find(|a| a.id == Some(n)) {
+            Some(app) => Ok(vec![Sel { app: app.clone(), worker, standby }]),
+            None => Err(no_such_id(ctx, name)),
+        };
     }
     Err(format!("no app or namespace named {name:?}; `warden list` shows what is on this host"))
+}
+
+/// No app has this id (or none in this range): say which ids exist.
+fn no_such_id(ctx: &Ctx, what: &str) -> String {
+    let ids: Vec<u32> = ctx.apps.iter().filter_map(|a| a.id).collect();
+    if ids.is_empty() {
+        return format!("no app has the id {what}; `warden list` shows the apps, which you can name");
+    }
+    format!("no app has the id {what} (the ids on this host: {}); `warden list` shows them", crate::ids::compact(&ids))
 }
 
 fn no_apps_error() -> String {
@@ -341,7 +470,7 @@ pub async fn act(args: &Args, action: &Action) -> i32 {
         }
     };
     match action {
-        Action::List => list(&sels, args, ctx.single).await,
+        Action::List => list(&sels, args, &ctx).await,
         Action::Describe => describe(&sels, args).await,
         Action::Env { show_secrets } => env(&sels, *show_secrets).await,
         Action::Config { show_secrets } => show_config(&sels, *show_secrets).await,
@@ -353,10 +482,10 @@ pub async fn act(args: &Args, action: &Action) -> i32 {
     }
 }
 
-async fn list(sels: &[Sel], args: &Args, single: bool) -> i32 {
-    let apps: Vec<App> = sels.iter().map(|s| s.app.clone()).collect();
+async fn list(sels: &[Sel], args: &Args, ctx: &Ctx) -> i32 {
+    let apps = unique_apps(sels);
     let all = statuses(&apps).await;
-    if single {
+    if ctx.single {
         // One app (-c): its status object, as `warden status --json` always printed.
         return match &all[..] {
             [(_, Ok(st))] => {
@@ -379,6 +508,7 @@ async fn list(sels: &[Sel], args: &Args, single: bool) -> i32 {
             .iter()
             .map(|(a, st)| {
                 serde_json::json!({
+                    "id": a.id,
                     "app": a.name,
                     "namespace": a.namespace,
                     "config": a.config,
@@ -400,13 +530,18 @@ async fn list(sels: &[Sel], args: &Args, single: bool) -> i32 {
         }
     }
     // Offline apps are a state to show, not an error (as with `pm2 list`).
-    print!("{}", cli::render_list(&all));
+    print!("{}", cli::render_list_with(&all, cli::use_color(1)));
+    if let Some(w) = &ctx.ids_warning {
+        eprintln!("warden: {w}");
+    }
     0
 }
 
 async fn describe(sels: &[Sel], args: &Args) -> i32 {
     let mut code = 0;
-    for (i, s) in sels.iter().enumerate() {
+    // Once per app, whichever workers the target named.
+    let once: Vec<Sel> = unique_apps(sels).into_iter().map(|app| Sel { app, worker: None, standby: None }).collect();
+    for (i, s) in once.iter().enumerate() {
         if i > 0 {
             println!();
         }
@@ -571,7 +706,9 @@ async fn one_op(ctx: &Ctx, app: &App, req: Request, args: &Args) -> i32 {
 }
 
 async fn ops(ctx: &Ctx, sels: &[Sel], action: &Action, args: &Args) -> i32 {
-    let mut worst = 0;
+    // Every selection is checked before the first request goes out: a wrong
+    // item (`warden stop 0 1:2`) acts on nothing, not on the items before it.
+    let mut jobs: Vec<(&Sel, Request)> = Vec::new();
     for s in sels {
         if let Some(sb) = &s.standby {
             let app = &s.app.name;
@@ -604,17 +741,25 @@ async fn ops(ctx: &Ctx, sels: &[Sel], action: &Action, args: &Args) -> i32 {
             Action::LogLevel(level) => Request::LogLevel { level: *level },
             _ => return 2,
         };
+        jobs.push((s, req));
+    }
+    let mut worst = 0;
+    for (n, (s, req)) in jobs.iter().enumerate() {
         if !ctx.single && !s.app.socket.exists() {
             eprintln!("warden: {}: not running (start it with `warden start {}`)", s.app.name, s.app.name);
             worst = worst.max(2);
             continue;
         }
-        let code = one_op(ctx, &s.app, req, args).await;
+        let code = one_op(ctx, &s.app, req.clone(), args).await;
         worst = worst.max(code);
         // Deploys across several apps stop at the first failure.
-        if code == 1 && matches!(action, Action::Reload { .. } | Action::Restart { hard: false }) && sels.len() > 1 {
-            let rest: Vec<&str> =
-                sels.iter().skip_while(|x| x.app.name != s.app.name).skip(1).map(|x| x.app.name.as_str()).collect();
+        if code == 1 && matches!(action, Action::Reload { .. } | Action::Restart { hard: false }) && jobs.len() > 1 {
+            let mut rest: Vec<&str> = Vec::new();
+            for (later, _) in &jobs[n + 1..] {
+                if later.app.name != s.app.name && !rest.contains(&later.app.name.as_str()) {
+                    rest.push(&later.app.name);
+                }
+            }
             if !rest.is_empty() {
                 eprintln!("warden: stopped here; not reloaded: {}", rest.join(", "));
             }
@@ -1033,16 +1178,47 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// `warden start <app | config.toml | script>`.
+/// Does `what` read as app ids or a list of apps (`3`, `0-2`, `0,1,api`) rather
+/// than a script, a path or a command line?
+fn is_selector_list(what: &str) -> bool {
+    let ids = what.split(',').all(|i| {
+        let i = i.trim();
+        i.parse::<u32>().is_ok() || id_range(i).is_some()
+    });
+    let list = what.contains(',') && !what.contains(char::is_whitespace) && !Path::new(what).exists();
+    ids || list
+}
+
+/// `warden start <app | id | config.toml | script>`.
 pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     let ctx = context(args);
-    // 1. Apps we know (name, namespace, all).
-    if let Ok(sels) = resolve(&ctx, Some(what), true) {
-        let mut worst = 0;
-        for s in sels {
-            worst = worst.max(start_app(&ctx, &s.app, OnFailedStart::Stop).await);
+    // 1. Apps we know: a name, an id, a namespace, `all`, or a list of them.
+    match resolve(&ctx, Some(what), true) {
+        Ok(sels) => {
+            let mut worst = 0;
+            let mut started: Vec<&str> = Vec::new();
+            for s in &sels {
+                // `0,0:1` or a namespace plus a member: once is enough.
+                if started.contains(&s.app.name.as_str()) {
+                    continue;
+                }
+                started.push(&s.app.name);
+                worst = worst.max(start_app(&ctx, &s.app, OnFailedStart::Stop).await);
+            }
+            return worst;
         }
-        return worst;
+        // Meant as app ids or a list of apps, not a script or a command line:
+        // say what is wrong with it rather than trying it as a program.
+        Err(e) if is_selector_list(what) => {
+            eprintln!("warden: {e}");
+            if what.split(',').any(|i| i.parse::<u32>().is_err() && id_range(i).is_none()) {
+                eprintln!(
+                    "  (to run a program with arguments, quote the command line: warden start \"node server.js\" --name api)"
+                );
+            }
+            return 2;
+        }
+        Err(_) => {}
     }
     let path = Path::new(what);
     // 2. A config file.
@@ -1090,7 +1266,10 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
                 return 1;
             }
             println!("{name}: wrote {} (edit it for health checks, limits and more)", file.display());
-            start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
+            // Numbered now, so ids follow the order apps were created.
+            let mut app = app_from_config(&file);
+            app.id = crate::ids::register(&state_dir(), &name);
+            start_app(&ctx, &app, OnFailedStart::Stop).await
         }
         Err(e) => {
             eprintln!("warden: {e}");
@@ -1163,7 +1342,9 @@ pub async fn serve(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
         return 1;
     }
     println!("{name}: serving {} on port {port} (config {})", root.display(), file.display());
-    start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
+    let mut app = app_from_config(&file);
+    app.id = crate::ids::register(&state_dir(), &name);
+    start_app(&ctx, &app, OnFailedStart::Stop).await
 }
 
 /// What `warden start <what>` runs when `what` is not an app or a config.
@@ -1889,7 +2070,9 @@ pub async fn delete(args: &Args, target: &str) -> i32 {
         }
     };
     let mut worst = 0;
-    for s in sels {
+    // Once per app: `delete 0 0:1` must not try to move the config twice.
+    for app in unique_apps(&sels) {
+        let s = Sel { app, worker: None, standby: None };
         let st = status_of(&s.app).await.ok();
         match stop_supervisor(&s.app, st.as_ref(), true).await {
             Ok(m) => println!("{}: {m}", s.app.name),
@@ -1904,7 +2087,13 @@ pub async fn delete(args: &Args, target: &str) -> i32 {
             let moved = std::fs::create_dir_all(dest.parent().unwrap_or(Path::new("/")))
                 .and_then(|_| std::fs::rename(cfg, &dest));
             match moved {
-                Ok(()) => println!("{}: config moved to {}", s.app.name, dest.display()),
+                Ok(()) => {
+                    println!("{}: config moved to {}", s.app.name, dest.display());
+                    // Its number is free again (a later `warden list` won't show it).
+                    if let Err(e) = crate::ids::forget(&state_dir(), &s.app.name) {
+                        eprintln!("warden: {}: its id stays reserved: {e}", s.app.name);
+                    }
+                }
                 Err(e) => {
                     eprintln!("warden: {}: could not move {}: {e}", s.app.name, cfg.display());
                     worst = 1;
@@ -2114,7 +2303,7 @@ pub async fn top(args: &Args) -> i32 {
     loop {
         let ctx = context(args);
         let apps: Vec<App> = match resolve(&ctx, args.target.as_deref(), false) {
-            Ok(s) => s.into_iter().map(|s| s.app).collect(),
+            Ok(s) => unique_apps(&s),
             Err(e) => {
                 eprintln!("warden: {e}");
                 return 2;
@@ -2126,7 +2315,7 @@ pub async fn top(args: &Args) -> i32 {
             out += "\x1b[2J\x1b[H";
         }
         out += &format!("warden top - {} (Ctrl-C to quit)\n\n", crate::logging::timestamp_now());
-        out += &cli::render_list(&all);
+        out += &cli::render_list_with(&all, tty && cli::use_color(1));
         print!("{out}");
         if !tty {
             return 0;
@@ -2146,14 +2335,113 @@ mod tests {
             config: Some(PathBuf::from(format!("/etc/warden/{name}.toml"))),
             socket: PathBuf::from(format!("/run/warden/{name}/control.sock")),
             problem: None,
+            id: None,
         }
     }
 
+    fn numbered(name: &str, ns: &str, id: u32) -> App {
+        App { id: Some(id), ..app(name, ns) }
+    }
+
+    /// api 0, web 1, queue 2: a host numbered the way `ids::assign` does.
     fn ctx() -> Ctx {
         Ctx {
-            apps: vec![app("api", "backend"), app("web", "backend"), app("queue", "default")],
+            apps: vec![numbered("api", "backend", 0), numbered("web", "backend", 1), numbered("queue", "default", 2)],
             single: false,
             no_wait: false,
+            ids_warning: None,
+        }
+    }
+
+    /// "api", "web:1" … from a list of selections.
+    fn show(v: Vec<Sel>) -> Vec<String> {
+        v.into_iter()
+            .map(|s| match (s.worker, s.standby) {
+                (Some(w), _) => format!("{}:{w}", s.app.name),
+                (None, Some(sb)) => format!("{}:{sb}", s.app.name),
+                _ => s.app.name,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ids_lists_and_ranges_pick_apps() {
+        let c = ctx();
+        let pick = |t: &str| resolve(&c, Some(t), true).map(show);
+        // `warden start 0,1,2`, in the order given, and a single id.
+        assert_eq!(pick("0,1,2").unwrap(), ["api", "web", "queue"]);
+        assert_eq!(pick("2,0").unwrap(), ["queue", "api"]);
+        assert_eq!(pick("1").unwrap(), ["web"]);
+        // Names, namespaces, workers and ids mix; spaces around commas are fine.
+        assert_eq!(pick("queue, 0:1").unwrap(), ["queue", "api:1"]);
+        assert_eq!(pick("backend,2").unwrap(), ["api", "web", "queue"]);
+        // The same app twice (or through its namespace) is picked once.
+        assert_eq!(pick("0,api,backend").unwrap(), ["api", "web"]);
+        assert_eq!(pick("0,0").unwrap(), ["api"]);
+        // Ranges; a trailing comma is harmless.
+        assert_eq!(pick("0-1").unwrap(), ["api", "web"]);
+        assert_eq!(pick("1-2,").unwrap(), ["web", "queue"]);
+        assert_eq!(pick("0-99").unwrap(), ["api", "web", "queue"], "ids that do not exist inside a range are skipped");
+        // Wrong in any item: nothing is picked (no half-done `restart`).
+        let e = pick("0,7").unwrap_err();
+        assert!(e.contains("no app has the id 7") && e.contains("0-2"), "{e}");
+        assert!(pick("0,nope").unwrap_err().contains("no app or namespace named \"nope\""));
+        assert!(pick("7-9").unwrap_err().contains("no app has the id 7-9"));
+        assert!(pick("5-2").unwrap_err().contains("a range goes up"));
+        assert!(pick("0-99999").unwrap_err().contains("too long"));
+        assert!(pick(",").unwrap_err().contains("no app named"));
+    }
+
+    #[test]
+    fn a_name_wins_over_the_same_number_and_numbers_need_ids() {
+        // An app called "1" (a legal name) is picked by `1`, not the app with id 1.
+        let mut c = ctx();
+        c.apps.push(numbered("1", "default", 3));
+        assert_eq!(show(resolve(&c, Some("1"), true).unwrap()), ["1"]);
+        assert_eq!(show(resolve(&c, Some("3"), true).unwrap()), ["1"], "id 3 is the app named 1");
+        // A name that looks like a range is a name when an app has it.
+        c.apps.push(numbered("2-3", "default", 4));
+        assert_eq!(show(resolve(&c, Some("2-3"), true).unwrap()), ["2-3"]);
+        // Apps with no number (found running from a config elsewhere) are named only.
+        let c = Ctx { apps: vec![app("a", "default"), numbered("b", "default", 0)], ..ctx() };
+        assert_eq!(show(resolve(&c, Some("0"), true).unwrap()), ["b"]);
+        let none = Ctx { apps: vec![app("a", "default")], ..ctx() };
+        assert!(resolve(&none, Some("0"), true).unwrap_err().contains("which you can name"));
+    }
+
+    #[test]
+    fn numbers_mean_workers_in_a_single_app_context() {
+        let c = Ctx { apps: vec![app("api", "default")], single: true, no_wait: false, ids_warning: None };
+        let pick = |t: &str| resolve(&c, Some(t), true).map(show);
+        assert_eq!(pick("1").unwrap(), ["api:1"]);
+        assert_eq!(pick("0,2").unwrap(), ["api:0", "api:2"]);
+        assert_eq!(pick("0-2").unwrap(), ["api:0", "api:1", "api:2"]);
+        assert_eq!(pick("api,3").unwrap(), ["api", "api:3"]);
+        assert!(pick("web").is_err());
+    }
+
+    /// Naming one app several ways (workers, an id and a name, `-c` with
+    /// worker numbers) lists and describes it once.
+    #[test]
+    fn an_app_picked_twice_is_listed_once() {
+        let c = ctx();
+        let sels = resolve(&c, Some("0,api:1,api:2,web"), true).unwrap();
+        assert_eq!(sels.len(), 4);
+        let names: Vec<String> = unique_apps(&sels).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["api", "web"]);
+        let single = Ctx { apps: vec![app("api", "default")], single: true, no_wait: false, ids_warning: None };
+        let sels = resolve(&single, Some("0,1"), true).unwrap();
+        assert_eq!((sels.len(), unique_apps(&sels).len()), (2, 1));
+    }
+
+    #[test]
+    fn what_start_treats_as_ids_or_a_list_of_apps() {
+        for yes in ["3", "0,1,2", "0-2", "api,web", "api,2", "0,"] {
+            assert!(is_selector_list(yes), "{yes}");
+        }
+        // A script, a path, a command line: still tried as a program.
+        for no in ["server.js", "./a.js", "python3 -m http.server", "node -e a,b", "api", "my-app"] {
+            assert!(!is_selector_list(no), "{no}");
         }
     }
 
@@ -2167,7 +2455,7 @@ mod tests {
         assert_eq!(resolve(&c, Some("all"), true).unwrap().len(), 3);
         assert_eq!(resolve(&c, None, false).unwrap().len(), 3);
         assert!(resolve(&c, None, true).unwrap_err().contains("which app?"));
-        assert!(resolve(&c, Some("3"), true).unwrap_err().contains("names apps, not numeric ids"));
+        assert!(resolve(&c, Some("3"), true).unwrap_err().contains("no app has the id 3"));
         assert!(resolve(&c, Some("nope"), true).unwrap_err().contains("no app or namespace"));
         assert!(resolve(&c, Some("backend:1"), true).unwrap_err().contains("needs an app"));
         assert!(resolve(&c, Some("api:x"), true).is_err());
@@ -2260,7 +2548,7 @@ mod tests {
 
     #[test]
     fn single_app_targets() {
-        let c = Ctx { apps: vec![app("api", "default")], single: true, no_wait: false };
+        let c = Ctx { apps: vec![app("api", "default")], single: true, no_wait: false, ids_warning: None };
         let one = |t: Option<&str>| resolve(&c, t, true).map(|v| v[0].worker);
         assert_eq!(one(None), Ok(None));
         assert_eq!(one(Some("2")), Ok(Some(2)));

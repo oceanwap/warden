@@ -27,6 +27,13 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
 - CLI: start/stop/reload/scale/status/logs, `doctor`, `flush`, `startup` /
   `unstartup` (systemd and launchd), PM2 migration, per-worker event-loop
   delay, `warden start` that fails fast when an app cannot start.
+- `warden list` as a boxed table like `pm2 list`, with an id for every app
+  (kept in the state directory's `ids.json`), and ids, lists and ranges as
+  targets for every command: `warden start 0,1,2`, `warden stop 0-3`,
+  `warden restart api web:2`.
+- `pm2-migrate` leaves out environment names an env file cannot hold (PM2
+  records one named after the app) and lists them in `MIGRATION.md`, instead
+  of writing an env file Warden refuses to read.
 - Built-in static file server with an in-memory cache.
 - Log capture and `worker_output = "direct"` (splice into files), rotation,
   history and search.

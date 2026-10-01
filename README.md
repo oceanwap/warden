@@ -222,7 +222,7 @@ warning.
 | Crash, without the startup time | A hot standby (started, app initialized, not listening) takes the dead worker's slot in a few milliseconds; a new standby starts in the background | `[workers] standby` |
 | Unhealthy worker | Replaced gracefully (new worker ready first) after `failure_threshold` failed checks | `[health] on_failure = "replace"` |
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
-| Slow event loop | Each heartbeat carries the worker's event-loop delay over the last second (p50/p99/max, sampled natively every 100 ms: no cost per request). `warden list`/`top`/`describe` show p99 (`Loop p99`), `status --json` all three (`loop_delay`), Prometheus `warden_worker_event_loop_delay_{p50,p99,max}_seconds`; a WARN when p99 stays high for 10 s | `[watchdog] loop_delay_warn` |
+| Slow event loop | Each heartbeat carries the worker's event-loop delay over the last second (p50/p99/max, sampled natively every 100 ms: no cost per request). `warden list`/`top`/`describe` show p99 (`loop p99`), `status --json` all three (`loop_delay`), Prometheus `warden_worker_event_loop_delay_{p50,p99,max}_seconds`; a WARN when p99 stays high for 10 s | `[watchdog] loop_delay_warn` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
@@ -322,7 +322,8 @@ has everything; the differences are in the right column.
 | PM2 | Warden | Difference |
 |---|---|---|
 | `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). An app that can't start (every worker crashes before one is ready: a syntax error, a missing module, a port in use) fails at once with exit 1, its last error output and a hint; its workers are stopped and it stays listed as `errored`, as PM2 leaves it, until `warden start` again. Any program or command line works, as with PM2 |
-| `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | ~2 ms instead of ~140-160 ms |
+| `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | The same boxed table with an `id` column, ~2 ms instead of ~140-160 ms. One row per worker; colors on a terminal (`NO_COLOR` turns them off) |
+| `pm2 restart 0`, `pm2 stop 1 2` | `warden restart 0`, `warden stop 1,2` | Every command that takes an app takes its id from `warden list`, a name, a namespace or `all`, one or several: `warden start 0,1,2`, `warden stop 0-3`, `warden restart api web:2` (`:2`: one worker). Ids are numbered the first time Warden sees an app (alphabetically for the first batch, then in creation order), kept in `ids.json` in the state directory, and never change; only `warden delete` frees one. Use names in scripts |
 | `pm2 describe api` | `warden describe api` | Also the last exits and the last rollout |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
@@ -369,11 +370,14 @@ Memory:      4.0 MB (supervisor)
 Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
              health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...
 
-Worker   Status      PID      Uptime   Restarts  RSS        CPU     Loop p99  Health   Last exit
-1        RUNNING     8172     25s      1         40.1 MB    0.0%    0.21ms    ok       -
-2        RUNNING     8180     13s      1         40.1 MB    0.0%    0.18ms    ok       -
-3        RUNNING     8188     10s      1         40.2 MB    0.0%    0.20ms    ok       -
-4        RUNNING     8196     8s       1         40.2 MB    0.0%    0.19ms    ok       -
+┌────────┬─────────┬──────┬────────┬───┬──────┬─────────┬──────────┬────────┬───────────┐
+│ worker │ status  │ pid  │ uptime │ ↺ │ cpu  │ mem     │ loop p99 │ health │ last exit │
+├────────┼─────────┼──────┼────────┼───┼──────┼─────────┼──────────┼────────┼───────────┤
+│ 1      │ RUNNING │ 8172 │ 25s    │ 1 │ 0.0% │ 40.1 MB │ 0.21ms   │ ok     │ -         │
+│ 2      │ RUNNING │ 8180 │ 13s    │ 1 │ 0.0% │ 40.1 MB │ 0.18ms   │ ok     │ -         │
+│ 3      │ RUNNING │ 8188 │ 10s    │ 1 │ 0.0% │ 40.2 MB │ 0.20ms   │ ok     │ -         │
+│ 4      │ RUNNING │ 8196 │ 8s     │ 1 │ 0.0% │ 40.2 MB │ 0.19ms   │ ok     │ -         │
+└────────┴─────────┴──────┴────────┴───┴──────┴─────────┴──────────┴────────┴───────────┘
 ```
 
 The CLI talks to the running supervisor over a Unix socket with mode 0600.
