@@ -561,9 +561,10 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
         let _ = std::fs::create_dir_all(dir);
     }
     write(&out, &json)?;
+    // The copy kept in git: compact (the samples would take thousands of lines).
     let latest = root.join("bench/results/latest");
     if latest.is_dir() && o.out.is_none() {
-        let _ = std::fs::write(latest.join("chaos.json"), &json);
+        let _ = std::fs::write(latest.join("chaos.json"), serde_json::to_string(&rep.json).unwrap_or_default() + "\n");
     }
     println!("\nchaos: wrote {}", out.display());
 

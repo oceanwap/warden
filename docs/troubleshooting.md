@@ -35,6 +35,7 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | A reload takes about 2 s more per worker | Workers with WebSocket or SSE clients wait `long_lived_timeout` for them to end by themselves before closing them | Lower `[shutdown] long_lived_timeout` (fractions work: `0.5`); `0` leaves them open until `grace_period` |
 | `shutdown.long_lived_timeout = X must be below shutdown.grace_period` (at start or `warden check`) | The worker needs time after closing them to finish and exit, or it is SIGKILLed and its clients see resets | Lower `long_lived_timeout` or raise `grace_period` |
 | An SSE stream still holds a draining worker until `grace_period` | The shim didn't see it as SSE: a Bun response returned straight from `fetch()` (a proxied stream), a content type other than `text/event-stream`, an HTTPS `node:http` server | Bun: rebuild it, `const r = await fetch(url); return new Response(r.body, r)`. Other long streams (downloads, NDJSON) are left to finish on purpose: ending them would make a cut-off body look complete |
+| `aborted: workers are being stopped` (the CLI of a reload or restart exits 1) | A `stop`, `restart --hard` or shutdown came in while the rollout ran, and took over | Run the rollout again once the workers are back, if it is still needed |
 | `reload failed at worker 2 … Rolled back: the 2 new workers started together were stopped` | With `[reload] surge`, one worker of a batch failed a gate | Nothing to undo: the batch's new workers were stopped and the old ones keep serving. The message names the worker and the gate |
 | `reload.surge = N starts new workers next to the ones they replace, but …` (at start or `warden check`) | Surge needs a worker and its replacement to run at once; with `port_strategy = "offset"` each worker owns its port, and apps without the shim can't share one | Remove `surge` (one worker at a time), or let the workers share the port (`port_strategy = "shared"`) |
 | Workers still run the old release after a deploy, or a restarted worker did | `[app] pin_release` (default): workers start in the release `current` pointed to at the last start / reload / safe-reload / restart. A crash restart stays on it on purpose, so versions don't mix | Reload after swapping the symlink: `warden safe-reload` (or `reload`). `warden status` shows the pinned release |
@@ -68,6 +69,8 @@ carries the same reason with a `hint=`.
 | `crashed: SIGABRT (aborted)` | The program aborted itself: `process.abort()`, a failed native assertion, a fatal runtime error | Its last output lines say why |
 | `killed by Warden (SIGKILL)` | Warden killed it: it didn't exit within `shutdown.grace_period`, was hung (watchdog), or not ready in time | The line before it says which; see those entries |
 | `exit code 0 after Warden's SIGTERM` | A normal stop: the worker exited after Warden's stop signal | Nothing to do |
+| `worker crashed … reason="exit code N"` | The app exited by itself | Its last output lines say why (`warden logs <app> --worker N`); it is restarted with backoff, then FAILED after `max_restarts` |
+| `worker thread error` then `worker thread crashed` (worker mode) | An uncaught error (in `message=`) or `process.exit()` in one Worker | The host keeps serving with its other Workers while Warden starts a replacement host; fix the error |
 
 ## Health
 
@@ -75,7 +78,8 @@ carries the same reason with a `hint=`.
 |---|---|---|
 | `worker unhealthy` / `worker health check failed` | The worker's health path failed `failure_threshold` times in a row on its private socket | The line has the HTTP status or error; the worker is replaced gracefully (`on_failure = "replace"`) |
 | `only 0 of 4 private health socket(s) reported` | A health path is set, but the app didn't listen through the shim | Keep `shim` on (Bun and Node), or use `health.url` for an app-level check |
-| `worker hung: no heartbeat from its event loop` | The event loop was blocked for `watchdog.timeout` (60 s): an infinite loop, a sync call that never returns | The worker is killed and restarted; profile the app (`event loop was blocked` warnings show shorter stalls) |
+| `worker hung: no heartbeat from its event loop` | The event loop was blocked for `watchdog.timeout` (60 s): an infinite loop, a sync call that never returns | The worker is killed and restarted; profile the app |
+| `event loop was blocked` (Warden's own line, `for_ms=`) | Warden itself did not run for that long: it was stopped (SIGSTOP, a debugger), the VM was paused, the host was starved, or its stdout blocked | Workers kept serving, and the watchdog does not count that time against them (a freeze used to get every worker killed as hung). If it repeats, check the host's load and what reads Warden's output |
 
 ## Logs
 
