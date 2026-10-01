@@ -12,6 +12,7 @@ use crate::history::Series;
 use iced::mouse;
 use iced::widget::canvas::{self, Frame, Path, Stroke, Text};
 use iced::{Color, Pixels, Point, Rectangle, Renderer, Size, Theme, alignment};
+use std::cell::Cell;
 
 /// What the numbers are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,18 +73,50 @@ pub struct Chart<'a> {
     pub faded: bool,
 }
 
-/// Whether the pointer was over the chart (to redraw when it leaves).
-#[derive(Debug, Default)]
-pub struct Hover {
+/// What a canvas keeps between frames: its drawing, redrawn only when what
+/// it shows changes (statuses come every second; a pixel moves far less
+/// often), and whether the pointer was over it.
+#[derive(Default)]
+pub struct Drawn {
+    cache: canvas::Cache,
+    /// Fingerprint of what `cache` shows.
+    shown: Cell<u64>,
     inside: bool,
 }
 
+impl Drawn {
+    /// The cached drawing, redrawn by `draw` if `key` differs from what it shows.
+    fn get(&self, renderer: &Renderer, size: Size, key: u64, draw: impl Fn(&mut Frame)) -> canvas::Geometry {
+        if self.shown.replace(key) != key {
+            self.cache.clear();
+        }
+        self.cache.draw(renderer, size, |frame| {
+            // tiny-skia repaints only the damaged parts of the window, and it
+            // takes a canvas text's damage to start at its anchor: a changed
+            // right-aligned or centered label would keep pieces of the old
+            // one. A rebuilt drawing counts as damaged over the whole of
+            // its bounds, so this invisible rectangle makes them the canvas.
+            frame.fill_rectangle(Point::ORIGIN, size, Color::TRANSPARENT);
+            draw(frame);
+        })
+    }
+}
+
+/// Where everything goes, for the drawing, the crosshair and the fingerprint.
+struct Layout {
+    plot: Rectangle,
+    top: f32,
+    step: f32,
+    /// The points with a value, in the plot: (index, position).
+    points: Vec<(usize, Point)>,
+}
+
 impl<Message> canvas::Program<Message> for Chart<'_> {
-    type State = Hover;
+    type State = Drawn;
 
     fn update(
         &self,
-        state: &mut Hover,
+        state: &mut Drawn,
         event: &canvas::Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
@@ -101,18 +134,24 @@ impl<Message> canvas::Program<Message> for Chart<'_> {
 
     fn draw(
         &self,
-        _state: &Hover,
+        state: &Drawn,
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-        self.draw_into(&mut frame, theme, cursor.position_in(bounds));
-        vec![frame.into_geometry()]
+        let l = self.layout(bounds.size());
+        let key = self.fingerprint(&l, theme);
+        let mut layers = vec![state.get(renderer, bounds.size(), key, |frame| self.draw_base(frame, theme, &l))];
+        if let Some(c) = cursor.position_in(bounds).filter(|c| l.plot.contains(*c) && !self.faded) {
+            let mut frame = Frame::new(renderer, bounds.size());
+            self.draw_crosshair(&mut frame, theme, &l, c);
+            layers.push(frame.into_geometry());
+        }
+        layers
     }
 
-    fn mouse_interaction(&self, _state: &Hover, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
+    fn mouse_interaction(&self, _state: &Drawn, bounds: Rectangle, cursor: mouse::Cursor) -> mouse::Interaction {
         match cursor.position_in(bounds) {
             Some(p) if plot_area(bounds.size()).contains(p) => mouse::Interaction::Crosshair,
             _ => mouse::Interaction::default(),
@@ -149,12 +188,39 @@ impl Chart<'_> {
         self.start_s as f64 + (i as f64 + 0.5) * self.step_s as f64
     }
 
-    fn draw_into(&self, frame: &mut Frame, theme: &Theme, cursor: Option<Point>) {
-        let plot = plot_area(frame.size());
-        let color = Hue::color(self.hue, theme);
-        let fade = if self.faded { 0.35 } else { 1.0 };
+    fn layout(&self, size: Size) -> Layout {
+        let plot = plot_area(size);
         let max = self.series.values.iter().flatten().fold(0.0f32, |m, v| m.max(*v));
         let (top, step) = y_scale(max, self.unit);
+        let y_of = |v: f32| plot.y + plot.height - (v / top).clamp(0.0, 1.0) * plot.height;
+        let points = self
+            .series
+            .values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.map(|v| (i, Point::new(self.x_of(plot, self.t_of(i)), y_of(v)))))
+            .filter(|(_, p)| p.x >= plot.x - 0.5 && p.x <= plot.x + plot.width + 0.5)
+            .collect();
+        Layout { plot, top, step, points }
+    }
+
+    /// Everything the drawing depends on, positions to the half pixel.
+    fn fingerprint(&self, l: &Layout, theme: &Theme) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.start_s, self.step_s, self.end_s, self.span_s, self.unit as u8, self.hue as u8).hash(&mut h);
+        (self.bars, self.area, self.faded, theme.extended_palette().is_dark).hash(&mut h);
+        (l.plot.width.to_bits(), l.plot.height.to_bits(), l.top.to_bits()).hash(&mut h);
+        for (i, p) in &l.points {
+            (*i, (p.x * 2.0) as i32, (p.y * 2.0) as i32).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn draw_base(&self, frame: &mut Frame, theme: &Theme, l: &Layout) {
+        let (plot, top, step) = (l.plot, l.top, l.step);
+        let color = Hue::color(self.hue, theme);
+        let fade = if self.faded { 0.35 } else { 1.0 };
         let y_of = |v: f32| plot.y + plot.height - (v / top).clamp(0.0, 1.0) * plot.height;
 
         // Grid: hairlines at the y ticks (the baseline a step stronger), x ticks.
@@ -185,25 +251,21 @@ impl Chart<'_> {
                 let x = self.x_of(plot, t as f64).round() + 0.5;
                 let tick = Path::line(Point::new(x, plot.y), Point::new(x, plot.y + plot.height));
                 frame.stroke(&tick, Stroke::default().with_width(1.0).with_color(ink(theme, 0.05)));
-                frame.fill_text(label(
-                    clock(t, false),
-                    Point::new(x, plot.y + plot.height + 5.0),
-                    ink(theme, 0.62),
-                    alignment::Horizontal::Center,
-                    alignment::Vertical::Top,
-                ));
+                // Not under the y axis' labels, nor cut at the right edge.
+                if x >= plot.x + 20.0 && x <= plot.x + plot.width - 14.0 {
+                    frame.fill_text(label(
+                        clock(t, false),
+                        Point::new(x, plot.y + plot.height + 5.0),
+                        ink(theme, 0.62),
+                        alignment::Horizontal::Center,
+                        alignment::Vertical::Top,
+                    ));
+                }
             }
             t += every;
         }
 
-        let points: Vec<(usize, Point)> = self
-            .series
-            .values
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| v.map(|v| (i, Point::new(self.x_of(plot, self.t_of(i)), y_of(v)))))
-            .filter(|(_, p)| p.x >= plot.x - 0.5 && p.x <= plot.x + plot.width + 0.5)
-            .collect();
+        let points = &l.points;
         if points.is_empty() {
             frame.fill_text(label(
                 if self.faded { "loading…".into() } else { "no samples in this period".into() },
@@ -227,7 +289,7 @@ impl Chart<'_> {
             // Runs of consecutive points: a gap in the samples is a gap in the line.
             let mut runs: Vec<Vec<Point>> = Vec::new();
             let mut prev: Option<usize> = None;
-            for (i, p) in &points {
+            for (i, p) in points {
                 match (prev, runs.last_mut()) {
                     (Some(j), Some(run)) if *i == j + 1 => run.push(*p),
                     _ => runs.push(vec![*p]),
@@ -266,10 +328,14 @@ impl Chart<'_> {
                 );
             }
         }
+    }
 
-        // The crosshair: the point nearest the pointer, its time and value.
-        let Some(c) = cursor.filter(|c| plot.contains(*c) && !self.faded) else { return };
-        let Some((i, p)) = points.iter().min_by(|a, b| (a.1.x - c.x).abs().total_cmp(&(b.1.x - c.x).abs())) else {
+    /// The crosshair: the point nearest the pointer `c`, its time and value.
+    fn draw_crosshair(&self, frame: &mut Frame, theme: &Theme, l: &Layout, c: Point) {
+        let (plot, step) = (l.plot, l.step);
+        let base = plot.y + plot.height;
+        let color = Hue::color(self.hue, theme);
+        let Some((i, p)) = l.points.iter().min_by(|a, b| (a.1.x - c.x).abs().total_cmp(&(b.1.x - c.x).abs())) else {
             return;
         };
         let hair = Path::line(Point::new(p.x, plot.y), Point::new(p.x, base));
@@ -399,17 +465,16 @@ pub struct Sparkline<'a> {
 }
 
 impl<Message> canvas::Program<Message> for Sparkline<'_> {
-    type State = ();
+    type State = Drawn;
 
     fn draw(
         &self,
-        _state: &(),
+        state: &Drawn,
         renderer: &Renderer,
         theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
         let (w, h) = (bounds.width, bounds.height);
         let n = self.series.values.len().max(2);
         let max = self.series.values.iter().flatten().fold(self.floor, |m, v| m.max(*v));
@@ -417,6 +482,21 @@ impl<Message> canvas::Program<Message> for Sparkline<'_> {
         let pt = |i: usize, v: f32| {
             Point::new(1.0 + (w - 2.0) * i as f32 / (n - 1) as f32, h - 1.0 - (v / top).clamp(0.0, 1.0) * (h - 2.0))
         };
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut k = std::collections::hash_map::DefaultHasher::new();
+            (w.to_bits(), h.to_bits(), self.hue as u8, theme.extended_palette().is_dark).hash(&mut k);
+            for (i, v) in self.series.values.iter().enumerate() {
+                v.map(|v| (pt(i, v).y * 2.0) as i32).hash(&mut k);
+            }
+            k.finish()
+        };
+        vec![state.get(renderer, bounds.size(), key, |frame| self.draw_line(frame, theme, w, h, &pt))]
+    }
+}
+
+impl Sparkline<'_> {
+    fn draw_line(&self, frame: &mut Frame, theme: &Theme, w: f32, h: f32, pt: &dyn Fn(usize, f32) -> Point) {
         frame.fill_rectangle(Point::new(0.0, h - 1.0), Size::new(w, 1.0), ink(theme, 0.15));
         let color = Hue::color(self.hue, theme);
         let mut run: Vec<Point> = Vec::new();
@@ -444,11 +524,10 @@ impl<Message> canvas::Program<Message> for Sparkline<'_> {
         for (i, v) in self.series.values.iter().enumerate() {
             match v {
                 Some(v) => run.push(pt(i, *v)),
-                None => flush(&mut run, &mut frame),
+                None => flush(&mut run, frame),
             }
         }
-        flush(&mut run, &mut frame);
-        vec![frame.into_geometry()]
+        flush(&mut run, frame);
     }
 }
 

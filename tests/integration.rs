@@ -2522,7 +2522,7 @@ min_interval = "1h"
 name = "log"
 on = ["all"]
 command = ["/bin/sh", "-c", "cat >> '{out}'; echo >> '{out}'"]
-min_interval = "6s"
+min_interval = "15s"
 "#,
             out = out.display()
         ),
@@ -2624,13 +2624,13 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     assert!(out.contains("alert #1 (line 1): webhook ftp://x/… must start with https://"), "{out}");
     assert!(out.contains("alert #2 (line 5): needs `command"), "{out}");
     assert!(!out.contains("s3cr3t"), "{out}");
-    let good = "[[alert]]\nname = \"ops\"\non = [\"gave_up\", \"died\"]\ncommand = [\"/bin/true\"]\n";
+    let good = "[[alert]]\nname = \"ops\"\non = [\"gave_up\", \"died\"]\ncommand = [\"/bin/sh\"]\n";
     std::fs::write(&file, good).unwrap();
     let out = f.ok(&["daemon", "check"]);
     assert!(out.contains("ok, 1 alert rule"), "{out}");
-    assert!(out.contains("ops: gave_up, died of every app → command /bin/true (min_interval 5m)"), "{out}");
+    assert!(out.contains("ops: gave_up, died of every app → command /bin/sh (min_interval 5m)"), "{out}");
     let other = f.home.join("other.toml.txt");
-    std::fs::write(&other, "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/true\"]\napps = [\"ghost\"]\n").unwrap();
+    std::fs::write(&other, "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\napps = [\"ghost\"]\n").unwrap();
     let out = f.ok(&["daemon", "check", "-c", other.to_str().unwrap()]);
     assert!(out.contains("no app \"ghost\" on this host"), "{out}");
     let (code, out) = f.cli(&["daemon", "reload"]);
@@ -2640,13 +2640,13 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     let mut d = Wardend::start(&f, &[]);
     wait_log(&d, "alert rules read rules=1");
     // A bad file: the running rules stay, and the reload says why.
-    std::fs::write(&file, "[[alert]]\non = [\"all\"]\ncommand = \"/bin/true\"\n").unwrap();
+    std::fs::write(&file, "[[alert]]\non = [\"all\"]\ncommand = \"/bin/sh\"\n").unwrap();
     let (code, out) = f.cli(&["daemon", "reload"]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("keeps the 1 rule in force") && out.contains("line 3"), "{out}");
     wait_log(&d, "wardend.toml has errors; keeping the alert rules in force");
     // Fixed, and read again on SIGHUP (which no longer stops wardend).
-    std::fs::write(&file, format!("{good}\n[[alert]]\non = [\"all\"]\ncommand = [\"/bin/true\"]\n")).unwrap();
+    std::fs::write(&file, format!("{good}\n[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\n")).unwrap();
     unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
     wait_log(&d, "alert rules read rules=2 file=");
     assert!(d.log().contains("on=SIGHUP"), "{}", d.log());

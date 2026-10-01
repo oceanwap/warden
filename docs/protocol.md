@@ -156,6 +156,8 @@ Requests are `events::DaemonRequest`, tagged by `cmd`; replies are one
 | `{"cmd":"start","app":"api"}` | starts that app's supervisor (config from the config directory) under `wardend`'s watch; clears a `gave_up` |
 | `{"cmd":"app","app":"api","request":{"cmd":"reload","safe":true}}` | forwards any app request and returns its `control::Response` in `response` (`logs` streams lines) |
 | `{"cmd":"shutdown"}` | `wardend` exits; every app keeps running |
+| `{"cmd":"history","app":"api","since_ms":1790000000000,"step_s":60}` | `history`: the resource history ([below](#resource-history)). Every field is optional |
+| `{"cmd":"reload"}` | reads `wardend.toml` (the [alert rules](#alerts)) again, as SIGHUP does. `ok: false` with every problem in `message` when the file has errors; the rules in force then stay |
 
 On `wardend`'s `subscribe` stream:
 
@@ -182,6 +184,153 @@ On `wardend`'s `subscribe` stream:
 (`systemd`, `wardend`, `terminal`), `supervisor_pid`,
 `supervisor_restarts`, `status` (the last `control::Status`), `problem`
 (why it is not running, with the fix).
+
+### Resource history
+
+`wardend` keeps the last 24 hours of every app's and the host's resource
+use in memory, from what it already receives: each app's `status` (every
+second) and the host metrics (every second while a client subscribes,
+else every 10 s). Nothing is polled for it. Every 10 s of wall-clock time
+one sample per series is committed, covering `[t, t + 10 s)` with `t` a
+multiple of 10 s:
+
+| Series | One sample (10 s) | A point of `step_s` |
+|---|---|---|
+| app `cpu_percent` | mean of the statuses' CPU (workers + worker-mode host; 100 = one core) | mean |
+| app `rss_bytes` | max of the statuses' resident memory (workers + worker-mode host + supervisor) | max |
+| app `workers_ready` | min | min |
+| app `workers_configured` | max | max |
+| app `restarts` | restarts seen: what the workers' (and worker-mode host's) `restarts` counters grew by between statuses of one supervisor (all of a new supervisor's), plus `wardend`'s restarts of the supervisor | sum |
+| host `cpu_percent` | mean (100 = all CPUs) | mean |
+| host `mem_used_bytes` | max | max |
+| host `load1` | mean of the 1-minute load | mean |
+
+The request: `{"cmd":"history","app":"api","since_ms":…,"step_s":60}`.
+
+- `app`: that app (and the host); `""`: the host only; absent: every app.
+  An app without a series (unknown, or no sample yet) is not an error: its
+  entry is missing from `apps`.
+- `since_ms`: from then (default, and at most, 24 h ago). The first point
+  starts at `since_ms` rounded down to a multiple of `step_s`, the last one
+  holds now (it is not committed yet, so it is `null` until the next 10 s).
+- `step_s`: seconds per point (default 10), rounded up to a multiple of 10,
+  at most 86400. A reply holds at most 1,000,000 numbers: with many apps at
+  a small step, wardend doubles the step until it fits. The reply says the
+  step it used.
+
+The reply, in `history`:
+
+```json
+{"ok":true,"history":{"start_ms":1790000000000,"step_s":60,"points":1440,
+  "host":{"cpu_percent":[12.5,null,…],"mem_used_bytes":[…],"mem_total_bytes":8220000000,"load1":[…]},
+  "apps":[{"app":"api","cpu_percent":[…],"rss_bytes":[…],"workers_ready":[…],
+           "workers_configured":[…],"restarts":[…]}]}}
+```
+
+Point `i` covers `[start_ms + i * step_s * 1000, + step_s)`; every array
+has `points` entries; `null` where nothing was sampled (the app was not
+watched, `wardend` was not running). CPU is rounded to 0.1, load to 0.01.
+
+- **Memory bound.** A fixed ring of 8640 samples (24 h) per series, in
+  16-byte records (f32 CPU, u32 KiB, u16 counts): at most 135 KiB per app,
+  plus 169 KiB for the host and the sample times, for at most 128 apps.
+  Rings grow an hour at a time, so a young `wardend` holds less. 10 apps:
+  1.5 MB at most. A unit test checks the bound.
+- **Lifetime.** An app's series is kept by name: it survives the app's
+  restarts and `wardend` restarting its supervisor, and goes once it has
+  had no sample for 24 h (or, past 128 apps, when a newer app needs room
+  and it has had none for 10 minutes).
+- **Not on disk.** The history does not survive `wardend` itself. Writing
+  ~1.4 MB for 10 apps every few minutes from `wardend`'s one thread, and
+  parsing that file back as root at start, would cost I/O and add a file
+  format to keep safe, for a history whose job is "what happened today":
+  `wardend` restarts are rare (upgrades) and lose at most that day's charts.
+  The GUI says when a period has no samples.
+
+## Alerts
+
+`wardend` sends alerts by the rules in `<config dir>/wardend.toml`
+(`/etc/warden/wardend.toml` for root, `~/.config/warden/wardend.toml` for a
+user, `$WARDEN_HOME/wardend.toml`). The file is optional; without it no
+alert is sent. It is read at start, on SIGHUP and on the `reload` request
+(`warden daemon reload`), and checked with `warden daemon check [-c FILE]`.
+A file with errors is reported (every problem, with its line) and the rules
+in force stay. App discovery ignores this file (it is not an app).
+
+```toml
+# Optional: what makes a crash loop (these are the defaults).
+[crash_loop]
+crashes = 3        # worker crashes of one app …
+window = "5m"      # … within this long
+
+[[alert]]
+name = "ops"                                        # optional, in logs and alerts (default: "alert #N")
+on = ["crash_loop", "gave_up", "rollout_failed", "unresponsive", "worker_failed", "oom"]   # or ["all"]
+apps = ["api"]                                      # optional; default every app
+command = ["/usr/local/bin/notify", "--channel", "ops"]   # the alert as JSON on stdin, and WARDEN_ALERT_*
+min_interval = "5m"                                 # the default
+
+[[alert]]
+on = ["all"]
+webhook = "https://hooks.slack.com/services/…"      # POSTed as JSON (with `text`, for Slack)
+```
+
+Durations: `500ms`, `30s`, `5m`, `1h30m`, `1d`, or a number of seconds.
+
+### Kinds
+
+| `kind` | When |
+|---|---|
+| `crash_loop` | `crashes` worker `crashed` events of one app within `window`. Once per loop: crashes meanwhile are counted (in `recovered`); the loop ends after `window` without a crash |
+| `oom` | a worker `crashed` event whose `detail` holds the word `oom-killed` (see below); it counts as a crash too |
+| `worker_failed` | a worker `failed` event (too many restarts), or a worker already `FAILED` in the status `wardend` sees when it begins watching an app |
+| `unhealthy` | a worker `unhealthy` or `hung` event |
+| `rollout_failed` | `rollout_done` with `ok: false` |
+| `recycled` | `rollout_done` of a `replace` whose message names `max_memory` or `max_lifetime` |
+| `died` | `supervisor` `died` (no `bye`) |
+| `gave_up` | `supervisor` `gave_up` |
+| `unresponsive` | `supervisor` `unresponsive` |
+| `recovered` | after any of the above but `rollout_failed` and `recycled`: every worker ready (and no rollout) for 1 minute |
+
+**The OOM marker.** A worker's exit reason (the `crashed` event's `detail`,
+`WorkerStatus.last_exit`) that starts with `oom-killed` marks an OOM kill:
+`oom-killed (memory.max 512M): signal 9 (SIGKILL)`. `wardend` matches the
+word `oom-killed` anywhere in the detail (case-insensitive, as a whole word),
+so a supervisor that writes `signal 9 (SIGKILL), oom-killed` is matched as well.
+
+### What a rule gets
+
+```json
+{"text":"web-1: api crash loop: 3 worker crashes within 5m; the last: worker 2 exit code 1",
+ "kind":"crash_loop","app":"api","host":"web-1",
+ "detail":"3 worker crashes within 5m; the last: worker 2 exit code 1",
+ "at_ms":1790000000000,"count":1,"first_ms":1790000000000,"rule":"ops"}
+```
+
+- `command`: run with that JSON on stdin and `WARDEN_ALERT_KIND`, `_APP`,
+  `_HOST`, `_TEXT`, `_DETAIL`, `_COUNT`, `_AT_MS`, `_RULE` in its
+  environment (and `wardend`'s). It runs as `wardend`'s user (root for the
+  system `wardend`), in a process group of its own; a non-zero exit is a
+  failure. The program is checked when the file is read: an absolute path,
+  or a name on `wardend`'s PATH.
+- `webhook`: `curl -fsS --max-time 10 --proto =http,https -K -`, which reads
+  the URL, the `Content-Type: application/json` header and the body from
+  its stdin, so neither the URL (often a secret) nor the alert ever appear
+  in a process list. Warden carries no TLS stack of its own. An HTTP error
+  status is a failure. Without curl, `wardend` logs one error with the fix.
+- `min_interval` (per rule, app and kind): an alert goes out at once; the
+  same alert within `min_interval` is held back and counted; when the
+  interval has passed, the held ones go out as one alert with `count` (and
+  `first_ms`, the first of them). `"0s"` sends every one.
+
+### Delivery
+
+Alerts never make `wardend` wait. They go into a queue of 64 (more are
+dropped, counted and logged once a minute); at most 4 deliveries run at
+once; each is killed after 10 s (the command's whole process group); a
+failed one is tried once more after 5 s, then logged as lost. Every failure
+is logged with the rule, the kind, the app, the target (a command's program
+only, a webhook's host only: never its path or token) and the fix.
 
 ## Second-level supervision
 
@@ -231,4 +380,9 @@ else would:
   TCP listener to secure. It keeps one `subscribe` stream open (reconnecting
   with backoff), opens a second one with `logs: true` and `apps: [<app>]`
   only while its logs pane shows that app, and sends every action as a short
-  `app` or `start` request.
+  `app` or `start` request. Its History tab asks `history` for the shown app
+  and range (1 h at 10 s, 6 h at 1 min, 24 h at 4 min per point) when it
+  opens, and its header for the host's last hour; then it adds the live
+  `status` and `host` events to those series, the way `wardend` counts them
+  (`events::Usage`, `events::restarts_since`).
+- `warden daemon check` and `warden daemon reload`: the [alert rules](#alerts).

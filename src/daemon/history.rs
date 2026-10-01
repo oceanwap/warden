@@ -181,8 +181,12 @@ pub(crate) struct Store {
 impl Store {
     /// An app's status. `sup_restarts`: wardend's restarts of its supervisor.
     pub fn observe_app(&mut self, app: &Arc<str>, s: &Status, sup_restarts: u32) {
-        if !self.apps.contains_key(app) && !self.make_room() {
-            return;
+        if !self.apps.contains_key(app) {
+            if !self.make_room() {
+                return;
+            }
+            #[cfg(debug_assertions)]
+            self.prefill_for_tests(app);
         }
         let seq = self.seq;
         let a = self.apps.entry(app.clone()).or_insert_with(|| AppSeries { last_present: seq, ..Default::default() });
@@ -216,6 +220,47 @@ impl Store {
         h.mem_used_max = h.mem_used_max.max(mem_used);
         h.mem_total = mem_total;
         h.n += 1;
+    }
+
+    /// Debug builds only (like `WARDEN_FAULT`): `WARDEN_HISTORY_PREFILL=1`
+    /// gives every new app (and the host) a full day of made-up samples, to
+    /// measure wardend and the GUI with full rings without waiting a day.
+    #[cfg(debug_assertions)]
+    fn prefill_for_tests(&mut self, app: &Arc<str>) {
+        if std::env::var_os("WARDEN_HISTORY_PREFILL").is_none_or(|v| v != "1") {
+            return;
+        }
+        let now = crate::events::now_ms() / 1000;
+        let now = now - now % STEP_S;
+        if self.times.len() < CAP {
+            self.times = Ring::default();
+            self.host = Ring::default();
+            for i in 0..CAP {
+                let wave = ((i as f32) / 180.0).sin();
+                self.times.push(u32::try_from(now - (CAP - i) as u64 * STEP_S).unwrap_or(0));
+                self.host.push(HostSample {
+                    cpu: 20.0 + 10.0 * wave,
+                    load1: 0.5,
+                    mem_used_kib: 3_000_000,
+                    mem_total_kib: 8_000_000,
+                });
+            }
+            self.seq = self.seq.max(CAP as u64);
+        }
+        let mut ring = Ring::default();
+        for i in 0..CAP {
+            let wave = ((i as f32) / 90.0).sin();
+            ring.push(AppSample {
+                cpu: 3.0 + 2.0 * wave,
+                mem_kib: 150_000 + (i as u32 % 1000) * 100,
+                ready: 2,
+                configured: 2,
+                restarts: u16::from(i % 700 == 0),
+                flags: PRESENT | MEM,
+            });
+        }
+        let seq = self.seq;
+        self.apps.insert(app.clone(), AppSeries { ring, last_present: seq, ..Default::default() });
     }
 
     /// Room for one more app: drop the series of the app gone the longest

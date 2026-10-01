@@ -97,6 +97,12 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `supervisor is unresponsive; not killing it` | No event and no `status` answer for 3 s + 5 s; its workers probably still serve | `cat /proc/<pid>/stack` or `gdb -p <pid>` shows where it is stuck; restart it yourself if it stays stuck |
 | `supervisor died; not restarting it (it was not started in the background)` | It ran in a terminal (or under systemd, which restarts it itself) | `warden start <app>` runs it in the background, where wardend restarts it |
 | `a saved app's config is gone; not starting it` | `warden daemon --resurrect` found a saved app whose config was deleted | `warden save` again to forget it |
+| `wardend.toml has errors; keeping the alert rules in force` | The alert rules file did not parse or check (at start, SIGHUP or `warden daemon reload`); `errors=` lists every problem with its line | `warden daemon check` shows the same list; fix it, then `warden daemon reload`. Until then the previous rules (none at start) apply |
+| `alert delivery failed; trying once more` / `… failed twice; this alert is lost` | The rule's command exited non-zero or ran over 10 s (it is killed, with its children), or the webhook answered an HTTP error or could not be reached | `error=` has the exit status and the command's first stderr line, or curl's error; `hint=` the next step. Run the command by hand with a JSON alert on stdin; for a webhook, check the URL (a 404 often means a revoked Slack hook) and that this host reaches it (DNS, firewall, `https_proxy` in wardend's environment) |
+| `cannot send alerts to webhooks: curl is not installed` | Webhooks are POSTed by running `curl` (Warden has no TLS stack of its own); said once | `apt install curl` (`dnf`, `apk`, …), or use `command = [...]` |
+| `alert queue is full; dropping alerts` | More than 64 alerts wait: deliveries are slow (each may take 10 s, one retry) and many alerts fire | Make the command or webhook answer fast; raise `min_interval`; narrow `on` / `apps` |
+| `alert rules: a warning` | The file is valid, but: a plain `http://` webhook to another host (the token crosses the network unencrypted), or curl missing | Use `https://`; install curl |
+| `resource history is full; new apps get none` | 128 apps have a series and none has been gone 10 minutes | Unusual; the history of an app gone for 10 minutes makes room |
 
 ## Containers
 
