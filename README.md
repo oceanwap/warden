@@ -150,6 +150,22 @@ starts, and a failure can't be rolled back.
 `warden reload` (also SIGHUP) runs the same gates without the canary soak,
 fleet check or pauses. `warden restart N` replaces one worker through the gates.
 
+**WebSockets and SSE.** A long-lived connection never finishes by itself, so
+a draining worker would hold it until `grace_period` and then be killed, and
+its clients would see a reset (WebSocket 1006, a broken EventSource). Instead,
+the shim gives these connections `[shutdown] long_lived_timeout` (default
+2 s) to end by themselves, then closes each WebSocket with **1001 (Going
+Away)** and ends each SSE response cleanly after its last complete event.
+Clients reconnect, and land on the new workers: EventSource does this by
+itself, and WebSocket clients should reconnect on close. This covers `Bun.serve`
+(`websocket` handlers; `text/event-stream` bodies from a ReadableStream, a
+`type: "direct"` stream or an async generator) and `node:http` on Node and
+Bun (WebSockets taken over through `'upgrade'`, as the `ws` library does;
+SSE written with `res.write`), in process and worker mode. Other streamed
+responses, such as downloads, are never cut short: they finish like any
+request in flight, within `grace_period`. Each worker logs what it closed:
+`closed long-lived connections … websockets=3 sse=12`.
+
 ## Staying up for weeks
 
 | | What happens | Config |
@@ -159,7 +175,7 @@ fleet check or pauses. `warden restart N` replaces one worker through the gates.
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
-| Stop / shutdown | SIGTERM to each process group, drain, SIGKILL after `grace_period` | `[shutdown]` |
+| Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
 
 ## CLI
 

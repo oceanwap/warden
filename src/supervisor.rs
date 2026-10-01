@@ -457,6 +457,7 @@ impl Supervisor {
         add("WARDEN_MODE", mode_name(self.cfg.workers.mode).into());
         add("WARDEN_WORKER_COUNT", self.count.to_string());
         add("WARDEN_DRAIN_MS", self.cfg.shutdown.drain_ms.to_string());
+        add("WARDEN_LONG_LIVED_MS", self.cfg.long_lived_timeout().as_millis().to_string());
         add("WARDEN_INSTANCE", inst_id.to_string());
         if self.cfg.private_sockets() {
             add("WARDEN_HEALTH_DIR", self.runtime_dir.display().to_string());
@@ -693,6 +694,13 @@ impl Supervisor {
                 warn!("worker thread error", worker = worker, message = msg.message.unwrap_or_default());
             }
             "draining" => debug!("draining", worker = worker),
+            "long_lived_closed" => info!(
+                "closed long-lived connections so their clients reconnect to new workers",
+                worker = worker,
+                pid = inst.handle.pid,
+                websockets = msg.ws.unwrap_or(0),
+                sse = msg.sse.unwrap_or(0),
+            ),
             other => debug!("unknown IPC event", ev = other),
         }
     }

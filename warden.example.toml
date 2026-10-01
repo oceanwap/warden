@@ -41,6 +41,9 @@ stop_exit_codes = []                         # exit codes that mean "done, don't
 grace_period = 30                            # s to exit after the stop signal before SIGKILL
 drain_ms = 500                               # ms the shim keeps answering with Connection: close
 signal = "SIGTERM"                           # or "SIGINT" for apps written for PM2 (its default)
+long_lived_timeout = 2                       # s (fractions ok) a draining worker lets WebSockets and SSE streams
+                                             # end by themselves, then closes them (1001 / end of stream) so clients
+                                             # reconnect to new workers; below grace_period; 0 = leave them open
 
 [health]
 enabled = true                               # example (default false): periodic per-worker checks
