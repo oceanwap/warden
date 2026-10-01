@@ -1,10 +1,13 @@
 {
   "meta": {
-    "date": "2026-09-30T16:26:06.251Z",
+    "date": "2026-10-01T06:58:18.197Z",
     "kernel": "6.18.44-fc-v50 x86_64",
     "cpus": 2,
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "warden": "warden 0.1.0",
+    "loadgen": "oha 1.16.0",
+    "app_cpus": "all",
+    "loadgen_cpus": "all",
     "tcp_migrate_req": "1",
     "app": "nest-bun",
     "workers": 4,
@@ -18,48 +21,48 @@
   "results": [
     {
       "name": "bare",
-      "startup_ms": 771,
+      "startup_ms": 685,
       "idle": {
-        "total_rss_mb": 335.6,
-        "total_pss_mb": 196.6,
+        "total_rss_mb": 340.8,
+        "total_pss_mb": 200,
         "manager_rss_mb": 0
       },
       "loaded": {
-        "total_rss_mb": 460.1,
-        "total_pss_mb": 317,
+        "total_rss_mb": 435.7,
+        "total_pss_mb": 292.7,
         "manager_rss_mb": 0
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 31075,
-          "p50_ms": 1.28,
-          "p95_ms": 5.98,
-          "p99_ms": 11.17,
-          "mb_per_s": 0.4,
-          "ok": 310901,
+          "rps": 40054,
+          "p50_ms": 1.08,
+          "p95_ms": 4.39,
+          "p99_ms": 8.81,
+          "mb_per_s": 0.5,
+          "ok": 400650,
           "errors": 0,
-          "cpu_s": 15.13
+          "cpu_s": 14.52
         },
         "/json": {
-          "rps": 29124,
-          "p50_ms": 1.42,
-          "p95_ms": 6.22,
-          "p99_ms": 10.75,
-          "mb_per_s": 27.1,
-          "ok": 291329,
+          "rps": 38120,
+          "p50_ms": 1.15,
+          "p95_ms": 4.47,
+          "p99_ms": 8.5,
+          "mb_per_s": 35.5,
+          "ok": 381355,
           "errors": 0,
-          "cpu_s": 15
+          "cpu_s": 14.62
         },
         "/cpu": {
-          "rps": 1185,
-          "p50_ms": 49.54,
-          "p95_ms": 76.26,
-          "p99_ms": 95.16,
+          "rps": 1364,
+          "p50_ms": 46.45,
+          "p95_ms": 60.85,
+          "p99_ms": 94.16,
           "mb_per_s": 0,
-          "ok": 11797,
+          "ok": 13581,
           "errors": 0,
-          "cpu_s": 19.55
+          "cpu_s": 19.58
         }
       },
       "recovery_ms": "n/a (nothing restarts it)",
@@ -69,177 +72,257 @@
     },
     {
       "name": "pm2",
-      "startup_ms": 1482,
+      "startup_ms": 1187,
       "idle": {
-        "total_rss_mb": 420,
-        "total_pss_mb": 274.6,
+        "total_rss_mb": 425.3,
+        "total_pss_mb": 279.9,
         "manager_rss_mb": 69.9
       },
       "loaded": {
-        "total_rss_mb": 513.6,
-        "total_pss_mb": 366.3,
-        "manager_rss_mb": 65.2
-      },
-      "manager_idle_cpu_pct": 0.2,
-      "endpoints": {
-        "/plaintext": {
-          "rps": 26008,
-          "p50_ms": 1.54,
-          "p95_ms": 7.01,
-          "p99_ms": 16.79,
-          "mb_per_s": 0.3,
-          "ok": 260264,
-          "errors": 0,
-          "cpu_s": 15.63
-        },
-        "/json": {
-          "rps": 25657,
-          "p50_ms": 1.62,
-          "p95_ms": 7.05,
-          "p99_ms": 13.49,
-          "mb_per_s": 23.9,
-          "ok": 256604,
-          "errors": 0,
-          "cpu_s": 15.42
-        },
-        "/cpu": {
-          "rps": 1086,
-          "p50_ms": 56.5,
-          "p95_ms": 87.54,
-          "p99_ms": 112.72,
-          "mb_per_s": 0,
-          "ok": 10801,
-          "errors": 0,
-          "cpu_s": 19.33
-        }
-      },
-      "recovery_ms": 781,
-      "crash": {
-        "ok": 5631,
-        "failed": 0
-      },
-      "rolling": {
-        "ok": 4375,
-        "failed": 4324,
-        "ms": 1659,
-        "replaced_all": true
-      },
-      "cli_ms": 152.7
-    },
-    {
-      "name": "warden-process",
-      "startup_ms": 761,
-      "idle": {
-        "total_rss_mb": 343.9,
-        "total_pss_mb": 200.3,
-        "manager_rss_mb": 6
-      },
-      "loaded": {
-        "total_rss_mb": 488.8,
-        "total_pss_mb": 343,
-        "manager_rss_mb": 6
+        "total_rss_mb": 515.5,
+        "total_pss_mb": 368.1,
+        "manager_rss_mb": 65.4
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 30474,
-          "p50_ms": 1.47,
-          "p95_ms": 5.57,
-          "p99_ms": 9.94,
+          "rps": 35844,
+          "p50_ms": 1.23,
+          "p95_ms": 4.65,
+          "p99_ms": 11.02,
           "mb_per_s": 0.4,
-          "ok": 304821,
+          "ok": 358552,
           "errors": 0,
-          "cpu_s": 15.05
+          "cpu_s": 15.74
         },
         "/json": {
-          "rps": 30655,
-          "p50_ms": 1.33,
-          "p95_ms": 5.78,
-          "p99_ms": 8.95,
-          "mb_per_s": 28.6,
-          "ok": 306614,
+          "rps": 33690,
+          "p50_ms": 1.42,
+          "p95_ms": 4.63,
+          "p99_ms": 8.82,
+          "mb_per_s": 31.4,
+          "ok": 336984,
           "errors": 0,
-          "cpu_s": 14.89
+          "cpu_s": 15.68
         },
         "/cpu": {
-          "rps": 1185,
-          "p50_ms": 51.72,
-          "p95_ms": 69.8,
-          "p99_ms": 99.02,
+          "rps": 1294,
+          "p50_ms": 53.4,
+          "p95_ms": 73.64,
+          "p99_ms": 84.72,
           "mb_per_s": 0,
-          "ok": 11789,
+          "ok": 12876,
+          "errors": 0,
+          "cpu_s": 19.55
+        }
+      },
+      "recovery_ms": 529,
+      "crash": {
+        "ok": 5160,
+        "failed": 0
+      },
+      "rolling": {
+        "ok": 4321,
+        "failed": 1904,
+        "ms": 1119,
+        "replaced_all": true
+      },
+      "cli_ms": 129.5
+    },
+    {
+      "name": "warden-process",
+      "startup_ms": 830,
+      "idle": {
+        "total_rss_mb": 349.5,
+        "total_pss_mb": 205.6,
+        "manager_rss_mb": 7.7
+      },
+      "loaded": {
+        "total_rss_mb": 430.7,
+        "total_pss_mb": 284.7,
+        "manager_rss_mb": 7.7
+      },
+      "manager_idle_cpu_pct": 0,
+      "endpoints": {
+        "/plaintext": {
+          "rps": 41050,
+          "p50_ms": 1.18,
+          "p95_ms": 3.97,
+          "p99_ms": 7.73,
+          "mb_per_s": 0.5,
+          "ok": 410641,
+          "errors": 0,
+          "cpu_s": 14.58
+        },
+        "/json": {
+          "rps": 38079,
+          "p50_ms": 0.95,
+          "p95_ms": 5.07,
+          "p99_ms": 9.44,
+          "mb_per_s": 35.5,
+          "ok": 380906,
+          "errors": 0,
+          "cpu_s": 14.56
+        },
+        "/cpu": {
+          "rps": 1362,
+          "p50_ms": 48.92,
+          "p95_ms": 71.89,
+          "p99_ms": 96.98,
+          "mb_per_s": 0,
+          "ok": 13561,
+          "errors": 0,
+          "cpu_s": 19.56
+        }
+      },
+      "recovery_ms": 406,
+      "crash": {
+        "ok": 5332,
+        "failed": 0
+      },
+      "rolling": {
+        "ok": 3764,
+        "failed": 0,
+        "ms": 1297,
+        "replaced_all": true
+      },
+      "cli_ms": 1.6
+    },
+    {
+      "name": "warden-surge",
+      "startup_ms": 773,
+      "idle": {
+        "total_rss_mb": 351.8,
+        "total_pss_mb": 208.1,
+        "manager_rss_mb": 8.1
+      },
+      "loaded": null,
+      "manager_idle_cpu_pct": "-",
+      "endpoints": {},
+      "recovery_ms": "-",
+      "crash": "-",
+      "rolling": {
+        "ok": 2198,
+        "failed": 0,
+        "ms": 964,
+        "replaced_all": true
+      },
+      "cli_ms": "-"
+    },
+    {
+      "name": "warden-worker",
+      "startup_ms": 749,
+      "idle": {
+        "total_rss_mb": 187.7,
+        "total_pss_mb": 166.2,
+        "manager_rss_mb": 8.2
+      },
+      "loaded": {
+        "total_rss_mb": 279.6,
+        "total_pss_mb": 257.8,
+        "manager_rss_mb": 8.2
+      },
+      "manager_idle_cpu_pct": 0,
+      "endpoints": {
+        "/plaintext": {
+          "rps": 34549,
+          "p50_ms": 1,
+          "p95_ms": 5.87,
+          "p99_ms": 15.05,
+          "mb_per_s": 0.4,
+          "ok": 345526,
+          "errors": 0,
+          "cpu_s": 14.3
+        },
+        "/json": {
+          "rps": 35367,
+          "p50_ms": 1.01,
+          "p95_ms": 5.61,
+          "p99_ms": 11.83,
+          "mb_per_s": 32.9,
+          "ok": 353726,
+          "errors": 0,
+          "cpu_s": 14.32
+        },
+        "/cpu": {
+          "rps": 1359,
+          "p50_ms": 46.69,
+          "p95_ms": 62.64,
+          "p99_ms": 97.13,
+          "mb_per_s": 0,
+          "ok": 13535,
+          "errors": 0,
+          "cpu_s": 19.57
+        }
+      },
+      "recovery_ms": 999,
+      "crash": {
+        "ok": 3836,
+        "failed": 0
+      },
+      "rolling": {
+        "ok": 3765,
+        "failed": 0,
+        "ms": 839,
+        "replaced_all": true
+      },
+      "cli_ms": 2
+    },
+    {
+      "name": "warden-standby",
+      "startup_ms": 877,
+      "idle": {
+        "total_rss_mb": 434.7,
+        "total_pss_mb": 248.4,
+        "manager_rss_mb": 8.3
+      },
+      "loaded": {
+        "total_rss_mb": 517.1,
+        "total_pss_mb": 328.6,
+        "manager_rss_mb": 8.3
+      },
+      "manager_idle_cpu_pct": 0,
+      "endpoints": {
+        "/plaintext": {
+          "rps": 39648,
+          "p50_ms": 1.11,
+          "p95_ms": 4.39,
+          "p99_ms": 8.31,
+          "mb_per_s": 0.5,
+          "ok": 396583,
+          "errors": 0,
+          "cpu_s": 14.59
+        },
+        "/json": {
+          "rps": 36604,
+          "p50_ms": 1.14,
+          "p95_ms": 4.85,
+          "p99_ms": 8.45,
+          "mb_per_s": 34.1,
+          "ok": 366133,
+          "errors": 0,
+          "cpu_s": 14.74
+        },
+        "/cpu": {
+          "rps": 1373,
+          "p50_ms": 43.59,
+          "p95_ms": 69.42,
+          "p99_ms": 92.85,
+          "mb_per_s": 0,
+          "ok": 13672,
           "errors": 0,
           "cpu_s": 19.5
         }
       },
-      "recovery_ms": 474,
+      "recovery_ms": 45,
       "crash": {
-        "ok": 4686,
+        "ok": 2898,
         "failed": 0
       },
       "rolling": {
-        "ok": 3207,
+        "ok": 4561,
         "failed": 0,
-        "ms": 1323,
-        "replaced_all": true
-      },
-      "cli_ms": 1.9
-    },
-    {
-      "name": "warden-worker",
-      "startup_ms": 779,
-      "idle": {
-        "total_rss_mb": 180.6,
-        "total_pss_mb": 159.1,
-        "manager_rss_mb": 5
-      },
-      "loaded": {
-        "total_rss_mb": 357.9,
-        "total_pss_mb": 336.2,
-        "manager_rss_mb": 5
-      },
-      "manager_idle_cpu_pct": 0,
-      "endpoints": {
-        "/plaintext": {
-          "rps": 25860,
-          "p50_ms": 1.02,
-          "p95_ms": 10.97,
-          "p99_ms": 18.85,
-          "mb_per_s": 0.3,
-          "ok": 258658,
-          "errors": 0,
-          "cpu_s": 14.44
-        },
-        "/json": {
-          "rps": 27787,
-          "p50_ms": 1.3,
-          "p95_ms": 7.39,
-          "p99_ms": 15.35,
-          "mb_per_s": 25.9,
-          "ok": 277932,
-          "errors": 0,
-          "cpu_s": 14.66
-        },
-        "/cpu": {
-          "rps": 1154,
-          "p50_ms": 55.88,
-          "p95_ms": 76.37,
-          "p99_ms": 110.11,
-          "mb_per_s": 0,
-          "ok": 11482,
-          "errors": 0,
-          "cpu_s": 19.52
-        }
-      },
-      "recovery_ms": 1057,
-      "crash": {
-        "ok": 2842,
-        "failed": 0
-      },
-      "rolling": {
-        "ok": 3512,
-        "failed": 0,
-        "ms": 1048,
+        "ms": 1376,
         "replaced_all": true
       },
       "cli_ms": 1.8

@@ -225,8 +225,7 @@ systemd-analyze verify contrib/warden@.service   # with ExecStart pointed at /bi
 
 ### Valgrind for the `unsafe` code
 
-Miri can't run the system calls in `src/sys.rs` and `src/sys/uring.rs`, so
-their tests also run under Valgrind's memcheck: invalid reads and writes,
+Miri can't run the system calls in `src/sys.rs`, so its tests also run under Valgrind's memcheck: invalid reads and writes,
 uninitialised bytes handed to a system call, definite leaks.
 
 ```sh
@@ -248,13 +247,6 @@ echo $?        # 0: every test passed and memcheck found nothing
 - `nofile_limit_matches_proc` is skipped: Valgrind keeps 12 descriptors for
   itself and lowers `RLIMIT_NOFILE` by them, so `getrlimit` and
   `/proc/self/limits` disagree under it, by design.
-- The io_uring tests' timeouts are 20× longer under Valgrind (they find it
-  in `LD_PRELOAD`; `WARDEN_TEST_TIMEOUT_SCALE=N` sets the factor anywhere
-  else that is slow), and they yield between ring waits: memcheck runs one
-  thread at a time and does not switch during `io_uring_enter`.
-- memcheck checks the system calls it sees. It does not follow what the
-  kernel reads and writes later through io_uring entries: for those, the
-  ownership argument at the top of `src/sys/uring.rs` is the review.
 
 ## 5. Report format
 

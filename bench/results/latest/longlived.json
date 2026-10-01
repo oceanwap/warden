@@ -1,0 +1,130 @@
+{
+  "meta": {
+    "date": "2026-10-01T07:08:38.156Z",
+    "kernel": "6.18.44-fc-v50 x86_64",
+    "cpus": 2,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "warden": "warden 0.1.0",
+    "loadgen": "oha 1.16.0",
+    "app_cpus": "all",
+    "loadgen_cpus": "all",
+    "tcp_migrate_req": "1",
+    "clients": 50,
+    "workers": 4,
+    "bun": "1.3.13",
+    "node": "v22.22.2",
+    "pm2": "6.0.14"
+  },
+  "results": [
+    {
+      "name": "node-pm2",
+      "restart_ms": 709,
+      "command_ms": 703,
+      "back_ms": "not all within 90 s (98/100)",
+      "ws": {
+        "clean": 0,
+        "abnormal": 62,
+        "how": {
+          "1006 (no close frame)": 62
+        },
+        "connectErrors": 0
+      },
+      "sse": {
+        "clean": 0,
+        "abnormal": 70,
+        "how": {
+          "cut (no last chunk)": 70
+        },
+        "connectErrors": 0
+      }
+    },
+    {
+      "name": "node-warden",
+      "restart_ms": 8562,
+      "command_ms": 8552,
+      "back_ms": 8392,
+      "ws": {
+        "clean": 69,
+        "abnormal": 0,
+        "how": {
+          "1001": 69
+        },
+        "connectErrors": 0
+      },
+      "sse": {
+        "clean": 67,
+        "abnormal": 0,
+        "how": {
+          "end of stream": 67
+        },
+        "connectErrors": 0
+      }
+    },
+    {
+      "name": "bun-pm2",
+      "restart_ms": 565,
+      "command_ms": 404,
+      "back_ms": 369,
+      "ws": {
+        "clean": 0,
+        "abnormal": 73,
+        "how": {
+          "1006 (no close frame)": 73
+        },
+        "connectErrors": 150
+      },
+      "sse": {
+        "clean": 0,
+        "abnormal": 82,
+        "how": {
+          "cut (no last chunk)": 82
+        },
+        "connectErrors": 150
+      }
+    },
+    {
+      "name": "bun-warden",
+      "restart_ms": 8304,
+      "command_ms": 8303,
+      "back_ms": 8264,
+      "ws": {
+        "clean": 83,
+        "abnormal": 0,
+        "how": {
+          "1001": 83
+        },
+        "connectErrors": 0
+      },
+      "sse": {
+        "clean": 64,
+        "abnormal": 0,
+        "how": {
+          "end of stream": 64
+        },
+        "connectErrors": 0
+      }
+    },
+    {
+      "name": "bun-warden-worker",
+      "restart_ms": 2268,
+      "command_ms": 2267,
+      "back_ms": 2155,
+      "ws": {
+        "clean": 50,
+        "abnormal": 0,
+        "how": {
+          "1001": 50
+        },
+        "connectErrors": 0
+      },
+      "sse": {
+        "clean": 50,
+        "abnormal": 0,
+        "how": {
+          "end of stream": 50
+        },
+        "connectErrors": 0
+      }
+    }
+  ]
+}

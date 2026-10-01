@@ -39,7 +39,7 @@ supervisor latencies it reports are a debug build's). Needs Linux, `bun`,
 | `api-node` | `tests/fixtures/longlived_node.mjs` on Node, 3 workers, `[reload] surge = 2` | surge rollouts, the Node shim, WebSocket + SSE on node:http |
 | `ws-bun` | `tests/fixtures/longlived.ts`, 2 workers | Bun.serve WebSockets and every SSE body (stream, direct, generator) |
 | `threads` | `bench/chaos/app.ts` in worker mode, 2 Workers | the host process, a Worker that throws |
-| `site` | Warden's static server, 2 workers, `io = "uring"` | the file server, its cache and drain |
+| `site` | Warden's static server, 2 workers | the file server, its cache and drain |
 | `direct` | `bench/chaos/app.ts`, 2 workers, `worker_output = "direct"` | spliced output files, their rotation, a full disk |
 | `crashy` | `bench/chaos/app.ts`, 1 worker, `max_restarts = 3` | a crash loop to FAILED and `warden reset` |
 | wardend | `warden daemon --background`, an alert rule writing to a file | supervisor restarts, alerts, its own death |

@@ -7,13 +7,11 @@
 // Markdown table on stdout. See bench/README.md.
 //
 //   bun bench/static.ts [--duration 10] [--connections 64] [--workers 4] [--scenarios warden,nginx,pm2-serve,serve]
-//                       [--io epoll|uring]
 //
 // Scenarios:
 //   warden        warden serve: N worker processes sharing the port (SO_REUSEPORT), small files from its
-//                 response cache, sendfile above; `--io uring` runs it with [static] io = "uring"
-//   warden-uring  the same with io_uring (not in the default set: `--scenarios warden,warden-uring,nginx`
-//                 compares the two I/O paths side by side); fails if io_uring is unavailable here
+//                 response cache, sendfile above
+//   warden-nocache  warden with the response cache off ([static] cache_size = 0): what the cache buys
 //   nginx         nginx with N worker processes, sendfile, tcp_nopush, access log off (skipped if not installed)
 //   pm2-serve  PM2's static server (`pm2 serve`), N instances in cluster mode
 //   serve      the `serve` npm package (one process: it has no cluster mode)
@@ -35,8 +33,6 @@ const PORT = 3910;
 const SITE = join(TMP, "site");
 const ALL = ["warden", "nginx", "pm2-serve", "serve"];
 const SCENARIOS = (args.scenarios ?? ALL.join(",")).split(",");
-const IO = args.io ?? "epoll";
-if (IO !== "epoll" && IO !== "uring") throw new Error(`--io ${IO}: expected epoll or uring`);
 
 // ----------------------------------------------------------------------- site
 
@@ -72,18 +68,18 @@ interface Running {
   stop: () => Promise<void>;
 }
 
-async function startWarden(io: string): Promise<Running> {
+async function startWarden(cache = true): Promise<Running> {
   if (!existsSync(WARDEN)) throw new Error("build first: cargo build --release");
   const cfg = join(TMP, "warden-static.toml");
   const log = join(TMP, "warden-static.log");
   writeFileSync(
     cfg,
     `[app]\nname = "bench-static"\nport = ${PORT}\n[workers]\ncount = ${WORKERS}\n[static]\nroot = ${JSON.stringify(SITE)}\n` +
-      `io = "${io}"\n[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(join(TMP, "warden-static.sock"))}\n`,
+      `${cache ? "" : "cache_size = 0\n"}[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(join(TMP, "warden-static.sock"))}\n`,
   );
   writeFileSync(log, "");
   const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), {
-    env: { ...baseEnv, WARDEN_STATIC_IO: io },
+    env: baseEnv,
     stdout: Bun.file(log),
     stderr: "ignore",
   });
@@ -91,11 +87,8 @@ async function startWarden(io: string): Promise<Running> {
     pids: () => [w.pid, ...childrenOf(w.pid)],
     managerPids: () => [w.pid],
     ready: async () => {
-      // Each worker says how it serves; an io_uring run that fell back to
-      // epoll would publish epoll's numbers under the wrong name.
-      await waitFor(() => (readFileSync(log, "utf8").match(/ via (epoll|io_uring)/g) ?? []).length >= WORKERS, 10_000);
-      const text = readFileSync(log, "utf8");
-      if (io === "uring" && !text.includes("via io_uring")) throw new Error(`io_uring is unavailable here:\n${text}`);
+      // Each worker says when it serves.
+      await waitFor(() => (readFileSync(log, "utf8").match(/ via (epoll|kqueue)/g) ?? []).length >= WORKERS, 10_000);
     },
     stop: async () => {
       w.kill("SIGTERM");
@@ -195,8 +188,8 @@ async function startServe(): Promise<Running> {
 }
 
 const starters: Record<string, () => Promise<Running>> = {
-  warden: () => startWarden(IO),
-  "warden-uring": () => startWarden("uring"),
+  warden: () => startWarden(),
+  "warden-nocache": () => startWarden(false),
   nginx: startNginx,
   "pm2-serve": startPm2Serve,
   serve: startServe,
@@ -282,7 +275,7 @@ console.log(
   [
     `${WORKERS} workers · ${meta.nginx} · pm2 ${meta.pm2} · serve ${meta.serve} · node ${meta.node} · ${meta.warden}`,
     "",
-    table(results, (r) => (r.name === "serve" ? "serve (1 process)" : r.name === "warden" && IO === "uring" ? "warden (io_uring)" : r.name), [
+    table(results, (r) => (r.name === "serve" ? "serve (1 process)" : r.name), [
       ["processes", (r) => r.processes],
       ["total RAM idle: RSS / PSS (MB)", (r) => `${r.idle_mb} / ${r.idle_pss_mb}`],
       ["total RAM after load: RSS / PSS (MB)", (r) => `${r.loaded_mb} / ${r.loaded_pss_mb}`],

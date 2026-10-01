@@ -22,47 +22,65 @@ claim an optimisation the data doesn't show).
 
 ## What the data says
 
-Numbers from the README run (2 CPUs, 4 workers).
+Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
+`tcp_migrate_req = 1`).
 
 - **Warden adds nothing on the request path.** In process mode the workers
   own the port (SO_REUSEPORT); req/s and latency match the same processes
-  run bare (node:http: 66.5k vs 61.4k req/s, within noise). PM2's cluster
-  mode passes every connection through its daemon: 53.4k req/s and a p99
-  three times as long (8.5 vs 2.8 ms). Watt: 51.9k req/s, p99 5.0 ms.
-- **Manager cost.** Warden's supervisor: ~6 MB RSS, under 1 MB PSS per app
-  (10 apps: 7.3 MB PSS in all), 0 % idle CPU. PM2's daemon: ~65 MB RSS
-  (35 MB PSS), 0.2–0.7 % idle CPU. Watt runs the app inside its own runtime:
-  almost 5× the memory of 4 processes for the Node app (PSS 475 vs 101 MB)
-  and 2–3 % idle CPU.
-- **Startup and CLI.** Warden starts 4 workers as fast as starting them bare;
-  PM2 needs 0.6–1 s more (its daemon), Watt 3–4.5 s. `warden status` answers
-  in ~2 ms, `pm2 jlist` in ~160 ms, `wattpm ps` in ~450 ms. With 10 apps:
-  `warden list` 2.7 ms, `pm2 list` 167 ms; starting 10 apps 0.6 s vs 2.2 s.
-- **Recovery.** A crashed worker answers again 2–4× sooner under Warden than
-  under PM2: node:http 113 vs 447 ms, NestJS on Node 813 vs 1,677 ms, Bun
-  47 vs 155 ms; Watt 1.8–2 s. The first crash after a healthy run restarts
-  with no backoff.
+  run bare (node:http 76.2k vs 71.7k req/s, within noise, p99 2.4 vs
+  3.9 ms). PM2's cluster mode passes every connection through its daemon:
+  61.1k req/s, p99 8.0 ms. Watt: 66.7k, p99 3.1 ms.
+- **Manager cost.** Warden's supervisor: ~8 MB RSS, about 1 MB PSS per app
+  (10 apps: 10 MB PSS in all), 0–0.2 % idle CPU. PM2's daemon: ~65 MB RSS
+  (39 MB PSS for 10 apps), 0.2–0.7 % idle CPU. Watt runs the app inside its
+  own runtime: about 4× the memory of 4 processes for the Node app (PSS 477
+  vs 109 MB) and 2–3 % idle CPU.
+- **Startup and CLI.** Warden starts 4 workers about as fast as starting them
+  bare (node:http 215 vs 171 ms); PM2 needs 0.4–0.6 s more, Watt 3–4 s.
+  `warden status` answers in ~2 ms, `pm2 jlist` in ~130 ms, `wattpm ps` in
+  ~370 ms. With 10 apps: `warden list` 2.2 ms, `pm2 list` 163 ms; starting
+  10 apps 0.58 s vs 1.9 s.
+- **Recovery.** A crashed worker answers again 1.3–3× sooner under Warden
+  than under PM2: node:http 129 vs 289 ms, NestJS on Node 687 vs 1,182 ms,
+  Bun 54 vs 166 ms, NestJS on Bun 406 vs 529 ms; Watt 1.2–1.6 s. **With a
+  hot standby** (`[workers] standby = 1`) recovery no longer waits for the
+  app to boot: 44 ms (node:http), 57 ms (NestJS on Node), 17 ms (Bun),
+  45 ms (NestJS on Bun): 7–12× faster than PM2 for NestJS. The standby
+  costs one idle worker (node:http +8 MB PSS idle, NestJS on Bun +43 MB).
 - **Rolling restarts.** Warden lost no request in any run, and finished
-  sooner (node:http 554 ms vs PM2 857 ms, Watt 3.5 s). PM2's `reload` is
-  graceful only in cluster mode (Node): for Bun apps it runs fork mode,
-  where reload is a restart, and NestJS on Bun lost 4,324 of 8,699 requests
-  (half) during it.
-- **Worker (thread) mode** (Bun only): by RSS it looks like half the memory
-  of 4 processes, but most of that difference is shared pages. By PSS it
-  saves ~20 % idle (NestJS 159 vs 200 MB) and 2 % after load (336 vs
-  343 MB), with a worse p99 for NestJS (18.9 vs 9.9 ms), and one crash takes
-  all workers down. **Use process mode in production.** For Node, threads
-  don't save memory at all: 4 `node:http` processes use 96 MB PSS, one
-  process with 4 worker threads 104 MB; so Warden has no Node thread mode.
-- **Static files.** `warden serve` is within ~7 % of nginx on small files
-  (1.5 KB page 85.0k vs 90.9k req/s; 48 KB 68.4k vs 71.0k), ties it on a new
-  connection per request (29.3k both), is ahead on a 1 MB file (5.1 vs
-  4.3 GB/s), and uses 40 % less memory (PSS 7.6 vs 12.9 MB). That is 2.5–39×
-  what `pm2 serve` and `serve` deliver.
-- **Logs.** Warden reads a flooding worker at ~920 MB/s (PM2 153 MB/s) for
-  one eleventh of PM2's CPU per GB; with `max_lines_per_sec = 0` it keeps
-  every line at 2× PM2's throughput. Steady logging (20k lines/s) costs it a
-  quarter of PM2's CPU (0.36 vs 1.42 s per 10 s).
+  sooner (node:http 295 ms vs PM2 728 ms, Watt 3.5 s). `[reload] surge =
+  "all"` starts every new worker at once: NestJS on Node 1,268 vs 1,556 ms
+  one at a time, NestJS on Bun 964 vs 1,297 ms (the fast apps are already
+  bound by the drain, ~300 ms either way). PM2's `reload` is graceful only
+  in cluster mode (Node): for Bun apps it runs fork mode, where reload is a
+  restart, and NestJS on Bun lost 1,904 of 6,225 requests during it.
+- **WebSockets and SSE across a restart.** Every connection an old Warden
+  worker held ended cleanly (WebSocket close 1001, SSE end of stream: 0
+  abnormal of ~150 per runtime), and every client was back on a new worker.
+  Under PM2 every one was cut (1006 / broken stream), and with Bun in fork
+  mode 300 reconnects failed outright. The price is time: each worker with
+  long-lived clients waits `long_lived_timeout` (2 s) first, so the
+  4-worker restart took ~8.5 s (worker mode 2.3 s); `surge` overlaps those
+  waits.
+- **Worker (thread) mode** (Bun only): by PSS it saves ~20 % idle (NestJS
+  166 vs 206 MB) and ~10 % after load (258 vs 285 MB), with a worse p99 for
+  NestJS (15.1 vs 7.7 ms), and one crash takes all workers down (crash
+  recovery 999 ms vs 406 ms). **Use process mode in production.** For Node,
+  threads don't save memory at all (4 `node:http` processes 96 MB PSS, one
+  process with 4 threads 104 MB), so Warden has no Node thread mode.
+- **Static files.** With the response cache, `warden serve` is **ahead of
+  nginx** on small files (1.5 KB page 107.6k vs 100.8k req/s; without the
+  cache 99.4k), on a new connection per request (35.3k vs 31.6k) and on a
+  1 MB file (5.1–6.7 vs 4.9 GB/s), and behind on the 48 KB script (74.7k vs
+  82.6k; the cache neither helps nor hurts there). It uses 40 % less memory
+  (PSS 8.0 vs 13.0 MB), and delivers 4–37× what `pm2 serve` and `serve` do.
+- **Logs.** Warden reads a flooding worker at ~890 MB/s (PM2 163 MB/s) for
+  a twelfth of PM2's CPU per GB. Keeping every line costs more when lines
+  are parsed (`max_lines_per_sec = 0`: 332 MB/s, 3.4 CPU s/GB); with
+  `worker_output = "direct"` the kernel splices the bytes into the file:
+  823 MB/s, 0.67 CPU s/GB, every line kept, 11× PM2's CPU efficiency.
+  Steady logging (20k lines/s): 0.29 s CPU per 10 s captured, 0.11 s direct,
+  PM2 1.23 s.
 
 ## Findings about the other managers
 
@@ -94,43 +112,29 @@ Numbers from the README run (2 CPUs, 4 workers).
 | Private health socket only when a health path or `verify_command` uses it | a second server per worker | always | only when used |
 | Output readers share one read buffer per thread | supervisor with 16 workers | 7.4 MB RSS | 5.5 MB RSS |
 
-Static server, response cache and io_uring (kept; throughput to be measured
-on a quiet machine with `bun bench/static.ts --scenarios warden,warden-uring,nginx`):
+2026-10-01 round (same machine as the README run):
 
 | Change | Measured on | Before | After |
 |---|---|---|---|
-| Response cache (`[static] cache_size`, default 16 MB per worker): a small-file hit is one `send(2)` of a prebuilt response | worker syscalls per keep-alive request, 1.5 KB page (strace -c, oha 20k requests, 16 connections, 1 worker) | ~9.1 (3 openat2: the file and its `.br` / `.gz` siblings, as oha sends `Accept-Encoding: gzip, br`; statx, preadv2, fcntl, close, send, recv) | ~2.1 (send, recv; an `epoll_wait` per ~14 requests) |
-| same | req/s, 1.5 KB / 48 KB | 85.0k / 68.4k | (to measure) |
-| `[static] io = "uring"` (off by default): io_uring RECV/SEND/ACCEPT, one `io_uring_enter` per driver turn for all connections | worker syscalls per keep-alive request, same setup | ~2.1 | ~0.17 (2,588 `io_uring_enter` + 716 `epoll_wait` for 20k requests) |
-| same | req/s, 1.5 KB / 48 KB / new connection per request | (epoll numbers) | (to measure: flip the default only if it wins) |
-
-Notes for that run:
-
-- The cache now serves 16–64 KB files from memory with one copying
-  `send(2)`, where they used to go out as headers + `sendfile(2)` (the
-  48 KB row above). If the 48 KB row loses against the old numbers, lower
-  the default `cache_max_file` to 16 KB (the old single-write limit).
-- Under strace the io_uring path did 29.5k req/s against epoll's 12.9k, but
-  strace inflates every syscall, so that ratio says nothing about the real
-  one.
-- Worker CPU per request (`/proc/<pid>/schedstat`, 40k keep-alive
-  requests, 1 worker, release build, CPUs shared with other jobs, so only
-  indicative): the 1.5 KB page cost about the same with both paths (epoll
-  4.4–4.7 µs, io_uring 4.3 µs). The 48 KB file first cost more with
-  io_uring (8.6–11 µs vs 7.0–7.4 µs): its sends came back short and went
-  round the driver again. With `MSG_WAITALL` the kernel finishes the
-  send itself, and the two paths measured the same (9.3–10.5 µs vs
-  9.4–12.7 µs, on a busier machine). Most of that time is the kernel's
-  loopback TCP work, which neither path changes.
-- A browser (`Accept-Encoding: gzip, br`) and curl (none) get separate
-  cache entries for the same file (the variant can differ); both are
-  counted against `cache_size`.
-- Not tried yet: multishot accept/recv with provided buffer rings (no
-  per-request re-arm), `IORING_SETUP_COOP_TASKRUN | SINGLE_ISSUER` (fewer
-  interrupts), registered files. The driver works without them; each is a
-  small change if the plain version wins.
+| Response cache (`[static] cache_size`, default 16 MB per worker): a small-file hit is one `send(2)` of a prebuilt response | worker syscalls per keep-alive request, 1.5 KB page (strace -c, 1 worker) | ~9.1 | ~2.1 |
+| same | 1.5 KB page, 4 workers, same run (`warden-nocache` column) | 99.4k req/s | 107.6k req/s (nginx 100.8k) |
+| same | 48 KB script, `cache_max_file` 64 KB vs 16 KB vs off (8 s × 2 each) | 72–74k req/s | 72–74k req/s: no difference, so 64 KB stays |
+| Hot standby (`[workers] standby = 1`) | crash recovery, 4 workers | node:http 129 ms, NestJS/Node 687 ms, Bun 54 ms, NestJS/Bun 406 ms | 44 / 57 / 17 / 45 ms |
+| Surge rollouts (`[reload] surge = "all"`) | rolling restart under load | NestJS/Node 1,556 ms, NestJS/Bun 1,297 ms | 1,268 / 964 ms, 0 failed |
+| `worker_output = "direct"` (splice into the file) | flood, every line kept | 332 MB/s, 3.38 CPU s/GB | 823 MB/s, 0.67 CPU s/GB |
+| same | steady 20k lines/s, manager CPU per 10 s | 0.29 s | 0.11 s (PM2 1.23 s) |
+| WebSocket 1001 / SSE end in the drain | abnormal closes in a rolling restart, ~150 clients | all cut (as under PM2) | 0 |
 
 Tried and dropped (no measurable win, so no code):
+
+- **io_uring for the static server** (accept/recv/send through one ring per
+  worker, about 1,500 lines with its `unsafe` driver): fewer syscalls per
+  request (~0.17 vs ~2.1) but **slower** in the same run: 1.5 KB page 94.3k
+  vs 107.6k req/s with epoll and the cache, 48 KB 64.8k vs 74.7k, new
+  connections 33.5k vs 35.3k. It also lost a request during rolling restarts
+  (an accept already queued in the ring when the drain began), and CI
+  kernels hung a `MSG_WAITALL` send. Most of the time per request is the
+  kernel's loopback TCP work, which neither path changes; removed.
 
 - Bigger worker pipe buffers (`F_SETPIPE_SZ`, 256 KB and 1 MB): the same
   flood throughput as the default 64 KB.

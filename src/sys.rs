@@ -7,11 +7,12 @@
 //! expose (SO_REUSEPORT before bind, process groups, pdeathsig, openat2) or
 //! where it measurably pays on a hot path: the static file server
 //! (sendfile, openat2 instead of a realpath walk, cache-only preadv2,
-//! MSG_MORE, TCP_DEFER_ACCEPT; and, opt-in, io_uring in `sys/uring.rs`)
-//! and worker log capture (vectorised memchr).
+//! MSG_MORE, TCP_DEFER_ACCEPT) and worker log capture (vectorised memchr).
 //! Each is a plain system or C library call on borrowed descriptors and
 //! slices. Tried and dropped for lack of a measured win: bigger worker pipe
-//! buffers (F_SETPIPE_SZ: same throughput at 64 KB, 256 KB and 1 MB).
+//! buffers (F_SETPIPE_SZ: same throughput at 64 KB, 256 KB and 1 MB), and
+//! an io_uring transport for the static server (slower than epoll with the
+//! response cache; docs/benchmarks.md).
 //! No unsafe memory tricks (`transmute`, unchecked indexing,
 //! `from_utf8_unchecked`): they would buy nanoseconds against microsecond
 //! syscalls, and a mistake there is silent corruption.
@@ -221,8 +222,6 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 
 /// A listening TCP socket, non-blocking and close-on-exec, with
 /// SO_REUSEADDR and optionally SO_REUSEPORT set before bind (std can't).
-/// Non-blocking is for epoll; the io_uring server makes it blocking again
-/// (`static_server/uring_io.rs`, `Listener::new`).
 pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Result<std::net::TcpListener> {
     let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: socket(2) with constant arguments.
@@ -564,14 +563,6 @@ pub fn splice(pipe: BorrowedFd<'_>, out: BorrowedFd<'_>, off_out: Option<&mut u6
     }
     Ok(n as usize)
 }
-
-// ------------------------------------------------------------ io_uring
-//
-// `[static] io = "uring"`: the static server's sockets driven through an
-// io_uring (sys/uring.rs), whose ring owns every buffer and socket the
-// kernel may still touch until the operation's completion.
-#[cfg(target_os = "linux")]
-pub mod uring;
 
 // ------------------------------------------------ between fork and exec
 //

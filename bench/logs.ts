@@ -2,7 +2,7 @@
 // Log-heavy apps: what capturing worker output costs the process manager.
 // Results go to bench/results/<date>-logs.json plus a Markdown table.
 //
-//   bun bench/logs.ts [--scenarios warden,pm2] [--workers 4] [--rate 5000] [--seconds 10] [--mb 200]
+//   bun bench/logs.ts [--scenarios warden,warden-direct,pm2] [--workers 4] [--rate 5000] [--seconds 10] [--mb 200]
 //
 // Two loads, each under Warden (out_file, like PM2's out log) and PM2 (its
 // default per-app log files):
@@ -13,7 +13,9 @@
 //           default Warden keeps at most 10,000 lines/s per worker and counts
 //           the rest as dropped (so one runaway worker can't eat the host);
 //           PM2 writes everything. "warden (keep all)" is the flood with
-//           max_lines_per_sec = 0, writing everything too.
+//           max_lines_per_sec = 0, writing everything too. "warden-direct" is
+//           worker_output = "direct": the bytes are spliced from each worker's
+//           pipe into its own file (per_worker_files), unparsed.
 
 import { spawn, spawnSync } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -25,7 +27,7 @@ const WORKERS = Number(args.workers ?? 4);
 const RATE = Number(args.rate ?? 5000);
 const SECONDS = Number(args.seconds ?? 10);
 const FLOOD_MB = Number(args.mb ?? 200);
-const SCENARIOS = (args.scenarios ?? "warden,pm2").split(",");
+const SCENARIOS = (args.scenarios ?? "warden,warden-direct,pm2").split(",");
 const APP = join(ROOT, "bench/logs/app.mjs");
 const FLOOD = join(ROOT, "bench/logs/flood.sh");
 const DIR = join(TMP, "logs");
@@ -50,7 +52,9 @@ interface Running {
   stop: () => Promise<void>;
 }
 
-async function startWarden(load: Load, done: string, keepAll = false): Promise<Running> {
+type WardenMode = "capture" | "keep-all" | "direct";
+
+async function startWarden(load: Load, done: string, mode: WardenMode = "capture"): Promise<Running> {
   if (!existsSync(WARDEN)) throw new Error("build first: cargo build --release");
   const out = join(DIR, "warden-out.log");
   const cfg = join(DIR, "warden.toml");
@@ -62,13 +66,15 @@ async function startWarden(load: Load, done: string, keepAll = false): Promise<R
     `[app]\nname = "logbench"\ncommand = ${JSON.stringify(load.command[0])}\nargs = ${JSON.stringify(load.command.slice(1))}\nenv = { ${env} }\n` +
       `[workers]\ncount = ${load.workers}\n` +
       `[logging]\nlevel = "warn"\nout_file = ${JSON.stringify(out)}\nrotate = { max_size = "10G" }\n` +
-      (keepAll ? "max_lines_per_sec = 0\n" : "") +
+      (mode === "keep-all" ? "max_lines_per_sec = 0\n" : "") +
+      (mode === "direct" ? `worker_output = "direct"\n${load.workers > 1 ? "per_worker_files = true\n" : ""}` : "") +
       `[control]\nsocket = ${JSON.stringify(join(DIR, "w.sock"))}\n`,
   );
   const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
   return {
     manager: () => [w.pid],
-    logFiles: () => [out],
+    // Direct mode with several workers writes one file per worker.
+    logFiles: () => readdirSync(DIR).filter((f) => /^warden-out.*\.log$/.test(f)).map((f) => join(DIR, f)),
     stop: async () => {
       w.kill("SIGTERM");
       await w.exited;
@@ -126,7 +132,8 @@ async function run(name: string, load: Load) {
   const done = join(DIR, "done");
   mkdirSync(done, { recursive: true });
   const t0 = performance.now();
-  const r = name === "pm2" ? await startPm2(load, done) : await startWarden(load, done, name === "warden-keep-all");
+  const mode: WardenMode = name === "warden-keep-all" ? "keep-all" : name === "warden-direct" ? "direct" : "capture";
+  const r = name === "pm2" ? await startPm2(load, done) : await startWarden(load, done, mode);
   let peak = 0;
   // Wait for every worker's "done" marker, sampling the manager's memory.
   while (readdirSync(done).length < load.workers) {

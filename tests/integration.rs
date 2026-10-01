@@ -1761,8 +1761,7 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
             _ => "(files opened with realpath check)",
         };
         w.wait_log(how, T);
-        // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
-        static_io_used(&w, &std::env::var("WARDEN_STATIC_IO").unwrap_or_default());
+        w.wait_log("via epoll", T);
         let get = |p: &str| get_close(port, p, "");
         // The first round fills the cache, the second is answered from it.
         for _ in 0..2 {
@@ -1801,22 +1800,8 @@ fn raw_exchange(port: u16, req: &str) -> Vec<u8> {
     buf
 }
 
-/// How the static worker says it serves: "via epoll", or "via io_uring"
-/// unless io_uring is unavailable here (then it must have said why).
-fn static_io_used(w: &Warden, io: &str) -> &'static str {
-    let log = w.wait_log("serving ", T);
-    if io != "uring" || log.contains("via io_uring") {
-        assert!(log.contains(if io == "uring" { "via io_uring" } else { "via epoll" }), "{log}");
-        return if io == "uring" { "io_uring" } else { "epoll" };
-    }
-    assert!(log.contains("io_uring is unavailable") && log.contains("via epoll"), "no fallback warning:\n{log}");
-    eprintln!("note: io_uring is unavailable here; tested the epoll fallback");
-    "epoll"
-}
-
 /// The static cache (default on): cached responses are byte-identical to
-/// an uncached server's (`cache_size = 0` behaves as before), in both I/O
-/// modes; an edited or deleted file shows within cache_valid_ms; a cached
+/// an uncached server's (`cache_size = 0` behaves as before); an edited or deleted file shows within cache_valid_ms; a cached
 /// path swapped for a symlink out of the root is refused, not served.
 /// CPU time (user + system, in clock ticks) `pid` has used.
 fn cpu_ticks(pid: u32) -> u64 {
@@ -1828,15 +1813,10 @@ fn cpu_ticks(pid: u32) -> u64 {
 
 /// A static worker out of file descriptors (EMFILE) neither spins nor goes
 /// quiet: it backs off, says why and how to fix it, and serves again once
-/// descriptors are free. Both I/O modes.
+/// descriptors are free.
 #[test]
 fn static_accept_errors_back_off_and_say_why() {
-    for io in ["epoll", "uring"] {
-        static_emfile_case(io);
-    }
-}
-
-fn static_emfile_case(io: &str) {
+    let io = "epoll";
     struct Kill(Child);
     impl Drop for Kill {
         fn drop(&mut self) {
@@ -1856,7 +1836,6 @@ fn static_emfile_case(io: &str) {
         .args(["-c", "ulimit -n 48 && exec \"$0\" serve-static", BIN])
         .env("WARDEN_STATIC", serde_json::json!({ "root": dir.join("site") }).to_string())
         .env("PORT", port.to_string())
-        .env("WARDEN_STATIC_IO", io)
         .stdout(Stdio::from(file.try_clone().unwrap()))
         .stderr(file)
         .spawn()
@@ -1868,8 +1847,8 @@ fn static_emfile_case(io: &str) {
         assert!(t0.elapsed() < T, "the static worker does not serve:\n{}", log());
         std::thread::sleep(Duration::from_millis(50));
     }
-    let via = if log().contains("via io_uring") { "io_uring" } else { "epoll" };
-    assert!(io == "uring" || via == "epoll", "{}", log());
+    let via = io;
+    assert!(log().contains("via epoll"), "{}", log());
 
     // Half a request head each: every connection holds a descriptor of the
     // worker until the head timeout (10 s).
@@ -1911,12 +1890,7 @@ fn static_emfile_case(io: &str) {
 
 #[test]
 fn static_cache_hits_match_and_stay_fresh() {
-    for io in ["epoll", "uring"] {
-        static_cache_case(io);
-    }
-}
-
-fn static_cache_case(io: &str) {
+    let io = "epoll";
     let dir = std::env::temp_dir().join(format!("warden-it-cache-{io}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let site = dir.join("site");
@@ -1948,14 +1922,13 @@ fn static_cache_case(io: &str) {
             site.display()
         )
     };
-    let env = [("WARDEN_STATIC_IO", io)];
+    let env: [(&str, &str); 0] = [];
     let mut w_on =
         Warden::start_env(&format!("cache-on-{io}"), on, &toml("cache-on", on, "cache_valid_ms = 300\n"), &env);
     let w_off = Warden::start_env(&format!("cache-off-{io}"), off, &toml("cache-off", off, "cache_size = 0\n"), &env);
     w_on.wait_for("cached static worker ready", T, ready(1));
     w_off.wait_for("uncached static worker ready", T, ready(1));
-    let used = static_io_used(&w_on, io);
-    assert_eq!(static_io_used(&w_off, io), used);
+    let used = "epoll";
     w_on.wait_log(&format!("via {used}, cache 16384 KB per worker"), T);
     w_off.wait_log(&format!("via {used}, no cache"), T);
     // Files changed in the last 2 s are served but not cached (a write in
@@ -2268,18 +2241,6 @@ fn serve_static_files() {
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
     assert!(out.contains("site: online (2/2"), "{out}");
-    // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
-    if std::env::var("WARDEN_STATIC_IO").as_deref() == Ok("uring") {
-        let t0 = Instant::now();
-        let logs = loop {
-            let logs = f.cli(&["logs", "site", "-n", "100"]).1;
-            if logs.contains("serving ") || t0.elapsed() > T {
-                break logs;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        assert!(logs.contains("via io_uring") || logs.contains("io_uring is unavailable"), "{logs}");
-    }
 
     let (st, h, body) = get_close(port, "/", "");
     assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));
@@ -4564,7 +4525,8 @@ fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -
 /// that moment lost it. Now requests during the drain get `Connection: close`.
 #[test]
 fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
-    for io in ["epoll", "uring"] {
+    {
+        let io = "epoll";
         let dir = std::env::temp_dir().join(format!("warden-it-static-drain-{io}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -4574,7 +4536,7 @@ fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
             "[app]\nname = \"sdrain-{io}\"\nport = {port}\n[workers]\ncount = 2\n[static]\nroot = \"{}\"\n",
             dir.display()
         );
-        let w = Warden::start_env(&format!("sdrain-{io}"), port, &cfg, &[("WARDEN_STATIC_IO", io)]);
+        let w = Warden::start_env(&format!("sdrain-{io}"), port, &cfg, &[]);
         w.wait_for("ready", T, ready(2));
         let ((), ok, cut, fresh) = keep_alive_through(port, "/index.html", || {
             for _ in 0..3 {
@@ -4921,11 +4883,14 @@ fn exit_reasons_name_crashes_and_who_stopped_a_worker() {
         return;
     }
 
-    // Bun's own process.abort().
+    // Bun's own process.abort(). No core dump (`ulimit -c 0`): where cores
+    // go to a slow handler (apport on CI runners) the dying process lingers
+    // for many seconds while the kernel feeds it its memory.
     let w = Warden::start(
         "bunabort",
         0,
-        "[app]\nname = \"bunabort\"\nargs = [\"-e\", \"setTimeout(() => process.abort(), 300)\"]\n\
+        "[app]\nname = \"bunabort\"\ncommand = \"sh\"\n\
+         args = [\"-c\", \"ulimit -c 0; exec bun -e 'setTimeout(() => process.abort(), 300)'\"]\n\
          [workers]\nmin_uptime = 100\n[restart]\nbackoff_initial = 2000\nbackoff_max = 2000\n",
     );
     let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));

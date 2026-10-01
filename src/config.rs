@@ -87,19 +87,6 @@ pub struct Static {
     /// an edited or deleted file is served fresh within this time.
     #[serde(default = "default_cache_valid_ms")]
     pub cache_valid_ms: u64,
-    /// How connections are driven: "epoll" (default) or "uring" (io_uring,
-    /// Linux; falls back to epoll where it is unavailable).
-    /// `WARDEN_STATIC_IO` overrides it.
-    #[serde(default)]
-    pub io: StaticIo,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StaticIo {
-    #[default]
-    Epoll,
-    Uring,
 }
 
 fn default_cache_size() -> u64 {
@@ -1389,27 +1376,19 @@ mod tests {
         let st = c.static_files.unwrap();
         assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
         assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
-        assert_eq!(st.io, StaticIo::Epoll);
     }
 
     #[test]
     fn static_cache_and_io_settings() {
         let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
         let st = Config::parse(base).unwrap().static_files.unwrap();
-        assert_eq!(
-            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
-            (16 << 20, 64 << 10, 1000, StaticIo::Epoll)
-        );
-        let st = Config::parse(&format!(
-            "{base}cache_size = \"64MB\"\ncache_max_file = \"256K\"\ncache_valid_ms = 0\nio = \"uring\"\n"
-        ))
-        .unwrap()
-        .static_files
-        .unwrap();
-        assert_eq!(
-            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
-            (64 << 20, 256 << 10, 0, StaticIo::Uring)
-        );
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
+        let st =
+            Config::parse(&format!("{base}cache_size = \"64MB\"\ncache_max_file = \"256K\"\ncache_valid_ms = 0\n"))
+                .unwrap()
+                .static_files
+                .unwrap();
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (64 << 20, 256 << 10, 0));
         // 0 turns the cache off; plain numbers are bytes.
         let st =
             Config::parse(&format!("{base}cache_size = 0\ncache_max_file = 1000\n")).unwrap().static_files.unwrap();
@@ -1420,7 +1399,8 @@ mod tests {
             ("cache_max_file = \"17M\"", "static.cache_max_file"),
             ("cache_valid_ms = 3600001", "static.cache_valid_ms"),
             ("cache_size = \"lots\"", "not a size"),
-            ("io = \"kqueue\"", "unknown variant"),
+            // io_uring was tried and dropped (docs/benchmarks.md): the key is gone.
+            ("io = \"uring\"", "unknown field"),
         ] {
             let e = Config::parse(&format!("{base}{bad}\n")).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");

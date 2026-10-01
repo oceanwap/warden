@@ -118,9 +118,6 @@ carries the same reason with a `hint=`.
 | A symlinked file returns 404 | Its target is outside the served root | Put the target under the root, or serve a directory that contains it. Symlinks that stay inside the root, relative or absolute, are served |
 | `openat2 is unavailable … checking paths with realpath instead` | Kernel before 5.6, or a seccomp profile blocks `openat2` (some container runtimes) | Nothing breaks, it is slower; allow `openat2` in the seccomp profile. `WARDEN_STATIC_OPEN=legacy` forces this mode for testing |
 | Stale content after a deploy | Workers resolve a `current` symlink when they start | `warden restart <site>` (rolling, no downtime) |
-| `io_uring is unavailable, so this worker serves with epoll instead` (`… with kqueue instead` outside Linux) | `[static] io = "uring"` (or `WARDEN_STATIC_IO=uring`), but io_uring is blocked by seccomp (Docker's default profile), turned off by `kernel.io_uring_disabled`, missing from the kernel, or not Linux | Nothing breaks: it serves with epoll. Allow io_uring, or set `io = "epoll"` (the default) and unset `WARDEN_STATIC_IO` to silence it |
-| `io_uring stopped working; this static worker exits so Warden restarts it` | The worker's ring failed while serving (`error=`) | Warden restarts the worker with a fresh ring (or epoll, if io_uring is gone now). If it keeps happening, set `[static] io = "epoll"` |
-| `ignoring WARDEN_STATIC_IO: it is neither "epoll" nor "uring"` | The environment variable has another value (`value=`); the config's `[static] io` is used (`using=`) | Unset `WARDEN_STATIC_IO`, or set it to `epoll` or `uring` |
 
 ## The CLI
 

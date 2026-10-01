@@ -149,4 +149,3 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # cache_size = "16MB"                        # per worker: prebuilt responses of small files in memory (0 = off)
 # cache_max_file = "64KB"                    # larger files are not cached (sent with sendfile)
 # cache_valid_ms = 1000                      # a cached file is re-checked on disk at most this often
-# io = "epoll"                               # or "uring" (io_uring, Linux; experimental, falls back to epoll)

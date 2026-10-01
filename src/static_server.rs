@@ -13,14 +13,12 @@
 //!
 //! Small files are answered from an in-memory cache of complete responses
 //! (`cache.rs`: one send(2) per hit). Connections are driven by tokio
-//! (epoll) or, with `io = "uring"`, by io_uring (`uring_io.rs`): the HTTP
-//! code is the same either way, only the bytes travel differently.
+//! (epoll). An io_uring transport was tried and dropped: it was slower than
+//! epoll with the cache (docs/benchmarks.md).
 
 mod cache;
-#[cfg(target_os = "linux")]
-mod uring_io;
 
-use crate::config::{Static, StaticIo};
+use crate::config::Static;
 use cache::{Cache, Dep, Entry, Lookup, Seen, Stamp};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -107,20 +105,6 @@ pub fn main() -> i32 {
         _ => OPEN_CACHED,
     };
     let cache = Cache::new(cfg.cache_size, cfg.cache_max_file, cfg.cache_valid_ms);
-    let io = match std::env::var("WARDEN_STATIC_IO").as_deref() {
-        Ok("uring") => StaticIo::Uring,
-        Ok("epoll") => StaticIo::Epoll,
-        Ok("") | Err(_) => cfg.io,
-        Ok(other) => {
-            crate::warn!(
-                "ignoring WARDEN_STATIC_IO: it is neither \"epoll\" nor \"uring\"",
-                value = other,
-                using = format!("{:?}", cfg.io).to_lowercase(),
-                hint = "unset WARDEN_STATIC_IO, or set it to epoll or uring"
-            );
-            cfg.io
-        }
-    };
     let site = Arc::new(Site {
         root,
         dir,
@@ -133,7 +117,7 @@ pub fn main() -> i32 {
         draining: AtomicBool::new(false),
         active: AtomicUsize::new(0),
     });
-    match rt.block_on(serve(site, port, io)) {
+    match rt.block_on(serve(site, port)) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("warden serve-static: {e}");
@@ -157,65 +141,21 @@ fn report(msg: serde_json::Value) {
     let _ = crate::sys::write_fd(fd, line.as_bytes());
 }
 
-/// Where TCP connections come from: tokio's listener (epoll), or io_uring.
-enum Listener {
-    Tokio(tokio::net::TcpListener),
-    #[cfg(target_os = "linux")]
-    Uring(uring_io::Listener),
-}
-
-enum Accepted {
-    Tokio(tokio::net::TcpStream),
-    #[cfg(target_os = "linux")]
-    Uring(uring_io::Stream),
-}
+/// Where TCP connections come from: tokio's listener (epoll; kqueue
+/// outside Linux).
+struct Listener(tokio::net::TcpListener);
 
 impl Listener {
-    /// The listener for `io`; io_uring falls back to epoll (with a warning
-    /// that says why and what to do) wherever it can't be set up.
-    fn new(l: std::net::TcpListener, io: StaticIo) -> Result<Listener, String> {
-        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut l = l;
-        if io == StaticIo::Uring {
-            #[cfg(target_os = "linux")]
-            match uring_io::Listener::new(l) {
-                Ok(u) => return Ok(Listener::Uring(u)),
-                Err((e, back)) => {
-                    crate::warn!(
-                        "io_uring is unavailable, so this worker serves with epoll instead",
-                        error = e,
-                        hint = "io_uring is blocked by seccomp (Docker's default profile), turned off by sysctl \
-                                kernel.io_uring_disabled, or missing from the kernel: allow it, or set [static] \
-                                io = \"epoll\" (and unset WARDEN_STATIC_IO) to silence this"
-                    );
-                    l = back;
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            crate::warn!(
-                "io_uring is unavailable (it is Linux-only), so this worker serves with kqueue instead",
-                hint = "set [static] io = \"epoll\" (the default; kqueue outside Linux) and unset WARDEN_STATIC_IO \
-                        to silence this"
-            );
-        }
-        tokio::net::TcpListener::from_std(l).map(Listener::Tokio).map_err(|e| e.to_string())
+    fn new(l: std::net::TcpListener) -> Result<Listener, String> {
+        tokio::net::TcpListener::from_std(l).map(Listener).map_err(|e| e.to_string())
     }
 
     fn name(&self) -> &'static str {
-        match self {
-            Listener::Tokio(_) if cfg!(target_os = "linux") => "epoll",
-            Listener::Tokio(_) => "kqueue",
-            #[cfg(target_os = "linux")]
-            Listener::Uring(_) => "io_uring",
-        }
+        if cfg!(target_os = "linux") { "epoll" } else { "kqueue" }
     }
 
-    async fn accept(&mut self) -> std::io::Result<Accepted> {
-        match self {
-            Listener::Tokio(l) => l.accept().await.map(|(s, _)| Accepted::Tokio(s)),
-            #[cfg(target_os = "linux")]
-            Listener::Uring(l) => l.accept().await.map(Accepted::Uring),
-        }
+    async fn accept(&mut self) -> std::io::Result<tokio::net::TcpStream> {
+        self.0.accept().await.map(|(s, _)| s)
     }
 }
 
@@ -232,7 +172,7 @@ const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(10);
 struct AcceptErrors {
     /// What it accepts ("connections").
     what: &'static str,
-    /// How ("epoll", "io_uring").
+    /// How ("epoll", "kqueue").
     via: &'static str,
     /// Failures in a row.
     streak: u32,
@@ -350,13 +290,13 @@ fn accept_hint(e: &std::io::Error) -> &'static str {
     }
 }
 
-async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
+async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let reuse = std::env::var("WARDEN_REUSE_PORT").is_ok_and(|v| v == "1");
     let std_listener = reuseport_listener(&site.cfg.host, port, reuse)?;
     // Wake up for a connection only once its request has arrived. Optional:
     // without it the server is just as correct, a little busier.
     let _ = crate::sys::tcp_defer_accept(std_listener.as_fd(), HEAD_TIMEOUT.as_secs() as i32);
-    let mut listener = Listener::new(std_listener, io)?;
+    let mut listener = Listener::new(std_listener)?;
     let worker: u64 = std::env::var("WARDEN_WORKER_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
 
     // Private socket for this worker's health checks.
@@ -431,24 +371,13 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
                 };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let site = site.clone();
-                match accepted {
-                    Accepted::Tokio(stream) => {
-                        let _ = stream.set_nodelay(true);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let (r, w) = stream.into_split();
-                            connection(BufReader::new(r), Conn::Tcp(w), site).await;
-                        });
-                    }
-                    #[cfg(target_os = "linux")]
-                    Accepted::Uring(stream) => {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let (r, w) = stream.split();
-                            connection(r, Conn::Uring(w), site).await;
-                        });
-                    }
-                }
+                let stream = accepted;
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let (r, w) = stream.into_split();
+                    connection(BufReader::new(r), Conn::Tcp(w), site).await;
+                });
             }
             acc = async { match unix_listener { Some(l) => l.accept().await.map(|(s, _)| s), None => std::future::pending().await } }, if unix_errors.resume_at.is_none() => {
                 let stream = match acc {
@@ -499,9 +428,8 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
     Ok(())
 }
 
-/// Bytes to send, owned, so an io_uring send can keep them until the
-/// kernel is done with them (no copy): a buffer built for this response,
-/// or a range of a cached one.
+/// Bytes to send: a buffer built for this response, or a range of a cached
+/// one (no copy).
 pub enum OutBuf {
     Vec(Vec<u8>),
     Shared(Arc<[u8]>, std::ops::Range<usize>),
@@ -533,8 +461,6 @@ impl From<Vec<u8>> for OutBuf {
 enum Conn {
     Tcp(tokio::net::tcp::OwnedWriteHalf),
     Unix(tokio::net::unix::OwnedWriteHalf),
-    #[cfg(target_os = "linux")]
-    Uring(uring_io::Writer),
 }
 
 impl Conn {
@@ -543,8 +469,6 @@ impl Conn {
         match self {
             Conn::Tcp(w) => w.write_all(b.as_slice()).await,
             Conn::Unix(w) => w.write_all(b.as_slice()).await,
-            #[cfg(target_os = "linux")]
-            Conn::Uring(w) => w.send_all(b, false).await,
         }
     }
 
@@ -552,8 +476,6 @@ impl Conn {
         match self {
             Conn::Tcp(w) => w.flush().await,
             Conn::Unix(w) => w.flush().await,
-            #[cfg(target_os = "linux")]
-            Conn::Uring(_) => Ok(()),
         }
     }
 
@@ -561,8 +483,6 @@ impl Conn {
         match self {
             Conn::Tcp(w) => w.shutdown().await,
             Conn::Unix(w) => w.shutdown().await,
-            #[cfg(target_os = "linux")]
-            Conn::Uring(w) => w.shutdown(),
         }
     }
 
@@ -588,8 +508,6 @@ impl Conn {
                 Ok(())
             }
             Conn::Unix(w) => w.write_all(b.as_slice()).await,
-            #[cfg(target_os = "linux")]
-            Conn::Uring(w) => w.send_all(b, true).await,
         }
     }
 
@@ -605,8 +523,6 @@ impl Conn {
                 }
                 tokio::io::copy(&mut f.take(count), w).await
             }
-            #[cfg(target_os = "linux")]
-            Conn::Uring(w) => w.send_file(&file, offset, count).await,
         }
     }
 }
@@ -701,7 +617,7 @@ async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> Result<Opti
 }
 
 /// One client connection: requests in a loop while keep-alive holds. `r`
-/// is buffered (tokio's BufReader, or the io_uring reader's own buffer).
+/// is buffered (tokio's BufReader).
 ///
 /// A drain does not close idle keep-alive connections: a client may be
 /// sending its next request at that very moment, and would see it fail

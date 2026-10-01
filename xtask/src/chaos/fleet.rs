@@ -274,7 +274,7 @@ pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) 
     let mut app = vec![format!("name = \"{}\"", spec.name), format!("port = {}", spec.port)];
     let mut workers = vec![format!("count = {}", spec.count)];
     if spec.static_site {
-        s.entry("static").or_default().extend([format!("root = {}", q(&home.join("site"))), "io = \"uring\"".into()]);
+        s.entry("static").or_default().push(format!("root = {}", q(&home.join("site"))));
     } else if spec.worker_mode {
         app.push(format!("entry = {}", q(&apps.join("app.ts"))));
         workers.push("mode = \"worker\"".into());
@@ -380,7 +380,7 @@ pub fn specs() -> Result<Vec<AppSpec>, String> {
         AppSpec { name: "ws-bun", longlived: &["/ws", "/ws", "/sse", "/sse-direct", "/sse-gen"], ..base.clone() },
         // Bun worker mode (threads in one host process).
         AppSpec { name: "threads", worker_mode: true, chaos_app: true, ..base.clone() },
-        // Warden's static file server (cache, io_uring).
+        // Warden's static file server (with its response cache).
         AppSpec { name: "site", static_site: true, load: Some(("/index.html", "/assets/app.js")), ..base.clone() },
         // worker_output = "direct": output spliced into files.
         AppSpec { name: "direct", chaos_app: true, direct: true, ..base.clone() },
