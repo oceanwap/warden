@@ -234,7 +234,10 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   version. Recycling (`Kind::Replace`: memory, lifetime, health, hang) keeps
   the code, so an available standby is the replacement: it listens next to
   the old worker, passes the remaining gates, then the old one drains.
-  `scale` changes only the slots. With `[reload] surge` a batch of new
+  A standby's instance number (`instance_var`) is past the workers' and no
+  other standby's; `scale` up replaces a standby whose number a new worker
+  takes (it would run instance-specific code twice until promoted), and
+  otherwise changes only the slots. With `[reload] surge` a batch of new
   workers starts next to the old ones; the standbys stay out of it (they
   are paused, and kept if the batch rolls back), so a surge's peak memory
   is 2 × batch + standbys.

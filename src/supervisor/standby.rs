@@ -128,6 +128,47 @@ impl Supervisor {
         }
     }
 
+    /// The instance number (`[app] instance_var`) of the next standby: the
+    /// lowest past the workers' (0..count) that no live standby has.
+    pub(super) fn free_standby_instance(&self) -> usize {
+        let taken: std::collections::BTreeSet<usize> = self
+            .insts
+            .values()
+            .filter(|i| i.role == Role::Standby && !i.stopping)
+            .filter_map(|i| i.standby.as_ref().map(|st| st.instance))
+            .collect();
+        (self.count..).find(|n| !taken.contains(n)).unwrap_or(self.count)
+    }
+
+    /// `scale` up (`count` already raised): a standby whose instance number
+    /// a new worker now has would run instance-specific code (cron on one
+    /// instance) twice, and keep that number until promoted. Replace it; its
+    /// successor starts past the new count once the new workers are up.
+    pub(super) fn standby_before_scale_up(&mut self) {
+        if self.cfg.app.instance_var.is_empty() {
+            return;
+        }
+        let count = self.count;
+        let clash: Vec<u64> = self
+            .live_standbys()
+            .into_iter()
+            .filter(|id| self.insts.get(id).and_then(|i| i.standby.as_ref()).is_some_and(|st| st.instance < count))
+            .collect();
+        if clash.is_empty() {
+            return;
+        }
+        info!(
+            "replacing standbys: a new worker takes their instance number",
+            worker = POOL,
+            standbys = clash.len(),
+            workers = count,
+            instance_var = self.cfg.app.instance_var,
+        );
+        for id in clash {
+            self.stop_instance(id);
+        }
+    }
+
     /// The release workers start in now (`[app] pin_release`; None: unpinned).
     fn pinned_release(&self) -> Option<PathBuf> {
         self.release.as_ref().map(|p| p.real.clone())
@@ -874,6 +915,50 @@ exec sleep 60
             // successor gets the same one, as a rollout's new worker does.
             r.sup.stop_instance(b);
             assert_eq!(r.sup.free_standby_number(), 2);
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// The instance number (`NODE_APP_INSTANCE`) a process started with.
+    #[cfg(target_os = "linux")]
+    fn instance_of(s: &Supervisor, id: u64) -> String {
+        let env = std::fs::read(format!("/proc/{}/environ", s.insts[&id].handle.pid)).unwrap_or_default();
+        let env = String::from_utf8_lossy(&env);
+        env.split('\0').find_map(|kv| kv.strip_prefix("NODE_APP_INSTANCE=")).unwrap_or("?").to_string()
+    }
+
+    /// Standbys get instance numbers past the workers' and unique (two
+    /// standbys used to share `count`). Scaling up past a standby's number
+    /// replaces it, so a new worker never shares it (after `scale 2`,
+    /// worker 2 and the standby both had instance 1).
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn standby_instance_numbers_stay_unique_when_scaling_up() {
+        local(async {
+            let mut r = Rig::new("scaleup", "");
+            r.sup.cfg.workers.standby = 2;
+            r.sup.start_all();
+            r.until("worker and two standbys ready", |s| running(s) && available(s).len() == 2).await;
+            let (a, b) = (available(&r.sup)[0], available(&r.sup)[1]);
+            assert_eq!((instance_of(&r.sup, a), instance_of(&r.sup, b)), ("1".into(), "2".into()));
+
+            assert!(r.sup.scale(2).ok);
+            assert!(r.sup.insts[&a].stopping, "s1 had instance 1, now worker 2's: replaced");
+            assert!(!r.sup.insts[&b].stopping, "s2 (instance 2) is still past the workers'");
+            let all_up = |s: &Supervisor| {
+                s.slots.values().all(|x| x.state == State::Running) && available(s).len() == 2 && s.insts.len() == 4
+            };
+            r.until("2 workers and 2 standbys", all_up).await;
+            let mut seen: Vec<String> = r.sup.insts.keys().map(|id| instance_of(&r.sup, *id)).collect();
+            seen.sort();
+            assert_eq!(seen, ["0", "1", "2", "3"], "every process has its own instance number");
+            let new = available(&r.sup).into_iter().find(|id| *id != b).unwrap();
+            assert_eq!((r.sup.inst_label(&r.sup.insts[&new]), instance_of(&r.sup, new)), ("s1".into(), "3".into()));
+
+            // Scaling down leaves them alone: still past the workers'.
+            assert!(r.sup.scale(1).ok);
+            assert!(available(&r.sup).len() == 2 && r.sup.live_standbys().len() == 2);
             r.shutdown().await;
         })
         .await;

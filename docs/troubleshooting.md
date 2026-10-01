@@ -57,6 +57,7 @@ standby` all of them with the pool's own lines (`worker=standby`).
 | `standbys disabled: a standby took the app's port before being promoted` | The app listens in a way the shim doesn't hold back (a raw TCP server on the port, a native HTTP server), so a standby would take traffic | Set `[workers] standby = 0`; the standbys were stopped and workers restart the normal way |
 | `promoted standby did not listen in time; killing` | A promoted standby didn't report listening within 5 s (its listen failed, or it is stuck) | The slot restarts the normal way; `warden logs <app> --worker <n>`. If it repeats, set `standby = 0` and report it |
 | A crash during `reload`/`safe-reload` restarts cold | Standbys run the previous version, so they are not promoted while a deploy runs; they are replaced when it succeeds and kept when it rolls back | Intended |
+| `replacing standbys: a new worker takes their instance number` (after `warden scale`) | Each standby has its own instance number past the workers' (`instance_var`); a scale-up gives a new worker that number, and two processes would run as the same instance | Intended: the standby is replaced by one past the new count once the new workers are up (a crash meanwhile restarts cold) |
 | A cron that runs on `NODE_APP_INSTANCE == 0` stops after worker 1 crashed | The standby started with a number past the workers' (so it doesn't run the job twice) and decided at startup | After promotion `process.env.NODE_APP_INSTANCE` is the slot's; start such jobs in `process.on("warden:promote", …)` as well |
 
 ## Why a worker died

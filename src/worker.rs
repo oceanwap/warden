@@ -116,6 +116,9 @@ pub struct StandbyGates {
     pub verified: bool,
     /// Passed every gate: may be promoted.
     pub available: bool,
+    /// Its instance number (`[app] instance_var`) until promoted: past the
+    /// workers' when it started, and no other standby's.
+    pub instance: usize,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -512,12 +512,17 @@ impl Supervisor {
         let inst_id = self.next_inst;
         self.next_inst += 1;
         self.check_release();
-        let number = (role == Role::Standby).then(|| self.free_standby_number());
-        let spec = self.spec(slot_id, inst_id, number);
+        // A standby: its number in the pool, and its instance number.
+        let standby = (role == Role::Standby).then(|| (self.free_standby_number(), self.free_standby_instance()));
+        let spec = self.spec(slot_id, inst_id, standby);
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
         let mut inst = Instance::new(slot_id, handle, role);
+        let number = standby.map(|(n, _)| n);
         inst.standby_number = number;
+        if let (Some(st), Some((_, instance))) = (inst.standby.as_mut(), standby) {
+            st.instance = instance;
+        }
         self.insts.insert(inst_id, inst);
         if self.is_worker_mode() {
             info!("host starting", pid = pid, workers = self.count, role = role_name(role));
@@ -538,8 +543,9 @@ impl Supervisor {
         Ok(inst_id)
     }
 
-    /// `standby`: the number of the standby this starts (`slot_id` is then 0).
-    fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<usize>) -> process::Spec {
+    /// `standby`: the number and instance number of the standby this starts
+    /// (`slot_id` is then 0).
+    fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
         let mut env: Vec<(String, String)> = a.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut add = |k: &str, v: String| env.push((k.to_string(), v));
@@ -575,10 +581,11 @@ impl Supervisor {
                 // slot's worker id and instance number.
                 add("WARDEN_WORKER_ID", "0".into());
                 add("WARDEN_STANDBY", "1".into());
-                if !a.instance_var.is_empty() {
-                    // Past the workers' numbers: code that runs only on
-                    // instance 0 (cron) does not run in a standby.
-                    add(&a.instance_var, self.count.to_string());
+                if let (false, Some((_, instance))) = (a.instance_var.is_empty(), standby) {
+                    // Past the workers' numbers and unique: code that runs
+                    // only on one instance (cron on 0) does not run in a
+                    // standby. A scale-up past it replaces the standby.
+                    add(&a.instance_var, instance.to_string());
                 }
                 // In the pinned release, as workers (`release.rs`).
                 let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
@@ -617,7 +624,7 @@ impl Supervisor {
             args,
             cwd: self.worker_dir(),
             env,
-            label: standby.map(standby_label).unwrap_or_else(|| self.label(slot_id)),
+            label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
             output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
@@ -1756,6 +1763,8 @@ impl Supervisor {
         let old = self.count;
         self.count = n;
         info!("scaling", from = old, to = n);
+        // Before the new workers start: none shares a standby's instance number.
+        self.standby_before_scale_up();
         if self.is_worker_mode() {
             if n != old {
                 return match self.begin_rollout(Kind::Reload, vec![1], "scale".into(), false) {
