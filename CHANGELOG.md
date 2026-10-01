@@ -35,7 +35,9 @@ with `cargo release 0.1.0` (see [`docs/releasing.md`](docs/releasing.md)).
 - CI: Linux (x86_64, arm64) and macOS builds and tests; a workflow that checks
   `warden startup` against real systemd and launchd; benchmarks on x86_64 and
   ARM64 runners; a short chaos run.
-- `install.sh` for the release assets.
+- `install.sh` for the release assets, and a Release workflow that can also
+  be started by hand from GitHub (Actions → Release → Run workflow), which
+  creates the tag itself once everything is built and tested.
 - [`contrib/nginx.conf`](contrib/nginx.conf) and
   [`docs/proxies.md`](docs/proxies.md) for running behind nginx or a cloud load
   balancer.

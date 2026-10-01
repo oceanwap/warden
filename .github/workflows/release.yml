@@ -8,9 +8,16 @@
 # about.toml): THIRD-PARTY-LICENSES.txt, and THIRD-PARTY-LICENSES-GUI.txt in
 # the GUI bundles.
 #
-# A tag v<version> (matching Cargo.toml) publishes a GitHub Release. Pushes to
-# ci-portability and manual runs are dry runs: everything is built, packaged,
-# checksummed and install-tested, and uploaded as workflow artifacts only.
+# Two ways to publish a GitHub Release:
+#   - push a tag v<version> (matching Cargo.toml): `cargo release <version>`
+#     does that from a checkout;
+#   - no checkout at all: Actions > Release > Run workflow on `main`, with
+#     "Publish the release" ticked. The tag v<version> is created at that
+#     commit once everything is built and tested, so a failed build leaves no
+#     tag behind. Needs a green CI run on the commit (see docs/releasing.md).
+# Pushes to ci-portability and manual runs without the box ticked are dry
+# runs: everything is built, packaged, checksummed and install-tested, and
+# uploaded as workflow artifacts only.
 name: Release
 
 on:
@@ -18,13 +25,23 @@ on:
     tags: ["v*"]
     branches: [ci-portability]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish the release (tag v<Cargo.toml version> at this commit). Unticked: a dry run."
+        type: boolean
+        default: false
+      skip_ci_check:
+        description: "Publish even without a green CI run on this commit (not recommended)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  # A release in progress is never cancelled by another run.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,10 +57,18 @@ env:
 jobs:
   meta:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # the CI runs of this commit, for a release started by hand
     outputs:
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.version.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
       gui: ${{ steps.gui.outputs.present == 'true' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: ${{ inputs.release }}
+      SKIP_CI_CHECK: ${{ inputs.skip_ci_check }}
     steps:
       - uses: actions/checkout@v5
       - id: version
@@ -57,7 +82,34 @@ jobs:
               exit 1
             fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
             echo "Release v$cargo_version"
+          elif [ "$RELEASE" = "true" ]; then
+            # Started by hand with "Publish the release" ticked. Everything that
+            # `cargo release` checks before it tags, checked here, before the
+            # slow builds.
+            tag="v$cargo_version"
+            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "::error title=Not on main::a release is cut from main, and this run is on $GITHUB_REF. Nothing was built or published. Run the workflow again and choose the branch main (or untick \"Publish the release\" for a dry run)."
+              exit 1
+            fi
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+              echo "::error title=Tag exists::$tag already exists in $GITHUB_REPOSITORY, so version $cargo_version was released before. Nothing was built or published. Raise [package] version in Cargo.toml, Cargo.lock, protocol/Cargo.toml and gui/Cargo.toml (all the same number), commit it to main, let CI pass, and run this again."
+              exit 1
+            fi
+            if [ "$SKIP_CI_CHECK" = "true" ]; then
+              echo "::warning title=CI check skipped::publishing $tag without looking for a green CI run on $GITHUB_SHA"
+            else
+              green=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=20" \
+                --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
+              if [ "${green:-0}" -lt 1 ]; then
+                echo "::error title=No green CI run::the CI workflow has no passed run on $GITHUB_SHA. Nothing was built or published. Wait for CI to pass on this commit (Actions > CI), or run this again with \"Publish even without a green CI run\" ticked if you are sure."
+                exit 1
+              fi
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "Release $tag at $GITHUB_SHA"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Dry run for version $cargo_version: artifacts only, no release"
@@ -397,6 +449,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.meta.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/download-artifact@v4
@@ -407,5 +460,12 @@ jobs:
         run: |
           flags=()
           [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # The tag was pushed: it is what was built.
+            flags+=(--verify-tag)
+          else
+            # Started by hand: this creates the tag, at the commit built.
+            flags+=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
             --title "Warden $VERSION" --generate-notes "${flags[@]}"

@@ -17,6 +17,31 @@ cargo xtask release --help      # every option
 `cargo-release` is installed, cargo warns that the alias shadows it; use
 `cargo xtask release`, the same command.
 
+## From GitHub, without a checkout
+
+The same workflow can publish by hand, for when you have no checkout or can't
+push tags from where you are:
+
+1. Make sure `main` has the commit to release, with the version in
+   `Cargo.toml` (and `protocol/Cargo.toml`, `gui/Cargo.toml`, `Cargo.lock`)
+   already at the number to release, and that **CI is green on it**.
+2. **Actions → Release → Run workflow**, choose the branch `main`, tick
+   **Publish the release**, and run it.
+
+The first job checks what `cargo release` checks before it tags, and stops
+with a message saying how to fix it: the run is on `main`; the tag
+`v<Cargo.toml version>` does not exist yet; the `CI` workflow has a passed
+run on this very commit (tick **Publish even without a green CI run** only
+if you are sure). Then it builds, packages and install-tests everything, and
+only when all of that passed does the last job create the GitHub Release and
+the tag `v<version>` at that commit, with generated notes. A failed build
+leaves no tag behind. Run it without ticking the box for a dry run: the
+files are kept as workflow artifacts.
+
+This path does not change the version: to release another number, commit
+the bump to `main` first (`cargo release <version>` does that and the tag
+locally in one go).
+
 ## The steps
 
 Each step is printed as it runs. The first failure stops the release and
@@ -87,9 +112,11 @@ hour, enough to follow a release at a slower pace.
 
 ## What the Release workflow does
 
-`.github/workflows/release.yml`, on a pushed `v*` tag:
+`.github/workflows/release.yml`, on a pushed `v*` tag, or run by hand with
+**Publish the release** ticked (above):
 
 - **meta**: the tag must match `Cargo.toml`'s version, or nothing is built.
+  By hand: the same, plus the checks above.
 - **licenses**: the third-party notices (cargo-about); fails on a license
   `about.toml` doesn't accept.
 - **cli**: `warden` for Linux x86_64 and arm64 (glibc 2.28 baseline, built
@@ -105,8 +132,9 @@ hour, enough to follow a release at a slower pace.
   `-` (`0.2.0-rc.1`) is marked as a pre-release.
 
 Nothing is published unless every build and install test passed. Pushes to
-the `ci-portability` branch and manual runs do everything but publish (the
-files are kept as workflow artifacts for 14 days).
+the `ci-portability` branch and manual runs without the box ticked do
+everything but publish (the files are kept as workflow artifacts for 14
+days).
 
 ## Where the artifacts land
 
@@ -126,10 +154,16 @@ always serves the newest release that is not a pre-release (README,
 
 Pushing the tag starts the release, so it needs write access to the
 repository (and, if a ruleset protects `v*` tags, the right to create them).
-The workflow needs nothing more: its `publish` job uses the run's own token.
-From an environment that may push to branches but not tags, the release
-stops at step 7 with the commit and the tag kept: run the printed
-`git push --atomic …` where you can push tags.
+The workflow needs nothing more: its `publish` job uses the run's own token
+(`contents: write`), also when it creates the tag itself in a run started by
+hand; running a workflow needs write access to the repository too. From an
+environment that may push to branches but not tags, the release stops at
+step 7 with the commit and the tag kept: run the printed `git push --atomic …`
+where you can push tags, or use the workflow by hand.
+
+GitHub Actions must be able to run: with a failed payment or a spending limit
+reached, every job is refused ("recent account payments have failed…"), and
+so is a release (**Settings → Billing & plans**).
 
 ## When something fails
 
