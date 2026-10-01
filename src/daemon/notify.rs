@@ -243,8 +243,14 @@ fn alert_env(p: &Payload) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Run `argv` with `input` on stdin, killed (with its process group) after
-/// `timeout`. Err: what went wrong, in words.
+/// How long a failed command's stderr is still read after it exited: a
+/// process it left in the background may hold the pipe open for good.
+const STDERR_AFTER_EXIT: Duration = Duration::from_millis(200);
+
+/// Run `argv` with `input` on stdin. Its exit status alone says whether it
+/// worked: a process it leaves in the background (holding stdout or stderr
+/// open) is its own business. Killed, with its process group, if it is still
+/// running after `timeout`. Err: what went wrong, in words.
 pub(crate) async fn run_command(
     argv: &[String],
     env: &[(&str, String)],
@@ -265,21 +271,39 @@ pub(crate) async fn run_command(
     let pid = child.id();
     let stdin = child.stdin.take();
     let stderr = child.stderr.take();
-    let work = async {
+    let mut err = Vec::new();
+    let status = {
         let feed = async move {
             if let Some(mut s) = stdin {
                 // A command that does not read its stdin is fine.
                 let _ = s.write_all(input).await;
             }
         };
-        let (_, err, status) = tokio::join!(feed, read_bounded(stderr), child.wait());
-        (err, status)
+        // stderr is read all along, so a chatty command never blocks on a full pipe.
+        let reader = read_bounded(stderr, &mut err);
+        let wait = child.wait();
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(feed, reader, wait, deadline);
+        let (mut fed, mut read) = (false, false);
+        let status = loop {
+            tokio::select! {
+                st = &mut wait => break Some(st),
+                _ = &mut feed, if !fed => fed = true,
+                _ = &mut reader, if !read => read = true,
+                _ = &mut deadline => break None,
+            }
+        };
+        // A failure's message: what stderr has within a moment of the exit.
+        if matches!(&status, Some(Ok(st)) if !st.success()) && !read {
+            let _ = tokio::time::timeout(STDERR_AFTER_EXIT, &mut reader).await;
+        }
+        status
     };
-    let outcome = tokio::time::timeout(timeout, work).await;
-    match outcome {
-        Ok((_, Ok(st))) if st.success() => Ok(()),
-        Ok((err, Ok(st))) => {
+    match status {
+        Some(Ok(st)) if st.success() => Ok(()),
+        Some(Ok(st)) => {
             let how = exit_text(st);
+            let err = String::from_utf8_lossy(&err);
             let said = err.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
             Err(if said.is_empty() {
                 format!("{prog} failed ({how})")
@@ -287,8 +311,10 @@ pub(crate) async fn run_command(
                 format!("{prog} failed ({how}): {said}")
             })
         }
-        Ok((_, Err(e))) => Err(format!("waiting for {prog} failed: {e}")),
-        Err(_) => {
+        Some(Err(e)) => Err(format!("waiting for {prog} failed: {e}")),
+        None => {
+            // Not reaped yet (`wait` did not return), so `pid` is still its
+            // process group's id, whoever else is in the group.
             if let Some(pid) = pid {
                 crate::sys::signal_child(pid, libc::SIGKILL, true);
             }
@@ -307,22 +333,21 @@ fn exit_text(st: std::process::ExitStatus) -> String {
     }
 }
 
-/// All of `r`, keeping the first `STDERR_KEEP` bytes (reading on, so the
-/// writer never blocks on a full pipe).
-async fn read_bounded(r: Option<tokio::process::ChildStderr>) -> String {
-    let Some(mut r) = r else { return String::new() };
-    let mut kept = Vec::new();
+/// `r` until its end, keeping the first `STDERR_KEEP` bytes in `kept`
+/// (reading on, so the writer never blocks on a full pipe). Stopping it
+/// early keeps what was read so far.
+async fn read_bounded(r: Option<tokio::process::ChildStderr>, kept: &mut Vec<u8>) {
+    let Some(mut r) = r else { return };
     let mut buf = [0u8; 1024];
     loop {
         match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => return,
             Ok(n) => {
                 let room = STDERR_KEEP.saturating_sub(kept.len());
                 kept.extend_from_slice(&buf[..n.min(room)]);
             }
         }
     }
-    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// A string for curl's config syntax: in double quotes, `\` and `"` escaped.
@@ -553,6 +578,63 @@ mod tests {
         let e = local(run_command(&argv("yes 'x' | head -c 100000 >&2; exit 1"), &[], b"", Duration::from_secs(5)))
             .unwrap_err();
         assert!(e.len() < 3000, "{}", e.len());
+    }
+
+    /// The pid a test's command wrote to `file` (waiting for it a little).
+    fn pid_in(file: &std::path::Path) -> i32 {
+        let t0 = Instant::now();
+        loop {
+            if let Some(p) = std::fs::read_to_string(file).ok().and_then(|s| s.trim().parse().ok()) {
+                return p;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "no pid in {}", file.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_command_that_leaves_a_background_process_is_done_when_it_exits() {
+        let d = dir("fork");
+        let (json, times, bg) = (d.join("fork.json"), d.join("fork.times"), d.join("bg.pid"));
+        // Its background process keeps stderr open for 30 s.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "cat > '{}'; date >> '{}'; (sleep 30 & echo $! > '{}')",
+                json.display(),
+                times.display(),
+                bg.display()
+            ),
+        ];
+        let delivery =
+            Delivery { rule: "ops".into(), target: Arc::new(Target::Command(argv)), payload: Arc::new(payload()) };
+        let limits = Limits { timeout: Duration::from_secs(3), retry_after: Duration::from_millis(50) };
+        let t0 = Instant::now();
+        local(deliver(&delivery, limits, &Shared::default()));
+        let took = t0.elapsed();
+        let sleeper = pid_in(&bg);
+        assert!(running(sleeper), "a command's background process is left alone");
+        crate::sys::signal_child(sleeper as u32, libc::SIGKILL, false);
+        assert!(took < Duration::from_secs(2), "done when the command exits, not at the timeout: {took:?}");
+        assert_eq!(std::fs::read_to_string(&times).unwrap().lines().count(), 1, "sent once, not retried");
+        let sent: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        assert_eq!(sent["kind"], "crash_loop");
+
+        // A failure says what it wrote, though stderr stays open.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("echo 'no such channel' >&2; (sleep 30 & echo $! > '{}'); exit 2", bg.display()),
+        ];
+        let _ = std::fs::remove_file(&bg);
+        let t0 = Instant::now();
+        let e = local(run_command(&argv, &[], b"{}", Duration::from_secs(3))).unwrap_err();
+        let took = t0.elapsed();
+        crate::sys::signal_child(pid_in(&bg) as u32, libc::SIGKILL, false);
+        assert_eq!(e, "/bin/sh failed (exit code 2): no such channel");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// Alive and not a zombie (an orphan may wait a while for its reaper).

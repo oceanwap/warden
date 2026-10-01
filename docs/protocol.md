@@ -332,9 +332,13 @@ looks like that too, and no `oom` alert is sent (the log line says so).
 - `command`: run with that JSON on stdin and `WARDEN_ALERT_KIND`, `_APP`,
   `_HOST`, `_TEXT`, `_DETAIL`, `_COUNT`, `_AT_MS`, `_RULE` in its
   environment (and `wardend`'s). It runs as `wardend`'s user (root for the
-  system `wardend`), in a process group of its own; a non-zero exit is a
-  failure. The program is checked when the file is read: an absolute path,
-  or a name on `wardend`'s PATH.
+  system `wardend`), in a process group of its own. Its exit status alone
+  decides: 0 is sent, anything else a failure (with the first line of its
+  stderr, read for at most 200 ms after it exits). A process it leaves in
+  the background is its own business and is not waited for; if it writes
+  to stderr later, redirect that (`… 2>/dev/null &`), as wardend no longer
+  reads it. The program is checked when the file is read: an absolute
+  path, or a name on `wardend`'s PATH.
 - `webhook`: `curl -fsS --max-time 10 --proto =http,https -K -`, which reads
   the URL, the `Content-Type: application/json` header and the body from
   its stdin, so neither the URL (often a secret) nor the alert ever appear
@@ -349,7 +353,8 @@ looks like that too, and no `oom` alert is sent (the log line says so).
 
 Alerts never make `wardend` wait. They go into a queue of 64 (more are
 dropped, counted and logged once a minute); at most 4 deliveries run at
-once; each is killed after 10 s (the command's whole process group); a
+once; each still running after 10 s is killed (the command's whole
+process group); a
 failed one is tried once more after 5 s, then logged as lost. Every failure
 is logged with the rule, the kind, the app, the target (a command's program
 only, a webhook's host only: never its path or token) and the fix.
