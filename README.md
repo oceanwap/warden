@@ -254,7 +254,8 @@ against 54-687 ms without a standby and 166-1,182 ms under PM2.
   is the slot's, and `process.on("warden:promote", ...)` runs late setup.
 
 `warden status` lists standbys after the workers as `s1`, `s2`… (`WARMING`
-then `STANDBY`; `standbys` in `--json`), and the GUI counts their memory.
+then `STANDBY`; `standbys` in `--json`), `warden events` and the GUI show
+their events as `worker s1`, and the GUI counts their memory.
 A standby starts in the pinned release (`pin_release`) and is promoted only
 while that is still the workers' release. Process mode only, with
 `app.port`, a shared port and the shim (bun and node commands).

@@ -131,6 +131,12 @@ impl Supervisor {
                 Some(i) if !worker_mode => self.inst_label(i),
                 _ => worker.to_string(),
             };
+            // Its event: the silent Worker (0: the host's own thread) in
+            // worker mode; else the process's slot, or a standby's number.
+            let event_who = match self.insts.get(&id) {
+                Some(i) if !worker_mode => self.event_who(i),
+                _ => (worker, None),
+            };
             let Some(i) = self.insts.get_mut(&id) else { continue };
             i.hung = true;
             let (slot, role, pid) = (i.slot, i.role, i.handle.pid);
@@ -143,9 +149,7 @@ impl Supervisor {
                         process is stopped; Warden kills it and starts a new one. Its last output is in `warden \
                         logs <app> --worker N`; raise [watchdog] timeout if it blocks this long on purpose",
             );
-            // Worker mode: the silent Worker (0: the host's own thread).
-            let wid = if worker_mode { worker } else { slot };
-            emit(&self.cfg.app.name, wid, WorkerEvent::Hung, Some(pid), || {
+            emit_to(&self.cfg.app.name, event_who, WorkerEvent::Hung, Some(pid), || {
                 Some(format!("no heartbeat for {}s", silent.as_secs()))
             });
             if worker_mode && role == Role::Current {

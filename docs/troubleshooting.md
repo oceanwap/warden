@@ -50,9 +50,11 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 
 ## Hot standbys (`[workers] standby`)
 
-Standbys are `s1`, `s2`… in `warden status` and `worker=s1` on their log
-lines and output: `warden logs <app> --worker s1` follows one, `--worker
-standby` all of them with the pool's own lines (`worker=standby`).
+Standbys are `s1`, `s2`… in `warden status`, `worker=s1` on their log
+lines and output, and `worker s1` in `warden events` and the GUI (the
+pool's own events: `worker standby`): `warden logs <app> --worker s1`
+follows one, `--worker standby` all of them with the pool's own lines
+(`worker=standby`).
 
 | You see | Why | Fix |
 |---|---|---|

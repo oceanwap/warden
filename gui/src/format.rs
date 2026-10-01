@@ -104,8 +104,10 @@ pub fn event_line(ev: &Event, now_ms: u64) -> Option<String> {
     Some(match ev {
         Event::Hello { app: None, pid, version, .. } => format!("{now} wardend pid={pid} version={version}"),
         Event::Hello { app: Some(app), pid, .. } => format!("{now} {app} connected pid={pid}"),
-        Event::Worker { app, worker, event, pid, detail, at_ms } => {
-            let mut t = format!("{} {app} worker {worker} {}", clock(*at_ms), event.as_str());
+        Event::Worker { app, worker, standby, event, pid, detail, at_ms } => {
+            // A hot standby is `s1` (the pool `standby`), as `warden status` names it.
+            let who = warden_protocol::events::worker_name(*worker, *standby);
+            let mut t = format!("{} {app} worker {who} {}", clock(*at_ms), event.as_str());
             if let Some(p) = pid {
                 t += &format!(" pid={p}");
             }
@@ -172,12 +174,32 @@ mod tests {
         let w = Event::Worker {
             app: "api".into(),
             worker: 2,
+            standby: None,
             event: WorkerEvent::Crashed,
             pid: Some(4230),
             detail: Some("exit code 3".into()),
             at_ms: 1,
         };
         assert_eq!(after_clock(&event_line(&w, 0).unwrap()), "api worker 2 crashed pid=4230 exit code 3");
+        // Hot standbys are `s1`, `s2`… (the pool `standby`), not worker 0.
+        let sb = |standby, event, detail: &str| Event::Worker {
+            app: "api".into(),
+            worker: 0,
+            standby: Some(standby),
+            event,
+            pid: None,
+            detail: Some(detail.into()),
+            at_ms: 1,
+        };
+        let line = |ev: &Event| after_clock(&event_line(ev, 0).unwrap()).to_string();
+        assert_eq!(
+            line(&sb(1, WorkerEvent::Ready, "startup_ms=80 role=standby")),
+            "api worker s1 ready startup_ms=80 role=standby"
+        );
+        assert_eq!(
+            line(&sb(0, WorkerEvent::Failed, "too many standby restarts")),
+            "api worker standby failed too many standby restarts"
+        );
         let r = Event::Rollout {
             app: "api".into(),
             rollout: RolloutStatus {

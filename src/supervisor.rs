@@ -431,6 +431,27 @@ impl Supervisor {
         emit(&self.cfg.app.name, self.event_worker(slot), event, pid, detail);
     }
 
+    /// An event about hot standby `number` (`s1`…; 0: the pool as a whole):
+    /// worker 0, with the standby's number (`Event::Worker::standby`).
+    fn emit_standby(
+        &self,
+        number: usize,
+        event: WorkerEvent,
+        pid: Option<u32>,
+        detail: impl FnOnce() -> Option<String>,
+    ) {
+        emit_to(&self.cfg.app.name, (STANDBY_SLOT, Some(number)), event, pid, detail);
+    }
+
+    /// `(worker, standby)` of an event about process `i`: its slot's worker
+    /// (`event_worker`), or a standby's own number until it is promoted.
+    fn event_who(&self, i: &Instance) -> (usize, Option<usize>) {
+        match i.standby_number.filter(|_| i.role == Role::Standby) {
+            Some(n) => (STANDBY_SLOT, Some(n)),
+            None => (self.event_worker(i.slot), None),
+        }
+    }
+
     /// A `rollout` event when a rollout started or its phase changed since
     /// the last one. Without subscribers: one atomic load.
     fn publish_rollout(&mut self) {
@@ -533,9 +554,11 @@ impl Supervisor {
         } else {
             info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
         }
-        self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || {
-            (role != Role::Current).then(|| format!("role={}", role_name(role)))
-        });
+        let detail = || (role != Role::Current).then(|| format!("role={}", role_name(role)));
+        match number {
+            Some(n) => self.emit_standby(n, WorkerEvent::Starting, Some(pid), detail),
+            None => self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), detail),
+        }
         if role == Role::Standby {
             // Ready = initialized (`standby_ready`); it never listens before promotion.
             self.send_later(self.cfg.ready_timeout(), Event::ReadyTimeout { inst: inst_id });
@@ -921,7 +944,7 @@ impl Supervisor {
                     info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
                 }
                 self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
-                    Some(pms) => Some(format!("promoted from standby promote_ms={pms}")),
+                    Some(pms) => Some(format!("promoted from standby {was} promote_ms={pms}")),
                     None => Some(format!("startup_ms={ms}")),
                 });
             }
@@ -938,7 +961,7 @@ impl Supervisor {
                     info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
                 }
                 self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
-                    Some(pms) => Some(format!("promoted from standby promote_ms={pms} role=replacement")),
+                    Some(pms) => Some(format!("promoted from standby {was} promote_ms={pms} role=replacement")),
                     None => Some(format!("startup_ms={ms} role=replacement")),
                 });
             }
@@ -1249,7 +1272,8 @@ impl Supervisor {
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
         let stop_signal = self.cfg.stop_signal();
-        let worker_mode = self.is_worker_mode();
+        let Some(i) = self.insts.get(&inst_id) else { return };
+        let who = self.event_who(i);
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
         if i.stopping {
             return;
@@ -1261,8 +1285,7 @@ impl Supervisor {
             // (EOF), so nothing it runs on can hold up the exit.
             i.handle.close_input();
         }
-        let wid = if worker_mode { 0 } else { i.slot };
-        emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || {
+        emit_to(&self.cfg.app.name, who, WorkerEvent::Stopping, Some(i.handle.pid), || {
             Some(format!("{} grace_s={}", crate::signals::name(stop_signal), grace.as_secs()))
         });
         if let Some(s) = self.slots.get_mut(&i.slot) {
@@ -1274,12 +1297,11 @@ impl Supervisor {
     }
 
     fn kill_instance(&mut self, inst_id: u64) {
-        let worker_mode = self.is_worker_mode();
+        let Some(who) = self.insts.get(&inst_id).map(|i| self.event_who(i)) else { return };
         if let Some(i) = self.insts.get_mut(&inst_id) {
             i.stopping = true;
             i.handle.signal(libc::SIGKILL);
-            let wid = if worker_mode { 0 } else { i.slot };
-            emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || Some("SIGKILL".into()));
+            emit_to(&self.cfg.app.name, who, WorkerEvent::Stopping, Some(i.handle.pid), || Some("SIGKILL".into()));
         }
     }
 
@@ -2016,8 +2038,19 @@ fn with_preload(command: &str, args: &[String], shim: Option<&Path>) -> Vec<Stri
 /// is only built when someone is subscribed: without subscribers this costs
 /// one atomic load.
 fn emit(app: &str, worker: usize, event: WorkerEvent, pid: Option<u32>, detail: impl FnOnce() -> Option<String>) {
+    emit_to(app, (worker, None), event, pid, detail);
+}
+
+/// `emit` for any process: `(worker, standby)` from `Supervisor::event_who`.
+fn emit_to(
+    app: &str,
+    (worker, standby): (usize, Option<usize>),
+    event: WorkerEvent,
+    pid: Option<u32>,
+    detail: impl FnOnce() -> Option<String>,
+) {
     if events::active() {
-        events::worker(app, worker, event, pid, detail());
+        events::worker(app, worker, standby, event, pid, detail());
     }
 }
 

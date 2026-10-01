@@ -5226,7 +5226,19 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
     assert_eq!(worker_story(&events, 1), ["crashed", "restarting", "starting", "ready"], "{events:#?}");
     let promoted: Vec<&Value> = events.iter().filter(|e| e["worker"] == 1 && e["pid"] == standby).collect();
     assert_eq!(promoted.len(), 2, "{events:#?}");
-    assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby")));
+    assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby s1")));
+    assert!(promoted.iter().all(|e| e.get("standby").is_none()), "worker 1's events, not a standby's: {events:#?}");
+    // A standby's own events say which standby it is (`s1`, next to worker
+    // 0), as `warden status` and the log lines name it: here the new s1.
+    let fresh = ev.until("the new standby ready", |e| e["standby"] == 1 && e["event"] == "ready");
+    let ready = fresh.last().unwrap();
+    assert_eq!(ready["worker"], 0, "{ready}");
+    assert_ne!(ready["pid"].as_u64(), Some(standby), "{ready}");
+    assert!(ready["detail"].as_str().unwrap().ends_with("role=standby"), "{ready}");
+    assert!(
+        fresh.iter().any(|e| e["standby"] == 1 && e["event"] == "starting" && e["pid"] == ready["pid"]),
+        "{fresh:#?}"
+    );
 
     let s =
         w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && s["workers_ready"] == 1);

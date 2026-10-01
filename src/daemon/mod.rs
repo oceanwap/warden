@@ -457,8 +457,11 @@ impl Core {
             }
             WatchMsg::Event { event, .. } => {
                 match *event {
-                    Event::Worker { worker, event, detail, .. } => {
+                    Event::Worker { worker, standby: None, event, detail, .. } => {
                         self.alerts.worker(&app, worker, event, detail.as_deref(), now)
+                    }
+                    Event::Worker { standby: Some(n), event, detail, .. } => {
+                        self.alerts.standby(&app, n, event, detail.as_deref(), now)
                     }
                     Event::RolloutDone { outcome, .. } => self.alerts.rollout_done(&app, &outcome, now),
                     _ => {}

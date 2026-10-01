@@ -512,6 +512,7 @@ pub(crate) mod tests {
             Event::Worker {
                 app: "api".into(),
                 worker: 1,
+                standby: None,
                 event: WorkerEvent::Crashed,
                 pid: Some(9),
                 detail: Some("exit code 1".into()),
@@ -569,6 +570,7 @@ pub(crate) mod tests {
                 Event::Worker {
                     app: "api".into(),
                     worker: i,
+                    standby: None,
                     event: WorkerEvent::Ready,
                     pid: None,
                     detail: None,

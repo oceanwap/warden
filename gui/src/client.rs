@@ -618,6 +618,7 @@ mod tests {
         b.push(Event::Worker {
             app: "api".into(),
             worker: 1,
+            standby: None,
             event: WorkerEvent::Ready,
             pid: None,
             detail: None,

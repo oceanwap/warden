@@ -175,7 +175,8 @@ impl Supervisor {
     }
 
     fn spawn_standby(&mut self) -> bool {
-        let label = standby_label(self.free_standby_number());
+        let number = self.free_standby_number();
+        let label = standby_label(number);
         match self.spawn_instance(STANDBY_SLOT, Role::Standby) {
             Ok(id) => {
                 // `spawn_instance` checked the pin; this is the one it used.
@@ -194,9 +195,7 @@ impl Supervisor {
                     hint = "the same command starts the workers: check it (`error` says what failed); standbys \
                             are retried with backoff",
                 );
-                self.emit_worker(STANDBY_SLOT, WorkerEvent::Crashed, None, || {
-                    Some(format!("spawn failed: {e} (standby)"))
-                });
+                self.emit_standby(number, WorkerEvent::Crashed, None, || Some(format!("spawn failed: {e} (standby)")));
                 self.pool.crashes += 1;
                 self.pool.last_exit = Some(format!("spawn failed: {e}"));
                 self.standby_crashed(Duration::ZERO);
@@ -274,9 +273,9 @@ impl Supervisor {
             return;
         }
         st.available = true;
-        let (pid, ms) = (i.handle.pid, i.started.elapsed().as_millis());
+        let (pid, ms, n) = (i.handle.pid, i.started.elapsed().as_millis(), i.standby_number.unwrap_or(0));
         info!("standby ready", worker = sb(i), pid = pid, startup_ms = ms);
-        self.emit_worker(STANDBY_SLOT, WorkerEvent::Ready, Some(pid), || Some(format!("startup_ms={ms} role=standby")));
+        self.emit_standby(n, WorkerEvent::Ready, Some(pid), || Some(format!("startup_ms={ms} role=standby")));
     }
 
     fn launch_standby_check(&self, inst: u64, sockets: Vec<PathBuf>, path: String) {
@@ -427,7 +426,8 @@ impl Supervisor {
                 }
                 if fails >= threshold && i.healthy != Some(false) {
                     i.healthy = Some(false);
-                    self.emit_worker(STANDBY_SLOT, WorkerEvent::Unhealthy, Some(pid), || {
+                    let n = i.standby_number.unwrap_or(0);
+                    self.emit_standby(n, WorkerEvent::Unhealthy, Some(pid), || {
                         Some(format!("failed {fails} health checks: {e} (standby)"))
                     });
                     if outage {
@@ -480,7 +480,8 @@ impl Supervisor {
                     in_ms = d.as_millis(),
                     attempt = self.pool.tracker.restarts_in_window()
                 );
-                self.emit_worker(STANDBY_SLOT, WorkerEvent::Restarting, None, || {
+                // The pool's: the next standby starts after the backoff.
+                self.emit_standby(0, WorkerEvent::Restarting, None, || {
                     Some(format!("in_ms={} role=standby", d.as_millis()))
                 });
                 self.send_later(d, Event::StandbyDue { token });
@@ -507,9 +508,7 @@ impl Supervisor {
                         self.cfg.app.name, self.cfg.app.name
                     ),
                 );
-                self.emit_worker(STANDBY_SLOT, WorkerEvent::Failed, None, || {
-                    Some(format!("too many standby restarts; {retry}"))
-                });
+                self.emit_standby(0, WorkerEvent::Failed, None, || Some(format!("too many standby restarts; {retry}")));
             }
         }
     }
@@ -578,13 +577,13 @@ impl Supervisor {
     /// `hint`: from the exit classification (the OOM killer, someone else's
     /// signal), as for workers.
     pub(super) fn on_standby_exit(&mut self, inst: &Instance, why: String, reason: String, hint: Option<&str>) {
-        let (pid, label) = (inst.handle.pid, sb(inst));
+        let (pid, label, n) = (inst.handle.pid, sb(inst), inst.standby_number.unwrap_or(0));
         if inst.stopping || self.shutting_down || self.stopped {
             match hint {
                 Some(h) => warn!("standby stopped", worker = label, pid = pid, reason = why, hint = h),
                 None => info!("standby stopped", worker = label, pid = pid, reason = why),
             }
-            self.emit_worker(STANDBY_SLOT, WorkerEvent::Stopped, Some(pid), || Some(why.clone()));
+            self.emit_standby(n, WorkerEvent::Stopped, Some(pid), || Some(why.clone()));
         } else {
             let uptime = inst.started.elapsed();
             let logs = format!("its output is in `warden logs {} --worker {label}`", self.cfg.app.name);
@@ -600,7 +599,7 @@ impl Supervisor {
                 },
             );
             // The reason leads the detail: alerts match `events::OOM_KILLED`.
-            self.emit_worker(STANDBY_SLOT, WorkerEvent::Crashed, Some(pid), || Some(format!("{reason} (standby)")));
+            self.emit_standby(n, WorkerEvent::Crashed, Some(pid), || Some(format!("{reason} (standby)")));
             self.pool.crashes += 1;
             self.pool.last_exit = Some(reason);
             self.standby_crashed(uptime);
@@ -659,7 +658,7 @@ impl Supervisor {
                 s.state = State::Starting;
             }
         }
-        self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || Some("promoted from standby".into()));
+        self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || Some(format!("promoted from standby {was}")));
         self.send_later(PROMOTE_TIMEOUT.min(self.cfg.ready_timeout()), Event::ReadyTimeout { inst: id });
         // Its successor starts once it listens (`mark_ready` → `fill_pool`).
         Some(id)

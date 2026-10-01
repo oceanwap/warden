@@ -495,6 +495,22 @@ fn clock(at_ms: u64) -> String {
     }
 }
 
+/// `12:00:09 api worker 2 crashed pid=4230 exit code 3`: a worker event as
+/// `warden events` prints it. A hot standby is `worker s1` (the pool as a
+/// whole `worker standby`), as `warden status` and the log lines name it.
+fn worker_line(ev: &Event) -> Option<String> {
+    let Event::Worker { app, worker, standby, event, pid, detail, at_ms } = ev else { return None };
+    let who = crate::events::worker_name(*worker, *standby);
+    let mut t = format!("{} {app} worker {who} {}", clock(*at_ms), worker_event_name(*event));
+    if let Some(p) = pid {
+        t += &format!(" pid={p}");
+    }
+    if let Some(d) = detail {
+        t += &format!(" {d}");
+    }
+    Some(t)
+}
+
 /// One line per event for people; the raw NDJSON with `--json`.
 pub(crate) struct Printer {
     out: crate::logview::PipeOut,
@@ -617,16 +633,7 @@ impl Printer {
                 self.shown.insert(app.clone(), t.clone());
                 format!("{} {app} {t}", clock(now))
             }
-            Event::Worker { app, worker, event, pid, detail, at_ms } => {
-                let mut t = format!("{} {app} worker {worker} {}", clock(*at_ms), worker_event_name(*event));
-                if let Some(p) = pid {
-                    t += &format!(" pid={p}");
-                }
-                if let Some(d) = detail {
-                    t += &format!(" {d}");
-                }
-                t
-            }
+            ev @ Event::Worker { .. } => worker_line(ev).unwrap_or_default(),
             Event::Rollout { app, rollout: r } => {
                 format!("{} {app} {} {}/{}: {}", clock(now), r.kind, r.done, r.total, r.phase)
             }
@@ -710,5 +717,47 @@ mod tests {
             assert_eq!(serde_json::to_value(e).unwrap(), worker_event_name(e));
         }
         assert_eq!(serde_json::to_value(SupervisorEvent::Died).unwrap(), supervisor_event_name(SupervisorEvent::Died));
+    }
+
+    /// `warden events` names hot standbys `s1`, `s2`… (and the pool
+    /// `standby`), as `warden status` and the log lines do, not worker 0;
+    /// an older supervisor's standby event (no `standby`) still prints.
+    #[test]
+    fn standby_events_print_as_s1() {
+        let line = |json: &str| {
+            let ev: Event = serde_json::from_str(json).unwrap();
+            let t = worker_line(&ev).unwrap();
+            t.split_once(' ').map(|(_, rest)| rest.to_string()).unwrap_or(t) // without the clock
+        };
+        assert_eq!(
+            line(
+                r#"{"type":"worker","app":"api","worker":0,"standby":1,"event":"ready","pid":7,"detail":"startup_ms=80 role=standby","at_ms":1}"#
+            ),
+            "api worker s1 ready pid=7 startup_ms=80 role=standby"
+        );
+        assert_eq!(
+            line(
+                r#"{"type":"worker","app":"api","worker":0,"standby":2,"event":"crashed","pid":8,"detail":"exit code 4 (standby)","at_ms":1}"#
+            ),
+            "api worker s2 crashed pid=8 exit code 4 (standby)"
+        );
+        assert_eq!(
+            line(
+                r#"{"type":"worker","app":"api","worker":0,"standby":0,"event":"restarting","detail":"in_ms=200 role=standby","at_ms":1}"#
+            ),
+            "api worker standby restarting in_ms=200 role=standby"
+        );
+        assert_eq!(
+            line(
+                r#"{"type":"worker","app":"api","worker":2,"event":"starting","pid":7,"detail":"promoted from standby s1","at_ms":1}"#
+            ),
+            "api worker 2 starting pid=7 promoted from standby s1"
+        );
+        assert_eq!(
+            line(r#"{"type":"worker","app":"api","worker":0,"event":"stopping","pid":9,"at_ms":1}"#),
+            "api worker 0 stopping pid=9",
+            "an older supervisor"
+        );
+        assert_eq!(worker_line(&Event::Lagged { app: None, dropped: 1 }), None);
     }
 }

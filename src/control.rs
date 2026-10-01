@@ -668,7 +668,7 @@ mod tests {
         assert!(matches!(next(&mut lines).await, Some(Event::Status { app, .. }) if app == APP));
 
         // Bus events are forwarded (other tests may emit on the same bus).
-        crate::events::worker(APP, 3, crate::events::WorkerEvent::Ready, Some(7), Some("startup_ms=1".into()));
+        crate::events::worker(APP, 3, None, crate::events::WorkerEvent::Ready, Some(7), Some("startup_ms=1".into()));
         let mut periodic = 0;
         loop {
             match next(&mut lines).await {

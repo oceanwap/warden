@@ -224,7 +224,9 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   shim listens for real and takes worker id k (`WARDEN_WORKER_ID`,
   `NODE_APP_INSTANCE`, `process.emit("warden:promote")`), Warden relabels its
   output `worker=k` and gives it `PROMOTE_TIMEOUT` (5 s) to listen. Events:
-  `starting` and `ready` of worker k with detail `promoted from standby`; log
+  `starting` and `ready` of worker k with detail `promoted from standby sN`
+  (before that, the standby's own events carry `standby: N` next to worker
+  0, so `warden events` shows `worker sN`); log
   `worker promoted from standby worker=k pid=… standby=sN promote_ms=…`. A new standby
   starts once the promoted one listens.
 - **Crash loops.** Standby exits (and failed gates) share one restart

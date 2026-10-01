@@ -26,6 +26,12 @@ pub enum Event {
     Worker {
         app: String,
         worker: usize,
+        /// A hot standby's event (`worker` is then 0): which one, 1..=standby
+        /// (`s1`, `s2`… in `warden status` and on its log lines), or 0 for
+        /// the pool as a whole (a refill backing off, standbys FAILED).
+        /// Absent for workers; clients that don't know it show worker 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standby: Option<usize>,
         event: WorkerEvent,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pid: Option<u32>,
@@ -109,6 +115,18 @@ impl WorkerEvent {
             WorkerEvent::Stopping => "stopping",
             WorkerEvent::Stopped => "stopped",
         }
+    }
+}
+
+/// How `warden events` and the GUI name what a `worker` event is about:
+/// the worker number, a hot standby's `s1`, `s2`…, or `standby` for the
+/// pool, as the log lines do (`worker=s1`, `worker=standby`) and as
+/// `warden logs --worker` takes it.
+pub fn worker_name(worker: usize, standby: Option<usize>) -> String {
+    match standby {
+        Some(0) => "standby".into(),
+        Some(n) => format!("s{n}"),
+        None => worker.to_string(),
     }
 }
 
@@ -369,6 +387,7 @@ mod tests {
         let ev = Event::Worker {
             app: "api".into(),
             worker: 2,
+            standby: None,
             event: WorkerEvent::Crashed,
             pid: Some(42),
             detail: Some("exit code 1".into()),
@@ -385,6 +404,45 @@ mod tests {
         let sup: Event =
             serde_json::from_str(r#"{"type":"supervisor","app":"api","event":"gave_up","at_ms":1}"#).unwrap();
         assert!(matches!(sup, Event::Supervisor { event: SupervisorEvent::GaveUp, .. }));
+    }
+
+    /// A hot standby's events carry its number next to `worker` 0 (0: the
+    /// pool); workers' events don't have the field, and an event from an
+    /// older supervisor, or one with fields this version doesn't know,
+    /// still parses.
+    #[test]
+    fn standby_events_say_which_standby() {
+        let ev = Event::Worker {
+            app: "api".into(),
+            worker: 0,
+            standby: Some(2),
+            event: WorkerEvent::Ready,
+            pid: Some(43),
+            detail: Some("startup_ms=80 role=standby".into()),
+            at_ms: 7,
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"type":"worker","app":"api","worker":0,"standby":2,"event":"ready","pid":43,"detail":"startup_ms=80 role=standby","at_ms":7}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&line).unwrap(), ev);
+        let pool: Event =
+            serde_json::from_str(r#"{"type":"worker","app":"api","worker":0,"standby":0,"event":"failed","at_ms":1}"#)
+                .unwrap();
+        assert!(matches!(pool, Event::Worker { standby: Some(0), event: WorkerEvent::Failed, .. }));
+        let old: Event =
+            serde_json::from_str(r#"{"type":"worker","app":"api","worker":0,"event":"ready","at_ms":1}"#).unwrap();
+        assert!(matches!(old, Event::Worker { worker: 0, standby: None, .. }));
+        let newer: Event = serde_json::from_str(
+            r#"{"type":"worker","app":"api","worker":1,"event":"ready","at_ms":1,"later":{"x":1}}"#,
+        )
+        .unwrap();
+        assert!(matches!(newer, Event::Worker { worker: 1, standby: None, .. }));
+        assert_eq!(
+            (worker_name(2, None), worker_name(0, Some(1)), worker_name(0, Some(0))),
+            ("2".into(), "s1".into(), "standby".into())
+        );
     }
 
     #[test]

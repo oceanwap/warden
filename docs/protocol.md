@@ -89,7 +89,7 @@ Every event has a `type`. Times (`at_ms`) are Unix milliseconds.
 |---|---|---|
 | `hello` | `protocol`, `app` (absent from `wardend`), `pid`, `version` | first line of a stream |
 | `status` | `app`, `status` (`control::Status`) | snapshot, then every interval |
-| `worker` | `app`, `worker`, `event`, `pid`, `detail`, `at_ms` | a worker changed state |
+| `worker` | `app`, `worker`, `standby` (hot standbys only), `event`, `pid`, `detail`, `at_ms` | a worker changed state |
 | `rollout` | `app`, `rollout` (`control::RolloutStatus`) | a rollout started or changed phase |
 | `rollout_done` | `app`, `outcome` (`control::RolloutOutcome`) | a rollout finished or rolled back |
 | `log` | `app`, `line` | with `logs: true` |
@@ -134,15 +134,24 @@ tells them apart), `state` `WARMING` (starting,
 or passing its health gates) then `STANDBY` (can take over), or `STOPPING`;
 a missing one shows as `RESTARTING` (backoff), `FAILED` or `STOPPED`.
 `restarts`, `crashes` and `last_exit` are the pool's. Their events are
-`worker` 0 (process-mode workers are numbered from 1): `starting` (detail
+`worker` 0 (process-mode workers are numbered from 1) with `standby`, the
+standby's number (`"worker":0,"standby":1` is `s1`): `starting` (detail
 `role=standby`), `ready` (`startup_ms=… role=standby`), `unhealthy`,
-`hung`, `crashed` (`… (standby)`), `restarting`, `failed`, `stopping`,
-`stopped`. A promotion is a story of the slot it fills: `crashed` (the dead
+`hung`, `crashed` (`… (standby)`), `stopping`, `stopped`. The pool's own
+decisions have `standby` 0: `restarting` (the next standby starts after a
+backoff) and `failed` (too many standby crashes). `warden events` and the
+GUI print them as `worker s1` and `worker standby`, the names `warden
+status`, the log lines (`worker=s1`, `worker=standby`) and `warden logs
+--worker` use. `standby` is absent on every other event; an older
+supervisor's standby events lack it (clients then show worker 0), and
+older clients ignore it. A promotion is a story of the slot it fills:
+`crashed` (the dead
 worker), `restarting`, then `starting` and `ready` with the standby's
-`pid` and detail `promoted from standby` (`promote_ms=…` on `ready`).
+`pid` and detail `promoted from standby s1` (`promote_ms=…` on `ready`).
 Crash details keep the exit reason first (`killed by the kernel OOM killer
-(out of memory) (standby)`), as alerts match it. These are additions:
-clients that don't know them show a worker 0.
+(out of memory) (standby)`), as alerts match it; an alert about a standby
+names it (`standby s2 was killed for lack of memory: …`, `the standby pool
+is left down: …`).
 
 `rollout` is sent when a rollout starts, before any worker is touched
 (`done` 0, `phase` `starting` or `running preflight`), and whenever its
