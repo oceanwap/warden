@@ -4333,8 +4333,10 @@ fn long_lived_connections_hand_over_in_a_bun_reload() {
     // Every kind of SSE body: a ReadableStream, a `type: "direct"` one, an async generator.
     let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-direct", "/sse-gen"]);
     // Two workers, each: start (~0.3 s), then at most long_lived_timeout (1 s)
-    // + the closing handshakes. Without the shim ending them: grace_period (30 s) each.
-    assert_clean_handover(&w, &run, Duration::from_secs(10));
+    // + the closing handshakes: ~3 s. Without the shim ending them:
+    // grace_period (30 s) each. The limit leaves room for a CI runner that
+    // stalls for seconds (seen: 5.5 s), and stays far below 30 s.
+    assert_clean_handover(&w, &run, Duration::from_secs(20));
     let log = w.log();
     assert!(log.contains("websockets=1") && log.contains("sse="), "{log}");
 }
@@ -4348,7 +4350,7 @@ fn long_lived_connections_hand_over_in_a_node_reload() {
     let app = format!("command = \"node\"\nargs = [\"{}\"]\n[workers]\ncount = 2", fixture("longlived_node.mjs"));
     let w = Warden::start("ll-node", port, &long_lived_config("ll-node", port, &app, ""));
     let run = reload_holding(&w, 2, &["/ws", "/sse"]);
-    assert_clean_handover(&w, &run, Duration::from_secs(10));
+    assert_clean_handover(&w, &run, Duration::from_secs(20));
 }
 
 #[test]
@@ -4361,7 +4363,7 @@ fn long_lived_connections_hand_over_in_bun_worker_mode() {
     let w = Warden::start("ll-threads", port, &long_lived_config("ll-threads", port, &app, ""));
     // The host is replaced as a whole: its Workers drain in parallel.
     let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-gen"]);
-    assert_clean_handover(&w, &run, Duration::from_secs(8));
+    assert_clean_handover(&w, &run, Duration::from_secs(16));
 }
 
 /// Without long-lived connections a drain is what it was: no wait for
@@ -5516,7 +5518,7 @@ fn a_promoted_standby_hands_over_long_lived_connections() {
         w.wait_for("promoted", T, |s| s["workers"][0]["pid"].as_u64() == Some(standby) && s["workers_ready"] == 1);
         let run = reload_holding(&w, 1, paths);
         assert_eq!(run.before, HashSet::from([standby]), "{name}: the clients held the promoted standby");
-        assert_clean_handover(&w, &run, Duration::from_secs(10));
+        assert_clean_handover(&w, &run, Duration::from_secs(20));
     }
 }
 
