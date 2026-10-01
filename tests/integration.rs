@@ -2433,6 +2433,237 @@ fn wardend_gives_up_on_a_supervisor_that_keeps_dying() {
     assert!(a["problem"].is_null(), "{a:#}");
 }
 
+// ---- wardend: alerts and resource history
+
+/// A plain-http server standing in for a webhook: each request's path and
+/// body come back on the channel; it answers 200.
+fn webhook_server() -> (u16, std::sync::mpsc::Receiver<(String, String)>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let (mut first, mut len) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if first.is_empty() {
+                    first = line.trim().to_string();
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            if tx.send((first, String::from_utf8_lossy(&body).into_owned())).is_err() {
+                return;
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// The alerts a `command` rule appended to `file`, one JSON object per line.
+fn alerts_in(file: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Wait until wardend's log (written by a thread of its own) has `needle`.
+fn wait_log(d: &Wardend, needle: &str) {
+    let t0 = Instant::now();
+    while !d.log().contains(needle) {
+        assert!(t0.elapsed() < T, "{needle:?} is not in wardend's log:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_alerts(file: &std::path::Path, what: &str, f: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let t0 = Instant::now();
+    loop {
+        let got = alerts_in(file);
+        if f(&got) {
+            return got;
+        }
+        assert!(t0.elapsed() < T, "timed out waiting for {what}; alerts so far: {got:#?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn wardend_alerts_a_crash_loop_once_and_counts_duplicates() {
+    if !have_bun() || Command::new("curl").arg("--version").output().is_err() {
+        return;
+    }
+    let f = Fleet::new("wd-alerts");
+    let (hook_port, hooks) = webhook_server();
+    let out = f.home.join("alerts.jsonl");
+    std::fs::write(
+        f.home.join("wardend.toml"),
+        format!(
+            r#"
+[[alert]]
+name = "hook"
+on = ["crash_loop"]
+webhook = "http://127.0.0.1:{hook_port}/services/T0/B0/s3cr3t"
+min_interval = "1h"
+
+[[alert]]
+name = "log"
+on = ["all"]
+command = ["/bin/sh", "-c", "cat >> '{out}'; echo >> '{out}'"]
+min_interval = "6s"
+"#,
+            out = out.display()
+        ),
+    )
+    .unwrap();
+    // A dead supervisor is restarted after 100 ms; the third death gives up.
+    let d = Wardend::start(&f, &[("WARDEN_DAEMON_POLICY", "initial_ms=100,max_ms=200,deaths=3,window_ms=60000")]);
+    wait_log(&d, "alert rules read rules=2");
+    assert!(f.list().iter().all(|a| a["app"] != "wardend"), "wardend.toml is not an app");
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+
+    // A worker that serves for a second, then exits 1: a crash loop, then FAILED.
+    let (fx, port) = (fixture("app.ts"), free_port().to_string());
+    let args = ["start", &fx, "--name", "boom", "--port", &port, "--env", "FIXTURE_EXIT_AFTER=1000"];
+    let (code, text) = f.cli(&[&args[..], &["--max-restarts", "5", "--restart-delay", "20", "--no-wait"]].concat());
+    assert_eq!(code, 0, "{text}");
+    ev.wait("boom failed", |v| v["type"] == "worker" && v["app"] == "boom" && v["event"] == "failed");
+
+    // The webhook gets the crash loop, once, as JSON with a text for people.
+    let (first, body) = hooks.recv_timeout(T).expect("a webhook POST");
+    assert_eq!(first, "POST /services/T0/B0/s3cr3t HTTP/1.1");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (v["kind"].as_str(), v["app"].as_str(), v["rule"].as_str()),
+        (Some("crash_loop"), Some("boom"), Some("hook"))
+    );
+    assert!(v["text"].as_str().unwrap().contains("boom crash loop: 3 worker crashes within 5m"), "{v}");
+    // The command gets every kind: the crash loop and the failed worker.
+    let got = wait_for_alerts(&out, "crash_loop and worker_failed", |a| {
+        a.iter().any(|v| v["kind"] == "crash_loop") && a.iter().any(|v| v["kind"] == "worker_failed")
+    });
+    let wf = got.iter().find(|v| v["kind"] == "worker_failed").unwrap();
+    assert!(wf["detail"].as_str().unwrap().contains("warden reset boom"), "{wf}");
+    assert_eq!((wf["app"].as_str(), wf["count"].as_u64()), (Some("boom"), Some(1)), "{wf}");
+
+    // A supervisor killed three times: `died` goes out once, the two deaths
+    // within min_interval follow in one alert (count 2), `gave_up` on its own.
+    let p2 = free_port().to_string();
+    f.ok(&["start", &fx, "--name", "api", "--port", &p2]);
+    let mut pid = d.wait_app("api watched", "api", |a| a["state"] == "running")["supervisor_pid"].as_u64().unwrap();
+    for death in 1..=3 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        ev.wait("api died", sup_event("api", "died"));
+        if death < 3 {
+            pid = ev.wait("api started", sup_event("api", "started"))["pid"].as_u64().unwrap();
+            d.wait_app("api running again", "api", |a| a["state"] == "running");
+        }
+    }
+    ev.wait("api gave up", sup_event("api", "gave_up"));
+    let got = wait_for_alerts(&out, "the held-back deaths", |a| {
+        a.iter().filter(|v| v["kind"] == "died" && v["app"] == "api").count() >= 2
+    });
+    let died: Vec<&Value> = got.iter().filter(|v| v["kind"] == "died").collect();
+    assert_eq!(died.len(), 2, "{got:#?}");
+    assert_eq!((died[0]["count"].as_u64(), died[1]["count"].as_u64()), (Some(1), Some(2)), "{died:#?}");
+    assert!(died[1]["text"].as_str().unwrap().contains("(×2 since"), "{}", died[1]);
+    let gave_up = got.iter().find(|v| v["kind"] == "gave_up").expect("gave_up");
+    assert!(gave_up["detail"].as_str().unwrap().contains("warden start api"), "{gave_up}");
+    assert_eq!(got.iter().filter(|v| v["kind"] == "crash_loop").count(), 1, "one loop, one alert: {got:#?}");
+    assert!(hooks.recv_timeout(Duration::from_millis(300)).is_err(), "no second webhook");
+    assert!(!d.log().contains("s3cr3t"), "the webhook's secret never reaches the log:\n{}", d.log());
+
+    // The resource history has boom's restarts (committed every 10 s).
+    let t0 = Instant::now();
+    loop {
+        let h = d.request(r#"{"cmd":"history","app":"boom"}"#);
+        assert_eq!(h["ok"], true, "{h}");
+        let hist = &h["history"];
+        let sum = |key: &str| -> u64 {
+            hist["apps"][0][key].as_array().map(|a| a.iter().filter_map(Value::as_u64).sum()).unwrap_or(0)
+        };
+        if sum("restarts") > 0 && sum("rss_bytes") > 0 {
+            assert_eq!(hist["step_s"], 10);
+            let n = hist["points"].as_u64().unwrap() as usize;
+            assert_eq!(hist["apps"][0]["workers_ready"].as_array().unwrap().len(), n);
+            assert_eq!(hist["host"]["cpu_percent"].as_array().unwrap().len(), n);
+            assert!(hist["host"]["mem_total_bytes"].as_u64() > Some(0), "{hist}");
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(40), "no restarts in the history: {hist}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn wardend_alert_rules_are_checked_and_reloaded() {
+    let f = Fleet::new("wd-alert-rules");
+    let file = f.home.join("wardend.toml");
+    // No file: nothing to check, no alerts.
+    let out = f.ok(&["daemon", "check"]);
+    assert!(out.contains("wardend sends no alerts"), "{out}");
+    // Every problem, with where it is and how to fix it.
+    std::fs::write(&file, "[[alert]]\non = [\"crashes\"]\nwebhook = \"ftp://x/s3cr3t\"\n\n[[alert]]\non = [\"all\"]\n")
+        .unwrap();
+    let (code, out) = f.cli(&["daemon", "check"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("has 3 problems"), "{out}");
+    assert!(out.contains("alert #1 (line 1): unknown event \"crashes\""), "{out}");
+    assert!(out.contains("alert #1 (line 1): webhook ftp://x/… must start with https://"), "{out}");
+    assert!(out.contains("alert #2 (line 5): needs `command"), "{out}");
+    assert!(!out.contains("s3cr3t"), "{out}");
+    let good = "[[alert]]\nname = \"ops\"\non = [\"gave_up\", \"died\"]\ncommand = [\"/bin/true\"]\n";
+    std::fs::write(&file, good).unwrap();
+    let out = f.ok(&["daemon", "check"]);
+    assert!(out.contains("ok, 1 alert rule"), "{out}");
+    assert!(out.contains("ops: gave_up, died of every app → command /bin/true (min_interval 5m)"), "{out}");
+    let other = f.home.join("other.toml.txt");
+    std::fs::write(&other, "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/true\"]\napps = [\"ghost\"]\n").unwrap();
+    let out = f.ok(&["daemon", "check", "-c", other.to_str().unwrap()]);
+    assert!(out.contains("no app \"ghost\" on this host"), "{out}");
+    let (code, out) = f.cli(&["daemon", "reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("wardend is not running"), "{out}");
+
+    let mut d = Wardend::start(&f, &[]);
+    wait_log(&d, "alert rules read rules=1");
+    // A bad file: the running rules stay, and the reload says why.
+    std::fs::write(&file, "[[alert]]\non = [\"all\"]\ncommand = \"/bin/true\"\n").unwrap();
+    let (code, out) = f.cli(&["daemon", "reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("keeps the 1 rule in force") && out.contains("line 3"), "{out}");
+    wait_log(&d, "wardend.toml has errors; keeping the alert rules in force");
+    // Fixed, and read again on SIGHUP (which no longer stops wardend).
+    std::fs::write(&file, format!("{good}\n[[alert]]\non = [\"all\"]\ncommand = [\"/bin/true\"]\n")).unwrap();
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    wait_log(&d, "alert rules read rules=2 file=");
+    assert!(d.log().contains("on=SIGHUP"), "{}", d.log());
+    assert!(d.child.try_wait().unwrap().is_none(), "still running after SIGHUP");
+    let out = f.ok(&["daemon", "reload"]);
+    assert!(out.contains("2 alert rules loaded from"), "{out}");
+
+    // The history answers at once, with the host's series on one grid.
+    let h = d.request(r#"{"cmd":"history","app":"","step_s":60}"#);
+    assert_eq!(h["ok"], true, "{h}");
+    assert_eq!(h["history"]["step_s"], 60);
+    let n = h["history"]["points"].as_u64().unwrap();
+    assert!((1440..=1442).contains(&n), "24 h at one point a minute: {n}");
+    assert_eq!(h["history"]["host"]["load1"].as_array().unwrap().len() as u64, n);
+    assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
+}
+
 // ---- subscribe (event stream)
 
 use std::io::BufRead;

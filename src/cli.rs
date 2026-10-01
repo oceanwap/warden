@@ -69,6 +69,9 @@ for live events; apps never depend on it and keep running without it):
     daemon status    wardend's pid and every app it watches  [--json]; exit 1 when
                      it is not running
     daemon stop      Stop wardend; every app keeps running (`warden kill` stops it too)
+    daemon check     Validate the alert rules in <config dir>/wardend.toml (or -c FILE)
+    daemon reload    Make the running wardend read wardend.toml again (as SIGHUP does);
+                     on an error it keeps the rules it had
     events [target]  Live events, one line each: workers, rollouts, supervisors
                      [--json] (NDJSON)  [--logs] (log lines too)  [--interval MS]
                      From wardend when it runs, else from the apps' sockets
@@ -160,6 +163,10 @@ pub enum DaemonCmd {
     },
     Status,
     Stop,
+    /// `warden daemon check [-c FILE]`: validate wardend.toml.
+    Check,
+    /// `warden daemon reload`: the running wardend reads it again.
+    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,7 +606,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 None | Some("start") | Some("run") => DaemonCmd::Run { background, resurrect },
                 Some("status") => DaemonCmd::Status,
                 Some("stop") => DaemonCmd::Stop,
-                Some(other) => return Err(format!("daemon {other:?}: expected `status`, `stop` or nothing")),
+                Some("check") => DaemonCmd::Check,
+                Some("reload") => DaemonCmd::Reload,
+                Some(other) => {
+                    return Err(format!("daemon {other:?}: expected `status`, `stop`, `check`, `reload` or nothing"));
+                }
             })
         }
         "events" => {
@@ -1082,6 +1093,11 @@ mod tests {
         assert_eq!(p("daemon status").unwrap().command, Command::Daemon(DaemonCmd::Status));
         assert!(p("daemon status --json").unwrap().json);
         assert_eq!(p("daemon stop").unwrap().command, Command::Daemon(DaemonCmd::Stop));
+        assert_eq!(p("daemon check").unwrap().command, Command::Daemon(DaemonCmd::Check));
+        let a = p("daemon check -c /tmp/wardend.toml").unwrap();
+        assert_eq!((a.command, a.config), (Command::Daemon(DaemonCmd::Check), Some("/tmp/wardend.toml".into())));
+        assert_eq!(p("wardend reload").unwrap().command, Command::Daemon(DaemonCmd::Reload));
+        assert!(p("daemon reload --background").is_err());
         assert!(p("daemon frobnicate").is_err());
         assert!(p("daemon stop now").is_err());
         assert!(p("start app.js --background").is_err(), "only for the daemon");

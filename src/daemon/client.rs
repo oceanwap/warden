@@ -220,6 +220,91 @@ pub async fn status(json: bool) -> i32 {
     0
 }
 
+// ------------------------------------------------------------------ alerts
+
+/// `warden daemon check [-c FILE]`: validate the alert rules
+/// (`<config dir>/wardend.toml`, or FILE). Exit 1 on any problem.
+pub fn check(file: Option<std::path::PathBuf>) -> i32 {
+    use super::alerts;
+    let (path, explicit) = match file {
+        Some(p) => (p, true),
+        None => (alerts::path(), false),
+    };
+    let cfg = match alerts::load(&path) {
+        Ok(Some(c)) => c,
+        Ok(None) if explicit => {
+            eprintln!("warden: {} does not exist", path.display());
+            return 1;
+        }
+        Ok(None) => {
+            println!(
+                "{}: not there, so wardend sends no alerts (an example: `[[alert]]` in docs/protocol.md, \"Alerts\")",
+                path.display()
+            );
+            return 0;
+        }
+        Err(problems) => {
+            let n = problems.len();
+            eprintln!("warden: {} has {n} problem{}:", path.display(), if n == 1 { "" } else { "s" });
+            for p in &problems {
+                eprintln!("  - {p}");
+            }
+            eprintln!("A running wardend keeps the rules it has until the file is fixed (`warden daemon reload`).");
+            return 1;
+        }
+    };
+    let n = cfg.rules.len();
+    println!("{}: ok, {n} alert rule{}", path.display(), if n == 1 { "" } else { "s" });
+    let known: Vec<String> = fleet::discover().into_iter().map(|a| a.name).collect();
+    let mut notes = cfg.notes.clone();
+    for r in &cfg.rules {
+        let kinds = r.kinds();
+        let on = if kinds.len() == alerts::AlertKind::ALL.len() {
+            "all events".to_string()
+        } else {
+            kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+        };
+        let apps = if r.apps.is_empty() { "every app".to_string() } else { r.apps.join(", ") };
+        println!(
+            "  {}: {on} of {apps} → {} (min_interval {})",
+            r.name,
+            r.target.shown(),
+            alerts::show_duration(r.min_interval)
+        );
+        for a in r.apps.iter().filter(|a| !known.contains(a)) {
+            notes.push(format!("{}: there is no app {a:?} on this host (yet)", r.name));
+        }
+    }
+    println!(
+        "  crash loop: {} worker crashes within {}",
+        cfg.crash_loop_crashes,
+        alerts::show_duration(cfg.crash_loop_window)
+    );
+    for note in notes {
+        println!("warning: {note}");
+    }
+    0
+}
+
+/// `warden daemon reload`: the running wardend reads wardend.toml again.
+pub async fn reload() -> i32 {
+    let path = socket_path();
+    match request(&path, &DaemonRequest::Reload, Duration::from_secs(5)).await {
+        Ok(r) if r.ok => {
+            println!("wardend: {}", r.message.unwrap_or_else(|| "rules read again".into()));
+            0
+        }
+        Ok(r) => {
+            eprintln!("warden: {}", r.message.unwrap_or_else(|| "wardend refused".into()));
+            1
+        }
+        Err(e) => {
+            eprintln!("warden: {e}; nothing to reload (`warden daemon check` validates the file without it)");
+            1
+        }
+    }
+}
+
 // ------------------------------------------------------------------ events
 
 /// `warden events [app] [--json] [--logs] [--interval MS]`: from wardend
@@ -494,7 +579,8 @@ impl Printer {
                 eprintln!("warden: {app}: watching failed ({panic})");
                 true
             }
-            WatchMsg::Status { .. } | WatchMsg::RestartDue { .. } => true,
+            // The event's own line was printed from the bus.
+            WatchMsg::Status { .. } | WatchMsg::RestartDue { .. } | WatchMsg::Event { .. } => true,
         }
     }
 
