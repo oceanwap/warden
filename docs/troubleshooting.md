@@ -160,6 +160,20 @@ carries the same reason with a `hint=`.
 | `the resource history on disk is newer than the clock; dropping the samples from the future` | The system clock is behind the newest saved sample (it went back, or was not set yet at boot) | Check the clock (`timedatectl`, NTP); the charts continue from now |
 | `the last save of the resource history is still running; not saving it again at exit` | At a clean exit the previous snapshot's fsync had not finished within 2 s: the disk is very slow or hung | The file on disk is the previous snapshot (up to a minute old); check the disk (`dmesg`) |
 
+## The GUI over SSH (`warden-gui --ssh`)
+
+The GUI shows ssh's own message with the fix; the usual ones:
+
+| You see | Why | Fix |
+|---|---|---|
+| `Permission denied (publickey)` | The server refused every key the GUI's ssh offered (it never asks for a password) | `ssh-add` your key; `ssh user@host` in a terminal must work without a prompt. The GUI then tries again only every 10 minutes (Connection… → Connect tries at once) |
+| `Host key verification failed` | The host's key is not in `known_hosts` yet | Connect once with `ssh user@host` in a terminal and check the fingerprint |
+| `…'s host key has changed since you last connected` | The key differs from the one in `known_hosts`: a reinstalled host, or someone in between | Check the new fingerprint with the host's administrator, then run the `ssh-keygen -R` line shown; if the change is unexpected, do not connect |
+| `nothing answers on <socket> on <host>` (`ssh: channel N: open failed: connect failed`) | wardend is not running there, runs as another user or with another socket, or that sshd does not forward Unix sockets | Start wardend (the button, or `warden daemon --background` there); fix the remote socket (`/run/warden/wardend.sock` for root's, `/run/user/<uid>/warden/wardend.sock` for a user's); in the remote `sshd_config`, `AllowStreamLocalForwarding yes` and neither `AllowTcpForwarding no` nor `DisableForwarding yes` |
+| `warden was not found on <host>` | The remote shell has no `warden` on its PATH (ssh runs commands without your login profile) | Install it there, or give its path: `--remote-warden ~/.local/bin/warden`, or in Connection… |
+| `the SSH tunnel to <host> ended: its ssh process was killed` | Something killed the GUI's ssh | Nothing to do: the GUI opens a new tunnel |
+| `Connection refused`, `timed out`, `No route to host`, `Could not resolve hostname` | The host or its sshd is down or unreachable, or the name is wrong | Check the host and its port (`~/.ssh/config`); the GUI keeps retrying |
+
 ## Containers
 
 - Don't run Warden as PID 1: orphaned grandchildren are never reaped. Use

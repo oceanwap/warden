@@ -142,16 +142,59 @@ pub fn shell_join<S: AsRef<str>>(argv: &[S]) -> String {
     argv.iter().map(|a| shell_quote(a.as_ref())).collect::<Vec<_>>().join(" ")
 }
 
+/// ssh failed for a reason that trying again will not fix: the server
+/// refused the login, or the host key is unknown or changed. Retrying such
+/// a login every few seconds fills the server's auth log, and tools like
+/// fail2ban ban the address after a few failures.
+pub fn needs_you(stderr: &str) -> bool {
+    [
+        "Permission denied",
+        "Host key verification failed",
+        "REMOTE HOST IDENTIFICATION HAS CHANGED",
+        "Too many authentication failures",
+    ]
+    .iter()
+    .any(|s| stderr.contains(s))
+}
+
+/// Why a tunnel could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenError {
+    pub message: String,
+    /// Trying again will not help until the user does something (`needs_you`).
+    pub needs_you: bool,
+}
+
+impl From<String> for OpenError {
+    fn from(message: String) -> OpenError {
+        OpenError { message, needs_you: false }
+    }
+}
+
 /// ssh failed: what it said, and how to fix the usual causes.
 pub fn explain(dest: &str, stderr: &str, exit: Option<i32>) -> String {
     let said = stderr.trim();
-    let last = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let last = said.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_end_matches('.');
     let fix = if said.contains("Permission denied") {
         format!(
             "the GUI logs in with your SSH agent and keys only, never a password: `ssh-add` your key, and check that \
              `ssh {dest}` works in a terminal without a password prompt"
         )
-    } else if said.contains("Host key verification failed") || said.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+    } else if said.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        // ssh prints the exact command that removes the old key.
+        let remove = said
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("ssh-keygen ") && l.contains(" -R "))
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("ssh-keygen -R <the host name of {dest}>"));
+        format!(
+            "{dest}'s host key has changed since you last connected. If the host was reinstalled or its keys \
+             replaced, check the new key's fingerprint with its administrator, then remove the old one (`{remove}`) \
+             and connect once with `ssh {dest}` in a terminal; if not, someone may be intercepting the connection: \
+             do not connect"
+        )
+    } else if said.contains("Host key verification failed") {
         format!("connect once with `ssh {dest}` in a terminal to check and accept the host key")
     } else if said.contains("Could not resolve hostname") {
         format!("check the host name in {dest:?} (or add a Host entry to ~/.ssh/config)")
@@ -164,6 +207,11 @@ pub fn explain(dest: &str, stderr: &str, exit: Option<i32>) -> String {
             .into()
     } else if said.contains("forwarding") || said.contains("bind") {
         "ssh could not set up the socket forward: check the local and remote socket paths".into()
+    } else if ["closed by remote host", "Broken pipe", "not responding", "Connection reset", "Connection closed"]
+        .iter()
+        .any(|s| said.contains(s))
+    {
+        "the connection dropped (the network, or sshd on that host restarted); the GUI connects again by itself".into()
     } else {
         format!("check that `ssh {dest}` works in a terminal")
     };
@@ -173,6 +221,22 @@ pub fn explain(dest: &str, stderr: &str, exit: Option<i32>) -> String {
     } else {
         format!("ssh to {dest} failed{code}: {last}; {fix}")
     }
+}
+
+/// A connection through the tunnel to `dest` ended before wardend
+/// answered: why, with ssh's last word on it (`ssh_said`). sshd answers
+/// "connect failed" whatever the cause (no socket, nothing listening, no
+/// permission, forwarding not allowed), so every likely one is named, the
+/// most likely first.
+pub fn explain_channel(dest: &str, remote_socket: &str, ssh_said: &str) -> String {
+    let said = if ssh_said.is_empty() { String::new() } else { format!(" (ssh: {ssh_said})") };
+    format!(
+        "nothing answers on {remote_socket} on {dest}{said}. wardend is not running there: start it (`warden daemon \
+         --background`, or Start wardend); or it runs as another user or with another socket (root's wardend: \
+         /run/warden/wardend.sock; a user's: /run/user/<uid>/warden/wardend.sock); or sshd there does not forward \
+         sockets (its sshd_config needs `AllowStreamLocalForwarding yes`, the default, and neither \
+         `AllowTcpForwarding no` nor `DisableForwarding yes`)"
+    )
 }
 
 /// A private directory for the local ends of tunnels: whoever can connect
@@ -206,17 +270,29 @@ pub fn local_socket() -> Result<PathBuf, String> {
     Ok(private_dir()?.join(format!("{}-{n}.sock", std::process::id())))
 }
 
+/// What ssh wrote to stderr: its last lines, and how many there were.
+#[derive(Default)]
+struct Stderr {
+    lines: VecDeque<String>,
+    total: u64,
+}
+
+/// Lines of ssh's stderr kept.
+const STDERR_KEEP: usize = 20;
+
 /// A running `ssh -N -L …`. Dropping it kills ssh and removes the socket.
 pub struct Tunnel {
     child: tokio::process::Child,
     pub local: PathBuf,
     pub dest: String,
-    stderr: Arc<Mutex<VecDeque<String>>>,
+    /// wardend's socket on the remote host.
+    pub remote: String,
+    stderr: Arc<Mutex<Stderr>>,
 }
 
 impl Tunnel {
     /// Start ssh and wait until the local socket exists.
-    pub async fn open(t: &Target) -> Result<Tunnel, String> {
+    pub async fn open(t: &Target) -> Result<Tunnel, OpenError> {
         let local = local_socket()?;
         let args = tunnel_args(t, &local)?;
         let mut child = tokio::process::Command::new("ssh")
@@ -232,22 +308,23 @@ impl Tunnel {
                 }
                 _ => format!("cannot run ssh: {e}"),
             })?;
-        let stderr = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr = Arc::new(Mutex::new(Stderr::default()));
         if let Some(err) = child.stderr.take() {
             let keep = stderr.clone();
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(err).lines();
                 while let Ok(Some(l)) = lines.next_line().await {
                     if let Ok(mut q) = keep.lock() {
-                        if q.len() == 20 {
-                            q.pop_front();
+                        if q.lines.len() == STDERR_KEEP {
+                            q.lines.pop_front();
                         }
-                        q.push_back(l);
+                        q.lines.push_back(l);
+                        q.total += 1;
                     }
                 }
             });
         }
-        let mut tunnel = Tunnel { child, local, dest: t.dest.clone(), stderr };
+        let mut tunnel = Tunnel { child, local, dest: t.dest.clone(), remote: t.remote_socket.clone(), stderr };
         let t0 = tokio::time::Instant::now();
         loop {
             if tunnel.local.exists() {
@@ -256,16 +333,16 @@ impl Tunnel {
             if let Ok(Some(st)) = tunnel.child.try_wait() {
                 // Let the reader take ssh's last words.
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                return Err(explain(&tunnel.dest, &tunnel.stderr_text(), st.code()));
+                return Err(OpenError { message: tunnel.why(st), needs_you: needs_you(&tunnel.stderr_text()) });
             }
             if t0.elapsed() > OPEN_TIMEOUT {
-                return Err(format!(
+                return Err(OpenError::from(format!(
                     "ssh to {} did not set up the tunnel within {} s ({}); check that `ssh {}` works in a terminal",
                     tunnel.dest,
                     OPEN_TIMEOUT.as_secs(),
                     tunnel.stderr_text().trim().lines().last().unwrap_or("no output"),
                     tunnel.dest
-                ));
+                )));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -274,16 +351,56 @@ impl Tunnel {
     /// What ssh wrote to stderr lately.
     pub fn stderr_text(&self) -> String {
         match self.stderr.lock() {
-            Ok(q) => q.iter().cloned().collect::<Vec<_>>().join("\n"),
+            Ok(q) => q.lines.iter().cloned().collect::<Vec<_>>().join("\n"),
             Err(_) => String::new(),
+        }
+    }
+
+    /// Lines ssh wrote to stderr so far.
+    pub fn stderr_lines(&self) -> u64 {
+        self.stderr.lock().map(|q| q.total).unwrap_or(0)
+    }
+
+    /// The lines ssh wrote after the first `from` (of those still kept).
+    pub fn stderr_since(&self, from: u64) -> Vec<String> {
+        match self.stderr.lock() {
+            Ok(q) => {
+                let new = q.total.saturating_sub(from).min(q.lines.len() as u64) as usize;
+                q.lines.iter().skip(q.lines.len() - new).cloned().collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Why ssh exited, with the fix.
+    fn why(&self, st: std::process::ExitStatus) -> String {
+        use std::os::unix::process::ExitStatusExt;
+        match st.signal() {
+            // Killed: by a person, a script, the OOM killer. It says nothing.
+            Some(sig) => format!(
+                "the SSH tunnel to {} ended: its ssh process was killed (signal {sig}); the GUI opens it again",
+                self.dest
+            ),
+            None => explain(&self.dest, &self.stderr_text(), st.code()),
         }
     }
 
     /// Wait for ssh to exit; why it did, with the fix.
     pub async fn exited(&mut self) -> String {
-        let code = self.child.wait().await.ok().and_then(|s| s.code());
+        let st = self.child.wait().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        explain(&self.dest, &self.stderr_text(), code)
+        match st {
+            Ok(st) => self.why(st),
+            Err(e) => format!("the SSH tunnel to {} ended (waiting for ssh failed: {e})", self.dest),
+        }
+    }
+
+    /// Why ssh exited, if it did (without waiting).
+    pub fn ended(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(st)) => Some(self.why(st)),
+            _ => None,
+        }
     }
 
     pub fn is_alive(&mut self) -> bool {
@@ -378,6 +495,40 @@ mod tests {
                 .contains("remote socket")
         );
         assert!(explain("u@h", "", Some(1)).contains("without saying why"));
+        let changed = "@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nremove with:\n  \
+                       ssh-keygen -f '/home/u/.ssh/known_hosts' -R 'web-1'\nHost key verification failed.";
+        let e = explain("u@h", changed, Some(255));
+        assert!(e.contains("host key has changed"), "{e}");
+        assert!(e.contains("`ssh-keygen -f '/home/u/.ssh/known_hosts' -R 'web-1'`"), "{e}");
+        assert!(!e.contains("accept the host key"), "never advise accepting a changed key: {e}");
+        let e = explain("u@h", "Connection to 10.0.0.1 closed by remote host.", Some(255));
+        assert!(e.contains("connects again by itself"), "{e}");
+    }
+
+    #[test]
+    fn logins_that_need_the_user_are_told_apart() {
+        assert!(needs_you("u@h: Permission denied (publickey)."));
+        assert!(needs_you(
+            "No ED25519 host key is known for h and you have requested strict checking.\nHost key verification failed."
+        ));
+        assert!(needs_you("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @"));
+        assert!(!needs_you("ssh: connect to host h port 22: Connection refused"));
+        assert!(
+            !needs_you("ssh: Could not resolve hostname h: Temporary failure in name resolution"),
+            "offline laptops"
+        );
+        assert!(!needs_you(""));
+    }
+
+    #[test]
+    fn channel_failures_name_every_likely_cause() {
+        let open_failed = "channel 2: open failed: connect failed: open failed";
+        let e = explain_channel("u@h", "/run/warden/wardend.sock", open_failed);
+        assert!(e.contains("nothing answers on /run/warden/wardend.sock on u@h (ssh: channel 2: open failed"), "{e}");
+        for cause in ["warden daemon --background", "another user", "AllowStreamLocalForwarding"] {
+            assert!(e.contains(cause), "{cause}: {e}");
+        }
+        assert!(!explain_channel("u@h", "/s", "").contains("(ssh:"));
     }
 
     #[test]
