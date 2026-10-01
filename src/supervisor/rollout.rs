@@ -1304,8 +1304,18 @@ impl Supervisor {
     pub(super) fn abort_rollout(&mut self, reason: &str) {
         // Every worker was replaced already, or its failure was reported:
         // that stays the outcome.
-        if let Some(Roll { step: Step::Ending { ok, message }, .. }) = &mut self.roll {
-            let (ok, message) = (*ok, message.take());
+        if let Some(Roll { step: Step::Ending { ok, message }, draining, .. }) = &mut self.roll {
+            let (ok, message, left) = (*ok, message.take(), draining.len());
+            // Old workers still draining are stopped with everything else
+            // (they were signalled already; they leave within their grace
+            // period): the outcome must not read as if none were left.
+            let message = match (message, left) {
+                (Some(m), n) if n > 0 => Some(format!("{m}; stopped while {n} old worker(s) were still draining")),
+                (None, n) if n > 0 => Some(format!(
+                    "every worker replaced; stopped ({reason}) while {n} old worker(s) were still draining"
+                )),
+                (m, _) => m,
+            };
             self.end_rollout(ok, message, !ok);
         } else if self.roll.is_some() {
             self.end_rollout(false, Some(format!("aborted: {reason}")), false);

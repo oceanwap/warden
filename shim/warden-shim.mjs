@@ -152,7 +152,7 @@ function wardenServe(options, ...rest) {
     appUsesNodeHttp = true;
     if (longLived) watchBunNodeServer();
   }
-  const own = drains && opts !== options && !nodeHttp && typeof options.fetch === "function";
+  const own = drains && opts !== options && !nodeHttp && runsAppHandler(options);
   // A server started while draining (rare) drains from its first request.
   const server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
   servers.add(server);
@@ -192,19 +192,58 @@ function withShimOptions(options) {
   return o;
 }
 
-// `o` with a fetch handler that adds `Connection: close` to every response:
-// what a server runs once its drain has started. A result that is not a
-// promise stays synchronous.
+// Does this Bun.serve() call run the app's own handlers: a `fetch` function
+// and/or `routes`?
+const runsAppHandler = (o) => typeof o.fetch === "function" || (!!o.routes && typeof o.routes === "object");
+
+// `o` with handlers that add `Connection: close` to every response: what a
+// server runs once its drain has started. That is `fetch`, every function in
+// `routes` (a static Response there becomes a function answering with a copy)
+// and `error`. A result that is not a promise stays synchronous.
 function drainingOptions(o) {
-  const fetch = o.fetch;
   const d = Object.create(o);
-  d.fetch = function (req, server) {
-    const res = fetch.call(this, req, server);
+  if (typeof o.fetch === "function") d.fetch = closing(o.fetch);
+  if (o.routes && typeof o.routes === "object") d.routes = closingRoutes(o.routes);
+  if (typeof o.error === "function") d.error = closing(o.error);
+  return d;
+}
+
+function closing(handler) {
+  return function (...args) {
+    const res = handler.apply(this, args);
     if (res instanceof Response) return connectionClose(res);
     if (res && typeof res.then === "function") return res.then(connectionClose);
     return res;
   };
-  return d;
+}
+
+const HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
+
+// Bun's `routes`: a handler, a static Response, or an object of handlers by
+// HTTP method. Anything else (an HTML import, `false`) is left as it is.
+function closingRoute(route) {
+  if (typeof route === "function") return closing(route);
+  if (route instanceof Response) {
+    return () => {
+      try {
+        return connectionClose(route.clone());
+      } catch {
+        return route;
+      }
+    };
+  }
+  if (route && typeof route === "object" && Object.keys(route).length > 0 && Object.keys(route).every((k) => HTTP_METHODS.has(k))) {
+    const byMethod = {};
+    for (const k of Object.keys(route)) byMethod[k] = closingRoute(route[k]);
+    return byMethod;
+  }
+  return route;
+}
+
+function closingRoutes(routes) {
+  const out = {};
+  for (const k of Object.keys(routes)) out[k] = closingRoute(routes[k]);
+  return out;
 }
 
 function connectionClose(r) {
@@ -250,7 +289,7 @@ function interceptReload(proto, native) {
       // Bun keeps the handler it has when the new options bring none.
       if (typeof options.fetch !== "function" && typeof app.opts.fetch === "function") o.fetch = app.opts.fetch;
       app.opts = o;
-      return Reflect.apply(native, this, [draining && typeof o.fetch === "function" ? drainingOptions(o) : o, ...rest]);
+      return Reflect.apply(native, this, [draining && runsAppHandler(o) ? drainingOptions(o) : o, ...rest]);
     },
   }.reload;
   nativeSource.set(reload, native);
@@ -264,7 +303,7 @@ function interceptReload(proto, native) {
 // started with.
 function drainBunApps() {
   for (const [server, app] of bunApps) {
-    if (typeof app.opts.fetch !== "function") continue;
+    if (!runsAppHandler(app.opts)) continue;
     try {
       Reflect.apply(app.reload, server, [drainingOptions(app.opts)]);
     } catch (e) {
@@ -339,13 +378,19 @@ function untrackPrivateConn() {
 // deals with those.
 const nodeBusy = (sock) => !!sock._httpMessage;
 
+// An https server's "connection" event hands over the raw TCP socket; the
+// HTTP parser and `_httpMessage` live on the TLSSocket that "secureConnection"
+// carries, so that is the one to track (on the raw socket nothing is ever
+// in flight and a drain would cut every slow request).
+const isTlsServer = (server) => typeof server.setSecureContext === "function";
+
 function trackNodeServer(server) {
   if (servers.has(server)) return;
   servers.add(server);
   if (isHttpServer(server)) {
     appUsesNodeHttp = true;
     if (longLived) trackNodeUpgrades(server);
-    if (drains) server.on("connection", trackConn);
+    if (drains) server.on(isTlsServer(server) ? "secureConnection" : "connection", trackConn);
   }
   server.once("listening", () => {
     const addr = server.address();

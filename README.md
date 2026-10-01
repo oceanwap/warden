@@ -862,10 +862,19 @@ Limitations:
 - Outside a drain the shim adds no work to a request: a `Bun.serve` app's
   own fetch handler answers it, and on Node it keeps one entry per open
   connection, nothing per request. When a drain starts, each `Bun.serve`
-  server gets a handler that adds `Connection: close` through
-  `server.reload()`; the shim intercepts `reload()` on Bun's server
-  prototype, so an app's own `server.reload()` still works (and a drain
-  never brings back a handler the app replaced).
+  server gets handlers that add `Connection: close` through
+  `server.reload()`: `fetch`, every function in `routes` (a static
+  `Response` there becomes a function answering with a copy of it) and
+  `error`; the shim intercepts `reload()` on Bun's server prototype, so an
+  app's own `server.reload()` still works (and a drain never brings back a
+  handler the app replaced). A Node `https` server is tracked on its TLS
+  connections. Known gap: `http2` servers are not tracked.
+- The shim reports to Warden over a blocking socket. A supervisor that stops
+  reading (SIGSTOPped, or hung) for several minutes fills it with
+  heartbeats, and the workers then block writing the next one; a dead
+  supervisor is not the same (workers are signalled and carry on or exit).
+  `[watchdog]` on the supervisor itself (systemd's `WatchdogSec=`) is what
+  covers a hung supervisor.
 - On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
   bodies in a drain (one call frame per `new Response`, which JSC inlines:
   no measurable difference, `bench/shim-cost.ts`). The wrappers pass for

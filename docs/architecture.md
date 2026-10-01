@@ -142,14 +142,16 @@ in worker mode. Enabled by default when `command` is `bun`. It:
    and `warden_worker_event_loop_delay_*_seconds` show it, and
    `[watchdog] loop_delay_warn` warns when p99 stays high for 10 s;
 4. on SIGTERM (process mode) or a `shutdown` message (worker mode) drains:
-   stop listeners, add `Connection: close` (Bun `fetch` handlers and
-   `node:http` responses), wait `drain_ms` and for in‑flight requests, exit 0.
+   stop listeners, add `Connection: close` (Bun `fetch` handlers, `routes`
+   and `error` handlers, and `node:http` / `node:https` responses), wait
+   `drain_ms` and for in‑flight requests, exit 0.
    Until the drain it adds nothing per request: `Bun.serve` runs the app's
    own handler, and the drain swaps in one that adds the header with
    `server.reload()` (requests in flight finish with the old one; verified
    on Bun 1.3.13 to keep routes, the error handler and open WebSockets);
    `node:http` requests in flight are read off the open connections
-   (`socket._httpMessage`) when the drain needs them, and responses get the
+   (`socket._httpMessage`; for `https` the TLS socket, which carries it, not
+   the raw TCP one) when the drain needs them, and responses get the
    header through `ServerResponse.prototype` patched at the drain's start.
    The app's own SIGTERM handlers (NestJS `enableShutdownHooks`) are deferred
    until the drain is done — otherwise Nest closes every connection at once
@@ -302,7 +304,11 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
 - **Deploys.** A standby runs the code it started with. While a reload,
   safe-reload or restart runs, standbys are neither promoted nor started
   (a crash restarts cold, on the new code like before). When it succeeds,
-  every standby is stopped and fresh ones go through the gates; when it fails
+  every standby is stopped and fresh ones go through the gates (this
+  happens after the rollout's "complete" line and its `warden restart`
+  return, and for about half a second the host runs `count + 2 × standbys`
+  processes: the old standbys and the new ones; it is outside the
+  `max_draining` and `surge` limits); when it fails
   or rolls back they stay, matching the workers that kept the previous
   version. Recycling (`Kind::Replace`: memory, lifetime, health, hang) keeps
   the code, so an available standby is the replacement: it listens next to

@@ -64,6 +64,18 @@ pub enum Reason {
     Unknown,
 }
 
+/// The exit code a shell reports for a child that died of SIGKILL (128 + 9).
+pub const SHELL_SIGKILL: i32 = 128 + libc::SIGKILL;
+
+/// The signal to ask the OOM counter about: the SIGKILL that ended the
+/// process, or the one a shell wrapper reports as exit code 137.
+pub fn kill_signal(code: Option<i32>, signal: Option<i32>) -> Option<i32> {
+    match (code, signal) {
+        (Some(SHELL_SIGKILL), None) => Some(libc::SIGKILL),
+        _ => signal,
+    }
+}
+
 /// What the wait status and Warden's own records say about one death.
 /// `oom`: what the cgroup's OOM kill count says (`OomTracker::verdict`). A
 /// SIGKILL Warden sent is Warden's, even if the counter moved meanwhile (a
@@ -79,6 +91,11 @@ pub fn classify(code: Option<i32>, signal: Option<i32>, sent: Sent, stop: i32, o
         (_, Some(s)) if crash_signal(s).is_some() => Reason::Crashed(s),
         (_, Some(s)) => Reason::Killed(s),
         (Some(c), None) if sent.has(stop) => Reason::AfterStop { stop, code: Some(c) },
+        // A shell wrapper (`sh -c 'bun app.ts'`) whose child was SIGKILLed
+        // exits with 128 + 9 itself: the same death, one process removed.
+        (Some(SHELL_SIGKILL), None) if oom == OomVerdict::Certain => Reason::Oom,
+        (Some(SHELL_SIGKILL), None) if oom == OomVerdict::Probable => Reason::OomProbable,
+        (Some(SHELL_SIGKILL), None) if oom == OomVerdict::Possible => Reason::KilledOrOom,
         (Some(c), None) => Reason::Code(c),
         (None, None) => Reason::Unknown,
     }
@@ -544,6 +561,16 @@ mod tests {
         let none = Sent::default();
         let k = Some(libc::SIGKILL);
         assert_eq!(classify(Some(1), None, none, TERM, V::No), Code(1));
+        // A shell wrapper reports its SIGKILLed child as exit code 137: the
+        // counter decides, as for a SIGKILL of the process itself.
+        assert_eq!(kill_signal(Some(137), None), Some(libc::SIGKILL));
+        assert_eq!(kill_signal(Some(1), None), None);
+        assert_eq!(kill_signal(None, Some(libc::SIGTERM)), Some(libc::SIGTERM));
+        assert_eq!(classify(Some(137), None, none, TERM, V::Certain), Oom);
+        assert_eq!(classify(Some(137), None, none, TERM, V::Probable), OomProbable);
+        assert_eq!(classify(Some(137), None, none, TERM, V::Possible), KilledOrOom);
+        assert_eq!(classify(Some(137), None, none, TERM, V::No), Code(137), "no kill counted: an exit code");
+        assert_eq!(classify(Some(137), None, sent(&[TERM]), TERM, V::No), AfterStop { stop: TERM, code: Some(137) });
         assert_eq!(classify(None, k, none, TERM, V::Certain), Oom, "the counter rose: OOM");
         assert_eq!(classify(None, k, sent(&[TERM]), TERM, V::Certain), Oom, "killed while draining");
         assert_eq!(classify(None, k, none, TERM, V::Probable), OomProbable);

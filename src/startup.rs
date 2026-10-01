@@ -558,9 +558,10 @@ fn linger() -> i32 {
 }
 
 /// The `warden@<app>` instances this manager runs (or is starting or stopping).
-fn running_instances(scope: Scope) -> Vec<String> {
+/// An error when systemd can't say (the template then stays: see the caller).
+fn running_instances(scope: Scope) -> Result<Vec<String>, String> {
     let args = ["list-units", "--plain", "--no-legend", "--state=active,activating,deactivating,reloading"];
-    let out = fleet::systemctl_output(scope, &[&args[..], &["warden@*.service"]].concat()).unwrap_or_default();
+    let out = fleet::systemctl_output(scope, &[&args[..], &["warden@*.service"]].concat())?;
     let mut v: Vec<String> = out
         .lines()
         .filter_map(|l| l.split_whitespace().next())
@@ -569,7 +570,7 @@ fn running_instances(scope: Scope) -> Vec<String> {
         .collect();
     v.sort();
     v.dedup();
-    v
+    Ok(v)
 }
 
 fn systemd_unstartup(args: &Args, scope: Scope) -> i32 {
@@ -604,8 +605,25 @@ fn systemd_unstartup(args: &Args, scope: Scope) -> i32 {
     // supervisor as hung every WatchdogSec and restarted it (CI,
     // service-managers.yml). So the template stays until no app runs under it.
     let running = running_instances(scope);
+    let listing_failed = running.is_err();
+    if let Err(e) = &running {
+        // Not knowing is not "none": deleting the template under running
+        // units is the half-configured state described above.
+        if template.exists() {
+            eprintln!(
+                "warden: {e}\n  hint: {} is kept, because it can't be told whether apps still run under it; run \
+                 `warden unstartup` again once `systemctl {}list-units 'warden@*'` works",
+                template.display(),
+                scope.shown(),
+            );
+            worst = 1;
+        }
+    }
+    let running = running.unwrap_or_default();
     if running.is_empty() {
-        worst = worst.max(remove(&template));
+        if template.exists() && !listing_failed {
+            worst = worst.max(remove(&template));
+        }
     } else if template.exists() {
         let apps: Vec<&str> =
             running.iter().filter_map(|u| u.strip_prefix("warden@")?.strip_suffix(".service")).collect();

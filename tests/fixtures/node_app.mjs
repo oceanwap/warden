@@ -3,18 +3,25 @@
 //   FIXTURE_SIGINT_ONLY=1     graceful stop on SIGINT only (PM2's default signal);
 //                             SIGTERM is ignored
 //   FIXTURE_BLOCK_MS=<ms>     block the event loop for <ms> every 400 ms (event-loop delay)
+//   FIXTURE_TLS_DIR=<dir>     serve https with <dir>/key.pem and <dir>/cert.pem
 // Endpoints: /whoami -> "<pid>:<NODE_APP_INSTANCE>", /slow?ms=N -> answers after N ms
+import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 
 const who = () => `${process.pid}:${process.env.NODE_APP_INSTANCE}`;
-const server = http.createServer((req, res) => {
+const handler = (req, res) => {
   const url = new URL(req.url, "http://x");
   if (url.pathname === "/slow") {
     setTimeout(() => res.end(who()), Number(url.searchParams.get("ms") || 500));
     return;
   }
   res.end(who());
-});
+};
+const dir = process.env.FIXTURE_TLS_DIR;
+const server = dir
+  ? https.createServer({ key: fs.readFileSync(`${dir}/key.pem`), cert: fs.readFileSync(`${dir}/cert.pem`) }, handler)
+  : http.createServer(handler);
 server.listen(Number(process.env.PORT), "127.0.0.1");
 
 if (process.env.FIXTURE_WAIT_READY) {

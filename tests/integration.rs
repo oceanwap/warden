@@ -4276,6 +4276,14 @@ fn startup_installs_system_units_and_wardend() {
     assert!(!f.home.join("units/wardend.service").exists(), "{out}");
     assert!(out.contains("kept, because api still runs under it") && out.contains("`warden kill api`"), "{out}");
 
+    // systemd that can't say what runs is not "nothing runs": the template stays.
+    let broken = ("systemctl", "list-units", 1, "Failed to connect to bus");
+    let fakes = Fakes::new(&f, &[broken]);
+    let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
+    assert_eq!(code, 1, "{out}");
+    assert!(f.home.join("units/warden@.service").exists(), "removed although the listing failed: {out}");
+    assert!(out.contains("can't be told whether apps still run under it"), "{out}");
+
     // Once nothing runs under it: everything goes, the sysctl file too.
     let fakes = Fakes::new(&f, &[]);
     let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
@@ -5411,6 +5419,60 @@ fn bun_drain_keeps_the_handler_the_app_reloaded() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// Bun `routes` (functions, a static Response, per-method handlers) and the
+/// `error` handler answer with `Connection: close` once a drain has started,
+/// like `fetch` does: a keep-alive client must not be left on the old worker.
+#[test]
+fn bun_drain_closes_connections_answered_by_routes_and_error_handlers() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"broutes\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 1\n\
+         [shutdown]\ndrain_ms = 4000\ngrace_period = 15\n",
+        fixture("bun_routes.ts")
+    );
+    let w = Warden::start("broutes", port, &cfg);
+    w.wait_for("ready", T, ready(1));
+    let paths = ["/r", "/api/7", "/static", "/m", "/async", "/throw", "/nothing-here"];
+    // One keep-alive connection per path, each used once before the drain
+    // (answered normally) and once during it.
+    let mut socks: Vec<TcpStream> = paths
+        .iter()
+        .map(|p| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            write!(s, "GET {p} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(!head.contains("connection: close"), "{p}: closed before any drain: {head}");
+            s
+        })
+        .collect();
+    let reload = {
+        let cfg = w.cfg.clone();
+        std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
+    };
+    w.wait_log("draining old process", T);
+    let t0 = Instant::now();
+    while listeners(port) != 1 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for (p, s) in paths.iter().zip(socks.iter_mut()) {
+        write!(s, "GET {p} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap_or(0);
+        let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 "), "{p}: no answer in the drain: {head:?}\n{}", w.log());
+        assert!(head.contains("connection: close"), "{p}: no Connection: close in the drain: {head}");
+    }
+    let out = reload.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// Node: a request in flight holds the drain until it is answered (the shim
 /// reads the requests in flight off the open connections; it adds nothing
 /// per request).
@@ -5444,6 +5506,67 @@ fn node_drain_waits_for_requests_in_flight() {
         "slow request cut by the drain: {r:?} {body:?}\n{}",
         w.log()
     );
+}
+
+/// Node over TLS: the connection the shim tracks is the TLS socket, not the
+/// raw TCP one (the HTTP state lives on it). On the raw one nothing was ever
+/// in flight and a drain cut every slow request.
+#[test]
+fn node_https_drain_waits_for_requests_in_flight() {
+    if !have_node() {
+        return;
+    }
+    let tls = std::env::temp_dir().join(format!("warden-it-tls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tls);
+    std::fs::create_dir_all(&tls).unwrap();
+    let made = Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2", "-subj", "/CN=localhost"])
+        .arg("-keyout")
+        .arg(tls.join("key.pem"))
+        .arg("-out")
+        .arg(tls.join("cert.pem"))
+        .output();
+    if !made.as_ref().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: no working openssl to make a test certificate ({made:?})");
+        return;
+    }
+    if !Command::new("curl").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: no curl");
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"nhttps\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n\
+         env = {{ FIXTURE_TLS_DIR = \"{}\" }}\n[workers]\ncount = 1\n\
+         [shutdown]\ndrain_ms = 100\ngrace_period = 15\n",
+        fixture("node_app.mjs"),
+        tls.display()
+    );
+    let w = Warden::start("nhttps", port, &cfg);
+    w.wait_for("ready", T, ready(1));
+    let url = format!("https://127.0.0.1:{port}/slow?ms=2500");
+    let slow: Vec<_> = (0..4)
+        .map(|_| {
+            let url = url.clone();
+            std::thread::spawn(move || {
+                Command::new("curl").args(["-sk", "--max-time", "20", "-w", " %{http_code}", &url]).output().unwrap()
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(500));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    for h in slow {
+        let o = h.join().unwrap();
+        let body = String::from_utf8_lossy(&o.stdout).to_string();
+        assert!(
+            o.status.success() && body.ends_with(" 200"),
+            "a slow https request was cut by the drain: curl {:?} {body:?}\n{}",
+            o.status.code(),
+            w.log()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tls);
 }
 
 /// None of the requests sent during a rolling replacement failed. Without

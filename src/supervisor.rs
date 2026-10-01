@@ -139,14 +139,29 @@ pub struct Supervisor {
     start_attempt: Option<StartAttempt>,
 }
 
+/// How many times each worker has to crash before one is ready for the app
+/// to count as unable to start. One crash can be a transient: a dependency
+/// that wasn't up for a moment, a port still held by the old process. The
+/// first restart is immediate, so a second crash follows at once for an app
+/// that is really broken.
+const START_FAIL_CRASHES: u32 = 2;
+
 /// A start of every worker that no worker has survived to be ready yet.
 #[derive(Debug, Default)]
 struct StartAttempt {
-    crashed: std::collections::BTreeSet<usize>,
+    /// Crashes per slot since the start.
+    crashes: std::collections::BTreeMap<usize, u32>,
     /// The last crash's reason (`exit code 1`, `not ready in time`).
     last_exit: Option<String>,
     /// The ERROR line saying so was logged (once per attempt).
     reported: bool,
+}
+
+impl StartAttempt {
+    /// Every slot crashed `START_FAIL_CRASHES` times, none ever ready.
+    fn every_slot_crashed(&self, ids: &[usize]) -> bool {
+        !ids.is_empty() && ids.iter().all(|id| self.crashes.get(id).copied().unwrap_or(0) >= START_FAIL_CRASHES)
+    }
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -1128,9 +1143,10 @@ impl Supervisor {
         // Warden's there is dying of SIGKILL at this moment to share it.
         let counter = inst.oom_counter.clone();
         let (oom, insts) = (&mut self.oom, &self.insts);
-        let verdict = oom.verdict(counter.as_deref(), signal, sent, Instant::now(), || {
-            insts.values().filter(|o| o.oom_counter == counter && o.handle.dying_of_sigkill()).count()
-        });
+        let verdict =
+            oom.verdict(counter.as_deref(), process::exit::kill_signal(code, signal), sent, Instant::now(), || {
+                insts.values().filter(|o| o.oom_counter == counter && o.handle.dying_of_sigkill()).count()
+            });
         let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), verdict);
         // A `note` (Warden lost track of it) is the whole story.
         let hint = if note.is_some() { None } else { cause.hint(counter.is_some()) };
@@ -1305,11 +1321,11 @@ impl Supervisor {
         let last = self.slots.get(&slot_id).and_then(|s| s.last_exit.clone());
         let ids = self.slot_ids();
         let Some(a) = self.start_attempt.as_mut() else { return };
-        a.crashed.insert(slot_id);
+        *a.crashes.entry(slot_id).or_insert(0) += 1;
         if last.is_some() {
             a.last_exit = last;
         }
-        if a.reported || !ids.iter().all(|id| a.crashed.contains(id)) {
+        if a.reported || !a.every_slot_crashed(&ids) {
             return;
         }
         a.reported = true;
@@ -1327,6 +1343,7 @@ impl Supervisor {
         error!(
             "app cannot start: every worker crashed before it was ready",
             workers = ids.len(),
+            crashes_each = START_FAIL_CRASHES,
             reason = reason,
             hint = format!(
                 "{why}. Warden keeps restarting it with backoff (FAILED after restart.max_restarts in \
@@ -1341,8 +1358,7 @@ impl Supervisor {
     fn start_failed(&self) -> Option<String> {
         let a = self.start_attempt.as_ref()?;
         let ids = self.slot_ids();
-        (!ids.is_empty() && ids.iter().all(|id| a.crashed.contains(id)))
-            .then(|| a.last_exit.clone().unwrap_or_else(|| "crashed".into()))
+        a.every_slot_crashed(&ids).then(|| a.last_exit.clone().unwrap_or_else(|| "crashed".into()))
     }
 
     fn on_slot_crash(&mut self, slot_id: usize, uptime: Duration) {
@@ -2365,8 +2381,9 @@ mod tests {
         assert!(get(&env, "WARDEN_INSTANCE_VAR").is_none(), "instance_var = \"\" sets none");
     }
 
-    /// W5: a start fails once every worker crashed before one was ready,
-    /// and says so once; a worker that crashes twice doesn't count twice.
+    /// W5: a start fails once every worker crashed (twice) before one was
+    /// ready, and says so once. One crash is not enough: it can be a
+    /// transient the restart policy gets past.
     #[test]
     fn start_attempt_fails_when_every_worker_crashed() {
         let mut s = sup("[app]\nname = \"api\"\ncommand = \"sh\"\n[workers]\ncount = 2\n");
@@ -2378,9 +2395,11 @@ mod tests {
         assert_eq!(s.start_failed(), None, "no start yet");
         s.start_attempt = Some(StartAttempt::default());
         s.note_start_crash(1);
-        s.note_start_crash(1);
-        assert_eq!(s.start_failed(), None, "worker 2 has not crashed");
+        s.note_start_crash(2);
+        assert_eq!(s.start_failed(), None, "each crashed once: a transient could explain it");
         assert!(!s.start_attempt.as_ref().unwrap().reported);
+        s.note_start_crash(1);
+        assert_eq!(s.start_failed(), None, "worker 2 has crashed only once");
         s.note_start_crash(2);
         assert_eq!(s.start_failed().as_deref(), Some("exit code 2"), "the last crash's reason");
         assert!(s.start_attempt.as_ref().unwrap().reported, "logged once");
