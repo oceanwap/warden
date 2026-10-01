@@ -5097,7 +5097,7 @@ fn standby_nestjs_on_bun_and_node() {
             // the standby's output carries the slot it took.
             let line = format!("worker=1 stdout: nest bench listening on :{port} ({standby}:");
             w.wait_log(&line, T);
-            assert!(!w.log().contains("worker=standby stdout: nest bench listening"), "{}", w.log());
+            assert!(!w.log().contains("worker=s1 stdout: nest bench listening"), "{}", w.log());
         }
     }
 }
@@ -5387,6 +5387,61 @@ fn standby_zero_changes_nothing() {
     let s = w.status().unwrap();
     assert_eq!(s["workers"].as_array().unwrap().len(), 1);
     assert_eq!(s["workers"][0]["restarts"], 1);
+}
+
+/// Every `warden logs` command a standby hint names works and shows the
+/// standbys' lines: their output (`worker=s1`), their own lines (`standby
+/// crashed worker=s1`) and the pool's (`worker=standby`). So does the
+/// `--worker standby` of the docs, with -c.
+#[test]
+fn standby_hints_name_log_commands_that_work() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = standby_config("sb-hints", port, 1, "env = { FIXTURE_STANDBY_EXIT = \"200\" }").replace(
+        "[restart]\nbackoff_initial = 50\n",
+        "[restart]\nbackoff_initial = 50\nmax_restarts = 1\nfailed_cooldown = 0\n",
+    );
+    let w = Warden::start("sb-hints", port, &cfg);
+    let log = w.wait_log("standbys failed: too many standby crashes", T);
+    let mut commands: Vec<String> = log
+        .lines()
+        .filter(|l| l.contains("standby") && l.contains("hint="))
+        .filter_map(|l| l.split("hint=").nth(1))
+        .flat_map(|h| h.split('`').skip(1).step_by(2).map(str::to_string).collect::<Vec<_>>())
+        .filter(|c| c.starts_with("warden logs "))
+        .collect();
+    commands.sort();
+    commands.dedup();
+    assert_eq!(
+        commands,
+        ["warden logs sb-hints --worker s1", "warden logs sb-hints --worker standby"],
+        "the hints:\n{log}"
+    );
+    let output = "OUT   worker=s1 stdout: fixture: standby exiting";
+    for c in &commands {
+        let args: Vec<&str> = c.split_whitespace().skip(1).chain(["--nostream", "-n", "100"]).collect();
+        let (code, out) = w.cli(&args);
+        assert_eq!(code, 0, "`{c}`: {out}");
+        assert!(out.contains(output), "`{c}` shows the standby's output:\n{out}");
+        assert!(out.contains("WARN  standby crashed worker=s1 pid="), "`{c}`:\n{out}");
+        assert!(!out.contains("worker ready worker=1"), "`{c}` shows only standbys:\n{out}");
+        if c.ends_with("standby") {
+            assert!(out.contains("restart the normal way meanwhile worker=standby max_restarts=1"), "`{c}`:\n{out}");
+        }
+    }
+    let (code, out) = w.cli(&["logs", "--worker", "standby", "--nostream", "-n", "100"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(output) && out.contains("standby starting worker=s1"), "{out}");
+    let (code, out) = w.cli(&["logs", "--worker", "s2", "--nostream"]);
+    assert_eq!((code, out.contains("worker=s1")), (0, false), "{out}");
+    let (code, out) = w.cli(&["logs", "--worker", "stand", "--nostream"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("`standby`"), "{out}");
+    let (code, out) = w.cli(&["restart", "--worker", "standby"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("takes no commands of its own"), "{out}");
 }
 
 /// Wait until `pid` is gone; returns how long that took from `t0`.

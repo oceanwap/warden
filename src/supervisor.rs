@@ -21,7 +21,7 @@ use crate::events::{self, WorkerEvent};
 use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
-use crate::worker::{Instance, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit};
+use crate::worker::{Instance, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
 use crate::{debug, error, info, metrics, networking, systemd, warn};
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
@@ -398,6 +398,7 @@ impl Supervisor {
         }
     }
 
+    /// `worker=` on log lines about a slot (`standby`: the pool as a whole).
     fn label(&self, slot: usize) -> String {
         if self.is_worker_mode() {
             "host".into()
@@ -405,6 +406,15 @@ impl Supervisor {
             "standby".into()
         } else {
             slot.to_string()
+        }
+    }
+
+    /// `worker=` on log lines about one process: its slot's, or a standby's
+    /// own (`s1`, `s2`… as `warden status` lists them).
+    fn inst_label(&self, i: &Instance) -> String {
+        match i.standby_number.filter(|_| i.role == Role::Standby) {
+            Some(n) => standby_label(n),
+            None => self.label(i.slot),
         }
     }
 
@@ -502,15 +512,17 @@ impl Supervisor {
         let inst_id = self.next_inst;
         self.next_inst += 1;
         self.check_release();
-        let spec = self.spec(slot_id, inst_id);
+        let number = (role == Role::Standby).then(|| self.free_standby_number());
+        let spec = self.spec(slot_id, inst_id, number);
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
-        let inst = Instance::new(slot_id, handle, role);
+        let mut inst = Instance::new(slot_id, handle, role);
+        inst.standby_number = number;
         self.insts.insert(inst_id, inst);
         if self.is_worker_mode() {
             info!("host starting", pid = pid, workers = self.count, role = role_name(role));
-        } else if role == Role::Standby {
-            info!("standby starting", pid = pid);
+        } else if let Some(n) = number {
+            info!("standby starting", worker = standby_label(n), pid = pid);
         } else {
             info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
         }
@@ -526,7 +538,8 @@ impl Supervisor {
         Ok(inst_id)
     }
 
-    fn spec(&self, slot_id: usize, inst_id: u64) -> process::Spec {
+    /// `standby`: the number of the standby this starts (`slot_id` is then 0).
+    fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<usize>) -> process::Spec {
         let a = &self.cfg.app;
         let mut env: Vec<(String, String)> = a.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
         let mut add = |k: &str, v: String| env.push((k.to_string(), v));
@@ -604,7 +617,7 @@ impl Supervisor {
             args,
             cwd: self.worker_dir(),
             env,
-            label: self.label(slot_id),
+            label: standby.map(standby_label).unwrap_or_else(|| self.label(slot_id)),
             output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
@@ -678,7 +691,8 @@ impl Supervisor {
             Event::ReadyTimeout { inst } => {
                 let timeout = self.cfg.workers.ready_timeout;
                 let promote_timeout = standby::PROMOTE_TIMEOUT.min(self.cfg.ready_timeout());
-                let label = self.insts.get(&inst).map(|i| self.label(i.slot));
+                let label = self.insts.get(&inst).map(|i| self.inst_label(i));
+                let app = self.cfg.app.name.clone();
                 if let Some(i) = self.insts.get_mut(&inst) {
                     // A standby is ready once initialized; a promoted one has
                     // `promote_timeout` to listen (the spawn-time timer is stale).
@@ -689,17 +703,24 @@ impl Supervisor {
                     };
                     if late && !i.stopping {
                         if i.standby.is_some() {
+                            let label = label.unwrap_or_default();
                             error!(
                                 "standby not initialized in time; killing",
+                                worker = label,
                                 pid = i.handle.pid,
                                 ready_timeout_s = timeout,
-                                hint = "a standby is ready when the app calls Bun.serve or listen() on app.port (the shim holds that call back); raise workers.ready_timeout if startup is slow",
+                                hint = format!(
+                                    "a standby is ready when the app calls Bun.serve or listen() on app.port (the shim \
+                                     holds that call back); its output is in `warden logs {app} --worker {label}`. \
+                                     Raise workers.ready_timeout if startup is slow"
+                                ),
                             );
                         } else if i.promoted_at.is_some() {
                             error!(
                                 "promoted standby did not listen in time; killing",
                                 worker = label.unwrap_or_default(),
                                 pid = i.handle.pid,
+                                standby = i.standby_number.map(standby_label).unwrap_or_default(),
                                 timeout_ms = promote_timeout.as_millis(),
                                 hint = "the slot restarts the normal way; if this repeats, set [workers] standby = 0 and report it",
                             );
@@ -721,7 +742,7 @@ impl Supervisor {
                 if let Some(i) = self.insts.get(&inst) {
                     warn!(
                         "worker did not exit within grace period; sending SIGKILL",
-                        worker = self.label(i.slot),
+                        worker = self.inst_label(i),
                         pid = i.handle.pid
                     );
                     i.handle.signal(libc::SIGKILL);
@@ -874,6 +895,8 @@ impl Supervisor {
         // Promoted standby: from the promotion to listening.
         let promote_ms = inst.promoted_at.map(|p| format!("{:.1}", p.elapsed().as_secs_f64() * 1000.0));
         let (slot_id, role, pid) = (inst.slot, inst.role, inst.handle.pid);
+        // The standby it was (`--worker sN` shows its whole story).
+        let was = inst.standby_number.map(standby_label).unwrap_or_default();
         match role {
             Role::Current => {
                 if let Some(s) = self.slots.get_mut(&slot_id) {
@@ -882,7 +905,7 @@ impl Supervisor {
                 if self.is_worker_mode() {
                     info!("host ready", pid = pid, workers = self.count, startup_ms = ms);
                 } else if let Some(pms) = &promote_ms {
-                    info!("worker promoted from standby", worker = slot_id, pid = pid, promote_ms = pms);
+                    info!("worker promoted from standby", worker = slot_id, pid = pid, standby = was, promote_ms = pms);
                 } else {
                     info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
                 }
@@ -897,6 +920,7 @@ impl Supervisor {
                         "standby promoted as the replacement; verifying it",
                         worker = self.label(slot_id),
                         pid = pid,
+                        standby = was,
                         promote_ms = pms
                     );
                 } else {

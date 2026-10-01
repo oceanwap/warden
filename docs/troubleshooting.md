@@ -44,6 +44,10 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 
 ## Hot standbys (`[workers] standby`)
 
+Standbys are `s1`, `s2`… in `warden status` and `worker=s1` on their log
+lines and output: `warden logs <app> --worker s1` follows one, `--worker
+standby` all of them with the pool's own lines (`worker=standby`).
+
 | You see | Why | Fix |
 |---|---|---|
 | `workers.standby … is for process mode` / `needs app.port` / `needs Warden's shim` / `needs workers.port_strategy = "shared"` / `does not work with … "direct"` | Config validation: a standby defers the app's listen on its port through the shim, and joins the shared port when promoted | Do what the message says, or remove `standby` |

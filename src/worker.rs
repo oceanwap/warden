@@ -96,6 +96,12 @@ pub enum Role {
 /// The slot number of standbys (process-mode slots start at 1).
 pub const STANDBY_SLOT: usize = 0;
 
+/// The name of standby number `n` (`s1`, `s2`…): its row in `warden
+/// status`, its `worker=` on log lines, `warden logs --worker s1`.
+pub fn standby_label(n: usize) -> String {
+    format!("s{n}")
+}
+
 /// A standby's way to "available": initialized, then the rollout gates a
 /// new worker must pass (health checks, verify_command).
 #[derive(Debug, Default, Clone)]
@@ -155,6 +161,9 @@ pub struct Instance {
     pub recycle_at: Option<Instant>,
     /// `Role::Standby`: its gates.
     pub standby: Option<StandbyGates>,
+    /// Started as a standby: its number in the pool (1..=standby; `sN` in
+    /// `warden status` and on its log lines), kept after its promotion.
+    pub standby_number: Option<usize>,
     /// A standby promoted into a slot: when (until it listens, then too).
     pub promoted_at: Option<Instant>,
     /// `Role::Standby`: the release (pinned working directory) it started
@@ -166,6 +175,7 @@ impl Instance {
     pub fn new(slot: usize, handle: Handle, role: Role) -> Self {
         Instance {
             standby: (role == Role::Standby).then(StandbyGates::default),
+            standby_number: None,
             promoted_at: None,
             release: None,
             slot,

@@ -425,22 +425,41 @@ fn level_name(l: crate::config::Level) -> &'static str {
 }
 
 /// `warden logs --worker N` keeps worker N's output and Warden's events that
-/// name it (`worker=N`); `--events` drops worker output.
+/// name it (`worker=N`); `--events` drops worker output. Hot standbys:
+/// `--worker s2` keeps standby 2's (`worker=s2`, and the promotion line
+/// naming it `standby=s2`), `--worker standby` every standby's and the
+/// pool's (`worker=standby`).
 pub fn log_filter(line: &str, worker: Option<&str>, events_only: bool) -> bool {
-    let is_output = line.contains(" OUT   worker=");
+    const OUT: &str = " OUT   worker=";
+    let is_output = line.contains(OUT);
     if events_only && is_output {
         return false;
     }
-    match worker {
-        None => true,
+    let Some(w) = worker else { return true };
+    if is_output {
         // Output lines: only the prefix counts, not what the app printed.
-        Some(w) if is_output => line.contains(&format!(" OUT   worker={w} ")),
-        Some(w) => {
-            let needle = format!(" worker={w}");
-            line.match_indices(&needle)
-                .any(|(i, _)| matches!(line.as_bytes().get(i + needle.len()), None | Some(b' ') | Some(b'\n')))
-        }
+        return line.split_once(OUT).and_then(|(_, rest)| rest.split(' ').next()).is_some_and(|l| worker_is(w, l));
     }
+    let values = |key: &'static str| line.match_indices(key).map(move |(i, _)| field_value(&line[i + key.len()..]));
+    values(" worker=").any(|l| worker_is(w, l)) || values(" standby=").any(|l| is_standby(l) && worker_is(w, l))
+}
+
+/// A field's value up to the next space (a quoted value never names a worker).
+fn field_value(rest: &str) -> &str {
+    rest.split([' ', '\n']).next().unwrap_or("")
+}
+
+/// Does `label` (a line's `worker=`) answer `--worker want`?
+fn worker_is(want: &str, label: &str) -> bool {
+    want == label || (want == "standby" && is_standby(label))
+}
+
+/// A standby's label: `standby` (the pool) or `sN` (one standby, N ≥ 1).
+pub fn is_standby(label: &str) -> bool {
+    label == "standby"
+        || label
+            .strip_prefix('s')
+            .is_some_and(|n| !n.is_empty() && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `--out` / `--err`: only worker output lines on that stream.
@@ -530,6 +549,39 @@ mod tests {
         assert!(!log_filter(out, Some("12"), false), "what the app printed doesn't count");
         assert!(!log_filter(other, Some("1"), false));
         assert!(!log_filter(out, Some("1"), true));
+    }
+
+    /// `--worker standby` / `--worker s2`: what every standby hint names.
+    #[test]
+    fn standby_log_filters() {
+        let out = "2026-09-30T12:00:00.000Z OUT   worker=s2 stdout: booting worker=1";
+        let crashed = "2026-09-30T12:00:00.000Z WARN  standby crashed worker=s2 pid=5 reason=\"exit code 4\"";
+        let pool = "2026-09-30T12:00:00.000Z ERROR standbys failed: too many standby crashes worker=standby";
+        let promoted = "2026-09-30T12:00:00.000Z INFO  worker promoted from standby worker=1 pid=5 standby=s2 \
+                        promote_ms=1.2";
+        let enabled = "2026-09-30T12:00:00.000Z INFO  hot standbys enabled: started once the workers are ready \
+                       standby=1";
+        let worker = "2026-09-30T12:00:00.000Z INFO  worker ready worker=2 pid=6";
+        for l in [out, crashed, pool, promoted] {
+            assert!(log_filter(l, Some("standby"), false), "{l}");
+        }
+        for l in [out, crashed, promoted] {
+            assert!(log_filter(l, Some("s2"), false), "{l}");
+        }
+        assert!(!log_filter(pool, Some("s2"), false), "the pool's lines name no single standby");
+        assert!(!log_filter(out, Some("s1"), false) && !log_filter(crashed, Some("s20"), false));
+        assert!(log_filter(promoted, Some("1"), false), "a promotion is worker 1's story too");
+        assert!(!log_filter(out, Some("1"), false), "what the app printed doesn't count");
+        assert!(!log_filter(enabled, Some("1"), false), "`standby=1` is a count, not worker 1");
+        assert!(!log_filter(enabled, Some("standby"), false) && !log_filter(worker, Some("standby"), false));
+        assert!(!log_filter(worker, Some("s2"), false));
+        assert!(!log_filter(out, Some("standby"), true), "--events drops output");
+        for l in ["standby", "s1", "s12"] {
+            assert!(is_standby(l), "{l}");
+        }
+        for l in ["s", "s0", "s01", "s+1", "sx", "1", "standbys", ""] {
+            assert!(!is_standby(l), "{l}");
+        }
     }
 
     fn status_of(app: &str) -> Status {

@@ -37,6 +37,15 @@ use super::*;
 use crate::restart::Tracker;
 use crate::worker::STANDBY_SLOT;
 
+/// `worker=` on a standby's log lines: its own `sN`.
+fn sb(i: &Instance) -> String {
+    standby_label(i.standby_number.unwrap_or(0))
+}
+
+/// `worker=` on log lines about the pool as a whole (`--worker standby`
+/// shows them with every standby's own lines).
+const POOL: &str = "standby";
+
 /// How long a promoted standby may take to listen: it is initialized, so
 /// this is a bind (milliseconds); a standby that can't is killed and the
 /// slot restarted (bounded by `workers.ready_timeout`).
@@ -81,6 +90,19 @@ impl Supervisor {
         ids
     }
 
+    /// The number of the next standby: the lowest no live standby has
+    /// (1..=standby). One being stopped may still have it, as an old worker
+    /// shares its number with its replacement during a rollout.
+    pub(super) fn free_standby_number(&self) -> usize {
+        let taken: std::collections::BTreeSet<usize> = self
+            .insts
+            .values()
+            .filter(|i| i.role == Role::Standby && !i.stopping)
+            .filter_map(|i| i.standby_number)
+            .collect();
+        (1..).find(|n| !taken.contains(n)).unwrap_or(1)
+    }
+
     /// Start standbys up to `[workers] standby`, in the background: not
     /// while a worker is starting (they would compete for the CPU), a
     /// deploy runs, or the pool backs off.
@@ -112,6 +134,7 @@ impl Supervisor {
     }
 
     fn spawn_standby(&mut self) -> bool {
+        let label = standby_label(self.free_standby_number());
         match self.spawn_instance(STANDBY_SLOT, Role::Standby) {
             Ok(id) => {
                 // `spawn_instance` checked the pin; this is the one it used.
@@ -124,9 +147,11 @@ impl Supervisor {
             Err(e) => {
                 error!(
                     "failed to start a standby",
+                    worker = label,
                     command = self.cfg.app.command,
                     error = e,
-                    hint = "the same command starts the workers: check it; standbys are retried with backoff",
+                    hint = "the same command starts the workers: check it (`error` says what failed); standbys \
+                            are retried with backoff",
                 );
                 self.emit_worker(STANDBY_SLOT, WorkerEvent::Crashed, None, || {
                     Some(format!("spawn failed: {e} (standby)"))
@@ -151,7 +176,7 @@ impl Supervisor {
         if let Some(s) = socket {
             i.sockets.insert(STANDBY_SLOT, PathBuf::from(s));
         }
-        let (pid, ms) = (i.handle.pid, i.started.elapsed().as_millis());
+        let (pid, ms, label) = (i.handle.pid, i.started.elapsed().as_millis(), sb(i));
         // Safety net: a standby in the port's SO_REUSEPORT group takes traffic.
         if let Some(p) = port {
             if networking::count_listeners(pid, p).is_some_and(|n| n > 0) {
@@ -159,7 +184,7 @@ impl Supervisor {
                 return;
             }
         }
-        debug!("standby initialized", pid = pid, startup_ms = ms);
+        debug!("standby initialized", worker = label, pid = pid, startup_ms = ms);
         self.standby_gates(inst_id);
     }
 
@@ -172,6 +197,7 @@ impl Supervisor {
         }
         error!(
             "standbys disabled: a standby took the app's port before being promoted",
+            worker = POOL,
             reason = why,
             action = "standbys stopped; crashed workers restart the normal way",
             hint = "the shim defers Bun.serve and node:http/net listen() on app.port; this app listens another way. Set [workers] standby = 0",
@@ -208,7 +234,7 @@ impl Supervisor {
         }
         st.available = true;
         let (pid, ms) = (i.handle.pid, i.started.elapsed().as_millis());
-        info!("standby ready", pid = pid, startup_ms = ms);
+        info!("standby ready", worker = sb(i), pid = pid, startup_ms = ms);
         self.emit_worker(STANDBY_SLOT, WorkerEvent::Ready, Some(pid), || Some(format!("startup_ms={ms} role=standby")));
     }
 
@@ -242,7 +268,7 @@ impl Supervisor {
         if let Some(p) = self.cfg.app.port {
             env.push(("PORT".into(), p.to_string()));
         }
-        debug!("running verify_command for a standby", pid = i.handle.pid, command = cmd);
+        debug!("running verify_command for a standby", worker = sb(i), pid = i.handle.pid, command = cmd);
         let fut = rollout::run_shell(
             cmd,
             self.cfg.app.working_directory.clone(),
@@ -260,8 +286,9 @@ impl Supervisor {
         let required = self.cfg.reload.health_passes;
         let threshold = self.cfg.health.failure_threshold;
         let every = Duration::from_millis(self.cfg.reload.health_interval_ms);
+        let app = self.cfg.app.name.clone();
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
-        let pid = i.handle.pid;
+        let (pid, label) = (i.handle.pid, sb(i));
         let Some(st) = i.standby.as_mut() else { return };
         st.checking = false;
         match result {
@@ -277,13 +304,23 @@ impl Supervisor {
             Err(e) => {
                 st.passes = 0;
                 st.fails += 1;
-                debug!("standby gate health check failed", pid = pid, error = e, consecutive = st.fails);
+                debug!(
+                    "standby gate health check failed",
+                    worker = label,
+                    pid = pid,
+                    error = e,
+                    consecutive = st.fails
+                );
                 if st.fails >= threshold * 3 {
                     warn!(
                         "standby keeps failing its health checks before promotion; replacing it",
+                        worker = label,
                         pid = pid,
                         error = e,
-                        hint = "the health path must answer once the app is initialized (a standby serves it on its private socket before listening)",
+                        hint = format!(
+                            "the health path must answer once the app is initialized (a standby serves it on its \
+                             private socket before listening); its output is in `warden logs {app} --worker {label}`"
+                        ),
                     );
                     self.standby_failed(inst_id, format!("failed its health checks: {e}"));
                 } else {
@@ -295,7 +332,7 @@ impl Supervisor {
 
     pub(super) fn on_standby_verified(&mut self, inst_id: u64, result: Result<(), String>) {
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
-        let pid = i.handle.pid;
+        let (pid, label) = (i.handle.pid, sb(i));
         let Some(st) = i.standby.as_mut() else { return };
         st.checking = false;
         match result {
@@ -306,6 +343,7 @@ impl Supervisor {
             Err(e) => {
                 warn!(
                     "standby failed reload.verify_command; replacing it",
+                    worker = label,
                     pid = pid,
                     error = e,
                     hint = "the command gets the standby's private socket as WARDEN_WORKER_SOCKET (WARDEN_STANDBY=1); PORT reaches the running workers, not the standby",
@@ -319,15 +357,16 @@ impl Supervisor {
     pub(super) fn on_standby_health(&mut self, inst_id: u64, result: Result<(), String>) {
         let threshold = self.cfg.health.failure_threshold;
         let outage = self.outage;
+        let app = self.cfg.app.name.clone();
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
         if i.stopping {
             return;
         }
-        let pid = i.handle.pid;
+        let (pid, label) = (i.handle.pid, sb(i));
         match result {
             Ok(()) => {
                 if i.healthy == Some(false) {
-                    info!("standby healthy again", pid = pid);
+                    info!("standby healthy again", worker = label, pid = pid);
                 }
                 i.healthy = Some(true);
                 i.health_fails = 0;
@@ -338,6 +377,7 @@ impl Supervisor {
                 if fails == 1 {
                     warn!(
                         "standby health check failed; it is not promoted while failing",
+                        worker = label,
                         pid = pid,
                         error = e,
                         threshold = threshold,
@@ -351,14 +391,18 @@ impl Supervisor {
                     });
                     if outage {
                         // Like workers (DS2): a shared dependency is down; don't churn.
-                        debug!("standby replacement held: fleet-wide health failure", pid = pid);
+                        debug!("standby replacement held: fleet-wide health failure", worker = label, pid = pid);
                     } else {
                         error!(
                             "standby unhealthy; replacing it",
+                            worker = label,
                             pid = pid,
                             failures = fails,
                             error = e,
-                            hint = "it went bad while idle (a lost connection, a timer); its output is under `warden logs <app> --worker standby`",
+                            hint = format!(
+                                "it went bad while idle (a lost connection, a timer); its output is in `warden logs \
+                                 {app} --worker {label}`"
+                            ),
                         );
                         self.standby_failed(inst_id, format!("failed {fails} health checks: {e}"));
                     }
@@ -389,7 +433,12 @@ impl Supervisor {
                 self.pool.token += 1;
                 self.pool.waiting = true;
                 let token = self.pool.token;
-                info!("standby restarting", in_ms = d.as_millis(), attempt = self.pool.tracker.restarts_in_window());
+                info!(
+                    "standby restarting",
+                    worker = POOL,
+                    in_ms = d.as_millis(),
+                    attempt = self.pool.tracker.restarts_in_window()
+                );
                 self.emit_worker(STANDBY_SLOT, WorkerEvent::Restarting, None, || {
                     Some(format!("in_ms={} role=standby", d.as_millis()))
                 });
@@ -407,6 +456,7 @@ impl Supervisor {
                 };
                 error!(
                     "standbys failed: too many standby crashes; crashed workers restart the normal way meanwhile",
+                    worker = POOL,
                     max_restarts = policy.max_restarts,
                     window_s = policy.window.as_secs(),
                     last_exit = self.pool.last_exit.clone().unwrap_or_default(),
@@ -439,7 +489,7 @@ impl Supervisor {
         let cooldown = Duration::from_secs(self.cfg.restart.failed_cooldown);
         if let Some(t) = self.pool.failed_at {
             if !cooldown.is_zero() && self.cfg.restart.enabled && t.elapsed() >= cooldown {
-                info!("retrying standbys after cooldown", cooldown_s = cooldown.as_secs());
+                info!("retrying standbys after cooldown", worker = POOL, cooldown_s = cooldown.as_secs());
                 self.pool.failed_at = None;
                 self.pool.tracker.reset();
             }
@@ -465,6 +515,7 @@ impl Supervisor {
         for id in stale {
             info!(
                 "replacing a standby: it runs another release than the workers",
+                worker = self.insts.get(&id).map(sb).unwrap_or_default(),
                 pid = self.insts.get(&id).map(|i| i.handle.pid).unwrap_or(0),
                 release = release.as_ref().map(|r| r.display().to_string()).unwrap_or_default(),
             );
@@ -486,18 +537,19 @@ impl Supervisor {
     /// `hint`: from the exit classification (the OOM killer, someone else's
     /// signal), as for workers.
     pub(super) fn on_standby_exit(&mut self, inst: &Instance, why: String, reason: String, hint: Option<&str>) {
-        let pid = inst.handle.pid;
+        let (pid, label) = (inst.handle.pid, sb(inst));
         if inst.stopping || self.shutting_down || self.stopped {
             match hint {
-                Some(h) => warn!("standby stopped", pid = pid, reason = why, hint = h),
-                None => info!("standby stopped", pid = pid, reason = why),
+                Some(h) => warn!("standby stopped", worker = label, pid = pid, reason = why, hint = h),
+                None => info!("standby stopped", worker = label, pid = pid, reason = why),
             }
             self.emit_worker(STANDBY_SLOT, WorkerEvent::Stopped, Some(pid), || Some(why.clone()));
         } else {
             let uptime = inst.started.elapsed();
-            let logs = format!("its output is in `warden logs {} --worker standby`", self.cfg.app.name);
+            let logs = format!("its output is in `warden logs {} --worker {label}`", self.cfg.app.name);
             warn!(
                 "standby crashed",
+                worker = label,
                 pid = pid,
                 reason = reason,
                 uptime_s = uptime.as_secs(),
@@ -535,12 +587,13 @@ impl Supervisor {
         let msg = format!("{{\"cmd\":\"promote\",\"worker\":{slot_id},\"count\":{}}}\n", self.count);
         let label = self.label(slot_id);
         let i = self.insts.get_mut(&id)?;
-        let pid = i.handle.pid;
+        let (pid, was) = (i.handle.pid, sb(i));
         if let Err(e) = i.handle.send(msg.as_bytes()) {
             warn!(
                 "could not reach a standby to promote it; starting a new worker instead",
                 worker = label,
                 pid = pid,
+                standby = was,
                 error = e,
                 hint = "the standby is replaced; if this repeats, please report it",
             );
@@ -595,7 +648,7 @@ impl Supervisor {
         if ok && all {
             let old = self.live_standbys();
             if !old.is_empty() {
-                info!("replacing standbys: they run the previous version", standbys = old.len());
+                info!("replacing standbys: they run the previous version", worker = POOL, standbys = old.len());
                 for id in old {
                     self.stop_instance(id);
                 }
@@ -604,8 +657,9 @@ impl Supervisor {
         self.fill_pool();
     }
 
-    /// `status.standbys`: the pool's standbys (numbered from 1, oldest
-    /// first), then a row per missing one when it can't be refilled.
+    /// `status.standbys`: the pool's standbys by number (`id`: `sN` in
+    /// `warden status`, `worker=sN` in the log), with a row for each missing
+    /// number when the pool can't be refilled.
     pub(super) fn standby_rows(&mut self, rows: &mut Vec<WorkerStatus>, sample: &Sampler<'_>) {
         let target = self.standby_target();
         if target == 0 {
@@ -629,7 +683,8 @@ impl Supervisor {
                 last_exit: last_exit.clone(),
                 healthy,
             };
-        let mut live = 0;
+        let first = rows.len();
+        let mut live = std::collections::BTreeSet::new();
         for id in ids {
             let Some(i) = self.insts.get_mut(&id) else { continue };
             let state = if i.stopping {
@@ -639,10 +694,12 @@ impl Supervisor {
             } else {
                 control::WARMING
             };
-            live += usize::from(!i.stopping);
+            let n = i.standby_number.unwrap_or(0);
+            if !i.stopping {
+                live.insert(n);
+            }
             let (pid, started) = (i.handle.pid, i.started);
             let stats = sample(pid, &mut i.cpu_prev, started);
-            let n = rows.len() + 1;
             rows.push(row(n, state, Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy));
         }
         let missing = if self.pool.failed_at.is_some() {
@@ -655,11 +712,12 @@ impl Supervisor {
             None
         };
         if let Some(state) = missing {
-            for _ in live..target {
-                let n = rows.len() + 1;
+            for n in (1..=target).filter(|n| !live.contains(n)) {
                 rows.push(row(n, state.as_str(), None, None, None, None));
             }
         }
+        // By number; a standby being replaced (older) before its successor.
+        rows[first..].sort_by_key(|w| w.id);
     }
 }
 
@@ -785,6 +843,42 @@ exec sleep 60
         .await;
     }
 
+    /// Standbys are numbered s1, s2… (`warden status` rows, `worker=` on
+    /// their log lines and output): a new one takes the lowest number no
+    /// live standby has, so the numbers stay 1..=standby.
+    #[tokio::test(flavor = "current_thread")]
+    async fn standbys_are_numbered_and_a_successor_takes_the_free_number() {
+        local(async {
+            let mut r = Rig::new("numbers", "");
+            r.sup.cfg.workers.standby = 2;
+            r.sup.start_all();
+            r.until("worker and two standbys ready", |s| running(s) && available(s).len() == 2).await;
+            let (a, b) = (available(&r.sup)[0], available(&r.sup)[1]);
+            let label = |s: &Supervisor, id: u64| s.inst_label(&s.insts[&id]);
+            assert_eq!((label(&r.sup, a), label(&r.sup, b)), ("s1".into(), "s2".into()));
+            let ids: Vec<usize> = rows(&mut r.sup).iter().map(|w| w.id).collect();
+            assert_eq!(ids, [1, 2]);
+
+            // s1 (the oldest) takes the dead worker's slot; its successor is s1.
+            r.kill(r.sup.slots[&1].current.unwrap());
+            r.until("s1 promoted", |s| running(s) && s.slots[&1].current == Some(a)).await;
+            assert_eq!(label(&r.sup, a), "1", "a promoted standby is its slot's worker");
+            assert_eq!(r.sup.insts[&a].standby_number, Some(1), "and remembers which standby it was");
+            r.until("a fresh standby", |s| available(s).len() == 2).await;
+            let new = available(&r.sup).into_iter().find(|id| *id != b).unwrap();
+            assert_eq!((label(&r.sup, new), label(&r.sup, b)), ("s1".into(), "s2".into()));
+            let ids: Vec<usize> = rows(&mut r.sup).iter().map(|w| w.id).collect();
+            assert_eq!(ids, [1, 2]);
+
+            // One being replaced keeps its number until it is gone; its
+            // successor gets the same one, as a rollout's new worker does.
+            r.sup.stop_instance(b);
+            assert_eq!(r.sup.free_standby_number(), 2);
+            r.shutdown().await;
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn crashing_standbys_back_off_then_fail_and_workers_restart_cold() {
         local(async {
@@ -801,7 +895,7 @@ exec sleep 60
             assert!(t0.elapsed() >= Duration::from_millis(60), "backoff between restarts: {:?}", t0.elapsed());
             let failed = rows(&mut r.sup);
             assert_eq!(failed.len(), 1);
-            assert_eq!(failed[0].state, "FAILED");
+            assert_eq!((failed[0].id, failed[0].state.as_str()), (1, "FAILED"), "s1, FAILED");
             assert!(failed[0].last_exit.as_deref().unwrap_or("").contains("exit code 4"), "{failed:?}");
             r.sup.fill_pool();
             assert!(r.sup.live_standbys().is_empty(), "nothing starts while FAILED");

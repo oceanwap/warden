@@ -127,7 +127,10 @@ is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
 Hot standbys (process mode, `[workers] standby`) are listed in
 `status.standbys` (`WorkerStatus` rows; the field is absent without
 standbys, and older clients ignore it), never in `status.workers`: `id` is
-the standby's place in the list (1..=standby), `state` `WARMING` (starting,
+the standby's number (1..=standby; `sN` in `warden status` and as `worker=sN`
+on its log lines; a new standby takes the lowest number no live one has, so
+one being replaced and its successor may share it for a moment: `pid`
+tells them apart), `state` `WARMING` (starting,
 or passing its health gates) then `STANDBY` (can take over), or `STOPPING`;
 a missing one shows as `RESTARTING` (backoff), `FAILED` or `STOPPED`.
 `restarts`, `crashes` and `last_exit` are the pool's. Their events are

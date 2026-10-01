@@ -198,7 +198,11 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   once no worker is starting (they would compete for the CPU). `status`
   lists them in `standbys` (`WARMING`, `STANDBY`; additive, so older
   clients just don't show them), the GUI counts their memory and CPU, and
-  Prometheus gets `warden_standbys_*`. A Bun standby's stand-in server
+  Prometheus gets `warden_standbys_*`. Standbys are numbered 1..=N (a new
+  one takes the lowest number no live one has): `s1`, `s2`… in `warden
+  status`, `worker=s1` on their log lines and output, so `warden logs
+  --worker s1` follows one and `--worker standby` all of them with the
+  pool's own lines (`worker=standby`). A Bun standby's stand-in server
   serves on its private health socket when there is one, else on an
   ephemeral 127.0.0.1 port: no socket path of its own, so no length limit.
 - **Gates.** Promotable only after `standby_ready` (initialized: the app
@@ -217,7 +221,7 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   `NODE_APP_INSTANCE`, `process.emit("warden:promote")`), Warden relabels its
   output `worker=k` and gives it `PROMOTE_TIMEOUT` (5 s) to listen. Events:
   `starting` and `ready` of worker k with detail `promoted from standby`; log
-  `worker promoted from standby worker=k pid=… promote_ms=…`. A new standby
+  `worker promoted from standby worker=k pid=… standby=sN promote_ms=…`. A new standby
   starts once the promoted one listens.
 - **Crash loops.** Standby exits (and failed gates) share one restart
   tracker with the slots' policy: backoff, then FAILED (a `FAILED` row) until

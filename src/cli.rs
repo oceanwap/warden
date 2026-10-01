@@ -33,6 +33,7 @@ APPS (familiar from PM2):
     scale <app> <N>  Set the number of workers (N, +N or -N)
     logs [target]    Recent lines, then follow on a terminal
                      [--lines N] [--err|--out] [--events] [--nostream] [-f]
+                     --worker N: one worker; s1, s2…: one hot standby; standby: all
                      --history: from the log files (rotated and .gz too) or journald
                      --grep TEXT --exclude TEXT --ignore-case --since 2h --until
                      2026-09-30T12:00 --level warn --json (one object per line)
