@@ -557,6 +557,7 @@ mod tests {
             rollout: None,
             last_rollout: None,
             workers: vec![],
+            release: None,
         }
     }
 

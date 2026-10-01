@@ -150,6 +150,23 @@ starts, and a failure can't be rolled back.
 `warden reload` (also SIGHUP) runs the same gates without the canary soak,
 fleet check or pauses. `warden restart N` replaces one worker through the gates.
 
+**Faster rollouts**: `[reload] surge = 2` (or `"all"`) starts that many new
+workers at once, each next to the worker it replaces. Once every one of them has
+passed the gates, the old ones drain together, then the next batch starts. If one
+fails, every new worker of the batch is stopped and the old ones keep serving.
+safe-reload still runs its canary alone first. The cost is memory: surge N runs up
+to N extra workers for a few seconds (`"all"`: twice the workers). It needs
+workers that can overlap, so not with `port_strategy = "offset"`.
+
+**Release pinning** (`[app] pin_release`, on by default): Warden resolves a
+`current` symlink in `working_directory` when it starts and when a reload,
+safe-reload or restart begins, and starts workers in that real path (with
+`args` that go through the symlink rewritten too). A worker that crashes after
+you swapped the symlink but before you reloaded comes back on the release the
+others run, not the new one. `warden status` shows the pinned release. If
+that directory is deleted, the next restart falls back to `current` and logs a
+warning.
+
 ## Staying up for weeks
 
 | | What happens | Config |
@@ -160,6 +177,7 @@ fleet check or pauses. `warden restart N` replaces one worker through the gates.
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain, SIGKILL after `grace_period` | `[shutdown]` |
+| Why it died | `last_exit` and the log line say who ended a worker: a crash (`SIGSEGV`, `SIGABRT`), the kernel's OOM killer (from the cgroup's `oom_kill` count), Warden, or another process, with a hint for the fix | |
 
 ## CLI
 
@@ -210,6 +228,7 @@ Workers:     4
 Ready:       4
 PID:         8139
 Uptime:      27s
+Release:     /srv/apps/travelerwe/api/releases/2026-09-30
 Memory:      4.0 MB (supervisor)
 Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
              health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...

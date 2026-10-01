@@ -6,7 +6,9 @@
 //!   canary, restart N, recycling), preflight, rollback.
 //! - `upkeep.rs`: the 1 s maintenance tick (watchdog, per-worker health,
 //!   memory / lifetime recycling, FAILED cooldown).
+//! - `release.rs`: release pinning (`[app] pin_release`).
 
+mod release;
 mod rollout;
 mod upkeep;
 
@@ -103,6 +105,10 @@ pub struct Supervisor {
     shutdown_reason: String,
     /// Rollout phase last published as a `rollout` event.
     rollout_published: Option<rollout::PhaseKey>,
+    /// `[app] pin_release`: the release workers start in.
+    release: Option<release::Pin>,
+    /// The cgroup's OOM kill counter, to tell OOM kills from other SIGKILLs.
+    oom: process::exit::OomCounter,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -212,6 +218,8 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         exe: own_exe(),
         shutdown_reason: "shutdown".into(),
         rollout_published: None,
+        release: None,
+        oom: process::exit::OomCounter::new(),
         cfg,
         cfg_path,
     };
@@ -239,6 +247,10 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     warn_if_no_migrate_req(&sup.cfg);
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
+    }
+    match sup.oom.path() {
+        Some(p) => debug!("OOM kills are told apart through the cgroup's counter", file = p.display()),
+        None => debug!("no cgroup OOM kill counter found: a SIGKILL's sender can't be told apart from an OOM kill"),
     }
     sup.schedule_next();
     if saved.as_ref().is_some_and(|s| s.stopped) {
@@ -387,6 +399,14 @@ impl Supervisor {
     // ---------------------------------------------------------------- start
 
     fn start_all(&mut self) {
+        // A start (also `restart --hard`, `start` after `stop`) takes the release `current` points to now.
+        if let Err(e) = self.pin_release() {
+            warn!(
+                "cannot pin the release",
+                error = e,
+                hint = "check working_directory and its `current` symlink; workers can't start until it resolves",
+            );
+        }
         for id in self.slot_ids() {
             let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
             slot.tracker.reset();
@@ -432,6 +452,7 @@ impl Supervisor {
         }
         let inst_id = self.next_inst;
         self.next_inst += 1;
+        self.check_release();
         let spec = self.spec(slot_id, inst_id);
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
@@ -485,10 +506,15 @@ impl Supervisor {
                 }
                 match &self.cfg.static_files {
                     Some(st) => {
-                        add("WARDEN_STATIC", serde_json::to_string(st).unwrap_or_default());
+                        let mut st = st.clone();
+                        st.root = self.pinned_path(st.root);
+                        add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
                         (self.exe.display().to_string(), vec!["serve-static".to_string()])
                     }
-                    None => (a.command.clone(), with_preload(&a.command, &a.args, self.shim_path.as_deref())),
+                    None => {
+                        let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
+                        (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
+                    }
                 }
             }
             Mode::Worker => {
@@ -498,13 +524,13 @@ impl Supervisor {
                 }
                 add("WARDEN_ENTRY", self.entry_path().display().to_string());
                 let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                (a.command.clone(), vec![host])
+                (self.pinned_arg(&a.command), vec![host])
             }
         };
         process::Spec {
             program,
             args,
-            cwd: a.working_directory.clone(),
+            cwd: self.worker_dir(),
             env,
             label: self.label(slot_id),
             output: process::Output::from_config(&self.cfg.logging),
@@ -515,10 +541,9 @@ impl Supervisor {
     fn entry_path(&self) -> PathBuf {
         let e = PathBuf::from(self.cfg.app.entry.as_deref().unwrap_or("index.js"));
         if e.is_absolute() {
-            return e;
+            return self.pinned_path(e);
         }
-        let base =
-            self.cfg.app.working_directory.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let base = self.worker_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         base.join(e)
     }
 
@@ -617,7 +642,7 @@ impl Supervisor {
 
     fn on_proc(&mut self, ev: ProcEvent) {
         match ev {
-            ProcEvent::Exited { inst, code, signal, note } => self.on_exit(inst, code, signal, note),
+            ProcEvent::Exited { inst, code, signal, note, sent } => self.on_exit(inst, code, signal, note, sent),
             ProcEvent::Ipc { inst, msg } => self.on_ipc(inst, msg),
         }
     }
@@ -744,12 +769,24 @@ impl Supervisor {
         }
     }
 
-    fn on_exit(&mut self, inst_id: u64, code: Option<i32>, signal: Option<i32>, note: Option<String>) {
+    fn on_exit(
+        &mut self,
+        inst_id: u64,
+        code: Option<i32>,
+        signal: Option<i32>,
+        note: Option<String>,
+        sent: process::exit::Sent,
+    ) {
         let Some(inst) = self.insts.remove(&inst_id) else { return };
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
-        let why = describe_exit(code, signal);
+        // Who ended it: the OOM killer, Warden, someone else, a crash.
+        let oom = signal == Some(libc::SIGKILL) && self.oom.took_one();
+        let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), oom);
+        // A `note` (Warden lost track of it) is the whole story.
+        let hint = if note.is_some() { None } else { cause.hint(self.oom.available()) };
+        let why = cause.short();
         let slot_id = inst.slot;
         let label = self.label(slot_id);
         let uptime = inst.started.elapsed();
@@ -765,22 +802,30 @@ impl Supervisor {
         };
 
         if inst.restart_on_exit && is_current && !self.shutting_down && !self.stopped {
-            // A bad release, not a crash of this slot: restart right away on the
-            // restored config, without counting it towards the restart limit.
-            warn!("worker that failed its rollout gates stopped; restarting", worker = label, pid = inst.handle.pid);
+            // A failed rollout, not a crash of this slot: restart right away on
+            // the restored config, without counting it towards the restart limit.
+            warn!(
+                "worker started by a rollout that failed has stopped; restarting it with the previous config",
+                worker = label,
+                pid = inst.handle.pid
+            );
             self.emit_worker(slot_id, WorkerEvent::Restarting, Some(inst.handle.pid), || {
-                Some("failed its rollout gates; restarting now".into())
+                Some("its rollout failed; restarting now".into())
             });
             if let Some(s) = self.slots.get_mut(&slot_id) {
                 s.current = None;
                 s.state = State::Restarting;
-                s.last_exit = Some("failed rollout gates".into());
+                s.last_exit = Some("stopped: its rollout failed".into());
                 s.restarts += 1;
                 s.token += 1;
             }
             self.spawn_current(slot_id);
         } else if inst.stopping || inst.role == Role::Retiring {
-            info!("worker stopped", worker = label, pid = inst.handle.pid, reason = why);
+            match hint {
+                // Killed while draining: by the OOM killer, a crash, someone else.
+                Some(h) => warn!("worker stopped", worker = label, pid = inst.handle.pid, reason = why, hint = h),
+                None => info!("worker stopped", worker = label, pid = inst.handle.pid, reason = why),
+            }
             self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(why.clone()));
             if is_current {
                 let mut remove = false;
@@ -795,7 +840,23 @@ impl Supervisor {
                 }
             }
         } else if inst.role == Role::Replacement {
-            error!("replacement exited before taking over", worker = label, pid = inst.handle.pid, reason = reason);
+            match hint {
+                Some(h) => error!(
+                    "replacement exited before taking over",
+                    worker = label,
+                    pid = inst.handle.pid,
+                    reason = reason,
+                    hint = h
+                ),
+                None => {
+                    error!(
+                        "replacement exited before taking over",
+                        worker = label,
+                        pid = inst.handle.pid,
+                        reason = reason
+                    )
+                }
+            }
             self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || {
                 Some(format!("{reason} (replacement, before taking over)"))
             });
@@ -829,13 +890,23 @@ impl Supervisor {
                 info!("worker exited", worker = label, pid = inst.handle.pid, reason = reason);
                 self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(reason.clone()));
             } else {
-                warn!(
-                    "worker crashed",
-                    worker = label,
-                    pid = inst.handle.pid,
-                    reason = reason,
-                    uptime_s = uptime.as_secs()
-                );
+                match hint {
+                    Some(h) => warn!(
+                        "worker crashed",
+                        worker = label,
+                        pid = inst.handle.pid,
+                        reason = reason,
+                        uptime_s = uptime.as_secs(),
+                        hint = h
+                    ),
+                    None => warn!(
+                        "worker crashed",
+                        worker = label,
+                        pid = inst.handle.pid,
+                        reason = reason,
+                        uptime_s = uptime.as_secs()
+                    ),
+                }
                 self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || Some(reason.clone()));
                 self.on_slot_crash(slot_id, uptime);
             }
@@ -1657,6 +1728,7 @@ impl Supervisor {
             rollout,
             last_rollout: self.last_rollout.clone(),
             workers,
+            release: self.release_text(),
         }
     }
 }

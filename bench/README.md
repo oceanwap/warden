@@ -68,6 +68,10 @@ Common options: `--duration S` (seconds per load test, default 10),
 - **rolling restart under load**: each manager's zero-downtime restart
   (`pm2 reload`, `wattpm restart`, `warden restart`) with 8 clients running;
   done when the command has returned and N new workers have answered.
+  `warden-surge` is `warden-process` with `[reload] surge = "all"`: every new
+  worker starts at once next to the old ones, which drain once all have passed
+  the gates (briefly twice the workers). Only this row, startup and idle memory
+  are measured for it; its other cells are `-`.
 - **status command**: the median of 10 runs of the manager's status command
   (`pm2 jlist`, `wattpm ps`, `warden status --json`).
 - **req/s, p50/p99**: oha with 64 keep-alive connections for `--duration`

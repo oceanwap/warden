@@ -345,6 +345,7 @@ pub(crate) mod tests {
             rollout: None,
             last_rollout: None,
             workers: (1..=n).map(|i| worker(i, Some(40 << 20), Some(1.5))).collect(),
+            release: None,
         }
     }
 

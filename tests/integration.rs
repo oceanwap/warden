@@ -3344,3 +3344,481 @@ fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
     assert!(out.contains("wardend: stopped wardend.service"), "{out}");
     assert!(fakes.take().contains("stop wardend.service"));
 }
+
+// ------------------------------------------------------------ surge rollouts
+
+/// Requests on fresh connections from one client thread while `f` runs:
+/// (what `f` returned, requests that succeeded, requests that failed).
+fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let client = {
+        let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match get(port, "/whoami") {
+                    Some(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    None => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let r = f();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    (r, ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed))
+}
+
+/// None of the requests sent during a rolling replacement failed. Without
+/// net.ipv4.tcp_migrate_req=1 the kernel resets connections queued on a
+/// listener that closes, whatever the order of replacement (one at a time
+/// too): then up to 1% may fail, as in `process_mode_lifecycle`.
+fn no_dropped_requests(ok: usize, fail: usize) {
+    if allowed_resets() == 0 {
+        assert_eq!(fail, 0, "{fail} requests failed during the rollout ({ok} ok)");
+    } else {
+        assert!(fail * 100 <= ok, "{fail} requests failed during the rollout ({ok} ok)");
+    }
+}
+
+/// `warden reload`, waited for: its duration and the CLI's output.
+fn timed_reload(w: &Warden) -> (f64, String) {
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let s = w.status().unwrap();
+    (s["last_rollout"]["duration_secs"].as_f64().unwrap(), out)
+}
+
+/// The `workers=` of each "starting new workers next to the old ones" log line.
+fn batch_lines(w: &Warden) -> Vec<String> {
+    w.log()
+        .lines()
+        .filter(|l| l.contains("starting new workers next to the old ones"))
+        .filter_map(|l| l.split(" workers=").nth(1))
+        .map(|rest| match rest.strip_prefix('"') {
+            Some(q) => q.split('"').next().unwrap_or("").to_string(),
+            None => rest.split(' ').next().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn surge_replaces_workers_in_batches_without_dropping_requests() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("surge", port, &gated("surge", port, 4, ""));
+    let mut before = pid_set(&w.wait_for("ready", T, ready(4)));
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+
+    // One at a time (the default)...
+    let ((one, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge 1: {one}s, {ok} ok, {fail} failed");
+    assert!(out.contains("reload complete: 4 worker(s) replaced") && !out.contains("batch"), "{out}");
+    no_dropped_requests(ok, fail);
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before));
+    before = pid_set(&s);
+    assert!(batch_lines(&w).is_empty());
+
+    // ...then two at a time: 2 batches, faster, nothing dropped.
+    std::fs::write(&w.cfg, good.replace("[reload]\n", "[reload]\nsurge = 2\n")).unwrap();
+    let ((two, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge 2: {two}s, {ok} ok, {fail} failed");
+    assert!(out.contains("4 worker(s) replaced") && out.contains("(2 batches of up to 2)"), "{out}");
+    // Phases name the batch, and `done` counts the workers it finished.
+    assert!(out.contains("[0/4] workers 1, 2: ") && out.contains("[2/4] workers 3, 4: "), "{out}");
+    no_dropped_requests(ok, fail);
+    assert!(ok > 20, "{ok}");
+    assert_eq!(batch_lines(&w), ["1, 2", "3, 4"], "{}", w.log());
+    assert!(two < one, "surge 2 ({two}s) should be faster than one at a time ({one}s)");
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new");
+    assert_eq!(s["workers_ready"], 4);
+    assert!(w.log().contains("reload started workers=4 seq=2 surge=2"), "{}", w.log());
+    before = pid_set(&s);
+
+    // "all": every new worker at once, one batch.
+    std::fs::write(&w.cfg, good.replace("[reload]\n", "[reload]\nsurge = \"all\"\n")).unwrap();
+    let ((all, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge all: {all}s, {ok} ok, {fail} failed");
+    assert!(out.contains("4 worker(s) replaced") && out.contains("(1 batch of up to 4)"), "{out}");
+    no_dropped_requests(ok, fail);
+    assert_eq!(batch_lines(&w), ["1, 2", "3, 4", "1-4"]);
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4, "the old workers are gone, the new ones serve");
+
+    // A rolling `restart` uses the same batches.
+    let (code, out) = w.cli(&["restart"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("restart complete") && out.contains("(1 batch of up to 4)"), "{out}");
+}
+
+#[test]
+fn surge_failure_rolls_back_the_whole_batch() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("surgefail", port, 4, "").replace("[reload]\n", "[reload]\nsurge = 2\n");
+    let w = Warden::start("surgefail", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(4)));
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+    let with = |extra: &str| good.replace("[reload]\n", &format!("[reload]\n{extra}\n"));
+
+    // Worker 2's new process fails its check; worker 1's passed, and is stopped too.
+    std::fs::write(&w.cfg, with("verify_command = \"test $WARDEN_WORKER_ID != 2\"")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("reload failed at worker 2: verify_command failed"), "{out}");
+    assert!(out.contains("Rolled back: the 2 new workers started together were stopped"), "{out}");
+    let s = w.status().unwrap();
+    assert_eq!(pid_set(&s), before, "the old workers keep serving");
+    assert_eq!(s["workers_ready"], 4);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4, "no new worker left behind");
+
+    // safe-reload: a failing canary rolls back before any batch starts.
+    std::fs::write(&w.cfg, good.replace("[workers]", "env = { FIXTURE_HEALTH_FAIL = \"1\" }\n[workers]")).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("safe-reload failed at worker 1") && out.contains("Rolled back"), "{out}");
+    assert_eq!(pid_set(&w.status().unwrap()), before);
+
+    // The canary passes, then the next batch fails at worker 3: the canary
+    // stays, both new workers of that batch are stopped.
+    std::fs::write(&w.cfg, with("verify_command = \"test $WARDEN_WORKER_ID != 3\"")).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("safe-reload halted at worker 3") && out.contains("1/4 workers were replaced"), "{out}");
+    let s = w.status().unwrap();
+    let pid = |i: usize| s["workers"][i]["pid"].as_u64().unwrap();
+    assert!(!before.contains(&pid(0)), "the canary took over worker 1");
+    assert!((1..4).all(|i| before.contains(&pid(i))), "workers 2-4 still run the old version: {s:#?}");
+    assert_eq!(batch_lines(&w).last().map(String::as_str), Some("2, 3"), "{}", w.log());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4);
+}
+
+// ------------------------------------------------------------ release pinning
+
+/// releases/v1..v3 (each a copy of the release fixture) and `current` -> v1.
+fn release_tree(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("warden-it-rel-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for v in ["v1", "v2", "v3"] {
+        std::fs::create_dir_all(dir.join("releases").join(v)).unwrap();
+        std::fs::copy(fixture("release_app.ts"), dir.join("releases").join(v).join("app.ts")).unwrap();
+    }
+    std::os::unix::fs::symlink(dir.join("releases/v1"), dir.join("current")).unwrap();
+    dir
+}
+
+/// Point `current` at another release, atomically (as deploy tools do).
+fn swap_current(dir: &std::path::Path, to: &str) {
+    let tmp = dir.join("current.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(dir.join("releases").join(to), &tmp).unwrap();
+    std::fs::rename(&tmp, dir.join("current")).unwrap();
+}
+
+/// The releases the workers answer from (their cwd). `script`: also check
+/// that the script runs from the same release ("(mixed)" when it doesn't).
+fn releases_seen(port: u16, script: bool) -> std::collections::BTreeSet<String> {
+    let rel = |s: &str| s.split("releases/").nth(1).and_then(|r| r.split('/').next()).unwrap_or("?").to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let Some(w) = get(port, "/where") else { continue };
+        let Some((cwd, path)) = w.split_once('|') else { continue };
+        let mixed = script && rel(cwd) != rel(path);
+        seen.insert(format!("{}{}", rel(cwd), if mixed { "(mixed)" } else { "" }));
+    }
+    seen
+}
+
+fn release_config(name: &str, port: u16, dir: &std::path::Path, extra: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nargs = [\"{}\"]\nworking_directory = \"{}\"\nport = {port}\n{extra}\n\
+         [workers]\ncount = 2\n[restart]\nbackoff_initial = 50\n[shutdown]\ndrain_ms = 100\n",
+        dir.join("current/app.ts").display(),
+        dir.join("current").display(),
+    )
+}
+
+/// kill -9 worker `idx` (0-based) and wait until it runs again; its old pid.
+fn kill_worker(w: &Warden, idx: usize) -> u64 {
+    let pid = w.status().unwrap()["workers"][idx]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    w.wait_for("worker restarted", T, |s| {
+        let x = &s["workers"][idx];
+        x["state"] == "RUNNING" && x["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    pid
+}
+
+#[test]
+fn pinned_release_survives_a_symlink_swap_until_reload() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let dir = release_tree("pin");
+    let w = Warden::start("pin", port, &release_config("pin", port, &dir, ""));
+    let s = w.wait_for("ready", T, ready(2));
+    let rel = |s: &Value| s["release"].as_str().unwrap_or("").to_string();
+    assert!(rel(&s).ends_with("releases/v1"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "cwd and script both in the pinned release");
+    assert!(w.log().contains("release pinned"));
+    let (_, out) = w.cli(&["status"]);
+    assert!(out.contains("Release:") && out.contains("releases/v1"), "{out}");
+
+    // Deploy, step 1: the symlink is swapped, and a worker crashes before the
+    // reload. It comes back on the release the others run.
+    swap_current(&dir, "v2");
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
+    assert!(rel(&s).ends_with("releases/v1"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "no mixed versions after a crash");
+    let log = w.wait_log("something outside Warden sent SIGKILL", T);
+    assert!(log.contains("worker crashed") && log.contains("killed by another process (SIGKILL)"), "{log}");
+
+    // Step 2: the reload moves every worker to the new release.
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.status().unwrap();
+    assert!(rel(&s).ends_with("releases/v2"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v2".to_string()].into());
+    let log = w.log();
+    let started = log.lines().find(|l| l.contains("reload started")).unwrap_or_default();
+    assert!(started.contains("release=") && started.contains("releases/v2"), "{started}");
+    let (_, out) = w.cli(&["describe"]);
+    assert!(out.contains("releases/v2 (pinned"), "{out}");
+
+    // Old releases cleaned up while still pinned: the next crash restart
+    // can't use v2 any more; it falls back to `current` (v3) and says so.
+    swap_current(&dir, "v3");
+    std::fs::remove_dir_all(dir.join("releases/v2")).unwrap();
+    kill_worker(&w, 1);
+    let log = w.wait_log("the pinned release directory is gone", T);
+    assert!(log.contains("reload has moved every worker off them"), "{log}");
+    let s = w.status().unwrap();
+    assert!(rel(&s).ends_with("releases/v3"), "{s:#?}");
+    let t0 = Instant::now();
+    while !releases_seen(port, true).contains("v3") {
+        assert!(t0.elapsed() < T, "the restarted worker should run v3");
+    }
+
+    // A failed rollout keeps the pin it had.
+    swap_current(&dir, "v1");
+    let cfg = std::fs::read_to_string(&w.cfg).unwrap();
+    std::fs::write(&w.cfg, cfg.replace("[workers]", "[reload]\nverify_command = \"false\"\n[workers]")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(rel(&w.status().unwrap()).ends_with("releases/v3"), "the failed reload's pin must be dropped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_pinning_a_crash_restart_picks_up_the_new_release() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let dir = release_tree("nopin");
+    let w = Warden::start("nopin", port, &release_config("nopin", port, &dir, "pin_release = false"));
+    let s = w.wait_for("ready", T, ready(2));
+    assert!(s["release"].is_null(), "{s:#?}");
+    swap_current(&dir, "v2");
+    kill_worker(&w, 0);
+    // Today's behaviour without a pin, and why it is on by default: two
+    // versions serve side by side.
+    let t0 = Instant::now();
+    while releases_seen(port, false) != ["v1".to_string(), "v2".to_string()].into() {
+        assert!(t0.elapsed() < T, "expected v1 and v2 side by side");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --------------------------------------------------------------- exit reasons
+
+/// A plain program that kills itself with `sig` after a moment.
+fn self_killer(name: &str, sig: &str) -> Warden {
+    Warden::start(
+        name,
+        0,
+        &format!(
+            "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"sleep 0.3; kill -{sig} $$\"]\n\
+             [workers]\nmin_uptime = 100\n[restart]\nbackoff_initial = 2000\nbackoff_max = 2000\n"
+        ),
+    )
+}
+
+#[test]
+fn exit_reasons_name_crashes_and_who_stopped_a_worker() {
+    // A segfault and an abort, as the kernel reports them.
+    let w = self_killer("segv", "SEGV");
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGSEGV (segmentation fault)");
+    let log = w.wait_log("coredumpctl", T);
+    assert!(log.contains("worker crashed") && log.contains("reason=\"crashed: SIGSEGV"), "{log}");
+    let w = self_killer("abrt", "ABRT");
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGABRT (aborted)");
+    w.wait_log("aborted itself", T);
+    if !have_bun() {
+        return;
+    }
+
+    // Bun's own process.abort().
+    let w = Warden::start(
+        "bunabort",
+        0,
+        "[app]\nname = \"bunabort\"\nargs = [\"-e\", \"setTimeout(() => process.abort(), 300)\"]\n\
+         [workers]\nmin_uptime = 100\n[restart]\nbackoff_initial = 2000\nbackoff_max = 2000\n",
+    );
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGABRT (aborted)");
+
+    // `warden stop`: an exit after Warden's stop signal...
+    let port = free_port();
+    let w = Warden::start("stopsig", port, &simple("stopsig", port, 1, ""));
+    w.wait_for("ready", T, ready(1));
+    assert_eq!(w.cli(&["stop"]).0, 0);
+    let s = w.wait_for("stopped", T, |s| s["workers"][0]["state"] == "STOPPED");
+    let why = s["workers"][0]["last_exit"].as_str().unwrap();
+    assert!(why == "exit code 0 after Warden's SIGTERM" || why == "stopped by Warden's SIGTERM", "{why}");
+
+    // ...and Warden's SIGKILL once the grace period is over.
+    let port = free_port();
+    let w = Warden::start(
+        "gracekill",
+        port,
+        &format!(
+            "[app]\nname = \"gracekill\"\nargs = [\"{}\"]\nport = {port}\nshim = false\n\
+             env = {{ FIXTURE_IGNORE_TERM = \"1\" }}\n[shutdown]\ngrace_period = 1\n",
+            fixture("app.ts")
+        ),
+    );
+    w.wait_for("ready", T, ready(1));
+    assert_eq!(w.cli(&["stop"]).0, 0);
+    let s = w.wait_for("stopped", T, |s| s["workers"][0]["state"] == "STOPPED");
+    assert_eq!(s["workers"][0]["last_exit"], "killed by Warden (SIGKILL)");
+}
+
+/// OOM kills are told apart by the cgroup's oom_kill counter. A fake
+/// `memory.events` (debug builds only) stands in for the kernel's here.
+#[test]
+fn oom_kill_is_told_apart_from_a_kill_9() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let events = std::env::temp_dir().join(format!("warden-it-memory.events-{}", std::process::id()));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    let ev = events.display().to_string();
+    let w = Warden::start_env("oomfake", port, &simple("oomfake", port, 1, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
+    w.wait_for("ready", T, ready(1));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)");
+    let log = w.wait_log("raise memory.max / MemoryMax= or lower `[limits] max_memory`", T);
+    assert!(log.contains("worker crashed") && log.contains("OOM killer"), "{log}");
+    // The counter didn't move this time: someone's kill -9.
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
+    w.wait_log("OOM killer was ruled out", T);
+    let _ = std::fs::remove_file(&events);
+}
+
+/// A child of our own memory cgroup with `limit` bytes (cgroup v1 or v2), if
+/// this machine lets us make one: (its directory, its cgroup.procs).
+fn memory_cgroup(limit: u64) -> Option<(PathBuf, PathBuf)> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let name = format!("warden-it-{}", std::process::id());
+    for line in cgroup.lines() {
+        let mut f = line.splitn(3, ':');
+        let (Some(_), Some(ctl), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
+        let rel = path.trim_start_matches('/');
+        let (dir, files) = if ctl.split(',').any(|c| c == "memory") {
+            let dir = PathBuf::from("/sys/fs/cgroup/memory").join(rel).join(&name);
+            (dir, [("memory.limit_in_bytes", limit.to_string()), ("memory.memsw.limit_in_bytes", limit.to_string())])
+        } else if ctl.is_empty() && std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            let dir = PathBuf::from("/sys/fs/cgroup").join(rel).join(&name);
+            (dir, [("memory.max", limit.to_string()), ("memory.swap.max", "0".to_string())])
+        } else {
+            continue;
+        };
+        if std::fs::create_dir(&dir).is_err() {
+            continue;
+        }
+        // The limit itself is required; a swap limit may not exist (no swap accounting).
+        if std::fs::write(dir.join(files[0].0), &files[0].1).is_ok() {
+            let _ = std::fs::write(dir.join(files[1].0), &files[1].1);
+            let procs = dir.join("cgroup.procs");
+            return Some((dir, procs));
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+    None
+}
+
+impl Warden {
+    /// Like `start`, with Warden (and so its workers) in the cgroup whose
+    /// `cgroup.procs` is `procs`.
+    fn start_in_cgroup(name: &str, port: u16, toml: &str, procs: &std::path::Path) -> Warden {
+        let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("warden.toml");
+        let text = format!("{toml}\n[control]\nsocket = \"{}\"\n", dir.join("w.sock").display());
+        std::fs::write(&cfg, text).unwrap();
+        let log = std::fs::File::create(dir.join("warden.log")).unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "echo $$ > \"$0\" && exec \"$@\""])
+            .arg(procs)
+            .arg(BIN)
+            .args(["start", "-c"])
+            .arg(&cfg)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        Warden { child, cfg, dir, port }
+    }
+}
+
+/// A real OOM kill, where the sandbox lets us make a memory cgroup.
+#[test]
+fn a_real_oom_kill_is_reported_with_its_fix() {
+    if !have_bun() {
+        return;
+    }
+    let Some((cg, procs)) = memory_cgroup(192 << 20) else {
+        eprintln!("skipping: can't create a memory cgroup with a limit here");
+        return;
+    };
+    let port = free_port();
+    let w = Warden::start_in_cgroup("oomreal", port, &simple("oomreal", port, 1, ""), &procs);
+    let pid = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    let _ = get(port, "/leak"); // ~200 MB more than the worker had
+    let s = w.wait_for("OOM-killed and restarted", T, |s| {
+        s["workers"][0]["state"] == "RUNNING" && s["workers"][0]["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
+    w.wait_log("raise memory.max / MemoryMax=", T);
+    drop(w);
+    for _ in 0..50 {
+        if std::fs::remove_dir(&cg).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -125,6 +125,12 @@ pub struct App {
     /// apps that run cron jobs only on instance 0 keep working. "" = unset.
     #[serde(default = "default_instance_var")]
     pub instance_var: String,
+    /// Start workers in the real path of `working_directory` (a `current`
+    /// symlink resolved), taken at start and at each reload / safe-reload /
+    /// restart of every worker. Crash restarts reuse it, so a crash after
+    /// the symlink was swapped doesn't start the new release next to the old.
+    #[serde(default = "yes")]
+    pub pin_release: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -259,6 +265,67 @@ pub struct Reload {
     pub preflight: Option<String>,
     /// Seconds allowed for one worker's gates (ready, checks, verify, soak).
     pub timeout: u64,
+    /// New workers started at once in a rolling replacement, each next to
+    /// the one it replaces: 1 (one at a time), N, or "all". Each passes the
+    /// gates; then the N old ones drain together. Runs up to N extra workers
+    /// for a few seconds.
+    #[serde(deserialize_with = "surge_count")]
+    pub surge: Surge,
+}
+
+/// `[reload] surge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surge {
+    Count(usize),
+    All,
+}
+
+impl Surge {
+    /// Workers per batch for a rollout of `total` workers.
+    pub fn batch(self, total: usize) -> usize {
+        match self {
+            Surge::Count(n) => n.clamp(1, total.max(1)),
+            Surge::All => total.max(1),
+        }
+    }
+    pub fn is_one(self) -> bool {
+        self == Surge::Count(1)
+    }
+}
+
+impl std::fmt::Display for Surge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Surge::Count(n) => write!(f, "{n}"),
+            Surge::All => f.write_str("all"),
+        }
+    }
+}
+
+impl serde::Serialize for Surge {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Surge::Count(n) => s.serialize_u64(*n as u64),
+            Surge::All => s.serialize_str("all"),
+        }
+    }
+}
+
+/// `surge = 2` or `surge = "all"`.
+fn surge_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Surge, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum S {
+        Num(i64),
+        Text(String),
+    }
+    match S::deserialize(d)? {
+        S::Num(n) if (1..=1024).contains(&n) => Ok(Surge::Count(n as usize)),
+        S::Num(n) => Err(D::Error::custom(format!("reload.surge = {n}: must be between 1 and 1024, or \"all\""))),
+        S::Text(t) if t.trim() == "all" => Ok(Surge::All),
+        S::Text(t) => Err(D::Error::custom(format!("reload.surge = {t:?}: expected a number or \"all\""))),
+    }
 }
 
 /// Liveness: the shim sends a heartbeat from each worker's event loop. No
@@ -505,6 +572,7 @@ impl Default for Reload {
             pause: 0,
             preflight: None,
             timeout: 120,
+            surge: Surge::Count(1),
         }
     }
 }
@@ -719,6 +787,23 @@ impl Config {
         let rl = &self.reload;
         if rl.health_interval_ms < 50 || rl.timeout == 0 {
             return Err("reload.health_interval_ms must be >= 50 and reload.timeout > 0".into());
+        }
+        if !rl.surge.is_one() && !self.overlap() {
+            let s = rl.surge;
+            return Err(if self.workers.port_strategy == PortStrategy::Offset {
+                format!(
+                    "reload.surge = {s} starts new workers next to the ones they replace, but with \
+                     workers.port_strategy = \"offset\" each worker owns its port, so a worker and its \
+                     replacement can't run at the same time. Fix: remove reload.surge (one worker at a \
+                     time, stopped then started), or use port_strategy = \"shared\""
+                )
+            } else {
+                format!(
+                    "reload.surge = {s} starts new workers next to the ones they replace, but this app's \
+                     workers can't overlap (workers.overlap = false, or a port without Warden's shim, so \
+                     no SO_REUSEPORT). Fix: remove reload.surge, or let the workers share the port"
+                )
+            });
         }
         for (name, cmd) in [("reload.verify_command", &rl.verify_command), ("reload.preflight", &rl.preflight)] {
             if cmd.as_deref().is_some_and(|c| c.trim().is_empty()) {
@@ -1137,6 +1222,8 @@ mod tests {
         assert_eq!(c.workers.count, 4);
         assert_eq!(c.logging.max_lines_per_sec, Logging::default().max_lines_per_sec);
         assert_eq!(c.logging.rotate, Rotate::default());
+        assert_eq!(c.reload.surge, Reload::default().surge);
+        assert!(c.app.pin_release);
         // The commented [static] block is valid too.
         let uncommented: String = text
             .split("# [static]")
@@ -1279,6 +1366,35 @@ level = "info"
         assert!(Config::parse(w).is_ok());
         assert!(Config::parse("[app]\nname = \"a\"\n[workers]\nmode = \"worker\"\n").is_err());
         assert!(Config::parse(&format!("{w}port_strategy = \"offset\"\n")).is_err());
+    }
+
+    #[test]
+    fn surge_values_and_rules() {
+        let c = Config::parse(MIN).unwrap();
+        assert_eq!(c.reload.surge, Surge::Count(1));
+        assert!(c.app.pin_release, "pinning is on by default");
+        let c = Config::parse(&format!("{MIN}[reload]\nsurge = 2\n")).unwrap();
+        assert_eq!((c.reload.surge, c.reload.surge.batch(4), c.reload.surge.batch(1)), (Surge::Count(2), 2, 1));
+        let c = Config::parse(&format!("{MIN}[reload]\nsurge = \"all\"\n")).unwrap();
+        assert_eq!((c.reload.surge, c.reload.surge.batch(4)), (Surge::All, 4));
+        assert_eq!(serde_json::to_value(c.reload.surge).unwrap(), serde_json::json!("all"));
+        assert_eq!(serde_json::to_value(Surge::Count(3)).unwrap(), serde_json::json!(3));
+        for bad in ["0", "-1", "2000", "\"most\""] {
+            let e = Config::parse(&format!("{MIN}[reload]\nsurge = {bad}\n")).unwrap_err();
+            assert!(e.contains("surge"), "{bad}: {e}");
+        }
+        // Workers that can't overlap can't surge.
+        let offset =
+            "[app]\nname = \"a\"\nargs = [\"s.ts\"]\nport = 3000\n[workers]\ncount = 4\nport_strategy = \"offset\"\n";
+        assert!(Config::parse(offset).is_ok());
+        let e = Config::parse(&format!("{offset}[reload]\nsurge = 2\n")).unwrap_err();
+        assert!(e.contains("port_strategy = \"offset\"") && e.contains("Fix:"), "{e}");
+        assert!(Config::parse(&format!("{offset}[reload]\nsurge = 1\n")).is_ok());
+        let py =
+            "[app]\nname = \"a\"\ncommand = \"python3\"\nargs = [\"s.py\"]\nport = 8000\n[reload]\nsurge = \"all\"\n";
+        assert!(Config::parse(py).unwrap_err().contains("can't overlap"));
+        let c = Config::parse(&format!("{MIN}pin_release = false\n")).unwrap();
+        assert!(!c.app.pin_release);
     }
 
     #[test]

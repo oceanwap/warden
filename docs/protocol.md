@@ -102,7 +102,7 @@ Every event has a `type`. Times (`at_ms`) are Unix milliseconds.
 `worker.event`: `starting`, `ready`, `unhealthy`, `hung`, `crashed`,
 `exited` (clean exit), `restarting`, `failed` (too many restarts),
 `stopping`, `stopped`. `detail` carries the reason in words
-(`exit code 1`, `signal SIGKILL`, `startup_ms=120`, …).
+(`exit code 1`, `killed by another process (SIGKILL)`, `startup_ms=120`, …).
 
 What a supervisor sends, one event per transition (next to its log line):
 
@@ -112,12 +112,12 @@ What a supervisor sends, one event per transition (next to its log line):
 | `ready` | it listens (or reported ready) | `startup_ms=120`, plus ` role=replacement` |
 | `unhealthy` | it failed `failure_threshold` health checks in a row | `failed 3 health checks: …` |
 | `hung` | no heartbeat for `watchdog.timeout` | `no heartbeat for 10s` |
-| `crashed` | it exited unasked (also a rollout's new process, a Worker thread, a failed spawn) | the exit reason: `signal 9 (SIGKILL)`, `exit code 1`, `not ready in time`, … |
+| `crashed` | it exited unasked (also a rollout's new process, a Worker thread, a failed spawn) | the exit reason: `exit code 1`, `killed by the kernel OOM killer (out of memory)`, `killed by another process (SIGKILL)`, `crashed: SIGSEGV (segmentation fault)`, `not ready in time`, … |
 | `exited` | it exited with one of `restart.stop_exit_codes` | `exit code 0` |
 | `restarting` | it will be started again | `in_ms=50` (backoff), or why (`FAILED; reset on request`) |
 | `failed` | restarts given up | `too many restarts (…)` |
 | `stopping` | Warden asked it to stop | `SIGTERM grace_s=30`, `SIGKILL` |
-| `stopped` | it exited after that, or stays down (`warden stop`, scaled down) | the exit reason |
+| `stopped` | it exited after that, or stays down (`warden stop`, scaled down) | the exit reason (`exit code 0 after Warden's SIGTERM`, `killed by Warden (SIGKILL)`) |
 
 `worker` is the worker number of `status.workers`. During a rollout two
 processes share a number: `pid` tells them apart. In worker mode, `worker` 0

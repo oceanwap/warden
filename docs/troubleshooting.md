@@ -31,7 +31,26 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `dependency outage suspected: holding worker replacements` | More than `health.outage_threshold` of the workers fail at once: probably a database or API is down, not the workers | Fix the dependency; Warden resumes replacements by itself. Use a `live_path` that checks the process only, and a `ready_path` for dependencies |
 | `net.ipv4.tcp_migrate_req is 0` | Connections waiting in a closing worker's accept queue get reset during restarts | `sysctl -w net.ipv4.tcp_migrate_req=1` and `contrib/99-warden.conf` (what `warden startup` installs) |
 | `worker did not exit within grace period; sending SIGKILL` | The app ignored the stop signal for `shutdown.grace_period` | Apps written for PM2 often listen for SIGINT: `shutdown.signal = "SIGINT"`. Otherwise close servers and DB pools on SIGTERM |
+| `reload failed at worker 2 … Rolled back: the 2 new workers started together were stopped` | With `[reload] surge`, one worker of a batch failed a gate | Nothing to undo: the batch's new workers were stopped and the old ones keep serving. The message names the worker and the gate |
+| `reload.surge = N starts new workers next to the ones they replace, but …` (at start or `warden check`) | Surge needs a worker and its replacement to run at once; with `port_strategy = "offset"` each worker owns its port, and apps without the shim can't share one | Remove `surge` (one worker at a time), or let the workers share the port (`port_strategy = "shared"`) |
+| Workers still run the old release after a deploy, or a restarted worker did | `[app] pin_release` (default): workers start in the release `current` pointed to at the last start / reload / safe-reload / restart. A crash restart stays on it on purpose, so versions don't mix | Reload after swapping the symlink: `warden safe-reload` (or `reload`). `warden status` shows the pinned release |
+| `the pinned release directory is gone; starting the worker in the current release instead` | The pinned release was deleted (old releases cleaned up) before a reload moved the workers off it | Delete old releases only after the reload; then run `warden reload` so every worker runs the same release again |
 | `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
+
+## Why a worker died
+
+`warden status` shows each worker's `last_exit`, and the log line of the death
+carries the same reason with a `hint=`.
+
+| You see | Why | Fix |
+|---|---|---|
+| `killed by the kernel OOM killer (out of memory)` | The cgroup Warden runs in (`MemoryMax=` of the unit, a container limit) ran out of memory and the kernel killed the worker; Warden saw the cgroup's `oom_kill` count go up | Raise `memory.max` / `MemoryMax=`, or set `[limits] max_memory` below it so Warden replaces a growing worker gracefully before the kernel kills it |
+| `killed by another process (SIGKILL)` | A SIGKILL Warden didn't send: `kill -9` by a person or script, a container runtime. With the cgroup counter readable, the OOM killer is ruled out | Find who sends it (`journalctl`, the audit log). Without a readable counter the hint says so: check `journalctl -k \| grep -i oom` |
+| `killed by another process (SIGTERM)` | Something else asked the worker to stop, often systemd stopping the unit with `KillMode=control-group` | Use `KillMode=mixed` (what `warden startup` writes), so only Warden gets the stop signal and drains its workers |
+| `crashed: SIGSEGV (segmentation fault)`, `SIGBUS`, `SIGILL` | A native crash in the runtime or a native module | The worker's last output (`warden logs <app>`) and core dumps (`coredumpctl list`) say where; try another Bun/Node version |
+| `crashed: SIGABRT (aborted)` | The program aborted itself: `process.abort()`, a failed native assertion, a fatal runtime error | Its last output lines say why |
+| `killed by Warden (SIGKILL)` | Warden killed it: it didn't exit within `shutdown.grace_period`, was hung (watchdog), or not ready in time | The line before it says which; see those entries |
+| `exit code 0 after Warden's SIGTERM` | A normal stop: the worker exited after Warden's stop signal | Nothing to do |
 
 ## Health
 

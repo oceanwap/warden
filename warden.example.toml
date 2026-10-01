@@ -15,6 +15,9 @@ env = { NODE_ENV = "production" }            # example
                                              # readiness, drain, health socket); false for anything else
 # namespace = "backend"                      # example; a group for `warden restart backend` (default "default")
 instance_var = "NODE_APP_INSTANCE"           # env var with the worker's 0-based index (PM2's instance_var); "" = none
+pin_release = true                           # start workers in the real path of working_directory (its `current`
+                                             # symlink resolved at start and at each reload / safe-reload / restart),
+                                             # so a crash restart after the symlink swap stays on the running release
 
 [workers]
 count = 4                                    # example (default 1); also "max" (one per CPU) or "max-1"
@@ -65,6 +68,10 @@ canary_soak = 30                             # s the safe-reload canary runs nex
 pause = 0                                    # s between workers (safe-reload)
 # preflight = "bun run check:deploy"         # example; runs before anything is touched
 timeout = 120                                # s allowed per worker for all gates
+surge = 1                                    # new workers started at once, each next to the one it replaces:
+                                             # 1, N or "all". The old ones drain once the whole batch passed the
+                                             # gates; a failure stops the batch's new workers. Briefly runs up to
+                                             # N extra workers (memory). Not with port_strategy = "offset"
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
