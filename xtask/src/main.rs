@@ -2,6 +2,7 @@
 //!
 //!   cargo xtask bench [--quick] [--only SUITES] [--duration S] [--no-readme]
 //!   cargo bench-all                       (the same as `cargo xtask bench`)
+//!   cargo xtask chaos [--minutes N] [--seed S] (a chaos soak; see chaos/mod.rs)
 //!   cargo xtask release VERSION [OPTIONS] (also `cargo release`; see release.rs)
 //!
 //! `bench` checks the tools the benchmarks need, builds Warden in release
@@ -11,6 +12,7 @@
 //! tables (between `<!-- bench:start -->` and `<!-- bench:end -->`).
 //! Nothing here is part of `cargo build`.
 
+mod chaos;
 mod release;
 
 use std::path::{Path, PathBuf};
@@ -89,6 +91,8 @@ cargo xtask TASK [OPTIONS]
 
 TASKS:
     bench      Run every benchmark suite, update README.md (also: cargo bench-all)
+    chaos      A chaos soak: a fleet under load, random faults, invariants checked
+               (docs/chaos.md)
     release    Release a version: checks, version bump, tag, push, then follow the
                Release workflow to the GitHub Release (also: cargo release)
 
@@ -116,6 +120,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("bench") => match bench(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("chaos") => match chaos::main(&args[1..], &root()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("xtask: {e}");
