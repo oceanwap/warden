@@ -139,13 +139,20 @@ pub fn file_chain(path: &Path) -> Vec<PathBuf> {
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
         let prefix = format!("{}.", name.to_string_lossy());
         if let Ok(rd) = std::fs::read_dir(dir) {
-            let mut rotated: Vec<(SystemTime, PathBuf)> = rd
+            let names: Vec<String> = rd
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().to_string();
-                    n.starts_with(&prefix) && !n.ends_with(".tmp")
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.starts_with(&prefix) && !n.ends_with(".tmp"))
+                .collect();
+            let mut rotated: Vec<(SystemTime, PathBuf)> = names
+                .iter()
+                // Being compressed right now: `x` and the finished `x.gz`
+                // both exist for a moment. Read the plain one, once.
+                .filter(|n| !n.strip_suffix(".gz").is_some_and(|plain| names.iter().any(|m| m == plain)))
+                .filter_map(|n| {
+                    let p = dir.join(n);
+                    Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))
                 })
-                .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
                 .collect();
             rotated.sort();
             chain.extend(rotated.into_iter().map(|(_, p)| p));
@@ -496,6 +503,31 @@ mod tests {
             .unwrap();
         }
         assert_eq!(seen, vec!["one", "two", "three", "four"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_being_compressed_is_read_once() {
+        // Between the rename of `x.gz` and the removal of `x`, both exist.
+        let dir = std::env::temp_dir().join(format!("warden-logview-gz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("app.log");
+        std::fs::write(dir.join("app.log.1"), "old\n").unwrap();
+        let gz = std::fs::File::create(dir.join("app.log.1.gz")).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(gz, flate2::Compression::default());
+        enc.write_all(b"old\n").unwrap();
+        enc.finish().unwrap();
+        std::fs::write(&p, "new\n").unwrap();
+        let mut seen = Vec::new();
+        for f in file_chain(&p) {
+            for_each_line(&f, &mut |l| {
+                seen.push(l.to_string());
+                true
+            })
+            .unwrap();
+        }
+        assert_eq!(seen, vec!["old", "new"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -766,6 +766,9 @@ impl Drop for FileSink {
 const FILE_BUFFER: usize = 64 * 1024;
 
 /// `file` → `file.gz` (written to a temp name first), then `file` removed.
+/// The `.gz` keeps the original's modification time: readers order rotated
+/// files by it (`logview::file_chain`), and a compression that runs later
+/// than a newer rotation must not move this file after it.
 fn gzip_file(path: &std::path::Path) -> std::io::Result<()> {
     let mut gz_name = path.as_os_str().to_owned();
     gz_name.push(".gz");
@@ -775,10 +778,13 @@ fn gzip_file(path: &std::path::Path) -> std::io::Result<()> {
     let tmp = PathBuf::from(tmp_name);
     {
         let mut input = std::fs::File::open(path)?;
+        let modified = input.metadata()?.modified()?;
         let out = std::fs::File::create(&tmp)?;
         let mut enc = flate2::write::GzEncoder::new(out, flate2::Compression::default());
         std::io::copy(&mut input, &mut enc)?;
-        enc.finish()?.sync_all()?;
+        let out = enc.finish()?;
+        out.set_modified(modified)?;
+        out.sync_all()?;
     }
     std::fs::rename(&tmp, &dest)?;
     std::fs::remove_file(path)
@@ -1877,6 +1883,24 @@ mod tests {
         assert_eq!(merge_newest(&ev, &out, 100, &all).len(), 10);
         let odd = |l: &str| l.ends_with(['1', '3', '5', '7', '9']);
         assert_eq!(strs(merge_newest(&ev, &out, 3, &odd)), vec!["l5", "l7", "l9"]);
+    }
+
+    #[test]
+    fn gzip_keeps_the_modification_time() {
+        // Readers order rotated files by it: a late compression must not
+        // move an older file after a newer one.
+        let dir = std::env::temp_dir().join(format!("warden-gzip-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("app.log.2");
+        std::fs::write(&f, "old lines\n").unwrap();
+        let then = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(then).unwrap();
+        gzip_file(&f).unwrap();
+        assert!(!f.exists());
+        let gz = std::fs::metadata(dir.join("app.log.2.gz")).unwrap().modified().unwrap();
+        assert_eq!(gz, then);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
