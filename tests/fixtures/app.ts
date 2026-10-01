@@ -16,6 +16,8 @@
 //   /hang    block the event loop forever (watchdog)
 //   /sick    this worker's /health starts answering 503
 //   /leak    allocate ~200 MB and keep it (max_memory)
+//   /reload-v2  the app swaps its own handler (server.reload): later answers
+//               start with "v2 "
 import { threadId } from "node:worker_threads";
 
 if (process.env.FIXTURE_EXIT) process.exit(Number(process.env.FIXTURE_EXIT));
@@ -51,33 +53,42 @@ if (process.env.FIXTURE_IPC_FLOOD) {
 let sick = process.env.FIXTURE_HEALTH_FAIL === "1";
 const hoard: Uint8Array[] = [];
 
+let server: ReturnType<typeof Bun.serve>;
+
+function handler(tag: string) {
+  return function fetch(req: Request) {
+    const path = new URL(req.url).pathname;
+    switch (path) {
+      case "/reload-v2":
+        server.reload({ fetch: handler("v2 ") });
+        break;
+      case "/health":
+        return new Response(sick ? "sick" : "ok", { status: sick ? 503 : 200 });
+      case "/throw":
+        setTimeout(() => { throw new Error(`fixture crash ${who}`); });
+        break;
+      case "/exit":
+        setTimeout(() => process.exit(3));
+        break;
+      case "/hang":
+        setTimeout(() => { for (;;) {} });
+        break;
+      case "/sick":
+        sick = true;
+        break;
+      case "/leak":
+        for (let i = 0; i < 20; i++) hoard.push(new Uint8Array(10 * 1024 * 1024).fill(1));
+        break;
+    }
+    return new Response(tag + who);
+  };
+}
+
 function serveApp() {
-  Bun.serve({
+  server = Bun.serve({
     port: Number(process.env.PORT),
     reusePort: true,
-    fetch(req) {
-      const path = new URL(req.url).pathname;
-      switch (path) {
-        case "/health":
-          return new Response(sick ? "sick" : "ok", { status: sick ? 503 : 200 });
-        case "/throw":
-          setTimeout(() => { throw new Error(`fixture crash ${who}`); });
-          break;
-        case "/exit":
-          setTimeout(() => process.exit(3));
-          break;
-        case "/hang":
-          setTimeout(() => { for (;;) {} });
-          break;
-        case "/sick":
-          sick = true;
-          break;
-        case "/leak":
-          for (let i = 0; i < 20; i++) hoard.push(new Uint8Array(10 * 1024 * 1024).fill(1));
-          break;
-      }
-      return new Response(who);
-    },
+    fetch: handler(""),
   });
 }
 

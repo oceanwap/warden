@@ -17,7 +17,11 @@
 //  4. Drains on the stop signal (WARDEN_STOP_SIGNAL, SIGTERM by default; SIGINT
 //     for apps written for PM2) or on a shutdown message (worker mode): closes
 //     listeners, answers remaining requests with `Connection: close`, waits
-//     WARDEN_DRAIN_MS and for in-flight requests, then exits.
+//     WARDEN_DRAIN_MS and for in-flight requests, then exits. Until then it
+//     adds no work to a request: Bun.serve runs the app's own fetch handler
+//     until the drain swaps in one that adds the header (server.reload), and
+//     node:http's requests in flight are read off the open connections when
+//     the drain needs them (one listener per connection, none per request).
 //  5. In Workers, closes listeners from an exit hook: Bun does not close the
 //     listening socket of a Worker that dies, which would black-hole 1/N of
 //     new connections.
@@ -55,7 +59,10 @@ const stopSignal = env.WARDEN_STOP_SIGNAL || "SIGTERM";
 // How long a drain lets WebSockets and SSE streams end by themselves before
 // closing them (0 = leave them alone). Only meaningful when there is a drain.
 const longLivedMs = Number(env.WARDEN_LONG_LIVED_MS ?? 2000);
-const longLived = longLivedMs > 0 && (inWorker || drainMs > 0);
+// Whether this worker drains at all: a Worker on the host's message, a
+// process on the stop signal unless WARDEN_DRAIN_MS is 0.
+const drains = inWorker || drainMs > 0;
+const longLived = longLivedMs > 0 && drains;
 // The app's own port. Other servers the app starts (metrics, admin) are
 // neither readiness signals nor health-check targets.
 const appPort = env.PORT ? Number(env.PORT) : null;
@@ -78,9 +85,10 @@ const drainPromise = new Promise((r) => (drainFinished = r));
 // and whether any of them was callback-style (returned no promise).
 const appHandlers = new Set();
 let appHandlerNoPromise = false;
-// Node: requests in flight, and every open connection with its state.
-let nodeInflight = 0;
+// Node: every open connection of the app's servers, and of the private
+// health socket (requests in flight are read off them in a drain).
 const nodeConns = new Set();
+const privateConns = new Set();
 // The app has a node:http server (Bun: one went through Bun.serve), so
 // node:http is loaded and its responses need `Connection: close` in a drain.
 let appUsesNodeHttp = false;
@@ -117,38 +125,32 @@ function privateSocketPath() {
 
 let originalServe = null;
 
+// Bun.serve servers that run the app's own fetch handler, and the options
+// they run with. Requests go straight to that handler: the shim adds nothing
+// per request. When a drain starts, server.reload() gives each one a handler
+// that adds `Connection: close` (requests in flight finish with the old
+// one), so keep-alive clients move to the new workers.
+const bunApps = new Map(); // server -> { opts, reload: the native reload }
+
 function wardenServe(options, ...rest) {
   if (standby && !promoted && deferrableBun(options)) return deferBunServe(options, rest);
+  const nodeHttp = !!options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function";
   let opts = options;
   if (opts && typeof opts === "object") {
     // Object.create keeps the caller's object (and its prototype methods)
     // intact while overriding just what we need.
-    const o = Object.create(opts);
-    if (forceReusePort && !opts.unix) o.reusePort = true;
-    if (typeof opts.fetch === "function") {
-      const fetch = opts.fetch;
-      o.fetch = function (req, server) {
-        const res = fetch.call(this, req, server);
-        if (!draining) return res;
-        return Promise.resolve(res).then((r) => {
-          if (r instanceof Response) {
-            try {
-              r.headers.set("connection", "close");
-            } catch {}
-          }
-          return r;
-        });
-      };
-    }
-    if (longLived && opts.websocket && typeof opts.websocket === "object") o.websocket = trackBunWebSockets(opts.websocket);
-    opts = o;
+    opts = withShimOptions(opts);
+    if (forceReusePort && !options.unix) opts.reusePort = true;
   }
-  if (options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function") {
+  if (nodeHttp) {
     appUsesNodeHttp = true;
     if (longLived) watchBunNodeServer();
   }
-  const server = originalServe.call(this, opts, ...rest);
+  const own = drains && opts !== options && !nodeHttp && typeof options.fetch === "function";
+  // A server started while draining (rare) drains from its first request.
+  const server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
   servers.add(server);
+  if (own) trackBunApp(server, opts);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
   if (isApp) {
     const socket = privateServer ? null : openPrivateBun(options);
@@ -173,6 +175,102 @@ function openPrivateBun(options) {
     return path;
   } catch {
     return null;
+  }
+}
+
+// The app's options plus what the shim adds to every server: WebSocket
+// open/close tracking (long-lived connections, below).
+function withShimOptions(options) {
+  const o = Object.create(options);
+  if (longLived && options.websocket && typeof options.websocket === "object") o.websocket = trackBunWebSockets(options.websocket);
+  return o;
+}
+
+// `o` with a fetch handler that adds `Connection: close` to every response:
+// what a server runs once its drain has started. A result that is not a
+// promise stays synchronous.
+function drainingOptions(o) {
+  const fetch = o.fetch;
+  const d = Object.create(o);
+  d.fetch = function (req, server) {
+    const res = fetch.call(this, req, server);
+    if (res instanceof Response) return connectionClose(res);
+    if (res && typeof res.then === "function") return res.then(connectionClose);
+    return res;
+  };
+  return d;
+}
+
+function connectionClose(r) {
+  if (r instanceof Response) {
+    try {
+      r.headers.set("connection", "close");
+    } catch {}
+  }
+  return r;
+}
+
+// server prototype (one per kind of server: plain, TLS, development) -> its
+// own reload()
+const nativeReloads = new WeakMap();
+
+function trackBunApp(server, opts) {
+  const proto = Object.getPrototypeOf(server);
+  if (!proto) return;
+  let native = nativeReloads.get(proto);
+  if (!native) {
+    native = proto.reload;
+    if (typeof native !== "function") return; // no reload(): see drainBunApps
+    nativeReloads.set(proto, native);
+    interceptReload(proto, native);
+  }
+  bunApps.set(server, { opts, reload: native });
+}
+
+// The app's own server.reload(newOptions) still works as before, through
+// the shim: its WebSockets stay tracked, a drain swaps in the handler the app
+// has now (never an older one), and a reload during a drain keeps draining.
+// Other servers' reload() (Bun's node:http) passes straight through.
+function interceptReload(proto, native) {
+  const desc = Object.getOwnPropertyDescriptor(proto, "reload");
+  if (desc && !desc.configurable && !desc.writable) return;
+  const reload = {
+    reload(options, ...rest) {
+      const app = bunApps.get(this);
+      if (!app || !options || typeof options !== "object" || typeof options.onNodeHTTPRequest === "function") {
+        return Reflect.apply(native, this, [options, ...rest]);
+      }
+      const o = withShimOptions(options);
+      // Bun keeps the handler it has when the new options bring none.
+      if (typeof options.fetch !== "function" && typeof app.opts.fetch === "function") o.fetch = app.opts.fetch;
+      app.opts = o;
+      return Reflect.apply(native, this, [draining && typeof o.fetch === "function" ? drainingOptions(o) : o, ...rest]);
+    },
+  }.reload;
+  nativeSource.set(reload, native);
+  try {
+    Object.defineProperty(proto, "reload", { ...(desc ?? { enumerable: false, configurable: true, writable: true }), value: reload });
+  } catch {}
+}
+
+// The drain: from now on every response of the app's Bun.serve servers says
+// `Connection: close`. Requests in flight finish with the handler they
+// started with.
+function drainBunApps() {
+  for (const [server, app] of bunApps) {
+    if (typeof app.opts.fetch !== "function") continue;
+    try {
+      Reflect.apply(app.reload, server, [drainingOptions(app.opts)]);
+    } catch (e) {
+      try {
+        process.stderr.write(
+          `warden: drain: server.reload() failed (${(e && e.message) || e}), so this worker's responses go out ` +
+            `without "Connection: close"; the drain goes on, and a keep-alive client whose connection closes as the ` +
+            `worker exits reconnects to another worker. hint: report this with \`bun --version\` ` +
+            `(https://github.com/oceanwap/warden/issues)\n`,
+        );
+      } catch {}
+    }
   }
 }
 
@@ -210,34 +308,38 @@ function withReusePort(args) {
 // server: every http.Server has `maxHeadersCount` (null by default).
 const isHttpServer = (server) => "maxHeadersCount" in server && typeof server.setTimeout === "function";
 
+// The open connections of the app's node:http servers (and, separately, of
+// the private health socket's), per connection: nothing is added per
+// request. A drain reads what it needs off the sockets (nodeBusy, below).
+function trackConn(sock) {
+  nodeConns.add(sock);
+  sock.on("close", untrackConn);
+}
+function untrackConn() {
+  nodeConns.delete(this);
+}
+function trackPrivateConn(sock) {
+  privateConns.add(sock);
+  sock.on("close", untrackPrivateConn);
+}
+function untrackPrivateConn() {
+  privateConns.delete(this);
+}
+
+// A response is in progress on this connection: node:http sets
+// `socket._httpMessage` when it hands a request to the app and clears it
+// once the response is finished (a pipelined request's response waits
+// behind it). An upgraded socket (WebSocket) has none; long-lived handling
+// deals with those.
+const nodeBusy = (sock) => !!sock._httpMessage;
+
 function trackNodeServer(server) {
   if (servers.has(server)) return;
   servers.add(server);
   if (isHttpServer(server)) {
     appUsesNodeHttp = true;
     if (longLived) trackNodeUpgrades(server);
-    server.on("connection", (sock) => {
-      sock.__warden = { served: false, busy: false };
-      nodeConns.add(sock);
-      sock.once("close", () => nodeConns.delete(sock));
-    });
-    server.on("request", (req, res) => {
-      nodeInflight++;
-      const st = req.socket && req.socket.__warden;
-      if (st) st.busy = true;
-      res.once("close", () => {
-        nodeInflight--;
-        if (st) {
-          st.busy = false;
-          st.served = true;
-        }
-      });
-      if (draining) {
-        try {
-          if (!res.headersSent) res.setHeader("connection", "close");
-        } catch {}
-      }
-    });
+    if (drains) server.on("connection", trackConn);
   }
   server.once("listening", () => {
     const addr = server.address();
@@ -261,6 +363,8 @@ function openPrivateNode(appServer, done) {
     fs.rmSync(path, { force: true });
     const p = http().createServer((req, res) => appServer.emit("request", req, res));
     privateServer = p;
+    // Health checks in flight count in a drain like the app's requests.
+    if (drains) p.on("connection", trackPrivateConn);
     p.once("error", () => done(null));
     p.listen(path, () => {
       privatePath = path;
@@ -437,12 +541,7 @@ function hookListeningEmit() {
           // Long-lived connections (below) track node:http connections from
           // this `listening`, which comes only once (for the stand-in): its
           // connections then include the real server's after promotion.
-          if (longLived) {
-            this.on("connection", (sock) => {
-              nodeConns.add(sock);
-              sock.once("close", () => nodeConns.delete(sock));
-            });
-          }
+          if (longLived) this.on("connection", trackConn);
           const host = r.options.hostname;
           const family = host && !host.includes(":") ? "IPv4" : "IPv6";
           // Until promotion, address() is the app's port, not the stand-in's path.
@@ -642,8 +741,10 @@ if (standby) readWardenCommands();
 // Then up to WS_CLOSE_WAIT_MS for clients to answer the close frames, so the
 // sockets end with FIN rather than RST.
 //
-// Cost: per request, nothing on Node and one call frame per `new Response()`
-// in Bun; a Set entry per open WebSocket / SSE stream, removed when it ends.
+// Cost: per request, nothing on Node (a Set entry per connection) and one
+// call frame per `new Response()` in Bun (JSC inlines it: no measurable
+// difference, bench/README.md "shim"); a Set entry per open WebSocket / SSE
+// stream, removed when it ends.
 
 const CLOSE_REASON = "server restarting";
 const WS_CLOSE_WAIT_MS = 1000;
@@ -737,10 +838,7 @@ function watchBunNodeServer() {
   if (t && typeof t.unref === "function") t.unref();
   proto.emit = function (ev) {
     if (ev === "listening" && bunNodeServersDue > 0) {
-      this.on("connection", (sock) => {
-        nodeConns.add(sock);
-        sock.once("close", () => nodeConns.delete(sock));
-      });
+      this.on("connection", trackConn);
       if (--bunNodeServersDue === 0) {
         clearTimeout(t);
         restore();
@@ -859,8 +957,9 @@ function reportLongLived() {
 // (passAsNative), so instanceof, subclasses and statics behave as before.
 //
 // A function, not a Proxy or a class: a Proxy's construct trap costs ~300 ns
-// per `new Response` in Bun 1.3 (this costs ~20 ns, one call frame), and a
-// class's `prototype` can't be the native one.
+// per `new Response` in Bun 1.3 (this one frame is inlined by JSC: `new
+// Response(text)` measured 202-238 ns through it, 199-252 ns native, Bun
+// 1.3.13, interleaved runs), and a class's `prototype` can't be the native one.
 
 // wrapper -> the native function whose source text it shows.
 const nativeSource = new WeakMap();
@@ -1094,7 +1193,12 @@ if (!inWorker && typeof process.send !== "function") {
 }
 
 function pending() {
-  if (!isBun) return nodeInflight;
+  if (!isBun) {
+    let n = 0;
+    for (const s of nodeConns) if (nodeBusy(s)) n++;
+    for (const s of privateConns) if (nodeBusy(s)) n++;
+    return n;
+  }
   let n = 0;
   for (const s of servers) n += s.pendingRequests || 0;
   return n;
@@ -1151,10 +1255,11 @@ function netServerClose(s) {
 // it also closes connections just accepted whose first request hasn't been
 // parsed yet, and those clients would see an empty reply. New connections
 // get their request answered (with Connection: close) and close after it.
+// Served: response bytes went out on it; idle: none in progress; still
+// HTTP: an upgraded socket (WebSocket) has no parser.
 function closeServedIdle() {
   for (const sock of nodeConns) {
-    const st = sock.__warden;
-    if (st && st.served && !st.busy) {
+    if (sock.bytesWritten > 0 && !nodeBusy(sock) && sock.parser) {
       try {
         sock.destroy();
       } catch {}
@@ -1175,6 +1280,7 @@ async function drain() {
   draining = true;
   stopReadingWardenCommands();
   report({ ev: "draining" });
+  drainBunApps();
   await markNodeResponsesClose();
   for (const s of servers) stopAccepting(s);
   const t0 = Date.now();

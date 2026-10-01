@@ -125,6 +125,19 @@ Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
 | same | steady 20k lines/s, manager CPU per 10 s | 0.29 s | 0.11 s (PM2 1.23 s) |
 | WebSocket 1001 / SSE end in the drain | abnormal closes in a rolling restart, ~150 clients | all cut (as under PM2) | 0 |
 
+2026-10-01, second round: the same 2-CPU machine shared with other build
+and test jobs, so req/s moved 2× between runs; these use the numbers that
+don't (`bench/shim-cost.ts`, `bench/profile.ts`: CPU time per request from
+schedstat, syscalls per request; medians of interleaved rounds). No hardware
+counters in this VM, so no instructions per request.
+
+| Change | Measured on | Before | After |
+|---|---|---|---|
+| Shim, Node: no `request` listener and no `res.once('close')` per request; requests in flight read off the open connections in a drain | node:http `request` + `close` in-process (shim-cost.ts, 3 rounds; bare 180–228 ns) | 384–483 ns | 203–216 ns: the same as bare within noise |
+| same | end to end, 1 Node process pinned to CPU 0, oha on CPU 1, 200k requests × 5 rounds, server CPU per request (bare 20.5 µs) | 22.4 µs | 21.3 µs (±2 µs between rounds) |
+| Shim, Bun: no fetch wrapper; a drain swaps in the `Connection: close` handler with `server.reload()` | the handler Bun calls, called from native code (shim-cost.ts) | wrapped | the app's own; no measurable difference either way (JSC inlines the wrapper; ±10 ns) |
+| same | end to end as above (bare 8.11 µs) | 8.21 µs | 8.12 µs: within noise |
+
 Tried and dropped (no measurable win, so no code):
 
 - **io_uring for the static server** (accept/recv/send through one ring per

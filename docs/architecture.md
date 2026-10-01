@@ -129,6 +129,13 @@ in worker mode. Enabled by default when `command` is `bun`. It:
 4. on SIGTERM (process mode) or a `shutdown` message (worker mode) drains:
    stop listeners, add `Connection: close` (Bun `fetch` handlers and
    `node:http` responses), wait `drain_ms` and for in‑flight requests, exit 0.
+   Until the drain it adds nothing per request: `Bun.serve` runs the app's
+   own handler, and the drain swaps in one that adds the header with
+   `server.reload()` (requests in flight finish with the old one; verified
+   on Bun 1.3.13 to keep routes, the error handler and open WebSockets);
+   `node:http` requests in flight are read off the open connections
+   (`socket._httpMessage`) when the drain needs them, and responses get the
+   header through `ServerResponse.prototype` patched at the drain's start.
    The app's own SIGTERM handlers (NestJS `enableShutdownHooks`) are deferred
    until the drain is done — otherwise Nest closes every connection at once
    (39 resets per reload measured) — and still run afterwards;

@@ -749,8 +749,16 @@ Limitations:
 - Worker mode needs Bun and the shim.
 - Node apps share the port through Warden's shim (`--import`, Node ≥ 22.12
   for `reusePort`); older Node needs `port_strategy = "offset"`.
+- Outside a drain the shim adds no work to a request: a `Bun.serve` app's
+  own fetch handler answers it, and on Node it keeps one entry per open
+  connection, nothing per request. When a drain starts, each `Bun.serve`
+  server gets a handler that adds `Connection: close` through
+  `server.reload()`; the shim intercepts `reload()` on Bun's server
+  prototype, so an app's own `server.reload()` still works (and a drain
+  never brings back a handler the app replaced).
 - On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
-  bodies in a drain (about 20 ns per `new Response`). The wrappers pass for
+  bodies in a drain (one call frame per `new Response`, which JSC inlines:
+  no measurable difference, `bench/shim-cost.ts`). The wrappers pass for
   Bun's own: `instanceof` (also for `fetch()` responses), `constructor`,
   `name`, `length`, the statics, subclassing, the error without `new`, and
   the source text (`Function.prototype.toString` is wrapped for that: one
