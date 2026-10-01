@@ -4675,15 +4675,12 @@ fn bun_drain_keeps_the_handler_the_app_reloaded() {
         let cfg = w.cfg.clone();
         std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
     };
+    // The new worker listens, Warden signals the old one, and the old one
+    // closes its listener when its drain starts (it then drains for 4 s).
+    w.wait_log("draining old process", T);
     let t0 = Instant::now();
-    let mut both = false;
-    loop {
-        let n = listeners(port);
-        both |= n == 2;
-        if both && n == 1 {
-            break; // the old worker stopped accepting: it drains
-        }
-        assert!(t0.elapsed() < Duration::from_secs(30), "the old worker never started draining\n{}", w.log());
+    while listeners(port) != 1 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
         std::thread::sleep(Duration::from_millis(5));
     }
     let (head, body) = exchange(&mut s, "/whoami");
