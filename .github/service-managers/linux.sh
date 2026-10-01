@@ -278,7 +278,10 @@ contains "unstartup says how to finish" "$OUT" "kept, because"
 if [ "$MODE" = system ]; then
   check_not "/etc/sysctl.d/99-warden.conf removed" test -e /etc/sysctl.d/99-warden.conf
 else
-  expect_eq "lingering left on (unstartup says how to turn it off)" yes "$(loginctl show-user "$ME" -p Linger --value 2>&1)"
+  # The file, not `loginctl show-user`: after the user manager was stopped
+  # and started by hand above, logind no longer lists the user.
+  check "lingering left on (unstartup says how to turn it off)" test -f "/var/lib/systemd/linger/$ME"
+  contains "unstartup says lingering stays on" "$OUT" "lingering stays on for $ME"
 fi
 sleep 12
 expect_eq "$API's supervisor still the same process 12 s later (WatchdogSec=10)" "$API_PID" "$(mainpid "warden@$API.service")"
