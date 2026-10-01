@@ -46,6 +46,15 @@ Requests are `control::Request`, tagged by `cmd`: `status`, `stop`,
 `control::Response` line (`{"ok":true,"message":…,"status":…}`), except
 `logs` (log lines) and `subscribe` (events).
 
+`config` (`{"cmd":"config","show_secrets":false,"worker":2}`) answers
+`info`: the effective config (`config`, defaults included, `app.env` merged
+from `env_file`), paths, and `worker_env`: the variables worker `worker`
+(default 1; the host in worker mode, `worker_env_of` says which) starts
+with on top of the supervisor's environment, in the order applied, each
+`{"name","value","from"}` with `from` `env_file`, `env` or `warden`. The
+app's values are hidden unless `show_secrets`; Warden's never are.
+`worker` is new: an older supervisor ignores it and sends no `worker_env`.
+
 `flush` empties the in-memory log buffer and the app's current log files
 (rotated ones are kept); its `message` lists the files, one per line after
 the first. `ok` is false when a file could not be emptied (the message

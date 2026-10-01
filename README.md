@@ -244,6 +244,43 @@ A standby starts in the pinned release (`pin_release`) and is promoted only
 while that is still the workers' release. Process mode only, with
 `app.port`, a shared port and the shim (bun and node commands).
 
+## Environment variables
+
+A worker starts with the supervisor's own environment (`PATH`, `HOME`, what
+systemd or your shell gave it), then, each one winning over the ones
+before:
+
+1. `[app] env_file`: `KEY=value` lines (dotenv / systemd `EnvironmentFile`
+   syntax), relative to the config file. Keep secrets there, mode 0600;
+   `warden reload` reads it again.
+2. `[app] env`.
+3. Warden's variables below. They win over the two above: `env = { PORT =
+   "8080" }` next to `port = 3000` gives the app 3000 (`warden env` marks
+   the override).
+
+`warden env api` prints exactly that for worker 1 (`api:3` for worker 3),
+with where each value comes from; the app's values are hidden unless
+`--show-secrets`. `warden config api` prints the whole effective config as
+JSON, defaults included.
+
+| Variable | Value | In |
+|---|---|---|
+| `PORT` | `[app] port`; with `port_strategy = "offset"`, `port + N - 1` for worker N | every worker and standby, `verify_command`; only with `app.port` |
+| `NODE_APP_INSTANCE` (the name is `[app] instance_var`; `""` sets none) | worker N gets `N - 1` (PM2's 0-based index). A hot standby gets a number past the workers' until it is promoted, then its slot's | process workers and standbys; in worker mode each Worker (set by the shim) |
+| `WARDEN_APP` | the app's name | everything Warden runs: workers, `verify_command`, `preflight` |
+| `WARDEN_WORKER_ID` | the worker number, 1..N. `0` in a standby until promoted (then its slot's). Worker mode: each Worker 1..N, none in the host process | workers; `verify_command`: the worker it checks (`host` in worker mode, `s1`… for a standby) |
+| `WARDEN_WORKER_COUNT` | workers configured when the process started (after `warden scale`, running workers keep the old count; a promoted standby gets the current one) | workers, standbys, worker-mode host and Workers |
+| `WARDEN_MODE` | `process` or `worker` | workers |
+| `WARDEN_STANDBY` | `1` in a hot standby until it is promoted | standbys, their `verify_command` |
+| `WARDEN_WORKER_PID`, `WARDEN_WORKER_SOCKET`, `WARDEN_WORKER_SOCKETS` | the new worker's pid and private health socket(s) (space-separated; one per Worker in worker mode) | `verify_command` only |
+| `WARDEN_WORKERS`, `WARDEN_ENTRY`, `WARDEN_SHIM` | how many Workers, the module each imports, the shim | worker-mode host process |
+| `WARDEN_STATIC` | the `[static]` section as JSON | `warden serve` workers |
+| `WARDEN_IPC_FD` | `3`: the shim's channel to Warden (readiness, heartbeat) | every worker |
+| `WARDEN_HEARTBEAT_MS`, `WARDEN_DRAIN_MS`, `WARDEN_LONG_LIVED_MS`, `WARDEN_STOP_SIGNAL`, `WARDEN_WAIT_READY`, `WARDEN_REUSE_PORT`, `WARDEN_HEALTH_DIR`, `WARDEN_INSTANCE_VAR`, `WARDEN_INSTANCE` | settings for the shim: heartbeat period (1000), `shutdown.drain_ms`, `long_lived_timeout` in ms, `shutdown.signal`, `1` with `wait_ready`, `1` with a shared port, where private health sockets go, the instance variable's name, an internal process number (unique per supervisor run) | every worker |
+
+PM2's `pm_id` and `name` are not set: use `WARDEN_WORKER_ID` and
+`WARDEN_APP` (`warden pm2-migrate` leaves them out of the migrated env).
+
 ## CLI
 
 If you know PM2 you know most of it: `warden` in place of `pm2`. `warden help`

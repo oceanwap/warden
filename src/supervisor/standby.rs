@@ -298,9 +298,11 @@ impl Supervisor {
     fn launch_standby_verify(&self, inst: u64) {
         let (Some(cmd), Some(i)) = (self.cfg.reload.verify_command.clone(), self.insts.get(&inst)) else { return };
         let socket = i.sockets.values().next().map(|p| p.display().to_string()).unwrap_or_default();
+        // Its label (`s1`, as in `warden status` and its log lines) as the
+        // worker id, as a worker's verify gets its number.
         let mut env = vec![
             ("WARDEN_APP".to_string(), self.cfg.app.name.clone()),
-            ("WARDEN_WORKER_ID".to_string(), "standby".to_string()),
+            ("WARDEN_WORKER_ID".to_string(), sb(i)),
             ("WARDEN_WORKER_PID".to_string(), i.handle.pid.to_string()),
             ("WARDEN_WORKER_SOCKET".to_string(), socket.clone()),
             ("WARDEN_WORKER_SOCKETS".to_string(), socket),
@@ -310,12 +312,9 @@ impl Supervisor {
             env.push(("PORT".into(), p.to_string()));
         }
         debug!("running verify_command for a standby", worker = sb(i), pid = i.handle.pid, command = cmd);
-        let fut = rollout::run_shell(
-            cmd,
-            self.cfg.app.working_directory.clone(),
-            env,
-            Duration::from_secs(self.cfg.reload.timeout),
-        );
+        // In the release the standby runs, as a worker's runs in the workers'.
+        let cwd = i.release.clone().or_else(|| self.worker_dir());
+        let fut = rollout::run_shell(cmd, cwd, env, Duration::from_secs(self.cfg.reload.timeout));
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
             let result = crate::guard::catch_unwind(fut).await.unwrap_or_else(|p| Err(format!("internal error: {p}")));

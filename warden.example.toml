@@ -11,6 +11,12 @@ args = ["run", "dist/main.js"]               # example (process mode)
 working_directory = "/srv/apps/travelerwe/api/current"   # example; relative = relative to this file
 port = 3000                                  # example; sets PORT and enables readiness detection
 env = { NODE_ENV = "production" }            # example
+# env_file = "api.env"                       # example; KEY=value lines (dotenv / systemd EnvironmentFile), relative
+                                             # to this file, read again by `warden reload`; keep secrets there (0600).
+                                             # Workers get the supervisor's environment, then env_file, then env, then
+                                             # Warden's variables (PORT, NODE_APP_INSTANCE, WARDEN_*): each wins over
+                                             # the ones before. `warden env <app>` shows the result (README:
+                                             # "Environment variables")
 # shim = true                                # default: true when command is bun or node (reusePort,
                                              # readiness, drain, health socket); false for anything else
 # namespace = "backend"                      # example; a group for `warden restart backend` (default "default")

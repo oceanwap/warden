@@ -547,8 +547,51 @@ impl Supervisor {
     /// (`slot_id` is then 0).
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
-        let mut env: Vec<(String, String)> = a.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let mut add = |k: &str, v: String| env.push((k.to_string(), v));
+        let env = self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        let (program, args) = match self.cfg.workers.mode {
+            // A standby (slot 0) runs the workers' command; the shim defers
+            // its listen until promoted. In the pinned release, as workers
+            // (`release.rs`).
+            Mode::Process if self.cfg.static_files.is_some() && slot_id != STANDBY_SLOT => {
+                (self.exe.display().to_string(), vec!["serve-static".to_string()])
+            }
+            Mode::Process => {
+                let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
+                (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
+            }
+            Mode::Worker => {
+                let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                (self.pinned_arg(&a.command), vec![host])
+            }
+        };
+        process::Spec {
+            program,
+            args,
+            cwd: self.worker_dir(),
+            env,
+            label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
+            output: process::Output::from_config(&self.cfg.logging),
+            max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
+        }
+    }
+
+    /// The variables a worker process starts with on top of the supervisor's
+    /// own environment, in the order applied (a later one wins): `env_file`,
+    /// `[app] env`, then Warden's (README, "Environment variables"), each
+    /// with where it comes from. `slot_id` 0 with `standby`: a standby.
+    /// Also what `warden env` prints, so the two can't drift apart.
+    fn worker_env(
+        &self,
+        slot_id: usize,
+        inst_id: u64,
+        standby: Option<(usize, usize)>,
+    ) -> Vec<(String, String, &'static str)> {
+        let a = &self.cfg.app;
+        let mut env: Vec<(String, String, &'static str)> = a
+            .environment()
+            .map(|(k, v)| (k.clone(), v.clone(), if a.env.contains_key(k) { "env" } else { "env_file" }))
+            .collect();
+        let mut add = |k: &str, v: String| env.push((k.to_string(), v, "warden"));
         add("WARDEN_APP", a.name.clone());
         add("WARDEN_MODE", mode_name(self.cfg.workers.mode).into());
         add("WARDEN_WORKER_COUNT", self.count.to_string());
@@ -565,9 +608,9 @@ impl Supervisor {
         if !a.instance_var.is_empty() {
             add("WARDEN_INSTANCE_VAR", a.instance_var.clone());
         }
-        if self.cfg.watchdog.timeout > 0 {
-            add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
-        }
+        // Always: the heartbeat carries the event-loop delay too; the
+        // watchdog only acts on it with [watchdog] timeout > 0.
+        add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
         if self.cfg.workers.port_strategy == PortStrategy::Shared {
             add("WARDEN_REUSE_PORT", "1".into());
         }
@@ -575,10 +618,10 @@ impl Supervisor {
             // Standbys (slot 0) need a shared port (config validation).
             add("PORT", networking::worker_port(p, self.cfg.workers.port_strategy, slot_id.max(1)).to_string());
         }
-        let (program, args) = match self.cfg.workers.mode {
+        match self.cfg.workers.mode {
             Mode::Process if slot_id == STANDBY_SLOT => {
-                // The shim defers its listen until promoted; it then takes the
-                // slot's worker id and instance number.
+                // The shim takes the slot's worker id and instance number
+                // when promoted.
                 add("WARDEN_WORKER_ID", "0".into());
                 add("WARDEN_STANDBY", "1".into());
                 if let (false, Some((_, instance))) = (a.instance_var.is_empty(), standby) {
@@ -587,47 +630,31 @@ impl Supervisor {
                     // standby. A scale-up past it replaces the standby.
                     add(&a.instance_var, instance.to_string());
                 }
-                // In the pinned release, as workers (`release.rs`).
-                let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
-                (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
             }
             Mode::Process => {
                 add("WARDEN_WORKER_ID", slot_id.to_string());
                 if !a.instance_var.is_empty() {
-                    add(&a.instance_var, (slot_id - 1).to_string());
+                    add(&a.instance_var, slot_id.saturating_sub(1).to_string());
                 }
-                match &self.cfg.static_files {
-                    Some(st) => {
-                        let mut st = st.clone();
-                        st.root = self.pinned_path(st.root);
-                        add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
-                        (self.exe.display().to_string(), vec!["serve-static".to_string()])
-                    }
-                    None => {
-                        let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
-                        (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
-                    }
+                if let Some(st) = &self.cfg.static_files {
+                    let mut st = st.clone();
+                    st.root = self.pinned_path(st.root);
+                    add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
                 }
             }
             Mode::Worker => {
+                // Each Worker gets WARDEN_WORKER_ID and the instance
+                // variable from the host and the shim.
                 add("WARDEN_WORKERS", self.count.to_string());
                 if let Some(shim) = &self.shim_path {
                     add("WARDEN_SHIM", shim.display().to_string());
                 }
                 add("WARDEN_ENTRY", self.entry_path().display().to_string());
-                let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                (self.pinned_arg(&a.command), vec![host])
             }
-        };
-        process::Spec {
-            program,
-            args,
-            cwd: self.worker_dir(),
-            env,
-            label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
-            output: process::Output::from_config(&self.cfg.logging),
-            max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
+        // Set by `process::spawn` for every child.
+        add("WARDEN_IPC_FD", process::IPC_FD.to_string());
+        env
     }
 
     fn entry_path(&self) -> PathBuf {
@@ -1576,7 +1603,9 @@ impl Supervisor {
             }
             Request::Reset { worker } => self.reset(worker),
             Request::Signal { signal, worker } => self.send_signal(&signal, worker),
-            Request::Config { show_secrets } => Response { info: Some(self.info(show_secrets)), ..Response::ok("") },
+            Request::Config { show_secrets, worker } => {
+                Response { info: Some(self.info(show_secrets, worker)), ..Response::ok("") }
+            }
             Request::Reload { safe } => self.request_reload(safe),
             Request::Stop => {
                 if self.shutting_down {
@@ -1719,8 +1748,25 @@ impl Supervisor {
     }
 
     /// Effective config and paths for `describe`, `config` and `env`.
-    fn info(&self, show_secrets: bool) -> serde_json::Value {
+    fn info(&self, show_secrets: bool, worker: Option<usize>) -> serde_json::Value {
         let mut v = serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null);
+        // The environment that worker starts with (`warden env`): which
+        // worker, then each variable with its value and where it comes from.
+        let slot = if self.is_worker_mode() { 1 } else { worker.unwrap_or(1).clamp(1, self.count.max(1)) };
+        let inst = self.slots.get(&slot).and_then(|s| s.current).unwrap_or(self.next_inst);
+        let worker_env: Vec<serde_json::Value> = self
+            .worker_env(slot, inst, None)
+            .into_iter()
+            .map(|(k, val, from)| {
+                // Warden's own values are never secret; the app's are hidden.
+                let val = if show_secrets || from == "warden" || is_plain_env(&k) {
+                    val
+                } else {
+                    format!("(hidden, {} chars)", val.len())
+                };
+                serde_json::json!({"name": k, "value": val, "from": from})
+            })
+            .collect();
         // What workers get: env_file's variables with `env` on top.
         if let Some(app) = v.pointer_mut("/app").and_then(|a| a.as_object_mut()) {
             let merged: serde_json::Map<String, serde_json::Value> =
@@ -1744,6 +1790,8 @@ impl Supervisor {
             "unit": systemd::own_unit(),
             "shim": self.shim_path.as_ref().map(|p| p.display().to_string()),
             "workers_running": self.count,
+            "worker_env_of": if self.is_worker_mode() { "host".to_string() } else { slot.to_string() },
+            "worker_env": worker_env,
         })
     }
 
@@ -2019,5 +2067,78 @@ mod tests {
             with_preload("/usr/bin/node", &s(&["--max-old-space-size=512", "server.js"]), shim),
             s(&["--import=/r/shim.mjs", "--max-old-space-size=512", "server.js"])
         );
+    }
+
+    fn sup(toml: &str) -> Supervisor {
+        let cfg = Config::parse(toml).unwrap();
+        let (tx, _) = mpsc::unbounded_channel();
+        let (proc_tx, _) = mpsc::unbounded_channel();
+        Supervisor::new(cfg, None, PathBuf::from("/run/w"), (None, None), tx, proc_tx)
+    }
+
+    /// The variable's value as a worker sees it (the last one set wins).
+    fn get<'a>(env: &'a [(String, String, &'static str)], k: &str) -> Option<(&'a str, &'static str)> {
+        env.iter().rev().find(|(n, ..)| n == k).map(|(_, v, from)| (v.as_str(), *from))
+    }
+
+    /// W1: what every worker, a standby and a worker-mode host start with
+    /// (README "Environment variables"), and that Warden's win.
+    #[test]
+    fn worker_environment() {
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\nenv = { PORT = \"9\", A = \"x\" }\n\
+                     [workers]\ncount = 3\nport_strategy = \"offset\"\n[watchdog]\ntimeout = 0\n");
+        let env = s.worker_env(2, 7, None);
+        assert_eq!(get(&env, "A"), Some(("x", "env")));
+        assert_eq!(get(&env, "PORT"), Some(("3001", "warden")), "Warden's PORT wins over env's");
+        assert_eq!(get(&env, "NODE_APP_INSTANCE"), Some(("1", "warden")));
+        assert_eq!(get(&env, "WARDEN_WORKER_ID"), Some(("2", "warden")));
+        assert_eq!(get(&env, "WARDEN_WORKER_COUNT"), Some(("3", "warden")));
+        assert_eq!(get(&env, "WARDEN_INSTANCE"), Some(("7", "warden")));
+        assert_eq!(get(&env, "WARDEN_APP"), Some(("api", "warden")));
+        assert_eq!(get(&env, "WARDEN_IPC_FD"), Some(("3", "warden")));
+        assert_eq!(get(&env, "WARDEN_HEARTBEAT_MS"), Some(("1000", "warden")), "also with the watchdog off");
+        assert!(get(&env, "WARDEN_STANDBY").is_none() && get(&env, "WARDEN_REUSE_PORT").is_none());
+        // The app's own come first, Warden's after: what `spec` applies in order.
+        let first_warden = env.iter().position(|e| e.2 == "warden").unwrap();
+        assert!(env[first_warden..].iter().all(|e| e.2 == "warden"));
+        let spec = s.spec(2, 7, None);
+        assert!(spec.env.iter().rev().find(|(k, _)| k == "PORT").is_some_and(|(_, v)| v == "3001"));
+
+        // A standby: worker id 0 and an instance number past the workers'.
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\n[workers]\ncount = 2\nstandby = 1\n");
+        let env = s.worker_env(STANDBY_SLOT, 9, Some((1, 2)));
+        assert_eq!(get(&env, "WARDEN_WORKER_ID"), Some(("0", "warden")));
+        assert_eq!(get(&env, "WARDEN_STANDBY"), Some(("1", "warden")));
+        assert_eq!(get(&env, "NODE_APP_INSTANCE"), Some(("2", "warden")));
+        assert_eq!(get(&env, "PORT"), Some(("3000", "warden")));
+        assert_eq!(get(&env, "WARDEN_REUSE_PORT"), Some(("1", "warden")));
+
+        // Worker mode: the host gets the Workers' count and entry; each
+        // Worker's id and instance number come from the host and the shim.
+        let s =
+            sup("[app]\nname = \"api\"\ncommand = \"bun\"\nentry = \"main.js\"\nport = 3000\ninstance_var = \"\"\n\
+                     [workers]\ncount = 4\nmode = \"worker\"\n");
+        let env = s.worker_env(1, 1, None);
+        assert_eq!(get(&env, "WARDEN_WORKERS"), Some(("4", "warden")));
+        assert_eq!(get(&env, "WARDEN_MODE"), Some(("worker", "warden")));
+        assert!(get(&env, "WARDEN_ENTRY").is_some_and(|(v, _)| v.ends_with("main.js")));
+        assert!(get(&env, "WARDEN_WORKER_ID").is_none() && get(&env, "NODE_APP_INSTANCE").is_none());
+        assert!(get(&env, "WARDEN_INSTANCE_VAR").is_none(), "instance_var = \"\" sets none");
+    }
+
+    /// `warden env`: the effective environment, secrets hidden.
+    #[test]
+    fn config_answer_has_the_worker_environment() {
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\nenv = { DB = \"secret\" }\n\
+                     [workers]\ncount = 2\n");
+        let info = s.info(false, Some(2));
+        assert_eq!(info["worker_env_of"], "2");
+        let vars = info["worker_env"].as_array().unwrap();
+        let val = |k: &str| vars.iter().rev().find(|v| v["name"] == k).map(|v| v["value"].clone());
+        assert_eq!(val("DB"), Some("(hidden, 6 chars)".into()));
+        assert_eq!(val("WARDEN_WORKER_ID"), Some("2".into()));
+        assert_eq!(val("NODE_APP_INSTANCE"), Some("1".into()), "Warden's values are never hidden");
+        assert_eq!(s.info(true, None)["worker_env"][0]["value"], "secret");
+        assert_eq!(s.info(false, Some(99))["worker_env_of"], "2", "clamped to the workers there are");
     }
 }

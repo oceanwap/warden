@@ -411,7 +411,7 @@ async fn describe(sels: &[Sel], args: &Args) -> i32 {
             println!();
         }
         let st = status_of(&s.app).await;
-        let info = call_with(&s.app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await;
+        let info = call_with(&s.app, &Request::Config { show_secrets: false, worker: None }, REQUEST_TIMEOUT).await;
         match (st, info) {
             (Ok(st), Ok(info)) => {
                 if args.json {
@@ -437,25 +437,20 @@ async fn describe(sels: &[Sel], args: &Args) -> i32 {
     code
 }
 
+/// `warden env <app>[:N]`: the environment worker N (default 1) starts
+/// with, on top of the supervisor's own: `env_file`, `[app] env`, then
+/// Warden's variables, as `KEY=value` lines (later ones win) with `#`
+/// comments saying where each group comes from.
 async fn env(sels: &[Sel], show_secrets: bool) -> i32 {
     let mut code = 0;
     for s in sels {
-        match call_with(&s.app, &Request::Config { show_secrets }, REQUEST_TIMEOUT).await {
+        let req = Request::Config { show_secrets, worker: s.worker };
+        match call_with(&s.app, &req, REQUEST_TIMEOUT).await {
             Ok(r) => {
                 if sels.len() > 1 {
                     println!("# {}", s.app.name);
                 }
-                let info = r.info.unwrap_or_default();
-                if let Some(env) = info.pointer("/config/app/env").and_then(|e| e.as_object()) {
-                    for (k, v) in env {
-                        println!("{k}={}", v.as_str().unwrap_or_default());
-                    }
-                }
-                println!(
-                    "# also set by Warden for each worker: PORT, WARDEN_APP, WARDEN_WORKER_ID, WARDEN_WORKER_COUNT, \
-                     WARDEN_MODE{}",
-                    if show_secrets { "" } else { "  (values hidden: --show-secrets)" }
-                );
+                print!("{}", render_env(&r.info.unwrap_or_default(), show_secrets));
             }
             Err(e) => {
                 code = 2;
@@ -466,10 +461,59 @@ async fn env(sels: &[Sel], show_secrets: bool) -> i32 {
     code
 }
 
+/// The text of `warden env` from a `config` answer.
+fn render_env(info: &serde_json::Value, show_secrets: bool) -> String {
+    let mut o = String::new();
+    let hidden = if show_secrets { "" } else { "; the app's values are hidden unless --show-secrets" };
+    let Some(vars) = info["worker_env"].as_array() else {
+        // An older supervisor: only the app's own variables.
+        if let Some(env) = info.pointer("/config/app/env").and_then(|e| e.as_object()) {
+            for (k, v) in env {
+                o += &format!("{k}={}\n", v.as_str().unwrap_or_default());
+            }
+        }
+        o += &format!("# also set by Warden for each worker: PORT, WARDEN_APP, WARDEN_WORKER_ID, …{hidden}\n");
+        return o;
+    };
+    let of = info["worker_env_of"].as_str().unwrap_or("1");
+    let who = if of == "host" { "the worker-mode host process".to_string() } else { format!("worker {of}") };
+    o += &format!(
+        "# The environment {who} starts with: the supervisor's own (PATH, HOME, …), then these, a later one \
+         winning{hidden}.\n"
+    );
+    let env_file = info.pointer("/config/app/env_file").and_then(|f| f.as_str()).unwrap_or("env_file");
+    let mut group = "";
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for v in vars {
+        let (Some(name), Some(value), Some(from)) = (v["name"].as_str(), v["value"].as_str(), v["from"].as_str())
+        else {
+            continue;
+        };
+        if from != group {
+            group = from;
+            o += &match from {
+                "env_file" => format!("# from {env_file}\n"),
+                "env" => "# from [app] env\n".to_string(),
+                _ => "# set by Warden (README: Environment variables)\n".to_string(),
+            };
+        }
+        let note = match seen.insert(name, from) {
+            Some(earlier) if earlier != from => format!("   # overrides the value from {earlier}"),
+            _ => String::new(),
+        };
+        o += &format!("{name}={value}{note}\n");
+    }
+    if of != "host" {
+        o += "# per worker: WARDEN_WORKER_ID, the instance variable (NODE_APP_INSTANCE) and, with port_strategy = \
+              \"offset\", PORT; `warden env <app>:N` shows worker N\n";
+    }
+    o
+}
+
 async fn show_config(sels: &[Sel], show_secrets: bool) -> i32 {
     let mut code = 0;
     for s in sels {
-        match call_with(&s.app, &Request::Config { show_secrets }, REQUEST_TIMEOUT).await {
+        match call_with(&s.app, &Request::Config { show_secrets, worker: None }, REQUEST_TIMEOUT).await {
             Ok(r) => println!("{}", serde_json::to_string_pretty(&r.info.unwrap_or_default()).unwrap_or_default()),
             Err(e) => {
                 code = 2;
@@ -681,18 +725,19 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
             q.worker = Some(w);
         }
         // Where this app logs: from the running supervisor, else its config.
-        let (cfg, unit) = match call_with(app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await {
-            Ok(r) => {
-                let info = r.info.unwrap_or_default();
-                let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
-                let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
-                let bg = info["log_file"].as_str().map(PathBuf::from);
-                (cfg.map(|c| (c, bg)), unit)
-            }
-            Err(_) => {
-                (app.config.as_ref().and_then(|p| Config::load(p).ok()).map(|c| (c, None)), systemd_unit_for(app))
-            }
-        };
+        let (cfg, unit) =
+            match call_with(app, &Request::Config { show_secrets: false, worker: None }, REQUEST_TIMEOUT).await {
+                Ok(r) => {
+                    let info = r.info.unwrap_or_default();
+                    let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
+                    let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
+                    let bg = info["log_file"].as_str().map(PathBuf::from);
+                    (cfg.map(|c| (c, bg)), unit)
+                }
+                Err(_) => {
+                    (app.config.as_ref().and_then(|p| Config::load(p).ok()).map(|c| (c, None)), systemd_unit_for(app))
+                }
+            };
         let Some((cfg, running_log)) = cfg else {
             eprintln!("warden: {}: cannot read its config to find its log files", app.name);
             worst = 2;
@@ -1952,6 +1997,33 @@ mod tests {
         assert_eq!(path, std::env::var_os("PATH"));
         assert_eq!(me.cwd, std::env::current_dir().ok());
         assert_eq!(Origin::of(u32::MAX / 2), None, "no such process");
+    }
+
+    #[test]
+    fn env_output_groups_and_marks_overrides() {
+        let info = serde_json::json!({
+            "config": {"app": {"env_file": "/etc/warden/api.env"}},
+            "worker_env_of": "2",
+            "worker_env": [
+                {"name": "DB", "value": "(hidden, 6 chars)", "from": "env_file"},
+                {"name": "PORT", "value": "9", "from": "env"},
+                {"name": "WARDEN_WORKER_ID", "value": "2", "from": "warden"},
+                {"name": "PORT", "value": "3001", "from": "warden"},
+            ],
+        });
+        let text = render_env(&info, false);
+        assert!(text.starts_with("# The environment worker 2 starts with"), "{text}");
+        assert!(
+            text.contains("# from /etc/warden/api.env\nDB=(hidden, 6 chars)\n# from [app] env\nPORT=9\n"),
+            "{text}"
+        );
+        assert!(text.contains("PORT=3001   # overrides the value from env\n"), "{text}");
+        assert!(text.contains("unless --show-secrets"), "{text}");
+        // Every value line is KEY=value: `grep ^PORT=` works.
+        assert!(text.lines().filter(|l| !l.starts_with('#')).all(|l| l.contains('=')), "{text}");
+        // An older supervisor: its app variables only.
+        let old = serde_json::json!({"config": {"app": {"env": {"A": "b"}}}});
+        assert!(render_env(&old, true).starts_with("A=b\n# also set by Warden"));
     }
 
     #[test]

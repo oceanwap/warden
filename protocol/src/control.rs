@@ -43,10 +43,13 @@ pub enum Request {
         worker: Option<usize>,
     },
     /// The effective config and paths, with env values hidden unless
-    /// `show_secrets`.
+    /// `show_secrets`; `info.worker_env` is the environment `worker` (or
+    /// worker 1, the host in worker mode) starts with (`warden env`).
     Config {
         #[serde(default)]
         show_secrets: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<usize>,
     },
     /// Empty the in-memory log buffers and the current log files (Warden's,
     /// every worker's out and err file); rotated files are kept. The

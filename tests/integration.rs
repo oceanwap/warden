@@ -3822,6 +3822,54 @@ fn log_history_reads_every_workers_files() {
     }
 }
 
+/// `warden env N` prints what worker N really started with: every value
+/// matches its /proc/<pid>/environ (env_file, env, Warden's variables, and
+/// Warden's winning over the app's).
+#[test]
+fn env_shows_what_a_worker_starts_with() {
+    let dir = direct_dir("env");
+    std::fs::write(dir.join("api.env"), "DB_URL=postgres://u:p@h/db\nNODE_ENV=dev\n").unwrap();
+    let port = free_port();
+    let toml = format!(
+        "[app]\nname = \"envapp\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 300\"]\nport = {port}\n\
+         env_file = \"{}\"\nenv = {{ NODE_ENV = \"production\", PORT = \"1\" }}\n\
+         [workers]\ncount = 2\nport_strategy = \"offset\"\nready_timeout = 60\n",
+        dir.join("api.env").display()
+    );
+    let w = Warden::start("env", port, &toml);
+    let st = w.wait_for("2 workers started", T, |s| Warden::pids(s).len() == 2);
+    let pid = st["workers"][1]["pid"].as_u64().unwrap();
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let real: std::collections::HashMap<String, String> = environ
+        .split(|b| *b == 0)
+        .filter_map(|kv| {
+            let s = String::from_utf8_lossy(kv);
+            s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    let (code, text) = w.cli(&["env", "2", "--show-secrets"]);
+    assert_eq!(code, 0, "{text}");
+    let mut shown = std::collections::HashMap::new();
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let (k, v) = l.split_once('=').unwrap();
+        shown.insert(k.to_string(), v.split("   #").next().unwrap().to_string()); // the last one wins
+    }
+    for (k, v) in &shown {
+        assert_eq!(real.get(k), Some(v), "{k}: `warden env` says {v:?}, the worker has {:?}\n{text}", real.get(k));
+    }
+    for k in ["DB_URL", "NODE_ENV", "PORT", "NODE_APP_INSTANCE", "WARDEN_WORKER_ID", "WARDEN_APP", "WARDEN_IPC_FD"] {
+        assert!(shown.contains_key(k), "{k} missing:\n{text}");
+    }
+    assert_eq!((shown["PORT"].as_str(), shown["NODE_ENV"].as_str()), (&*(port + 1).to_string(), "production"));
+    assert_eq!((shown["NODE_APP_INSTANCE"].as_str(), shown["WARDEN_WORKER_ID"].as_str()), ("1", "2"));
+    assert!(text.contains("overrides the value from env"), "{text}");
+    // Without --show-secrets the app's values are hidden, Warden's are not.
+    let (_, text) = w.cli(&["env"]);
+    assert!(text.contains("DB_URL=(hidden, 19 chars)") && text.contains("WARDEN_WORKER_ID=1\n"), "{text}");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to

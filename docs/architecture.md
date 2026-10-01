@@ -440,7 +440,10 @@ crate (`protocol/`, re-exported from `src/control.rs` and `src/events.rs`).
 ### 4.11 Security
 
 Warden needs no privileges and performs none: workers inherit Warden's user,
-group, environment (plus the configured `env`) and working directory. Run it as
+group, environment and working directory; `env_file`, then `env`, then
+Warden's own variables go on top, each winning over the ones before (one
+function, `worker_env`, builds them for spawning and for `warden env`; the
+list is in the README, "Environment variables"). Run it as
 the service user from systemd. The runtime directory (control socket, the shim
 every worker preloads, per-worker health sockets) must be owned by Warden's
 user, not a symlink, and not group/world-writable, or Warden refuses to start;

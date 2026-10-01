@@ -42,7 +42,8 @@ APPS (familiar from PM2):
     search <text> [target]   Search all of an app's logs (= logs --history --grep)
     flush [target]   Empty the log buffer and the current log files ([logging] file, out
                      and err files, every worker's); rotated files (.1, .gz) are kept
-    env <app>        The app's environment (values hidden unless --show-secrets)
+    env <app>        The environment a worker starts with: env_file, env, then Warden's
+                     variables (app:N for worker N; values hidden unless --show-secrets)
     reset <target>   Zero restart counters and retry FAILED workers now
     signal <SIG> <target>   Send a signal to the workers (SIGUSR2, USR2, 12)
     top              Live view of every app (also: monit)
@@ -922,7 +923,10 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     let mut o = format!("{} (namespace {}): {state}\n\n", s.app, s.namespace);
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row = |k: &str, v: String| rows.push(vec![format!("  {k}"), v]);
-    row("config", text(info["config_path"].clone()));
+    row(
+        "config",
+        format!("{} (every setting, defaults included: `warden config {}`)", text(info["config_path"].clone()), s.app),
+    );
     let args: Vec<String> =
         c("/app/args").as_array().map(|a| a.iter().map(|x| text(x.clone())).collect()).unwrap_or_default();
     row("command", format!("{} {}", text(c("/app/command")), args.join(" ")).trim().to_string());
@@ -997,11 +1001,33 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         ),
     );
     row(
+        "watchdog",
+        match num("/watchdog/timeout") {
+            0 => "off (the heartbeat still reports event-loop delay)".into(),
+            t => format!("hung after {t} s without an event-loop heartbeat"),
+        },
+    );
+    row(
         "logs",
         match &s.log_file {
             Some(f) => format!("{f} (+ `warden logs {}`)", s.app),
             None => format!("stdout / journald (+ `warden logs {}`)", s.app),
         },
+    );
+    let files: Vec<String> =
+        ["/logging/out_file", "/logging/err_file"].iter().filter_map(|p| c(p).as_str().map(String::from)).collect();
+    row(
+        "worker output",
+        format!(
+            "{}{}{}",
+            text(c("/logging/worker_output")),
+            if files.is_empty() { String::new() } else { format!(" → {}", files.join(", ")) },
+            if c("/logging/per_worker_files").as_bool() == Some(true) && !files.is_empty() {
+                " (one file per worker: out-1.log…)"
+            } else {
+                ""
+            }
+        ),
     );
     row("socket", text(info["socket"].clone()));
     row(
@@ -1017,7 +1043,11 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     );
     if let Some(env) = c("/app/env").as_object() {
         let items: Vec<String> = env.iter().map(|(k, v)| format!("{k}={}", text(v.clone()))).collect();
-        row("env", if items.is_empty() { "-".into() } else { items.join(", ") });
+        let from = match c("/app/env_file").as_str() {
+            Some(f) => format!(" (env_file {f}, then env; `warden env {}` adds Warden's)", s.app),
+            None => format!(" (`warden env {}` adds Warden's)", s.app),
+        };
+        row("env", if items.is_empty() { format!("-{from}") } else { items.join(", ") + &from });
     }
     if let Some(r) = &s.last_rollout {
         row("last rollout", format!("{} {}: {}", r.kind, if r.ok { "ok" } else { "FAILED" }, r.message));
