@@ -4278,6 +4278,113 @@ fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
     (r, ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed))
 }
 
+/// A keep-alive client (a request every 10 ms on one connection, a new one
+/// after `Connection: close`) while `f` runs: (what `f` returned, requests
+/// answered, requests cut on a connection that had served earlier ones,
+/// requests failed on a new connection).
+fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let client = {
+        let (stop, counts) = (stop.clone(), counts.clone());
+        std::thread::spawn(move || {
+            // One response off `s`: Some(the server asked to close).
+            let exchange = |s: &mut TcpStream, buf: &mut Vec<u8>| -> Option<bool> {
+                write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
+                let mut tmp = [0u8; 8192];
+                let end = loop {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    let n = s.read(&mut tmp).ok().filter(|n| *n > 0)?;
+                    buf.extend_from_slice(&tmp[..n]);
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                if !head.starts_with("http/1.1 200") {
+                    return None;
+                }
+                let len: usize =
+                    head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok())?;
+                while buf.len() < end + len {
+                    let n = s.read(&mut tmp).ok().filter(|n| *n > 0)?;
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                buf.drain(..end + len);
+                Some(head.contains("connection: close"))
+            };
+            let mut conn: Option<(TcpStream, Vec<u8>)> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let fresh = conn.is_none();
+                if fresh {
+                    match TcpStream::connect(("127.0.0.1", port)) {
+                        Ok(s) => {
+                            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            conn = Some((s, Vec::new()));
+                        }
+                        Err(_) => {
+                            counts[2].fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    }
+                }
+                let Some((s, buf)) = conn.as_mut() else { continue };
+                match exchange(s, buf) {
+                    Some(close) => {
+                        counts[0].fetch_add(1, Ordering::Relaxed);
+                        if close {
+                            conn = None;
+                        }
+                    }
+                    None => {
+                        counts[if fresh { 2 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+                        conn = None;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let r = f();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    let n = |i: usize| counts[i].load(Ordering::Relaxed);
+    (r, n(0), n(1), n(2))
+}
+
+/// Found by `cargo xtask chaos`: a draining static worker closed its idle
+/// keep-alive connections at once, so a client sending its next request at
+/// that moment lost it. Now requests during the drain get `Connection: close`.
+#[test]
+fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
+    for io in ["epoll", "uring"] {
+        let dir = std::env::temp_dir().join(format!("warden-it-static-drain-{io}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"sdrain-{io}\"\nport = {port}\n[workers]\ncount = 2\n[static]\nroot = \"{}\"\n",
+            dir.display()
+        );
+        let w = Warden::start_env(&format!("sdrain-{io}"), port, &cfg, &[("WARDEN_STATIC_IO", io)]);
+        w.wait_for("ready", T, ready(2));
+        let ((), ok, cut, fresh) = keep_alive_through(port, "/index.html", || {
+            for _ in 0..3 {
+                let (code, out) = w.cli(&["reload"]);
+                assert_eq!(code, 0, "{out}");
+            }
+        });
+        eprintln!("{io}: {ok} answered, {cut} cut, {fresh} failed on a new connection");
+        assert!(ok > 50, "{io}: {ok} answered");
+        assert_eq!(cut, 0, "{io}: keep-alive requests cut by a draining worker\n{}", w.log());
+        assert!(fresh <= 2 * allowed_resets(), "{io}: {fresh} failed on a new connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// None of the requests sent during a rolling replacement failed. Without
 /// net.ipv4.tcp_migrate_req=1 the kernel resets connections queued on a
 /// listener that closes, whatever the order of replacement (one at a time
