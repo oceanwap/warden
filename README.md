@@ -439,6 +439,9 @@ never in a process list or a log line. Details:
 **History.** wardend keeps the last 24 hours of every app's CPU, memory,
 workers ready and restarts, and the host's CPU, memory and load, from the
 statuses it already receives (a sample per 10 s; at most 135 KiB per app).
+It saves them every minute and when it stops (`<state dir>/wardend-history.bin`,
+written atomically), so a restart of wardend (an upgrade, a crash, a
+reboot) keeps the charts; a damaged file is moved aside with a warning.
 The GUI charts them; scripts ask `{"cmd":"history"}`
 ([Resource history](docs/protocol.md#resource-history)).
 

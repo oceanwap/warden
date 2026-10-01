@@ -40,7 +40,8 @@ one ~8 MB binary, no web view, no GPU driver.
   with the supervisor, max per point), restarts (per point) and workers ready
   (the fewest per point), each with its average, peak or total. A point is
   10 s, 1 min or 4 min (360 per chart). The series come from wardend's
-  `history` request when the tab opens (or the app or range changes, or the
+  `history` request (wardend keeps them on disk across its own restarts)
+  when the tab opens (or the app or range changes, or the
   connection comes back), then grow live from the statuses already
   streaming, counted the way wardend counts them. Gaps (wardend was not
   running, the app was not watched) stay gaps. Hovering a chart shows a

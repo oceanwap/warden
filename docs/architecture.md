@@ -97,8 +97,12 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   (their workers die with them). It holds no workers and no state an app
   needs: killing it stops nothing. Under systemd every app is its own unit and
   wardend only watches; under launchd, in containers and for background apps
-  it also resurrects the saved apps (once per boot). Protocol:
-  [`protocol.md`](protocol.md).
+  it also resurrects the saved apps (once per boot). It keeps a 24 h
+  resource history (fixed rings of 16-byte samples) and snapshots it to
+  `<state dir>/wardend-history.bin` every minute and at a clean exit
+  (temporary file, fsync, rename; versioned binary with a CRC and a size
+  bound; a damaged file is moved aside and wardend starts empty), so the
+  charts survive its restarts. Protocol: [`protocol.md`](protocol.md).
 
 ### 4.2 Modes
 
@@ -449,6 +453,6 @@ but costs fault isolation and (for NestJS) p99 latency.
   on `wardend.sock`, locally or through an SSH tunnel, and shares the
   `warden-protocol` crate with the daemon. Next: a resource history (charts),
   alerts, several hosts in one window.
-- wardend features beyond this round: alerts (webhook/command), in-memory
-  resource history, port registry, start order, fleet deploys with release
+- wardend features beyond this round (alerts and the resource history, on
+  disk, are done): port registry, start order, fleet deploys with release
   pinning, audit log (peer uid), self-upgrade by re-exec.

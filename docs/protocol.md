@@ -212,7 +212,8 @@ use in memory, from what it already receives: each app's `status` (every
 second) and the host metrics (every second while a client subscribes,
 else every 10 s). Nothing is polled for it. Every 10 s of wall-clock time
 one sample per series is committed, covering `[t, t + 10 s)` with `t` a
-multiple of 10 s:
+multiple of 10 s. It is saved to disk every minute and read back when
+`wardend` starts ([below](#on-disk)), so `wardend`'s own restarts keep it:
 
 | Series | One sample (10 s) | A point of `step_s` |
 |---|---|---|
@@ -257,15 +258,46 @@ watched, `wardend` was not running). CPU is rounded to 0.1, load to 0.01.
   Rings grow an hour at a time, so a young `wardend` holds less. 10 apps:
   1.5 MB at most. A unit test checks the bound.
 - **Lifetime.** An app's series is kept by name: it survives the app's
-  restarts and `wardend` restarting its supervisor, and goes once it has
+  restarts, `wardend` restarting its supervisor and `wardend`'s own
+  restarts ([on disk](#on-disk)), and goes once it has
   had no sample for 24 h (or, past 128 apps, when a newer app needs room
   and it has had none for 10 minutes).
-- **Not on disk.** The history does not survive `wardend` itself. Writing
-  ~1.4 MB for 10 apps every few minutes from `wardend`'s one thread, and
-  parsing that file back as root at start, would cost I/O and add a file
-  format to keep safe, for a history whose job is "what happened today":
-  `wardend` restarts are rare (upgrades) and lose at most that day's charts.
-  The GUI says when a period has no samples.
+- **Gaps.** While `wardend` is not running nothing is sampled: those points
+  are `null`, and the GUI shows them as gaps. Restarts while it was down are
+  not counted (the first status after a start is the baseline).
+
+#### On disk
+
+`<state dir>/wardend-history.bin` (`/var/lib/warden` for root,
+`$XDG_STATE_HOME/warden` or `~/.local/state/warden` for a user,
+`$WARDEN_HOME/state`), mode 0600:
+
+- **When.** Every minute if a sample was committed since the last write,
+  and when `wardend` exits on purpose (SIGTERM, SIGINT, `shutdown`; at most
+  5 s, then it exits anyway). A crash or `kill -9` loses at most the last
+  minute; the 10 s being sampled at an exit are never saved.
+- **Atomic.** Written to `.wardend-history.bin.tmp` (created new, 0600),
+  fsynced, renamed over the file, and the directory fsynced: a crash
+  leaves the previous snapshot or the new one, never a mix. The encoding
+  runs on `wardend`'s thread (straight into the file through a 64 KiB
+  buffer: about 3 ms for 10 apps with a full day, 1.1 MB, in a release
+  build); the fsync and the rename run on a thread of their own.
+- **Format.** Binary, little-endian, versioned: a header (magic
+  `WDHIST\r\n`, format version 1, the 10 s step, the save time, counts),
+  the sample times as runs, then the host's and each app's series as the
+  16-byte records above, where a run of absent samples (an app not
+  watched) takes 8 bytes, and a CRC-32 of everything. It is never bigger
+  than 17,936,432 bytes (128 apps with a full day): `wardend` refuses a
+  bigger file before reading it. The layout is in `src/daemon/history/disk.rs`.
+- **Loading.** Samples older than 24 h are dropped (`wardend` was down that
+  long), and so are samples from the future (the clock went back: a
+  warning says so), then apps with none left. A file that is truncated,
+  corrupt (bad checksum or structure), of another format version, too big,
+  not a history file or not a regular file is not used: `wardend` logs a
+  warning with the reason and the fix, moves it to
+  `wardend-history.bin.bad` (replacing an older one) and starts with an
+  empty history. A file it cannot read (permissions, an I/O error) is
+  reported and left in place; the next save replaces it.
 
 ## Alerts
 
@@ -395,7 +427,7 @@ else would:
   is not running; it is never used under systemd, where each app has its
   own unit. When it starts it finds every running supervisor
   (`found`); nothing is lost across its restarts because it holds no state
-  an app needs. A supervisor it restarts is started as `warden start`
+  an app needs (and its resource history is [on disk](#on-disk)). A supervisor it restarts is started as `warden start`
   started it: the same environment and working directory (read from
   `/proc/<pid>` when `wardend` found it), never `wardend`'s own, and without
   systemd's variables (`INVOCATION_ID`, ...).

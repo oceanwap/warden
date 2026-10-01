@@ -15,11 +15,16 @@
 //!   `MAX_APPS` apps. A test checks it.
 //! - **Life.** The series of an app is kept by name, so it survives the
 //!   app's restarts (and wardend restarting its supervisor), until 24 h
-//!   pass without a sample of it. It does not survive wardend: see
-//!   docs/protocol.md for why it is not written to disk.
+//!   pass without a sample of it.
+//! - **Disk** (`disk.rs`). A snapshot every minute and at a clean exit,
+//!   read back at start, so the history survives wardend's own restarts.
 //! - **Queries** downsample to `step_s`: CPU and load are the mean of a
 //!   point's samples, memory the max, workers ready the min, workers
 //!   configured the max, restarts the sum.
+
+mod disk;
+
+pub(crate) use disk::{Saver, load, path, save_every};
 
 use crate::control::Status;
 use std::collections::BTreeMap;
@@ -232,7 +237,8 @@ impl Store {
         }
         let now = crate::events::now_ms() / 1000;
         let now = now - now % STEP_S;
-        if self.times.len() < CAP {
+        // Not over a history loaded from disk: its apps' rings end with its times.
+        if self.times.len() < CAP && self.apps.is_empty() {
             self.times = Ring::default();
             self.host = Ring::default();
             for i in 0..CAP {
@@ -248,7 +254,7 @@ impl Store {
             self.seq = self.seq.max(CAP as u64);
         }
         let mut ring = Ring::default();
-        for i in 0..CAP {
+        for i in 0..self.times.len() {
             let wave = ((i as f32) / 90.0).sin();
             ring.push(AppSample {
                 cpu: 3.0 + 2.0 * wave,
@@ -510,7 +516,7 @@ impl AppAgg {
 mod tests {
     use super::*;
 
-    fn status(ready: usize, cpu: f64, rss: u64, restarts: u64) -> Status {
+    pub(super) fn status(ready: usize, cpu: f64, rss: u64, restarts: u64) -> Status {
         let mut s = super::super::policy::tests::status(false, false);
         s.workers_configured = 2;
         s.workers_ready = ready;

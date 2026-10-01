@@ -3039,6 +3039,130 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
 }
 
+/// `history` of `app` on a fixed grid (10 s points from `since_ms`).
+fn history_of(d: &Wardend, app: &str, since_ms: u64) -> Value {
+    let h = d.request(&format!(r#"{{"cmd":"history","app":"{app}","since_ms":{since_ms},"step_s":10}}"#));
+    assert_eq!(h["ok"], true, "{h}");
+    h["history"].clone()
+}
+
+/// The points of `app`'s `key` series that have a value: (index, value).
+fn points(h: &Value, key: &str) -> Vec<(usize, Value)> {
+    let Some(a) = h["apps"].as_array().and_then(|a| a.first()) else { return Vec::new() };
+    a[key].as_array().unwrap().iter().cloned().enumerate().filter(|(_, v)| !v.is_null()).collect()
+}
+
+/// The history file's modification time (a snapshot is renamed into place).
+fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// wardend's resource history survives its restarts: a clean stop (SIGTERM)
+/// saves it, a kill -9 keeps the last periodic snapshot, and a damaged file
+/// is moved aside with a warning while wardend starts with an empty history.
+#[test]
+fn wardend_history_survives_restarts_and_a_bad_file_is_moved_aside() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fleet::new("wd-history");
+    f.ok(&["start", "sleep 300", "--name", "napper"]);
+    let file = f.home.join("state/wardend-history.bin");
+    // A snapshot every half second instead of every minute (debug builds only).
+    let env = [("WARDEN_HISTORY_SAVE_MS", "500")];
+    let since = Instant::now();
+    let since_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - 60_000;
+    let d = Wardend::start(&f, &env);
+    // Two committed samples of napper (a sample per 10 s of wall-clock time).
+    let before = loop {
+        let h = history_of(&d, "napper", since_ms);
+        if points(&h, "rss_bytes").len() >= 2 {
+            break h;
+        }
+        assert!(since.elapsed() < Duration::from_secs(45), "no samples of napper: {h}\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let n = before["points"].as_u64().unwrap() as usize;
+    let keys = ["cpu_percent", "rss_bytes", "workers_ready", "workers_configured", "restarts"];
+
+    // A clean stop saves it, privately; the next wardend loads it and
+    // answers the same for those points.
+    let pid = d.child.id();
+    drop(d);
+    assert!(!alive(pid as u64));
+    let log = std::fs::read_to_string(f.home.join("wardend.out")).unwrap();
+    assert!(log.contains("resource history saved file="), "{log}");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!f.home.join("state/.wardend-history.bin.tmp").exists(), "no temporary file left");
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "resource history loaded file=");
+    assert!(d.log().contains(" apps=1 "), "{}", d.log());
+    let after = history_of(&d, "napper", since_ms);
+    for key in keys {
+        let old: Vec<(usize, Value)> = points(&before, key).into_iter().filter(|(i, _)| *i < n - 1).collect();
+        let new: Vec<(usize, Value)> = points(&after, key).into_iter().filter(|(i, _)| *i < n - 1).collect();
+        assert!(!old.is_empty(), "{key}: {before}");
+        assert_eq!(old, new, "{key} before and after the restart");
+    }
+    assert_eq!(points(&after, "workers_ready")[0].1, 1, "{after}");
+
+    // kill -9: the last periodic snapshot is there. Wait for a sample after
+    // the restart, then for a snapshot written after it.
+    let committed = points(&after, "rss_bytes").len();
+    let t0 = Instant::now();
+    let newer = loop {
+        let h = history_of(&d, "napper", since_ms);
+        if points(&h, "rss_bytes").len() > committed {
+            break h;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "no new sample:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    // A file modified after this holds every sample `newer` has (the kernel's
+    // file times lag the clock a little, never lead it).
+    let seen = std::time::SystemTime::now();
+    let t0 = Instant::now();
+    while mtime(&file).is_none_or(|m| m <= seen) {
+        assert!(t0.elapsed() < T, "no snapshot after the new sample:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut d = d;
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "resource history loaded file=");
+    let back = history_of(&d, "napper", since_ms);
+    let saved = points(&newer, "rss_bytes");
+    let last = saved.last().unwrap().0;
+    assert_eq!(
+        points(&back, "rss_bytes").into_iter().filter(|(i, _)| *i <= last).collect::<Vec<_>>(),
+        saved,
+        "every sample up to the last snapshot survives a kill -9"
+    );
+
+    // A damaged file: a warning with the fix, the file moved aside, an
+    // empty history (nothing before this start), and wardend runs on.
+    drop(d);
+    let bytes = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &bytes[..bytes.len() - 10]).unwrap();
+    let started_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "cannot use the resource history on disk; starting with an empty one");
+    let log = d.log();
+    assert!(log.contains("it is truncated") && log.contains("moved_to="), "{log}");
+    every_warning_has_a_hint(&log);
+    assert_eq!(std::fs::read(f.home.join("state/wardend-history.bin.bad")).unwrap(), &bytes[..bytes.len() - 10]);
+    let fresh = history_of(&d, "napper", since_ms);
+    let first_new = ((started_ms / 1000 - since_ms / 1000) / 10).saturating_sub(1) as usize;
+    assert!(points(&fresh, "rss_bytes").iter().all(|(i, _)| *i >= first_new), "nothing from before: {fresh}");
+    // The next snapshot is a good one again.
+    let t0 = Instant::now();
+    while !file.exists() {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no new snapshot:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(d.request(r#"{"cmd":"hello"}"#)["ok"] == true);
+}
+
 /// `on = ["oom"]` fires on the supervisor's own OOM exit reason, once per OOM
 /// kill, and never for a plain kill -9. A fake `memory.events` (debug builds
 /// only) stands in for the kernel's OOM kill counter.
