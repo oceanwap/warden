@@ -14,12 +14,18 @@ cargo xtask chaos                      # 10 minutes of faults, a random seed (pr
 cargo xtask chaos --minutes 3          # a short run while developing
 cargo xtask chaos --seed 2 --minutes 3 # the same faults, in the same order, on the same targets
 cargo xtask chaos --only stop-supervisor,kill-worker --minutes 2
+cargo xtask chaos --release            # against a release build (what production runs)
 cargo xtask chaos --help
 ```
 
-It builds Warden in **debug** mode (correctness, not speed: the CLI and
-supervisor latencies it reports are a debug build's). Needs Linux, `bun`,
-`node` ≥ 22.12, and root for the two things below; ~1 GB of RAM.
+It builds Warden in **debug** mode by default (correctness, not speed: the
+CLI and supervisor latencies it reports are then a debug build's);
+`--release` builds and runs a release build, and the report says which ran.
+Needs `bun`, `node` ≥ 22.12, ~1.2 GB of RAM, and npm once (the NestJS app's
+packages: `npm ci` in `bench/nest`, run for you when they are missing).
+Linux runs everything; as root, it also gets the three things below. macOS
+runs what it supports (see [On macOS](#on-macos)). Whatever a host lacks is
+left out, printed at the start and listed in the report.
 
 - **Its own pid and mount namespace** (`unshare`, with `bash` as the
   namespace's init). Background supervisors are orphans by design (`warden
@@ -30,6 +36,14 @@ supervisor latencies it reports are a debug build's). Needs Linux, `bun`,
   runs without it (and without the tmpfs).
 - **A 48 MB tmpfs for the apps' log files**, so the disk can really fill.
   It disappears with the namespace.
+- **A memory cgroup** (400 MB, no swap) for the `oom` app: a child of the
+  harness's own memory cgroup (v1 or v2), else of the cgroup v2 root (a
+  service's own cgroup holds processes, so it cannot give children the
+  memory controller). Warden limits no memory itself: it reads the OOM-kill
+  counter of the cgroup it runs in, as under a unit's `MemoryMax=` or a
+  container's limit. The app's supervisor is started inside it (its workers
+  inherit it); the cgroup is removed at the end. Where none can be made, the
+  app and the `oom-kill` fault are left out, with the reason.
 
 ## The fleet
 
@@ -42,6 +56,9 @@ supervisor latencies it reports are a debug build's). Needs Linux, `bun`,
 | `site` | Warden's static server, 2 workers | the file server, its cache and drain |
 | `direct` | `bench/chaos/app.ts`, 2 workers, `worker_output = "direct"` | spliced output files, their rotation, a full disk |
 | `crashy` | `bench/chaos/app.ts`, 1 worker, `max_restarts = 3` | a crash loop to FAILED and `warden reset` |
+| `memhog` | `bench/chaos/app.ts`, 2 workers, `[limits] max_memory = 200` (Linux: Warden reads RSS from /proc) | graceful memory recycling |
+| `oom` | `bench/chaos/app.ts`, 2 workers, its supervisor in the memory cgroup (Linux, root) | the kernel's OOM killer and how Warden reports it |
+| `nest` | `bench/nest/main.ts` (NestJS, Express) on Bun, 2 workers | `node:http` through the shim on a shared port, Nest's own shutdown hooks deferred to the drain |
 | wardend | `warden daemon --background`, an alert rule writing to a file | supervisor restarts, alerts, its own death |
 
 Every app runs with `[watchdog] timeout = 4`, `grace_period = 10` and
@@ -82,6 +99,11 @@ injection (the kill, the `SIGCONT`, the CLI returning) to that point.
 | `log-flood` | 10–60 MB of output from one worker; `direct`'s files must stay within their rotation bound | nothing |
 | `disk-full` | the log tmpfs filled, two apps flooding into it for 3–6 s, then freed | nothing |
 | `crash-loop` | `crashy` made to exit at start and killed: it must reach FAILED, and come back after the cause is gone and `warden reset` | its own outage (no load on it) |
+| `oom-kill` | a worker of `oom` allocates twice the cgroup's limit (`/grow`): the kernel must kill it, and Warden restart it and report it as an OOM kill: the slot's `last_exit`, the `worker crashed` log line with its `hint=`, wardend's `oom` alert | requests on that worker |
+| `memory-recycle` | a worker of `memhog` grows 300 MB over `max_memory`: Warden must replace it gracefully within 60 s (new worker first, the old one drained), not count a crash, log `worker scheduled for replacement … max_memory` and send a `recycled` alert | as `reload` (nothing else may be lost) |
+
+`kill-supervisor` never picks `oom`: wardend restarts a supervisor in its
+own cgroup, so the app would leave the memory cgroup.
 
 ## Invariants
 
@@ -97,8 +119,10 @@ Checked continuously and at the end; any violation fails the run.
 | No fd leak, no RSS growth | Open fds and RSS of every supervisor and wardend every 4 s while the fleet is quiet (recovered, no fault running); per process, the lowest of the first third against the lowest of the last third: growth above max(4 fds, 10 %) or max(4 MB, 25 %) fails. A process with under 2 minutes or 9 quiet samples (one that was killed and restarted late) is not judged |
 | No panics | `panicked at` or `essential task failed` in any supervisor's or wardend's log |
 | Every WARN/ERROR has a `hint=` | Every Warden line at WARN or ERROR in those logs (the static server's own lines included, the apps' output not) |
-| `warden list` and `status` answer in 100 ms (p99) | `warden list`, `warden status <app>`, `warden list --json`, timed every 0.5 s. Samples taken while a supervisor was frozen on purpose are left out (a frozen app costs `list` its 1 s timeout by design) |
-| `warden kill --yes` leaves nothing | No process with the run's `WARDEN_HOME` left `grace_period` + 10 s after it |
+| `warden list` and `status` answer in 100 ms (p99) | `warden list`, `warden status <app>`, `warden list --json`, timed every 0.5 s. Samples taken while a supervisor was frozen on purpose are left out (a frozen app costs `list` its 1 s timeout by design), and so are those of an `oom-kill` (until the kernel kills the worker, everything in the full cgroup that allocates, its supervisor too, waits in memory reclaim). A violation names its slowest samples, the fault each fell in and the apps that did not answer |
+| An OOM kill is reported as one | `oom-kill`'s checks: `last_exit`, the log line and its hint, the `oom` alert |
+| Recycling over `max_memory` is graceful | `memory-recycle`'s checks: replaced in time, no crash counted, no request lost, the log line, the `recycled` alert |
+| `warden kill --yes` leaves nothing | No process with the run's `WARDEN_HOME` left `grace_period` + 10 s after it; the memory cgroup removed |
 
 Plus the checks of each fault (exit codes, release pinning, the watchdog
 killing a stopped worker, a frozen supervisor or wardend not killing or
@@ -137,7 +161,18 @@ vanishes with the namespace (now only the apps' output goes there); the
 background log rotates with the app's `[logging.rotate]` settings, so a
 log flood rotated Warden's lines out of reach of the scan (now 64 MB
 before rotating, and a 2000 lines/s budget; the report says if a log
-rotated anyway); recovery times included the harness's own pauses.
+rotated anyway); recovery times included the harness's own pauses; alerts
+wardend delivers at the same moment (a crash loop and an OOM kill of the
+same death) run the alert rule's `cat >> file; echo >> file` at once, so two
+objects can share a line of `alerts.jsonl`, which is now read as a JSON
+stream rather than line by line.
+
+The `oom-kill`, `memory-recycle` and NestJS additions found no Warden bug:
+OOM kills were reported as such every time (status, log, alert), recycling
+was graceful with no request lost. On this 2-CPU box, shared with other
+builds at a load of 5, supervisors stalled 2–3 s while spawning workers
+(Bun took 1–2.5 s to start instead of 35 ms), which the CLI latency
+invariant flags; the 4-vCPU CI runners are the reference for that.
 
 ## Last run
 
@@ -194,16 +229,41 @@ faults on the same targets: 2 (3 minutes; bugs 1–4), 3 (4 minutes; bugs
 1, 3, 4) and 4 (5 minutes; bug 5).
 <!-- /chaos:last-run -->
 
+## On macOS
+
+macOS has no `/proc`: the harness reads processes with `ps` (one call for
+the whole table) and `lsof` (fds, a worker's working directory). It leaves
+out, and lists at the start and in the report: the pid namespace and the
+tmpfs (`disk-full`), memory cgroups (`oom` app, `oom-kill`), `memhog` and
+`memory-recycle` (Warden reads workers' RSS from `/proc`), and
+`kill-supervisor` (no parent-death signal: the workers of a SIGKILLed
+supervisor keep running next to the new ones, as the README's Platforms
+section says). Connections are not spread across `SO_REUSEPORT` listeners
+there, which changes which worker answers, not what may fail.
+
+## In CI
+
+`.github/workflows/chaos.yml` runs `cargo xtask chaos --release --minutes 3
+--seed 20261001` on every push and once a day: on Ubuntu as root (pid
+namespace, tmpfs, memory cgroup: everything), and on macOS. The fixed seed
+means the same faults in the same order on the same targets, so a new
+failure points at a change in Warden. The verdict, recovery per fault and
+the request counts are notice annotations, each violation an error
+annotation (job logs need a login to read; annotations don't), and the JSON
+report is an artifact. "Run workflow" takes other minutes and seeds.
+
 ## Not covered
 
-- Release builds and latency under real load: this is a correctness soak
-  on a debug build, 2 CPUs shared with the load generator.
-- `tcp_migrate_req = 1`: the sandbox runs with 0 and the harness does not
-  change host settings; with 1 the allowance for queued resets is off.
+- Latency under real load: this is a correctness soak; the load is steady,
+  not a benchmark (`cargo xtask bench` measures that).
+- `tcp_migrate_req = 1`: the harness does not change host settings; with 1
+  the allowance for queued resets is off.
 - systemd: supervisors run in the background under wardend, not as units;
-  `Type=notify`, `WatchdogSec=` and `KillMode=mixed` are not exercised.
-- The OOM killer (`a_real_oom_kill_is_reported_with_its_fix` covers it),
-  `max_memory`/`max_lifetime` recycling, health-based replacement on
-  purpose, NestJS, macOS.
+  `Type=notify`, `WatchdogSec=` and `KillMode=mixed` are exercised by
+  `.github/workflows/service-managers.yml` instead (`warden startup` on real
+  systemd and launchd), not under faults.
+- `max_lifetime` recycling, health-based replacement on purpose.
 - A wardend killed *while* a supervisor is dead: faults run one at a time,
   so wardend is always back before the next supervisor dies.
+- An app's memory cgroup after wardend restarts its supervisor: the new
+  supervisor lands in wardend's cgroup (so `kill-supervisor` skips `oom`).
