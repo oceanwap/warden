@@ -132,6 +132,155 @@ pub fn parse_time(s: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// One place `warden logs --history` reads, in the order they are read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    /// Lines framed by Warden (`<ts> LEVEL …`, `<ts> OUT   worker=…`):
+    /// `[logging] file` or a background supervisor's log, rotated ones too.
+    Framed(PathBuf),
+    /// journald (the app runs as a systemd unit and logs nowhere else).
+    Journal,
+    /// Output as a worker wrote it: an out/err file and its rotated ones.
+    /// `worker`: whose (per-worker files); None for a file all share.
+    Raw { path: PathBuf, worker: Option<String>, stream: &'static str },
+}
+
+/// What `--history` knows about where an app logs.
+pub struct Setup<'a> {
+    pub logging: &'a crate::config::Logging,
+    /// `[logging] file`, else the background supervisor's log, if any.
+    pub framed: Option<PathBuf>,
+    /// It runs as a systemd unit: journald has Warden's own lines.
+    pub journal: bool,
+    /// `[workers] count` in process mode, else 0 (one shared file is one
+    /// worker's only with a single worker process).
+    pub processes: usize,
+}
+
+/// Where `warden logs --history` finds the lines `q` asks for, in reading
+/// order: Warden's own log first, then each worker's files (by worker
+/// number, then standbys, then the worker-mode host; stdout before
+/// stderr). Each file comes with its rotated and gzipped ones, oldest
+/// first (`file_chain`). Err: nothing configured can answer, and why.
+///
+/// - Capture mode: `[logging] file` holds everything, each line tagged
+///   with its worker and stream, so it answers alone. `--out`/`--err`
+///   read the out/err files when set (as the app wrote them).
+/// - Direct mode: worker output is only in the out/err files; Warden's
+///   file (or journald) has its events. Both are read.
+/// - Per-worker files (`out-2.log`) are found on disk, so a worker that
+///   is gone (scaled down, an earlier run) is still read; `--worker N`
+///   reads only worker N's.
+pub fn sources(s: &Setup, q: &Query) -> Result<Vec<Source>, String> {
+    use crate::config::WorkerOutput;
+    let l = s.logging;
+    let capture = l.worker_output == WorkerOutput::Capture;
+    let direct = l.worker_output == WorkerOutput::Direct;
+    // Warden's own lines: its file, else journald.
+    let events: Vec<Source> = match &s.framed {
+        Some(f) => vec![Source::Framed(f.clone())],
+        None if s.journal => vec![Source::Journal],
+        None => Vec::new(),
+    };
+    // Warden's log answers questions about worker output only in capture mode.
+    let framed_output = capture && s.framed.is_some();
+    let no_files = || {
+        "no log files to read: set [logging] file (or out_file / err_file) to keep history; `warden logs` shows \
+         the recent lines in memory"
+            .to_string()
+    };
+    if q.events || q.level.is_some() {
+        return if events.is_empty() { Err(no_files()) } else { Ok(events) };
+    }
+    let worker = q.worker.as_deref();
+    let raw = |stream: &'static str| -> Option<Result<Vec<Source>, String>> {
+        let base = match stream {
+            "stdout" => l.out_file.as_ref()?,
+            _ => l.err_file.as_ref()?,
+        };
+        if l.per_worker_files {
+            let workers: Vec<Source> = crate::logging::worker_labels(base)
+                .into_iter()
+                .filter(|w| worker.is_none_or(|want| want == w || (want == "standby" && crate::control::is_standby(w))))
+                .map(|w| Source::Raw { path: crate::logging::worker_file(base, true, &w), worker: Some(w), stream })
+                .collect();
+            return Some(Ok(workers));
+        }
+        match worker {
+            Some(w) if !(s.processes == 1 && w == "1") => Some(Err(format!(
+                "{} is shared by every worker and its lines don't say whose they are, so --worker {w} can't pick \
+                 them out. Set [logging] per_worker_files = true{}",
+                base.display(),
+                if direct { "" } else { ", or [logging] file (each of its lines names the worker)" }
+            ))),
+            _ => Some(Ok(vec![Source::Raw { path: base.clone(), worker: None, stream }])),
+        }
+    };
+    if let Some(stream) = q.stream.as_deref() {
+        let stream: &'static str = if stream == "stderr" { "stderr" } else { "stdout" };
+        return match raw(stream) {
+            Some(Ok(v)) if !v.is_empty() => Ok(v),
+            _ if framed_output => Ok(events),
+            Some(Err(e)) => Err(e),
+            Some(Ok(_)) => Err(match worker {
+                Some(w) => format!("no {stream} file of worker {w} yet"),
+                None => format!("no per-worker {stream} files yet"),
+            }),
+            None if direct && stream == "stderr" => Err(format!(
+                "stderr goes into out_file together with stdout (no err_file is set), so it can't be read on its \
+                 own; drop --err to read both, or set [logging] err_file to keep stderr apart{}",
+                l.out_file.as_ref().map(|o| format!(" (out_file: {})", o.display())).unwrap_or_default()
+            )),
+            None if capture && !events.is_empty() => Ok(events),
+            None => Err(format!(
+                "no {stream} log file: set [logging] {} (or [logging] file) to keep history",
+                if stream == "stderr" { "err_file" } else { "out_file" }
+            )),
+        };
+    }
+    if framed_output {
+        return Ok(events);
+    }
+    // Direct mode (or files without Warden's log): Warden's events, then
+    // each worker's out and err files.
+    let (out, err) = (raw("stdout").transpose()?.unwrap_or_default(), raw("stderr").transpose()?.unwrap_or_default());
+    let mut files: Vec<Source> = out.into_iter().chain(err).collect();
+    let order = |src: &Source| match src {
+        Source::Raw { worker, stream, .. } => {
+            (worker.as_deref().map(crate::logging::label_order), u8::from(*stream == "stderr"))
+        }
+        _ => (None, 0),
+    };
+    // Stable: a shared file keeps its place; per worker, stdout then stderr.
+    files.sort_by_key(|src| order(src));
+    // Events from journald next to a capture mode's files would repeat
+    // the output journald has too; only direct mode adds them.
+    let events = if capture && s.framed.is_none() { Vec::new() } else { events };
+    let all: Vec<Source> = events.into_iter().chain(files).collect();
+    if all.is_empty() {
+        return match worker {
+            Some(w) if l.per_worker_files && (l.out_file.is_some() || l.err_file.is_some()) => {
+                Err(format!("no log file of worker {w} yet"))
+            }
+            _ if s.journal => Ok(vec![Source::Journal]),
+            _ => Err(no_files()),
+        };
+    }
+    Ok(all)
+}
+
+/// A line of an out/err file, shown among other files' lines: it says
+/// whose it is, framed like captured output. A line written with
+/// `file_timestamps` (`<ts>: text`) keeps its time; others have none. A
+/// file all workers share (`worker` None) names only the stream.
+pub fn frame_raw(worker: Option<&str>, stream: &str, line: &str) -> String {
+    let Some(worker) = worker else { return format!("{stream}: {line}") };
+    match timestamp_of(line).and_then(|ts| Some((ts, line.get(TS..)?.strip_prefix(": ")?))) {
+        Some((ts, text)) => format!("{ts} OUT   worker={worker} {stream}: {text}"),
+        None => format!("worker={worker} {stream}: {line}"),
+    }
+}
+
 /// Rotated siblings of `path` (numbered, dated, gzipped), oldest first, then
 /// `path` itself.
 pub fn file_chain(path: &Path) -> Vec<PathBuf> {
@@ -313,6 +462,28 @@ pub fn to_json(app: &str, line: &str) -> String {
             fields.into_iter().map(|(k, v)| (k, serde_json::Value::String(v))).collect();
         o.insert("fields".into(), serde_json::Value::Object(map));
     }
+    serde_json::Value::Object(o).to_string()
+}
+
+/// A line of a worker's out/err file as one JSON object: `kind` output,
+/// `worker` when the file is one worker's, `stream`, and `time` when the
+/// line was written with `file_timestamps`.
+pub fn raw_to_json(app: &str, worker: Option<&str>, stream: &str, line: &str) -> String {
+    let mut o = serde_json::Map::new();
+    o.insert("app".into(), app.into());
+    let text = match timestamp_of(line).and_then(|ts| Some((ts, line.get(TS..)?.strip_prefix(": ")?))) {
+        Some((ts, text)) => {
+            o.insert("time".into(), ts.into());
+            text
+        }
+        None => line,
+    };
+    o.insert("kind".into(), "output".into());
+    if let Some(w) = worker {
+        o.insert("worker".into(), w.into());
+    }
+    o.insert("stream".into(), stream.into());
+    o.insert("message".into(), text.into());
     serde_json::Value::Object(o).to_string()
 }
 
@@ -539,6 +710,178 @@ mod tests {
             .unwrap();
         }
         assert_eq!(seen, vec!["a", "b", "c", "d"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Which files `--history` reads for each setup and query: per-worker
+    /// files are found on disk (gone workers too), in worker order, and
+    /// direct mode reads Warden's events next to the workers' files.
+    #[test]
+    fn history_sources() {
+        use crate::config::{Logging, WorkerOutput};
+        let dir = std::env::temp_dir().join(format!("warden-sources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["out-1.log", "out-2.log", "out-10.log.1.gz", "out-s1.log", "err-1.log", "err-2.log.3"] {
+            std::fs::write(dir.join(f), "x\n").unwrap();
+        }
+        let (out, err, warden) = (dir.join("out.log"), dir.join("err.log"), dir.join("warden.log"));
+        let raw = |f: &str, w: Option<&str>, stream: &'static str| Source::Raw {
+            path: dir.join(f),
+            worker: w.map(String::from),
+            stream,
+        };
+        let per = Logging {
+            out_file: Some(out.clone()),
+            err_file: Some(err.clone()),
+            per_worker_files: true,
+            ..Logging::default()
+        };
+        let direct = Logging { worker_output: WorkerOutput::Direct, ..per.clone() };
+        let setup =
+            |l, framed: Option<&PathBuf>| Setup { logging: l, framed: framed.cloned(), journal: false, processes: 2 };
+        let q = |stream: Option<&str>, worker: Option<&str>| Query {
+            stream: stream.map(String::from),
+            worker: worker.map(String::from),
+            ..Default::default()
+        };
+
+        // Direct mode: Warden's events, then each worker's out and err.
+        assert_eq!(
+            sources(&setup(&direct, Some(&warden)), &q(None, None)).unwrap(),
+            vec![
+                Source::Framed(warden.clone()),
+                raw("out-1.log", Some("1"), "stdout"),
+                raw("err-1.log", Some("1"), "stderr"),
+                raw("out-2.log", Some("2"), "stdout"),
+                raw("err-2.log", Some("2"), "stderr"),
+                raw("out-10.log", Some("10"), "stdout"),
+                raw("out-s1.log", Some("s1"), "stdout"),
+            ]
+        );
+        // --out, --err, --worker.
+        assert_eq!(
+            sources(&setup(&direct, Some(&warden)), &q(Some("stdout"), None)).unwrap(),
+            vec![
+                raw("out-1.log", Some("1"), "stdout"),
+                raw("out-2.log", Some("2"), "stdout"),
+                raw("out-10.log", Some("10"), "stdout"),
+                raw("out-s1.log", Some("s1"), "stdout"),
+            ]
+        );
+        assert_eq!(
+            sources(&setup(&direct, None), &q(Some("stderr"), Some("2"))).unwrap(),
+            vec![raw("err-2.log", Some("2"), "stderr")]
+        );
+        assert_eq!(
+            sources(&setup(&direct, Some(&warden)), &q(None, Some("10"))).unwrap(),
+            vec![Source::Framed(warden.clone()), raw("out-10.log", Some("10"), "stdout")]
+        );
+        assert_eq!(
+            sources(&setup(&direct, None), &q(Some("stdout"), Some("standby"))).unwrap(),
+            vec![raw("out-s1.log", Some("s1"), "stdout")]
+        );
+        assert!(sources(&setup(&direct, None), &q(Some("stdout"), Some("7"))).unwrap_err().contains("worker 7"));
+        // Events only: Warden's log.
+        let events = Query { level: Some(Level::Warn), ..Default::default() };
+        assert_eq!(sources(&setup(&direct, Some(&warden)), &events).unwrap(), vec![Source::Framed(warden.clone())]);
+
+        // Capture mode: Warden's file has everything, tagged; --out reads the out files.
+        assert_eq!(
+            sources(&setup(&per, Some(&warden)), &q(None, Some("2"))).unwrap(),
+            vec![Source::Framed(warden.clone())]
+        );
+        assert_eq!(
+            sources(&setup(&per, Some(&warden)), &q(Some("stderr"), Some("1"))).unwrap(),
+            vec![raw("err-1.log", Some("1"), "stderr")]
+        );
+        // ...and without it, the files, by worker.
+        assert_eq!(
+            sources(&setup(&per, None), &q(None, Some("1"))).unwrap(),
+            vec![raw("out-1.log", Some("1"), "stdout"), raw("err-1.log", Some("1"), "stderr")]
+        );
+
+        // One shared file: whole, but it can't answer --worker (unless one worker).
+        let shared = Logging { per_worker_files: false, ..per.clone() };
+        assert_eq!(
+            sources(&setup(&shared, None), &q(Some("stdout"), None)).unwrap(),
+            vec![Source::Raw { path: out.clone(), worker: None, stream: "stdout" }]
+        );
+        let e = sources(&setup(&shared, None), &q(Some("stdout"), Some("2"))).unwrap_err();
+        assert!(e.contains("per_worker_files") && e.contains("--worker 2"), "{e}");
+        assert_eq!(
+            sources(&setup(&shared, Some(&warden)), &q(Some("stdout"), Some("2"))).unwrap(),
+            vec![Source::Framed(warden.clone())],
+            "capture mode: Warden's file tags each line with its worker"
+        );
+        let one = Setup { logging: &shared, framed: None, journal: false, processes: 1 };
+        assert_eq!(sources(&one, &q(Some("stdout"), Some("1"))).unwrap().len(), 1);
+
+        // Direct mode without err_file: stderr is in out_file.
+        let mixed = Logging { err_file: None, ..direct.clone() };
+        let e = sources(&setup(&mixed, None), &q(Some("stderr"), None)).unwrap_err();
+        assert!(e.contains("err_file"), "{e}");
+        // Nothing configured: journald under systemd, else a hint.
+        let none = Logging::default();
+        let journal = Setup { logging: &none, framed: None, journal: true, processes: 1 };
+        assert_eq!(sources(&journal, &q(None, None)).unwrap(), vec![Source::Journal]);
+        assert!(sources(&setup(&none, None), &q(None, None)).unwrap_err().contains("[logging] file"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_lines_say_whose_they_are() {
+        assert_eq!(frame_raw(Some("2"), "stderr", "boom"), "worker=2 stderr: boom");
+        assert_eq!(
+            frame_raw(Some("2"), "stdout", "2026-09-30T12:00:01.123Z: hello"),
+            "2026-09-30T12:00:01.123Z OUT   worker=2 stdout: hello"
+        );
+        assert_eq!(frame_raw(None, "stdout", "hello"), "stdout: hello");
+        let q = Query { worker: Some("2".into()), stream: Some("stdout".into()), ..Default::default() };
+        assert!(q.matches(&frame_raw(Some("2"), "stdout", "2026-09-30T12:00:01.123Z: hello")));
+        let v: serde_json::Value = serde_json::from_str(&raw_to_json("api", Some("2"), "stderr", "boom")).unwrap();
+        assert_eq!(
+            (v["kind"].as_str(), v["worker"].as_str(), v["stream"].as_str()),
+            (Some("output"), Some("2"), Some("stderr"))
+        );
+        assert_eq!((v["message"].as_str(), v.get("time")), (Some("boom"), None));
+        let v: serde_json::Value =
+            serde_json::from_str(&raw_to_json("api", None, "stdout", "2026-09-30T12:00:01.123Z: hi")).unwrap();
+        assert_eq!((v["time"].as_str(), v["message"].as_str()), (Some("2026-09-30T12:00:01.123Z"), Some("hi")));
+        assert!(v.get("worker").is_none());
+    }
+
+    #[test]
+    fn per_worker_chains_keep_their_rotation_order() {
+        // `out-1.log.` must not take `out-10.log.1`; each worker's chain is
+        // its own rotated files, oldest first, numbered and dated, .gz too.
+        let dir = std::env::temp_dir().join(format!("warden-logview-per-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gz = |name: &str, text: &[u8]| {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            let mut enc = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+            enc.write_all(text).unwrap();
+            enc.finish().unwrap();
+        };
+        gz("out-1.log.2.gz", b"1a\n");
+        std::fs::write(dir.join("out-1.log.1"), "1b\n").unwrap();
+        std::fs::write(dir.join("out-1.log"), "1c\n").unwrap();
+        std::fs::write(dir.join("out-10.log.1"), "10a\n").unwrap();
+        std::fs::write(dir.join("out-10.log"), "10b\n").unwrap();
+        let read = |p: &Path| {
+            let mut seen = Vec::new();
+            for f in file_chain(p) {
+                for_each_line(&f, &mut |l| {
+                    seen.push(l.to_string());
+                    true
+                })
+                .unwrap();
+            }
+            seen
+        };
+        assert_eq!(read(&dir.join("out-1.log")), vec!["1a", "1b", "1c"]);
+        assert_eq!(read(&dir.join("out-10.log")), vec!["10a", "10b"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

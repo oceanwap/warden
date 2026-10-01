@@ -43,12 +43,17 @@ pub enum Request {
         worker: Option<usize>,
     },
     /// The effective config and paths, with env values hidden unless
-    /// `show_secrets`.
+    /// `show_secrets`; `info.worker_env` is the environment `worker` (or
+    /// worker 1, the host in worker mode) starts with (`warden env`).
     Config {
         #[serde(default)]
         show_secrets: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker: Option<usize>,
     },
-    /// Empty the in-memory log buffers and truncate the log file.
+    /// Empty the in-memory log buffers and the current log files (Warden's,
+    /// every worker's out and err file); rotated files are kept. The
+    /// message lists the files; not ok if one could not be emptied.
     Flush,
     Logs {
         lines: usize,
@@ -183,6 +188,13 @@ pub struct Status {
     /// `workers`, so older clients don't see them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub draining: Vec<WorkerStatus>,
+    /// Since the workers were last started (the supervisor's start,
+    /// `start`, `restart --hard`), every one crashed and none was ready
+    /// yet: the app can't start as it is. The last crash's reason (`exit
+    /// code 1`, `not ready in time`). Stays while the workers are stopped
+    /// after it (`warden list` shows them `errored`); a start clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_failed: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -243,6 +255,22 @@ pub struct WorkerStatus {
     /// Per-worker health verdict (private-socket checks).
     #[serde(default)]
     pub healthy: Option<bool>,
+    /// How late its event loop ran over the last heartbeat interval (about
+    /// a second), from the shim. None without the shim (or a heartbeat in
+    /// the last few seconds). In worker mode, each Worker's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_delay: Option<LoopDelay>,
+}
+
+/// Event-loop delay over one heartbeat interval, in milliseconds: the
+/// median, the 99th percentile and the largest of the samples taken (one
+/// per 100 ms), i.e. how long a request that arrived then waited before its
+/// handler could start.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct LoopDelay {
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
 }
 
 #[cfg(test)]
@@ -292,6 +320,7 @@ mod tests {
             cpu_percent: None,
             last_exit: None,
             healthy: None,
+            loop_delay: None,
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["standbys"][0]["state"], "STANDBY");
@@ -322,11 +351,36 @@ mod tests {
             cpu_percent: None,
             last_exit: None,
             healthy: None,
+            loop_delay: None,
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!((v["draining"][0]["id"].as_u64(), v["draining"][0]["state"].as_str()), (Some(2), Some("DRAINING")));
         let back: Status = serde_json::from_value(v).unwrap();
         assert_eq!(back, s);
+    }
+
+    /// `loop_delay` is additive: absent from older supervisors' rows and
+    /// not sent without a figure.
+    #[test]
+    fn loop_delay_is_additive() {
+        let old = r#"{"id":1,"state":"RUNNING","pid":5,"uptime_secs":3,"restarts":0,"crashes":0,"rss_bytes":null,
+            "cpu_seconds":null,"cpu_percent":null,"last_exit":null}"#;
+        let mut w: WorkerStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(w.loop_delay, None);
+        assert!(!serde_json::to_string(&w).unwrap().contains("loop_delay"));
+        w.loop_delay = Some(LoopDelay { p50_ms: 0.2, p99_ms: 3.0, max_ms: 12.5 });
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["loop_delay"], serde_json::json!({"p50_ms": 0.2, "p99_ms": 3.0, "max_ms": 12.5}));
+        assert_eq!(serde_json::from_value::<WorkerStatus>(v).unwrap(), w);
+        // `config` with a worker; an older CLI's request has none.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"cmd":"config","show_secrets":true}"#).unwrap(),
+            Request::Config { show_secrets: true, worker: None }
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Config { show_secrets: false, worker: Some(2) }).unwrap(),
+            r#"{"cmd":"config","show_secrets":false,"worker":2}"#
+        );
     }
 
     #[test]

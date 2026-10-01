@@ -23,7 +23,7 @@ use crate::events::{self, WorkerEvent};
 use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
-use crate::worker::{Instance, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
+use crate::worker::{Instance, LoopState, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
 use crate::{debug, error, info, metrics, networking, systemd, warn};
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
@@ -133,6 +133,20 @@ pub struct Supervisor {
     /// The OOM kill counters of the cgroups workers run in, to tell OOM
     /// kills from other SIGKILLs.
     oom: process::exit::OomTracker,
+    /// Since the workers were last started (`start_all`) and until one is
+    /// ready: the slots that crashed meanwhile. Every slot in it = the app
+    /// can't start (`Status.start_failed`; `warden start` fails fast on it).
+    start_attempt: Option<StartAttempt>,
+}
+
+/// A start of every worker that no worker has survived to be ready yet.
+#[derive(Debug, Default)]
+struct StartAttempt {
+    crashed: std::collections::BTreeSet<usize>,
+    /// The last crash's reason (`exit code 1`, `not ready in time`).
+    last_exit: Option<String>,
+    /// The ERROR line saying so was logged (once per attempt).
+    reported: bool,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -385,6 +399,7 @@ impl Supervisor {
             pool: standby::Pool::default(),
             release: None,
             oom: process::exit::OomTracker::new(),
+            start_attempt: None,
             cfg,
             cfg_path,
         }
@@ -488,6 +503,9 @@ impl Supervisor {
                 hint = "check working_directory and its `current` symlink; workers can't start until it resolves",
             );
         }
+        // Ends with the first worker ready; until then crashes are counted
+        // (a spawn that fails below is one too).
+        self.start_attempt = Some(StartAttempt::default());
         for id in self.slot_ids() {
             let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
             slot.tracker.reset();
@@ -575,8 +593,51 @@ impl Supervisor {
     /// (`slot_id` is then 0).
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
-        let mut env: Vec<(String, String)> = a.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let mut add = |k: &str, v: String| env.push((k.to_string(), v));
+        let env = self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        let (program, args) = match self.cfg.workers.mode {
+            // A standby (slot 0) runs the workers' command; the shim defers
+            // its listen until promoted. In the pinned release, as workers
+            // (`release.rs`).
+            Mode::Process if self.cfg.static_files.is_some() && slot_id != STANDBY_SLOT => {
+                (self.exe.display().to_string(), vec!["serve-static".to_string()])
+            }
+            Mode::Process => {
+                let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
+                (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
+            }
+            Mode::Worker => {
+                let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                (self.pinned_arg(&a.command), vec![host])
+            }
+        };
+        process::Spec {
+            program,
+            args,
+            cwd: self.worker_dir(),
+            env,
+            label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
+            output: process::Output::from_config(&self.cfg.logging),
+            max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
+        }
+    }
+
+    /// The variables a worker process starts with on top of the supervisor's
+    /// own environment, in the order applied (a later one wins): `env_file`,
+    /// `[app] env`, then Warden's (README, "Environment variables"), each
+    /// with where it comes from. `slot_id` 0 with `standby`: a standby.
+    /// Also what `warden env` prints, so the two can't drift apart.
+    fn worker_env(
+        &self,
+        slot_id: usize,
+        inst_id: u64,
+        standby: Option<(usize, usize)>,
+    ) -> Vec<(String, String, &'static str)> {
+        let a = &self.cfg.app;
+        let mut env: Vec<(String, String, &'static str)> = a
+            .environment()
+            .map(|(k, v)| (k.clone(), v.clone(), if a.env.contains_key(k) { "env" } else { "env_file" }))
+            .collect();
+        let mut add = |k: &str, v: String| env.push((k.to_string(), v, "warden"));
         add("WARDEN_APP", a.name.clone());
         add("WARDEN_MODE", mode_name(self.cfg.workers.mode).into());
         add("WARDEN_WORKER_COUNT", self.count.to_string());
@@ -593,9 +654,9 @@ impl Supervisor {
         if !a.instance_var.is_empty() {
             add("WARDEN_INSTANCE_VAR", a.instance_var.clone());
         }
-        if self.cfg.watchdog.timeout > 0 {
-            add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
-        }
+        // Always: the heartbeat carries the event-loop delay too; the
+        // watchdog only acts on it with [watchdog] timeout > 0.
+        add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
         if self.cfg.workers.port_strategy == PortStrategy::Shared {
             add("WARDEN_REUSE_PORT", "1".into());
         }
@@ -603,10 +664,10 @@ impl Supervisor {
             // Standbys (slot 0) need a shared port (config validation).
             add("PORT", networking::worker_port(p, self.cfg.workers.port_strategy, slot_id.max(1)).to_string());
         }
-        let (program, args) = match self.cfg.workers.mode {
+        match self.cfg.workers.mode {
             Mode::Process if slot_id == STANDBY_SLOT => {
-                // The shim defers its listen until promoted; it then takes the
-                // slot's worker id and instance number.
+                // The shim takes the slot's worker id and instance number
+                // when promoted.
                 add("WARDEN_WORKER_ID", "0".into());
                 add("WARDEN_STANDBY", "1".into());
                 if let (false, Some((_, instance))) = (a.instance_var.is_empty(), standby) {
@@ -615,47 +676,31 @@ impl Supervisor {
                     // standby. A scale-up past it replaces the standby.
                     add(&a.instance_var, instance.to_string());
                 }
-                // In the pinned release, as workers (`release.rs`).
-                let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
-                (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
             }
             Mode::Process => {
                 add("WARDEN_WORKER_ID", slot_id.to_string());
                 if !a.instance_var.is_empty() {
-                    add(&a.instance_var, (slot_id - 1).to_string());
+                    add(&a.instance_var, slot_id.saturating_sub(1).to_string());
                 }
-                match &self.cfg.static_files {
-                    Some(st) => {
-                        let mut st = st.clone();
-                        st.root = self.pinned_path(st.root);
-                        add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
-                        (self.exe.display().to_string(), vec!["serve-static".to_string()])
-                    }
-                    None => {
-                        let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
-                        (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
-                    }
+                if let Some(st) = &self.cfg.static_files {
+                    let mut st = st.clone();
+                    st.root = self.pinned_path(st.root);
+                    add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
                 }
             }
             Mode::Worker => {
+                // Each Worker gets WARDEN_WORKER_ID and the instance
+                // variable from the host and the shim.
                 add("WARDEN_WORKERS", self.count.to_string());
                 if let Some(shim) = &self.shim_path {
                     add("WARDEN_SHIM", shim.display().to_string());
                 }
                 add("WARDEN_ENTRY", self.entry_path().display().to_string());
-                let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                (self.pinned_arg(&a.command), vec![host])
             }
-        };
-        process::Spec {
-            program,
-            args,
-            cwd: self.worker_dir(),
-            env,
-            label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
-            output: process::Output::from_config(&self.cfg.logging),
-            max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
         }
+        // Set by `process::spawn` for every child.
+        add("WARDEN_IPC_FD", process::IPC_FD.to_string());
+        env
     }
 
     fn entry_path(&self) -> PathBuf {
@@ -818,7 +863,33 @@ impl Supervisor {
         let worker = if worker_mode { msg.worker.unwrap_or(0) } else { inst.slot };
         match msg.ev.as_str() {
             "heartbeat" => {
-                inst.heartbeats.insert(worker, Instant::now());
+                let now = Instant::now();
+                inst.heartbeats.insert(worker, now);
+                let Some(d) = msg.loop_delay() else { return };
+                let warn_ms = self.cfg.watchdog.loop_delay_warn * 1000.0;
+                let state = inst.loop_delay.entry(worker).or_insert_with(|| LoopState::new(d, now));
+                if state.observe(d, now, warn_ms) {
+                    // The process (`s1`: a standby), or in worker mode the Worker thread.
+                    let who = match inst.standby_number.filter(|_| inst.role == Role::Standby) {
+                        _ if worker_mode => worker.to_string(),
+                        Some(n) => standby_label(n),
+                        None => inst.slot.to_string(),
+                    };
+                    warn!(
+                        "worker event loop delay is high",
+                        worker = who,
+                        pid = inst.handle.pid,
+                        p99_ms = d.p99_ms,
+                        max_ms = d.max_ms,
+                        for_s = state.high,
+                        threshold_ms = warn_ms,
+                        hint = "requests wait this long before their handler starts: synchronous work on the event \
+                                loop (large JSON, sync fs or crypto, a CPU-heavy route) or a starved host (`warden \
+                                top`, the host's load). Warden only reports it (the watchdog acts when heartbeats \
+                                stop). Profile it (node --cpu-prof, bun --inspect), move heavy work to a Worker, or \
+                                add workers; [watchdog] loop_delay_warn sets the threshold (0 = off)",
+                    );
+                }
             }
             "listening" => {
                 // Other servers the app may start (metrics, admin) don't count.
@@ -936,6 +1007,8 @@ impl Supervisor {
         let was = inst.standby_number.map(standby_label).unwrap_or_default();
         match role {
             Role::Current => {
+                // The app can start: a worker made it.
+                self.start_attempt = None;
                 if let Some(s) = self.slots.get_mut(&slot_id) {
                     s.state = State::Running;
                 }
@@ -1096,10 +1169,14 @@ impl Supervisor {
             self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(why.clone()));
             if is_current {
                 let mut remove = false;
+                // Stopped after a start that failed: the crash says why, not the stop.
+                let keep_crash = self.start_failed().is_some();
                 if let Some(s) = self.slots.get_mut(&slot_id) {
                     s.current = None;
                     s.state = State::Stopped;
-                    s.last_exit = Some(why);
+                    if !keep_crash {
+                        s.last_exit = Some(why);
+                    }
                     remove = s.removing;
                 }
                 if remove {
@@ -1195,6 +1272,55 @@ impl Supervisor {
         self.on_slot_crash(slot_id, uptime.unwrap_or_default());
     }
 
+    /// A slot crashed while no worker has been ready since the workers were
+    /// started. Once every slot has, the app can't start as it is: one ERROR
+    /// line says so and why. The restart policy goes on as configured (a
+    /// dependency may come back); an interactive `warden start` stops the
+    /// workers instead (it sees `Status.start_failed`).
+    fn note_start_crash(&mut self, slot_id: usize) {
+        let last = self.slots.get(&slot_id).and_then(|s| s.last_exit.clone());
+        let ids = self.slot_ids();
+        let Some(a) = self.start_attempt.as_mut() else { return };
+        a.crashed.insert(slot_id);
+        if last.is_some() {
+            a.last_exit = last;
+        }
+        if a.reported || !ids.iter().all(|id| a.crashed.contains(id)) {
+            return;
+        }
+        a.reported = true;
+        let reason = a.last_exit.clone().unwrap_or_default();
+        let app = &self.cfg.app.name;
+        let why = match self.cfg.app.port {
+            Some(p) if reason == "not ready in time" => format!(
+                "no worker listened on port {p} within workers.ready_timeout ({} s): another program on the port \
+                 (`ss -ltnp 'sport = :{p}'`), an app that doesn't listen on process.env.PORT, or a slow boot (raise \
+                 ready_timeout); its output: `warden logs {app}`",
+                self.cfg.workers.ready_timeout
+            ),
+            _ => format!("the app's own error output says why: `warden logs {app} --err`"),
+        };
+        error!(
+            "app cannot start: every worker crashed before it was ready",
+            workers = ids.len(),
+            reason = reason,
+            hint = format!(
+                "{why}. Warden keeps restarting it with backoff (FAILED after restart.max_restarts in \
+                 restart.restart_window, then retried after restart.failed_cooldown); fix the cause, then `warden \
+                 restart {app}`, or `warden stop {app}` to stop trying"
+            ),
+        );
+    }
+
+    /// `Status.start_failed`: every worker crashed since the workers were
+    /// started and none was ready; the last crash's reason.
+    fn start_failed(&self) -> Option<String> {
+        let a = self.start_attempt.as_ref()?;
+        let ids = self.slot_ids();
+        (!ids.is_empty() && ids.iter().all(|id| a.crashed.contains(id)))
+            .then(|| a.last_exit.clone().unwrap_or_else(|| "crashed".into()))
+    }
+
     fn on_slot_crash(&mut self, slot_id: usize, uptime: Duration) {
         if self.shutting_down || self.stopped {
             return;
@@ -1219,6 +1345,7 @@ impl Supervisor {
             info!("old worker gone; its replacement takes over the slot", worker = self.label(slot_id));
             return;
         }
+        self.note_start_crash(slot_id);
         let label = self.label(slot_id);
         let wid = self.event_worker(slot_id);
         let policy = self.policy.clone();
@@ -1638,7 +1765,9 @@ impl Supervisor {
             }
             Request::Reset { worker } => self.reset(worker),
             Request::Signal { signal, worker } => self.send_signal(&signal, worker),
-            Request::Config { show_secrets } => Response { info: Some(self.info(show_secrets)), ..Response::ok("") },
+            Request::Config { show_secrets, worker } => {
+                Response { info: Some(self.info(show_secrets, worker)), ..Response::ok("") }
+            }
             Request::Reload { safe } => self.request_reload(safe),
             Request::Stop => {
                 if self.shutting_down {
@@ -1651,6 +1780,14 @@ impl Supervisor {
                 }
                 info!("stopping all workers (supervisor stays up)");
                 self.stopped = true;
+                // Under systemd (Type=notify) the unit is started all the
+                // same: else it would wait for READY=1 until its timeout and
+                // restart us, starting the workers again (a start that failed
+                // and was stopped by `warden start`, for one).
+                if !self.announced_ready {
+                    self.announced_ready = true;
+                    systemd::notify("READY=1\nSTATUS=workers stopped on request");
+                }
                 self.stop_all();
                 Response::ok("stopping workers; `warden restart` starts them again")
             }
@@ -1781,8 +1918,23 @@ impl Supervisor {
     }
 
     /// Effective config and paths for `describe`, `config` and `env`.
-    fn info(&self, show_secrets: bool) -> serde_json::Value {
+    fn info(&self, show_secrets: bool, worker: Option<usize>) -> serde_json::Value {
         let mut v = serde_json::to_value(&self.cfg).unwrap_or(serde_json::Value::Null);
+        // The environment that worker starts with (`warden env`): which
+        // worker, then each variable with its value and where it comes from.
+        let slot = if self.is_worker_mode() { 1 } else { worker.unwrap_or(1).clamp(1, self.count.max(1)) };
+        let inst = self.slots.get(&slot).and_then(|s| s.current).unwrap_or(self.next_inst);
+        let worker_env: Vec<serde_json::Value> = self
+            .worker_env(slot, inst, None)
+            .into_iter()
+            .map(|(k, val, from)| {
+                // Warden's own values are not secret, except the [static]
+                // section (its basic_auth); the app's are hidden.
+                let secret = if from == "warden" { k == "WARDEN_STATIC" } else { !is_plain_env(&k) };
+                let val = if show_secrets || !secret { val } else { format!("(hidden, {} chars)", val.len()) };
+                serde_json::json!({"name": k, "value": val, "from": from})
+            })
+            .collect();
         // What workers get: env_file's variables with `env` on top.
         if let Some(app) = v.pointer_mut("/app").and_then(|a| a.as_object_mut()) {
             let merged: serde_json::Map<String, serde_json::Value> =
@@ -1806,6 +1958,8 @@ impl Supervisor {
             "unit": systemd::own_unit(),
             "shim": self.shim_path.as_ref().map(|p| p.display().to_string()),
             "workers_running": self.count,
+            "worker_env_of": if self.is_worker_mode() { "host".to_string() } else { slot.to_string() },
+            "worker_env": worker_env,
         })
     }
 
@@ -1927,18 +2081,22 @@ impl Supervisor {
                     cpu_percent: None,
                     last_exit: t.and_then(|t| t.last_exit.clone()),
                     healthy: inst.and_then(|i| i.healthy),
+                    // Each Worker thread has its own event loop and heartbeat.
+                    loop_delay: inst.and_then(|i| i.loop_delay.get(&id)).and_then(|l| l.current(now)),
                 });
             }
         } else {
             for s in self.slots.values() {
                 let inst = s.current.and_then(|c| self.insts.get_mut(&c));
-                let (pid, uptime, stats, healthy) = match inst {
+                let (pid, uptime, stats, healthy, loop_delay) = match inst {
                     Some(i) => {
                         let started = i.started;
                         let pid = i.handle.pid;
-                        (Some(pid), Some(started.elapsed().as_secs()), sample(pid, &mut i.cpu_prev, started), i.healthy)
+                        let stats = sample(pid, &mut i.cpu_prev, started);
+                        let loop_delay = i.loop_delay.get(&s.id).and_then(|l| l.current(now));
+                        (Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy, loop_delay)
                     }
-                    None => (None, None, None, None),
+                    None => (None, None, None, None, None),
                 };
                 if s.state == State::Running {
                     ready += 1;
@@ -1955,6 +2113,7 @@ impl Supervisor {
                     cpu_percent: stats.map(|x| x.1),
                     last_exit: s.last_exit.clone(),
                     healthy,
+                    loop_delay,
                 });
             }
             // Hot standbys: their own list (`Status.standbys`).
@@ -1983,6 +2142,8 @@ impl Supervisor {
                 cpu_percent: stats.map(|x| x.1),
                 last_exit: None,
                 healthy: None,
+                // An old process's loop delay is not tracked (the map is the new one's).
+                loop_delay: None,
             });
         }
         draining.sort_by_key(|w| w.id);
@@ -2024,6 +2185,7 @@ impl Supervisor {
             release: self.release_text(),
             standbys,
             draining,
+            start_failed: self.start_failed(),
         }
     }
 }
@@ -2119,5 +2281,108 @@ mod tests {
             with_preload("/usr/bin/node", &s(&["--max-old-space-size=512", "server.js"]), shim),
             s(&["--import=/r/shim.mjs", "--max-old-space-size=512", "server.js"])
         );
+    }
+
+    fn sup(toml: &str) -> Supervisor {
+        let cfg = Config::parse(toml).unwrap();
+        let (tx, _) = mpsc::unbounded_channel();
+        let (proc_tx, _) = mpsc::unbounded_channel();
+        Supervisor::new(cfg, None, PathBuf::from("/run/w"), (None, None), tx, proc_tx)
+    }
+
+    /// The variable's value as a worker sees it (the last one set wins).
+    fn get<'a>(env: &'a [(String, String, &'static str)], k: &str) -> Option<(&'a str, &'static str)> {
+        env.iter().rev().find(|(n, ..)| n == k).map(|(_, v, from)| (v.as_str(), *from))
+    }
+
+    /// W1: what every worker, a standby and a worker-mode host start with
+    /// (README "Environment variables"), and that Warden's win.
+    #[test]
+    fn worker_environment() {
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\nenv = { PORT = \"9\", A = \"x\" }\n\
+                     [workers]\ncount = 3\nport_strategy = \"offset\"\n[watchdog]\ntimeout = 0\n");
+        let env = s.worker_env(2, 7, None);
+        assert_eq!(get(&env, "A"), Some(("x", "env")));
+        assert_eq!(get(&env, "PORT"), Some(("3001", "warden")), "Warden's PORT wins over env's");
+        assert_eq!(get(&env, "NODE_APP_INSTANCE"), Some(("1", "warden")));
+        assert_eq!(get(&env, "WARDEN_WORKER_ID"), Some(("2", "warden")));
+        assert_eq!(get(&env, "WARDEN_WORKER_COUNT"), Some(("3", "warden")));
+        assert_eq!(get(&env, "WARDEN_INSTANCE"), Some(("7", "warden")));
+        assert_eq!(get(&env, "WARDEN_APP"), Some(("api", "warden")));
+        assert_eq!(get(&env, "WARDEN_IPC_FD"), Some(("3", "warden")));
+        assert_eq!(get(&env, "WARDEN_HEARTBEAT_MS"), Some(("1000", "warden")), "also with the watchdog off");
+        assert!(get(&env, "WARDEN_STANDBY").is_none() && get(&env, "WARDEN_REUSE_PORT").is_none());
+        // The app's own come first, Warden's after: what `spec` applies in order.
+        let first_warden = env.iter().position(|e| e.2 == "warden").unwrap();
+        assert!(env[first_warden..].iter().all(|e| e.2 == "warden"));
+        let spec = s.spec(2, 7, None);
+        assert!(spec.env.iter().rev().find(|(k, _)| k == "PORT").is_some_and(|(_, v)| v == "3001"));
+
+        // A standby: worker id 0 and an instance number past the workers'.
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\n[workers]\ncount = 2\nstandby = 1\n");
+        let env = s.worker_env(STANDBY_SLOT, 9, Some((1, 2)));
+        assert_eq!(get(&env, "WARDEN_WORKER_ID"), Some(("0", "warden")));
+        assert_eq!(get(&env, "WARDEN_STANDBY"), Some(("1", "warden")));
+        assert_eq!(get(&env, "NODE_APP_INSTANCE"), Some(("2", "warden")));
+        assert_eq!(get(&env, "PORT"), Some(("3000", "warden")));
+        assert_eq!(get(&env, "WARDEN_REUSE_PORT"), Some(("1", "warden")));
+
+        // Worker mode: the host gets the Workers' count and entry; each
+        // Worker's id and instance number come from the host and the shim.
+        let s =
+            sup("[app]\nname = \"api\"\ncommand = \"bun\"\nentry = \"main.js\"\nport = 3000\ninstance_var = \"\"\n\
+                     [workers]\ncount = 4\nmode = \"worker\"\n");
+        let env = s.worker_env(1, 1, None);
+        assert_eq!(get(&env, "WARDEN_WORKERS"), Some(("4", "warden")));
+        assert_eq!(get(&env, "WARDEN_MODE"), Some(("worker", "warden")));
+        assert!(get(&env, "WARDEN_ENTRY").is_some_and(|(v, _)| v.ends_with("main.js")));
+        assert!(get(&env, "WARDEN_WORKER_ID").is_none() && get(&env, "NODE_APP_INSTANCE").is_none());
+        assert!(get(&env, "WARDEN_INSTANCE_VAR").is_none(), "instance_var = \"\" sets none");
+    }
+
+    /// W5: a start fails once every worker crashed before one was ready,
+    /// and says so once; a worker that crashes twice doesn't count twice.
+    #[test]
+    fn start_attempt_fails_when_every_worker_crashed() {
+        let mut s = sup("[app]\nname = \"api\"\ncommand = \"sh\"\n[workers]\ncount = 2\n");
+        for id in [1, 2] {
+            let mut slot = Slot::new(id);
+            slot.last_exit = Some(format!("exit code {id}"));
+            s.slots.insert(id, slot);
+        }
+        assert_eq!(s.start_failed(), None, "no start yet");
+        s.start_attempt = Some(StartAttempt::default());
+        s.note_start_crash(1);
+        s.note_start_crash(1);
+        assert_eq!(s.start_failed(), None, "worker 2 has not crashed");
+        assert!(!s.start_attempt.as_ref().unwrap().reported);
+        s.note_start_crash(2);
+        assert_eq!(s.start_failed().as_deref(), Some("exit code 2"), "the last crash's reason");
+        assert!(s.start_attempt.as_ref().unwrap().reported, "logged once");
+        // Once a worker was ready, crashes are ordinary ones.
+        s.start_attempt = None;
+        s.note_start_crash(1);
+        assert_eq!(s.start_failed(), None);
+    }
+
+    /// `warden env`: the effective environment, secrets hidden.
+    #[test]
+    fn config_answer_has_the_worker_environment() {
+        let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\nenv = { DB = \"secret\" }\n\
+                     [workers]\ncount = 2\n");
+        let info = s.info(false, Some(2));
+        assert_eq!(info["worker_env_of"], "2");
+        let vars = info["worker_env"].as_array().unwrap();
+        let val = |k: &str| vars.iter().rev().find(|v| v["name"] == k).map(|v| v["value"].clone());
+        assert_eq!(val("DB"), Some("(hidden, 6 chars)".into()));
+        assert_eq!(val("WARDEN_WORKER_ID"), Some("2".into()));
+        assert_eq!(val("NODE_APP_INSTANCE"), Some("1".into()), "Warden's values are never hidden");
+        assert_eq!(s.info(true, None)["worker_env"][0]["value"], "secret");
+        assert_eq!(s.info(false, Some(99))["worker_env_of"], "2", "clamped to the workers there are");
+        // A static site's section carries its basic_auth: hidden too.
+        let s = sup("[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\nbasic_auth = \"u:pw\"\n");
+        let env = s.info(false, None)["worker_env"].to_string();
+        assert!(env.contains("WARDEN_STATIC") && !env.contains("pw"), "{env}");
+        assert!(s.info(true, None)["worker_env"].to_string().contains("u:pw"));
     }
 }

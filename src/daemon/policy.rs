@@ -250,6 +250,7 @@ pub(crate) mod tests {
             release: None,
             standbys: vec![],
             draining: vec![],
+            start_failed: None,
         }
     }
 

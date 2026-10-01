@@ -57,6 +57,45 @@ pub type Line = Arc<str>;
 enum Queued {
     Event(Level, Line),
     Output(Batch),
+    /// `warden flush`: empty the files this thread writes, between two
+    /// lines (so none is cut), then say what was done.
+    Truncate(tokio::sync::oneshot::Sender<Flushed>),
+}
+
+/// What `warden flush` did to the log files.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Flushed {
+    /// Files emptied.
+    pub files: Vec<PathBuf>,
+    /// Files that could not be emptied, with the error.
+    pub failed: Vec<(PathBuf, String)>,
+    /// A writer did not answer in time (a stalled disk or log consumer):
+    /// its files are emptied when it gets to the request.
+    pub pending: bool,
+}
+
+impl Flushed {
+    fn merge(&mut self, other: Flushed) {
+        for f in other.files {
+            if !self.files.contains(&f) {
+                self.files.push(f);
+            }
+        }
+        self.failed.extend(other.failed);
+        self.pending |= other.pending;
+    }
+
+    fn note(&mut self, path: &std::path::Path, res: std::io::Result<bool>) {
+        match res {
+            Ok(true) => {
+                if !self.files.iter().any(|f| f == path) {
+                    self.files.push(path.to_path_buf());
+                }
+            }
+            Ok(false) => {}
+            Err(e) => self.failed.push((path.to_path_buf(), e.to_string())),
+        }
+    }
 }
 
 /// Worker output lines from one read of one worker's pipe: same worker,
@@ -161,6 +200,10 @@ pub struct Files {
     pub per_worker: bool,
     pub timestamps: bool,
     pub rotate: RotatePolicy,
+    /// `worker_output = "direct"`: the files workers write through the
+    /// output thread (`out_file`/`err_file` above are then None), for
+    /// `warden flush`.
+    pub direct: Option<DirectFiles>,
 }
 
 /// When and how log files rotate (`[logging.rotate]`).
@@ -214,6 +257,20 @@ impl StreamFiles {
         let policy = &self.policy;
         self.files.entry(key.to_string()).or_insert_with(|| FileSink::new(path, policy.clone()))
     }
+
+    /// `warden flush`: every current file of this stream, the ones open
+    /// here through their descriptor, the others (workers gone, an earlier
+    /// run's) by path. Rotated files are kept.
+    fn truncate(&mut self, report: &mut Flushed) {
+        let mut paths = current_files(&self.base, self.per_worker);
+        for f in self.files.values_mut() {
+            paths.retain(|p| *p != f.rot.path);
+            report.note(&f.rot.path.clone(), f.truncate());
+        }
+        for p in paths {
+            report.note(&p, truncate_path(&p));
+        }
+    }
 }
 
 /// `out.log` → `out-2.log` for worker 2 when `per_worker`, else `base`.
@@ -227,6 +284,89 @@ pub fn worker_file(base: &std::path::Path, per_worker: bool, worker: &str) -> Pa
         None => format!("{stem}-{worker}"),
     };
     base.with_file_name(name)
+}
+
+/// A `worker=` label that names one process's output: a worker number,
+/// a standby (`s1`) or the worker-mode host (`host`). Only these are taken
+/// for per-worker files, so unrelated files next to them are never touched.
+pub fn is_output_label(label: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    label == "host" || digits(label) || label.strip_prefix('s').is_some_and(digits)
+}
+
+/// The workers that have per-worker files of `base` (`out-1.log`,
+/// `out-s1.log`, `out-host.log`), current or rotated (`out-1.log.2.gz`),
+/// in worker order: numbers, then standbys, then the host.
+pub fn worker_labels(base: &std::path::Path) -> Vec<String> {
+    let (Some(dir), Some(stem)) = (base.parent(), base.file_stem()) else { return Vec::new() };
+    let dir = if dir.as_os_str().is_empty() { std::path::Path::new(".") } else { dir };
+    let prefix = format!("{}-", stem.to_string_lossy());
+    let ext = base.extension().map(|e| format!(".{}", e.to_string_lossy()));
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut labels: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let rest = name.strip_prefix(&prefix)?;
+            // A label has no dot: what follows it is the extension, then
+            // maybe a rotation suffix (`.1`, `.2.gz`, `.2026-09-30T00-00-00`).
+            let (label, after) = rest.find('.').map_or((rest, ""), |i| rest.split_at(i));
+            let after = match &ext {
+                Some(ext) => after.strip_prefix(ext.as_str())?,
+                None => after,
+            };
+            let rotated = after.strip_prefix('.');
+            if !(after.is_empty() || rotated.is_some_and(|r| !r.is_empty())) || after.ends_with(".tmp") {
+                return None;
+            }
+            is_output_label(label).then(|| label.to_string())
+        })
+        .collect();
+    labels.sort_by_key(|l| label_order(l));
+    labels.dedup();
+    labels
+}
+
+/// Workers by number, then standbys by number, then the rest.
+pub fn label_order(label: &str) -> (u8, u64, String) {
+    if let Ok(n) = label.parse::<u64>() {
+        (0, n, String::new())
+    } else if let Some(n) = label.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()) {
+        (1, n, String::new())
+    } else {
+        (2, 0, label.to_string())
+    }
+}
+
+/// The current (not rotated) files of `base` that exist: `base`, or with
+/// `per_worker` each worker's.
+pub fn current_files(base: &std::path::Path, per_worker: bool) -> Vec<PathBuf> {
+    let all = if per_worker {
+        worker_labels(base).iter().map(|l| worker_file(base, true, l)).collect()
+    } else {
+        vec![base.to_path_buf()]
+    };
+    all.into_iter().filter(|p| p.is_file()).collect()
+}
+
+/// Empty the regular file at `path` (`warden flush` of a file nobody here
+/// has open). Ok(false): there is none (or it is a pipe or device, which
+/// can't be emptied). Never creates one, and never blocks on a FIFO.
+fn truncate_path(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    let f = match std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    f.set_len(0)?;
+    Ok(true)
 }
 
 /// `<ts> OUT   worker=<w> <stream>: <text>` → (w, stream, text). The
@@ -256,6 +396,8 @@ struct Logger {
     dropped_output: AtomicU64,
     dropped_events: AtomicU64,
     file_path: Option<PathBuf>,
+    /// `worker_output = "direct"` files, for `warden flush`.
+    direct: Option<DirectFiles>,
 }
 
 #[derive(Default)]
@@ -326,6 +468,7 @@ pub fn init(level: Level, timestamps: Option<bool>, mut files: Files) {
             dropped_output: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             file_path: file,
+            direct: files.direct,
         })
         .is_ok();
     if ok {
@@ -351,6 +494,7 @@ fn logger() -> &'static Logger {
             dropped_output: AtomicU64::new(0),
             dropped_events: AtomicU64::new(0),
             file_path: None,
+            direct: None,
         }
     })
 }
@@ -513,22 +657,60 @@ fn emit(l: &Logger, line: Line, level: Option<Level>) {
     let _ = l.tx.send(line);
 }
 
-/// Empty the in-memory buffers (`warden flush`); files are truncated by the
-/// writer thread.
-pub fn clear() {
+/// How long `warden flush` waits for the threads that write the files.
+const FLUSH_WAIT: Duration = Duration::from_secs(2);
+
+/// `warden flush`, like `pm2 flush`: empty the in-memory buffers and the
+/// current log files: `[logging] file` (or the background supervisor's
+/// log), and `out_file` / `err_file` with every worker's file when
+/// `per_worker_files`. Rotated files (`.1`, `.gz`, dated) are kept.
+///
+/// Each file is emptied by the thread that writes it, between two writes,
+/// through its own descriptor: the writer thread's files are O_APPEND and
+/// hold only whole lines, so the next line lands at the start and none is
+/// cut; direct-mode files are written at an offset, which resets to the
+/// start (an unfinished last line is kept, so they too start with a whole
+/// line). Lines logged before the flush and not written yet are dropped
+/// with the rest. Waits up to FLUSH_WAIT for those threads; a stalled one
+/// does it when it gets to it (`pending`).
+pub async fn flush_files() -> Flushed {
     let l = logger();
     {
         let mut rings = l.rings.lock().unwrap_or_else(|e| e.into_inner());
         rings.events.clear();
         rings.output.clear();
     }
-    if let Some(p) = &l.file_path {
-        // Truncating in place keeps the writer's O_APPEND handle valid.
-        if let Err(e) = std::fs::OpenOptions::new().write(true).truncate(true).open(p) {
-            crate::warn!("could not truncate the log file", path = p.display(), error = e);
+    let mut report = Flushed::default();
+    let mut answers = Vec::new();
+    if let Some(w) = &l.writer {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if w.tx.send(Queued::Truncate(tx)).is_ok() {
+            answers.push(rx);
         }
     }
-    truncate_direct_files();
+    match DIRECT_THREAD.get() {
+        Some(Some(tx)) => {
+            let (dtx, drx) = tokio::sync::oneshot::channel();
+            if tx.send(DirectMsg::Truncate(dtx)).is_ok() {
+                answers.push(drx);
+            } else {
+                // The thread is gone: its writers moved here (`on_output_thread`).
+                report.merge(truncate_direct_here(true));
+            }
+        }
+        // No output thread (no worker has written a direct file yet, or it
+        // could not start): every direct file is written from here.
+        _ => report.merge(truncate_direct_here(true)),
+    }
+    let deadline = tokio::time::Instant::now() + FLUSH_WAIT;
+    for rx in answers {
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(r)) => report.merge(r),
+            Ok(Err(_)) => {} // that thread is gone (only after a panic): nothing it writes is open
+            Err(_) => report.pending = true,
+        }
+    }
+    report
 }
 
 /// Moves a full log file out of the way: numbered (`app.log.1` newest …
@@ -677,6 +859,21 @@ impl FileSink {
         self.file = None;
         self.rot.rotate()?;
         self.open()
+    }
+
+    /// `warden flush`: empty the file. Through this sink's own descriptor,
+    /// which is O_APPEND: the next line lands at offset 0, never past a
+    /// hole. Buffered lines (logged before the flush) go too. Ok(false):
+    /// no file, or not a regular one (a pipe, `/dev/stdout`).
+    fn truncate(&mut self) -> std::io::Result<bool> {
+        self.buf.clear();
+        let Some(f) = self.file.as_ref() else { return truncate_path(&self.rot.path) };
+        if !f.metadata()?.is_file() {
+            return Ok(false);
+        }
+        f.set_len(0)?;
+        self.size = 0;
+        Ok(true)
     }
 
     /// Append one line; rotates first when the size or the schedule says so.
@@ -1377,21 +1574,41 @@ impl DirectFile {
         });
     }
 
-    /// `warden flush`: empty the file; the next byte goes to offset 0.
-    fn truncate(&mut self) {
-        let (Some(f), true) = (&self.file, self.regular) else { return };
-        match f.set_len(0) {
-            Ok(()) => {
-                self.offset = 0;
-                self.rotate_due = false;
-                self.last_writer = None;
-            }
-            Err(e) => crate::warn!(
-                "could not truncate the worker output file; it keeps its content",
-                file = self.rot.path.display(),
-                error = e,
-                hint = "check the file's permissions",
-            ),
+    /// `warden flush`: empty the file; the next byte goes to its start. A
+    /// line a worker is in the middle of (the file does not end with a
+    /// newline) keeps its beginning, so the file starts with a whole line,
+    /// as a captured file does; one longer than DIRECT_BUF is cut. Runs on
+    /// the thread that writes the file, between two writes. Ok(false): not
+    /// open here, or not a regular file.
+    fn truncate(&mut self) -> std::io::Result<bool> {
+        use std::os::unix::fs::FileExt;
+        // A file deleted meanwhile is closed here; the path is emptied by name.
+        self.sync_offset();
+        let (Some(f), true) = (&self.file, self.regular) else { return Ok(false) };
+        let keep = self.unfinished_line();
+        f.set_len(0)?;
+        if !keep.is_empty() {
+            f.write_all_at(&keep, 0)?;
+        }
+        self.offset = keep.len() as u64;
+        self.rotate_due = false;
+        Ok(true)
+    }
+
+    /// The bytes after the file's last newline (the line a writer is in the
+    /// middle of), if readable and at most DIRECT_BUF long; else nothing.
+    fn unfinished_line(&self) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let (Some(f), true) = (&self.file, self.readable) else { return Vec::new() };
+        let start = self.offset.saturating_sub(DIRECT_BUF as u64);
+        let mut buf = vec![0u8; (self.offset - start) as usize];
+        if f.read_exact_at(&mut buf, start).is_err() {
+            return Vec::new();
+        }
+        match buf.iter().rposition(|&b| b == b'\n') {
+            Some(i) => buf.split_off(i + 1),
+            None if start == 0 => buf,
+            None => Vec::new(),
         }
     }
 
@@ -1408,8 +1625,8 @@ impl DirectFile {
 enum DirectMsg {
     /// Called on the thread, inside its LocalSet: spawns a pump.
     Run(Box<dyn FnOnce() + Send>),
-    /// `warden flush`: truncate every open direct file, then say so.
-    Truncate(Sender<()>),
+    /// `warden flush`: empty every direct file, then say what was done.
+    Truncate(tokio::sync::oneshot::Sender<Flushed>),
 }
 
 static DIRECT_THREAD: OnceLock<Option<tokio::sync::mpsc::UnboundedSender<DirectMsg>>> = OnceLock::new();
@@ -1441,8 +1658,8 @@ fn output_thread() -> Option<&'static tokio::sync::mpsc::UnboundedSender<DirectM
                             match msg {
                                 DirectMsg::Run(start) => start(),
                                 DirectMsg::Truncate(done) => {
-                                    truncate_direct_here();
-                                    let _ = done.send(());
+                                    // The control task may have stopped waiting.
+                                    let _ = done.send(truncate_direct_here(true));
                                 }
                             }
                         }
@@ -1465,29 +1682,44 @@ fn output_thread() -> Option<&'static tokio::sync::mpsc::UnboundedSender<DirectM
         .as_ref()
 }
 
-fn truncate_direct_here() {
-    let files: Vec<_> = DIRECT_OPEN.with(|open| open.borrow().values().filter_map(Weak::upgrade).collect());
-    for f in files {
-        if let Ok(mut f) = f.try_borrow_mut() {
-            f.truncate();
+/// `warden flush` of direct files, on the thread that writes them (between
+/// two writes, so no write lands past the new end): those open here through
+/// their state, and with `unopened` the other current ones (workers gone,
+/// an earlier run's, the app stopped) by path. Rotated files are kept.
+fn truncate_direct_here(unopened: bool) -> Flushed {
+    let mut report = Flushed::default();
+    let open: Vec<_> = DIRECT_OPEN.with(|open| open.borrow().values().filter_map(Weak::upgrade).collect());
+    let mut done: Vec<PathBuf> = Vec::new();
+    for f in open {
+        // Not borrowed: this runs between two steps of the pumps.
+        let Ok(mut f) = f.try_borrow_mut() else { continue };
+        let path = f.rot.path.clone();
+        match f.truncate() {
+            // Not open after all (deleted meanwhile): by name below.
+            Ok(false) => {}
+            res => {
+                report.note(&path, res);
+                done.push(path);
+            }
         }
     }
-}
-
-/// `warden flush` for direct files: truncated on the thread that writes
-/// them, between two writes, so no write lands past the new end. Waits a
-/// moment so the command returns after the fact.
-fn truncate_direct_files() {
-    truncate_direct_here();
-    if let Some(Some(tx)) = DIRECT_THREAD.get() {
-        let (done, wait) = channel();
-        if tx.send(DirectMsg::Truncate(done)).is_ok() && wait.recv_timeout(Duration::from_millis(250)).is_err() {
-            crate::warn!(
-                "worker output files are still being truncated",
-                hint = "the disk is slow; the truncation finishes in the background",
-            );
+    if !unopened {
+        return report;
+    }
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(d) = &logger().direct {
+        for base in std::iter::once(&d.out).chain(d.err.as_ref()) {
+            paths.extend(current_files(base, d.per_worker));
         }
     }
+    // Files opened under another config (none today: logging changes need a restart).
+    paths.extend(DIRECT_KNOWN.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|k| k.0.clone()));
+    paths.sort();
+    paths.dedup();
+    for p in paths.iter().filter(|p| !done.contains(p)) {
+        report.note(p, truncate_path(p));
+    }
+    report
 }
 
 /// Someone is reading `warden logs` (and may follow it).
@@ -1669,6 +1901,20 @@ fn write_loop(rx: Receiver<Queued>, sinks: Sinks) {
                     l.output_queued.fetch_sub(n, Ordering::Relaxed);
                     l.output_bytes.fetch_sub(batch.bytes, Ordering::Relaxed);
                     l.pending.fetch_sub(n, Ordering::Relaxed);
+                }
+                Queued::Truncate(done) => {
+                    // In queue order: what was logged before the flush is
+                    // emptied with the files, what comes after starts them.
+                    let mut report = Flushed::default();
+                    if let Some(f) = file.as_mut() {
+                        let path = f.rot.path.clone();
+                        report.note(&path, f.truncate());
+                    }
+                    for t in [out_files.as_mut(), err_files.as_mut()].into_iter().flatten() {
+                        t.truncate(&mut report);
+                    }
+                    // The control task waits on the other end; it may have given up.
+                    let _ = done.send(report);
                 }
             }
         }
@@ -2018,6 +2264,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn per_worker_files_are_found_by_label() {
+        let dir = std::env::temp_dir().join(format!("warden-labels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "api-out-1.log",
+            "api-out-10.log.1",
+            "api-out-2.log.3.gz",
+            "api-out-2.log",
+            "api-out-s1.log",
+            "api-out-host.log.2026-09-30T00-00-00",
+            "api-out-9.log.1.gz.tmp", // being compressed: no worker of its own
+            "api-out.log",            // the shared file, not a worker's
+            "api-out-old.log",        // not a worker label
+            "api-out-1.logx",
+            "api-out-3.txt",
+            "api-err-4.log",
+        ] {
+            std::fs::write(dir.join(name), "x\n").unwrap();
+        }
+        let base = dir.join("api-out.log");
+        assert_eq!(worker_labels(&base), vec!["1", "2", "10", "s1", "host"]);
+        assert_eq!(
+            current_files(&base, true),
+            vec![dir.join("api-out-1.log"), dir.join("api-out-2.log"), dir.join("api-out-s1.log")]
+        );
+        assert_eq!(current_files(&base, false), vec![base.clone()]);
+        // Without an extension.
+        std::fs::write(dir.join("raw-1"), "").unwrap();
+        std::fs::write(dir.join("raw-1.2"), "").unwrap();
+        std::fs::write(dir.join("raw-2.1.gz"), "").unwrap();
+        assert_eq!(worker_labels(&dir.join("raw")), vec!["1", "2"]);
+        for l in ["1", "12", "s3", "host"] {
+            assert!(is_output_label(l), "{l}");
+        }
+        for l in ["", "s", "standby", "x1", "1a", "-1"] {
+            assert!(!is_output_label(l), "{l}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `warden flush` in capture mode: on the writer thread, through the
+    /// sinks' own O_APPEND descriptors; unopened per-worker files by path;
+    /// rotated files kept.
+    #[test]
+    fn flush_empties_current_files_and_keeps_rotated_ones() {
+        let dir = std::env::temp_dir().join(format!("warden-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut out = StreamFiles::new(dir.join("out.log"), true, RotatePolicy::default());
+        out.sink("1").write_parts(&[b"one"]).unwrap();
+        out.sink("1").flush().unwrap();
+        out.sink("2").write_parts(&[b"buffered, not written yet"]).unwrap();
+        // A worker of an earlier run (scaled down since), and rotated files.
+        std::fs::write(dir.join("out-3.log"), "old worker\n").unwrap();
+        std::fs::write(dir.join("out-1.log.1"), "rotated\n").unwrap();
+        std::fs::write(dir.join("out-3.log.2.gz"), "rotated\n").unwrap();
+        let mut report = Flushed::default();
+        out.truncate(&mut report);
+        let mut files = report.files.clone();
+        files.sort();
+        assert_eq!(files, vec![dir.join("out-1.log"), dir.join("out-2.log"), dir.join("out-3.log")]);
+        assert!(report.failed.is_empty() && !report.pending, "{report:?}");
+        for f in ["out-1.log", "out-3.log"] {
+            assert_eq!(std::fs::metadata(dir.join(f)).unwrap().len(), 0, "{f}");
+        }
+        assert!(!dir.join("out-2.log").exists() || std::fs::metadata(dir.join("out-2.log")).unwrap().len() == 0);
+        assert_eq!(std::fs::read_to_string(dir.join("out-1.log.1")).unwrap(), "rotated\n");
+        assert!(dir.join("out-3.log.2.gz").exists());
+        // Writing goes on at the start: O_APPEND, so no hole of zeros.
+        out.sink("1").write_parts(&[b"after"]).unwrap();
+        out.sink("2").write_parts(&[b"two"]).unwrap();
+        out.files.values_mut().for_each(|f| f.flush().unwrap());
+        assert_eq!(std::fs::read_to_string(dir.join("out-1.log")).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(dir.join("out-2.log")).unwrap(), "two\n");
+        assert_eq!(out.sink("1").size, 6, "the size count restarts too");
+        // Nothing to empty and nothing created for a path that doesn't exist.
+        assert!(!truncate_path(&dir.join("none.log")).unwrap());
+        assert!(!dir.join("none.log").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flush_report_says_what_happened() {
+        let mut r = Flushed::default();
+        r.note(Path::new("/l/a.log"), Ok(true));
+        r.note(Path::new("/l/a.log"), Ok(true));
+        r.note(Path::new("/l/b.log"), Ok(false));
+        r.note(Path::new("/l/c.log"), Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        r.merge(Flushed { files: vec!["/l/d.log".into()], failed: vec![], pending: true });
+        assert_eq!(r.files, vec![PathBuf::from("/l/a.log"), PathBuf::from("/l/d.log")]);
+        assert_eq!(r.failed.len(), 1);
+        assert!(r.pending);
+    }
+
     // -------------------------------------------- worker_output = "direct"
 
     fn scratch_dir(name: &str) -> PathBuf {
@@ -2191,7 +2533,30 @@ mod tests {
         t.join().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second\n");
         // `warden flush`.
-        truncate_direct_here();
+        assert_eq!(truncate_direct_here(false).files, vec![path.clone()]);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let (pipe, t) = feed(b"third\n".to_vec());
+        pump(&w, &pipe, true);
+        t.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third\n");
+        // A flush while the worker is in the middle of a line keeps the
+        // line's beginning: the file still starts with a whole line.
+        let (r, mut wr) = nb_pipe();
+        wr.write_all(b"done\nhalf a ").unwrap();
+        pump(&w, &r, false);
+        assert_eq!(truncate_direct_here(false).files, vec![path.clone()]);
+        assert_eq!(std::fs::read(&path).unwrap(), b"half a ");
+        wr.write_all(b"line\nnext\n").unwrap();
+        pump(&w, &r, false);
+        assert_eq!(std::fs::read(&path).unwrap(), b"half a line\nnext\n");
+        drop(wr);
+        pump(&w, &r, true);
+        // An unfinished line longer than what is kept is cut.
+        {
+            let mut f = w.file.borrow_mut();
+            f.write_bytes(&vec![b'x'; DIRECT_BUF + 10]).unwrap();
+            f.truncate().unwrap();
+        }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         let (pipe, t) = feed(b"third\n".to_vec());
         pump(&w, &pipe, true);

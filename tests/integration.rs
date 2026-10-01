@@ -3666,6 +3666,350 @@ fn direct_output_flush_and_logs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `warden flush` empties every current log file in both output modes,
+/// like `pm2 flush`: Warden's log, each worker's out and err file (also one
+/// no running worker writes), keeps the rotated ones, and writing goes on
+/// from the start of each file with whole lines (no hole, no cut line).
+#[test]
+fn flush_empties_the_log_files_in_both_modes() {
+    for mode in ["capture", "direct"] {
+        let dir = direct_dir(&format!("flush-{mode}"));
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // A worker of an earlier run (count was 3), with a rotated file.
+        std::fs::write(logs.join("out-3.log"), "from an earlier run\n").unwrap();
+        std::fs::write(logs.join("out-3.log.1"), "older still\n").unwrap();
+        // A burst that rotates (4 KB files), then slow ticks that don't.
+        let script = "i=0; while [ $i -lt 150 ]; do i=$((i+1)); echo burst $i padding padding padding padding; \
+                      done; echo boom >&2; i=0; while :; do i=$((i+1)); echo tick $i; sleep 0.05; done";
+        let toml = format!(
+            "[app]\nname = \"flush-{mode}\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+             [workers]\ncount = 2\nmin_uptime = 100\n\
+             [logging]\nworker_output = \"{mode}\"\nper_worker_files = true\nfile = \"{}\"\n\
+             out_file = \"{}\"\nerr_file = \"{}\"\n[logging.rotate]\nmax_size = \"4K\"\nkeep = 10\n",
+            logs.join("warden.log").display(),
+            logs.join("out.log").display(),
+            logs.join("err.log").display()
+        );
+        let w = Warden::start(&format!("flush-{mode}"), 0, &toml);
+        w.wait_for("2 workers", T, ready(2));
+        let ticks = |n: u32| -> Vec<u64> {
+            let text = std::fs::read_to_string(logs.join(format!("out-{n}.log"))).unwrap_or_default();
+            assert!(!text.contains('\0'), "{mode}: a hole in out-{n}.log: {text:?}");
+            text.lines().filter_map(|l| l.strip_prefix("tick ")?.parse().ok()).collect()
+        };
+        eventually(&w, "ticks from both workers", || ticks(1).len() >= 3 && ticks(2).len() >= 3);
+        assert!(logs.join("out-1.log.1").exists(), "{mode}: the burst rotated");
+        let before = [*ticks(1).last().unwrap(), *ticks(2).last().unwrap()];
+
+        let (code, text) = w.cli(&["flush"]);
+        assert_eq!(code, 0, "{mode}: {text}");
+        assert!(text.contains("rotated files are kept"), "{mode}: {text}");
+        for f in ["warden.log", "out-1.log", "out-2.log", "out-3.log", "err-1.log", "err-2.log"] {
+            assert!(text.contains(&logs.join(f).display().to_string()), "{mode}: {f} not listed:\n{text}");
+        }
+        assert!(!text.contains("out-1.log.1"), "{mode}: a rotated file listed:\n{text}");
+        // Emptied: only what came after the flush is there.
+        assert_eq!(std::fs::read_to_string(logs.join("out-3.log")).unwrap(), "", "{mode}");
+        assert_eq!(std::fs::read_to_string(logs.join("err-1.log")).unwrap(), "", "{mode}");
+        for (i, n) in [1, 2].into_iter().enumerate() {
+            let after = ticks(n);
+            assert!(after.first().is_none_or(|t| *t > before[i]), "{mode}: worker {n} kept old lines: {after:?}");
+        }
+        // Rotated files are kept, the burst with them.
+        assert_eq!(std::fs::read_to_string(logs.join("out-3.log.1")).unwrap(), "older still\n", "{mode}");
+        let rotated: String = (1..=10)
+            .map(|i| std::fs::read_to_string(logs.join(format!("out-1.log.{i}"))).unwrap_or_default())
+            .collect();
+        assert!(rotated.contains("burst 1 padding"), "{mode}: rotated files lost: {rotated:?}");
+
+        // Writing goes on from the start of each file, whole lines only.
+        eventually(&w, "new ticks after the flush", || ticks(1).len() >= 3 && ticks(2).len() >= 3);
+        for n in [1, 2] {
+            let text = std::fs::read_to_string(logs.join(format!("out-{n}.log"))).unwrap();
+            assert!(text.lines().all(|l| l.starts_with("tick ")), "{mode}: out-{n}.log: {text:?}");
+            let t = ticks(n);
+            assert!(t.windows(2).all(|p| p[1] == p[0] + 1), "{mode}: out-{n}.log: {t:?}");
+        }
+        let log = std::fs::read_to_string(logs.join("warden.log")).unwrap();
+        assert!(!log.contains('\0') && !log.contains("burst 1 ") && !log.contains("worker ready"), "{mode}: {log}");
+        assert!(log.contains("logs flushed on request files=6 failed=0"), "{mode}: {log}");
+        // The in-memory buffer was emptied too.
+        let (_, recent) = w.cli(&["logs", "--nostream", "-n", "500"]);
+        assert!(!recent.contains("burst 1 ") && !recent.contains("worker ready"), "{mode}: {recent}");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `warden logs --history` with a file per worker (direct mode's, or
+/// capture mode's out/err files): every worker's files, rotated and
+/// gzipped ones too, each oldest first, workers in order; `--out`, `--err`,
+/// `--worker N`, `--grep`/`search`, `--lines` and `--json` pick from them.
+#[test]
+fn log_history_reads_every_workers_files() {
+    for mode in ["direct", "capture"] {
+        let dir = direct_dir(&format!("history-{mode}"));
+        let logs = dir.join("logs");
+        let script = "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo w$WARDEN_WORKER_ID line $i padding padding; \
+                      done; echo boom $WARDEN_WORKER_ID >&2; exec sleep 300";
+        let toml = format!(
+            "[app]\nname = \"history-{mode}\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+             [workers]\ncount = 2\nmin_uptime = 100\n\
+             [logging]\nworker_output = \"{mode}\"\nper_worker_files = true\nfile = \"{}\"\n\
+             out_file = \"{}\"\nerr_file = \"{}\"\n[logging.rotate]\nmax_size = \"4K\"\nkeep = 20\ncompress = true\n",
+            logs.join("warden.log").display(),
+            logs.join("out.log").display(),
+            logs.join("err.log").display()
+        );
+        let w = Warden::start(&format!("history-{mode}"), 0, &toml);
+        w.wait_for("2 workers", T, ready(2));
+        let has = |f: &str, text: &str| std::fs::read_to_string(logs.join(f)).is_ok_and(|t| t.contains(text));
+        eventually(&w, "every line written", || has("err-1.log", "boom 1") && has("err-2.log", "boom 2"));
+        eventually(&w, "rotated files gzipped", || {
+            logs.join("out-1.log.1.gz").exists() && !logs.join("out-1.log.1").exists()
+        });
+        let history = |args: &[&str]| -> String {
+            let mut all = vec!["logs", "--history"];
+            all.extend_from_slice(args);
+            let (code, text) = w.cli(&all);
+            assert_eq!(code, 0, "{mode}: logs --history {args:?}:\n{text}");
+            text
+        };
+        let numbers = |text: &str, prefix: &str| -> Vec<u32> {
+            text.lines().filter_map(|l| l.strip_prefix(prefix)?.split(' ').next()?.parse().ok()).collect()
+        };
+
+        // --out: both workers' files, rotated and .gz included, in order, labelled.
+        let out = history(&["--out"]);
+        for n in [1, 2] {
+            let got = numbers(&out, &format!("worker={n} stdout: w{n} line "));
+            assert_eq!(got, (1..=300).collect::<Vec<_>>(), "{mode}: worker {n}:\n{out}");
+        }
+        let first_w2 = out.lines().position(|l| l.starts_with("worker=2 ")).unwrap();
+        assert!(out.lines().skip(first_w2).all(|l| !l.starts_with("worker=1 ")), "{mode}: workers in order");
+        assert!(!out.contains("boom"), "{mode}: --out has no stderr");
+        // --out --worker 2: that file alone, as written.
+        let two = history(&["--out", "--worker", "2"]);
+        assert_eq!(numbers(&two, "w2 line "), (1..=300).collect::<Vec<_>>(), "{mode}:\n{two}");
+        assert_eq!(two.lines().count(), 300, "{mode}:\n{two}");
+        // --err: both workers' stderr.
+        let err = history(&["--err"]);
+        assert_eq!(err.lines().collect::<Vec<_>>(), vec!["worker=1 stderr: boom 1", "worker=2 stderr: boom 2"]);
+        // --lines N: the last N of each file.
+        let last = history(&["--out", "--lines", "2"]);
+        assert_eq!(numbers(&last, "worker=1 stdout: w1 line "), vec![299, 300], "{mode}:\n{last}");
+        assert_eq!(numbers(&last, "worker=2 stdout: w2 line "), vec![299, 300], "{mode}:\n{last}");
+        // search / --grep: across every file.
+        let (code, found) = w.cli(&["search", "w2 line 150 "]);
+        assert_eq!(code, 0, "{found}");
+        assert_eq!(found.lines().count(), 1, "{mode}:\n{found}");
+        assert!(found.contains("w2 line 150 padding"), "{mode}:\n{found}");
+        let json = history(&["--grep", "boom 2", "--json"]);
+        let v: Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+        assert_eq!((v["worker"].as_str(), v["stream"].as_str()), (Some("2"), Some("stderr")), "{mode}: {json}");
+        assert_eq!(v["message"], "boom 2");
+        // --worker 1: Warden's lines about it and its output, nothing of worker 2.
+        let one = history(&["--worker", "1"]);
+        assert!(one.contains("worker ready worker=1"), "{mode}:\n{one}");
+        assert!(one.contains("w1 line 300 ") && one.contains("boom 1"), "{mode}:\n{one}");
+        assert!(!one.contains("w2 line") && !one.contains("boom 2"), "{mode}:\n{one}");
+        if mode == "direct" {
+            // Everything: Warden's events first, then each worker's files.
+            let all = history(&[]);
+            let events = all.lines().position(|l| l.contains("INFO  all workers ready")).unwrap();
+            let output = all.lines().position(|l| l.starts_with("worker=1 stdout: w1 line 1 ")).unwrap();
+            assert!(events < output, "{mode}: events first:\n{all}");
+            assert_eq!(numbers(&all, "worker=2 stdout: w2 line ").len(), 300, "{mode}");
+        }
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `warden env N` prints what worker N really started with: every value
+/// matches its /proc/<pid>/environ (env_file, env, Warden's variables, and
+/// Warden's winning over the app's).
+#[test]
+fn env_shows_what_a_worker_starts_with() {
+    let dir = direct_dir("env");
+    std::fs::write(dir.join("api.env"), "DB_URL=postgres://u:p@h/db\nNODE_ENV=dev\n").unwrap();
+    let port = free_port();
+    let toml = format!(
+        "[app]\nname = \"envapp\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 300\"]\nport = {port}\n\
+         env_file = \"{}\"\nenv = {{ NODE_ENV = \"production\", PORT = \"1\" }}\n\
+         [workers]\ncount = 2\nport_strategy = \"offset\"\nready_timeout = 60\n",
+        dir.join("api.env").display()
+    );
+    let w = Warden::start("env", port, &toml);
+    let st = w.wait_for("2 workers started", T, |s| Warden::pids(s).len() == 2);
+    let pid = st["workers"][1]["pid"].as_u64().unwrap();
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let real: std::collections::HashMap<String, String> = environ
+        .split(|b| *b == 0)
+        .filter_map(|kv| {
+            let s = String::from_utf8_lossy(kv);
+            s.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect();
+    let (code, text) = w.cli(&["env", "2", "--show-secrets"]);
+    assert_eq!(code, 0, "{text}");
+    let mut shown = std::collections::HashMap::new();
+    for l in text.lines().filter(|l| !l.starts_with('#')) {
+        let (k, v) = l.split_once('=').unwrap();
+        shown.insert(k.to_string(), v.split("   #").next().unwrap().to_string()); // the last one wins
+    }
+    for (k, v) in &shown {
+        assert_eq!(real.get(k), Some(v), "{k}: `warden env` says {v:?}, the worker has {:?}\n{text}", real.get(k));
+    }
+    for k in ["DB_URL", "NODE_ENV", "PORT", "NODE_APP_INSTANCE", "WARDEN_WORKER_ID", "WARDEN_APP", "WARDEN_IPC_FD"] {
+        assert!(shown.contains_key(k), "{k} missing:\n{text}");
+    }
+    assert_eq!((shown["PORT"].as_str(), shown["NODE_ENV"].as_str()), (&*(port + 1).to_string(), "production"));
+    assert_eq!((shown["NODE_APP_INSTANCE"].as_str(), shown["WARDEN_WORKER_ID"].as_str()), ("1", "2"));
+    assert!(text.contains("overrides the value from env"), "{text}");
+    // Without --show-secrets the app's values are hidden, Warden's are not.
+    let (_, text) = w.cli(&["env"]);
+    assert!(text.contains("DB_URL=(hidden, 19 chars)") && text.contains("WARDEN_WORKER_ID=1\n"), "{text}");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Event-loop delay (W2): the shim measures each worker's and the heartbeat
+/// carries it to `status --json`, `list` and `/metrics`: on Bun and Node
+/// (whose histogram counts the sampling period, which must not show), per
+/// Worker in worker mode; a loop that stays slow gets one WARN.
+#[test]
+fn event_loop_delay_is_reported() {
+    if !have_bun() {
+        return;
+    }
+    let delay = |s: &Value, i: usize, q: &str| s["workers"][i]["loop_delay"][q].as_f64();
+    // Bun, process mode: worker 2 blocks its loop for 150 ms every 400 ms.
+    // The shim samples every 100 ms, so each block holds up a sample by at
+    // least 50 ms (shorter blocks are only caught when a sample falls in them).
+    let (port, metrics) = (free_port(), free_port());
+    let cfg = format!(
+        "[app]\nname = \"loopy\"\nargs = [\"{}\"]\nport = {port}\nenv = {{ FIXTURE_BLOCK_MS = \"150\", \
+         FIXTURE_BLOCK_WORKER = \"2\" }}\n[workers]\ncount = 2\n[watchdog]\nloop_delay_warn = 0.03\n\
+         [metrics]\nlisten = \"127.0.0.1:{metrics}\"\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("loopy", port, &cfg);
+    let s = w.wait_for("loop delay of both workers", T, |s| {
+        s["workers_ready"] == 2 && delay(s, 0, "p50_ms").is_some() && delay(s, 1, "max_ms").is_some_and(|m| m >= 40.0)
+    });
+    let (quiet, busy) = (delay(&s, 0, "p50_ms").unwrap(), delay(&s, 1, "max_ms").unwrap());
+    assert!(quiet < 20.0, "an idle loop runs on time: p50 {quiet} ms\n{s:#}");
+    assert!((40.0..2000.0).contains(&busy), "150 ms blocks: max {busy} ms\n{s:#}");
+    let (_, list) = w.cli(&["status"]);
+    assert!(list.contains("Loop p99"), "{list}");
+    // One WARN once it stays high for 10 heartbeats, naming the worker.
+    let log = w.wait_log("worker event loop delay is high", T);
+    let line = log.lines().find(|l| l.contains("worker event loop delay is high")).unwrap();
+    assert!(line.contains("worker=2 ") && line.contains("hint="), "{line}");
+    assert!(!log.contains("worker event loop delay is high worker=1 "), "{log}");
+    let text = get(metrics, "/metrics").expect("metrics");
+    assert!(text.contains("warden_worker_event_loop_delay_p99_seconds{app=\"loopy\",worker=\"2\"}"), "{text}");
+    drop(w);
+
+    // Node: its histogram's samples include the 100 ms period, which must
+    // not show: an idle loop is ~0, a blocked one shows the block.
+    if have_node() {
+        for block in [None, Some(150)] {
+            let port = free_port();
+            let env = block.map(|ms| format!("env = {{ FIXTURE_BLOCK_MS = \"{ms}\" }}\n")).unwrap_or_default();
+            let cfg = format!(
+                "[app]\nname = \"loopnode\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n{env}\
+                 [workers]\ncount = 1\n",
+                fixture("node_app.mjs")
+            );
+            let w = Warden::start("loopnode", port, &cfg);
+            let s = match block {
+                None => w.wait_for("Node's loop delay", T, |s| delay(s, 0, "p50_ms").is_some()),
+                Some(_) => w.wait_for("Node's blocked loop", T, |s| delay(s, 0, "max_ms").is_some_and(|m| m >= 40.0)),
+            };
+            if block.is_none() {
+                assert!(delay(&s, 0, "p50_ms").unwrap() < 20.0, "{s:#}");
+            }
+            drop(w);
+        }
+    }
+
+    // Worker mode: each Worker's own loop.
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"loopthreads\"\nentry = \"{}\"\nport = {port}\nenv = {{ FIXTURE_BLOCK_MS = \"150\", \
+         FIXTURE_BLOCK_WORKER = \"2\" }}\n[workers]\ncount = 2\nmode = \"worker\"\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("loopthreads", port, &cfg);
+    let s = w.wait_for("each Worker's loop delay", T, |s| {
+        delay(s, 0, "p50_ms").is_some() && delay(s, 1, "max_ms").is_some_and(|m| m >= 40.0)
+    });
+    assert!(delay(&s, 0, "p50_ms").unwrap() < 20.0, "Worker 1 is not blocked by Worker 2:\n{s:#}");
+}
+
+/// W5: `warden start` of an app that can't start fails fast, says why with
+/// the app's own error output, and leaves it listed as errored with its
+/// workers stopped (no restart loop); a later `warden start` tries again.
+#[test]
+fn start_fails_fast_when_every_worker_crashes() {
+    let f = Fleet::new("failfast");
+    let cfg = |name: &str, body: &str| std::fs::write(f.home.join(format!("{name}.toml")), body).unwrap();
+    // Crashes at once until a file appears.
+    cfg(
+        "broken",
+        &format!(
+            "[app]\nname = \"broken\"\ncommand = \"sh\"\nargs = [\"-c\", \"[ -f ok ] || {{ echo 'error: cannot find \
+             module express' >&2; exit 3; }}; exec sleep 300\"]\nworking_directory = \"{}\"\n[workers]\ncount = 2\n\
+             min_uptime = 300\n",
+            f.home.display()
+        ),
+    );
+    let t0 = Instant::now();
+    let (code, out) = f.cli(&["start", "broken"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(t0.elapsed() < Duration::from_secs(15), "took {:?}:\n{out}", t0.elapsed());
+    assert!(out.contains("broken: failed to start: all 2 workers crashed before one was ready (exit code 3)"), "{out}");
+    assert_eq!(out.matches("error: cannot find module express").count(), 1, "its error, once:\n{out}");
+    assert!(out.contains("hint:") && out.contains("`warden start broken` tries again"), "{out}");
+    // Listed as errored, workers stopped: nothing restarts behind our back.
+    let st = &f.app("broken")["status"];
+    assert_eq!((st["stopped"].as_bool(), st["start_failed"].as_str()), (Some(true), Some("exit code 3")), "{st:#}");
+    let restarts = |f: &Fleet| f.app("broken")["status"]["workers"][0]["restarts"].as_u64();
+    let before = restarts(&f);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(restarts(&f), before, "no restart loop");
+    // One app: `list` shows its detail view; the crash, not the stop, is the last exit.
+    let list = f.ok(&["list"]);
+    assert!(list.contains("State:       errored: its last start failed"), "{list}");
+    assert!(list.lines().filter(|l| l.contains("STOPPED") && l.ends_with("exit code 3")).count() == 2, "{list}");
+    // Warden's own log says it once, with a hint.
+    let events = f.ok(&["logs", "broken", "--events", "--nostream", "-n", "200"]);
+    assert_eq!(events.matches("app cannot start: every worker crashed before it was ready").count(), 1, "{events}");
+    // Fixed: the next start works and the error is gone.
+    std::fs::write(f.home.join("ok"), "").unwrap();
+    let out = f.ok(&["start", "broken"]);
+    assert!(out.contains("online (2/2 workers ready)"), "{out}");
+    assert!(f.app("broken")["status"]["start_failed"].is_null());
+
+    // An app that never listens on its port: killed at ready_timeout, then
+    // the same, with a hint about the port.
+    let port = free_port();
+    cfg(
+        "deaf",
+        &format!(
+            "[app]\nname = \"deaf\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 300\"]\nport = {port}\n\
+             [workers]\nready_timeout = 1\n"
+        ),
+    );
+    let (code, out) = f.cli(&["start", "deaf"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("(not ready in time)") && out.contains(&format!("sport = :{port}")), "{out}");
+    assert!(out.contains("no output from it"), "{out}");
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to

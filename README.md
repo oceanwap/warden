@@ -206,6 +206,7 @@ warning.
 | Crash, without the startup time | A hot standby (started, app initialized, not listening) takes the dead worker's slot in a few milliseconds; a new standby starts in the background | `[workers] standby` |
 | Unhealthy worker | Replaced gracefully (new worker ready first) after `failure_threshold` failed checks | `[health] on_failure = "replace"` |
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
+| Slow event loop | Each heartbeat carries the worker's event-loop delay over the last second (p50/p99/max, sampled natively every 100 ms: no cost per request). `warden list`/`top`/`describe` show p99 (`Loop p99`), `status --json` all three (`loop_delay`), Prometheus `warden_worker_event_loop_delay_{p50,p99,max}_seconds`; a WARN when p99 stays high for 10 s | `[watchdog] loop_delay_warn` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
@@ -260,6 +261,43 @@ A standby starts in the pinned release (`pin_release`) and is promoted only
 while that is still the workers' release. Process mode only, with
 `app.port`, a shared port and the shim (bun and node commands).
 
+## Environment variables
+
+A worker starts with the supervisor's own environment (`PATH`, `HOME`, what
+systemd or your shell gave it), then, each one winning over the ones
+before:
+
+1. `[app] env_file`: `KEY=value` lines (dotenv / systemd `EnvironmentFile`
+   syntax), relative to the config file. Keep secrets there, mode 0600;
+   `warden reload` reads it again.
+2. `[app] env`.
+3. Warden's variables below. They win over the two above: `env = { PORT =
+   "8080" }` next to `port = 3000` gives the app 3000 (`warden env` marks
+   the override).
+
+`warden env api` prints exactly that for worker 1 (`api:3` for worker 3),
+with where each value comes from; the app's values are hidden unless
+`--show-secrets`. `warden config api` prints the whole effective config as
+JSON, defaults included.
+
+| Variable | Value | In |
+|---|---|---|
+| `PORT` | `[app] port`; with `port_strategy = "offset"`, `port + N - 1` for worker N | every worker and standby, `verify_command`; only with `app.port` |
+| `NODE_APP_INSTANCE` (the name is `[app] instance_var`; `""` sets none) | worker N gets `N - 1` (PM2's 0-based index). A hot standby gets a number past the workers' until it is promoted, then its slot's | process workers and standbys; in worker mode each Worker (set by the shim) |
+| `WARDEN_APP` | the app's name | everything Warden runs: workers, `verify_command`, `preflight` |
+| `WARDEN_WORKER_ID` | the worker number, 1..N. `0` in a standby until promoted (then its slot's). Worker mode: each Worker 1..N, none in the host process | workers; `verify_command`: the worker it checks (`host` in worker mode, `s1`… for a standby) |
+| `WARDEN_WORKER_COUNT` | workers configured when the process started (after `warden scale`, running workers keep the old count; a promoted standby gets the current one) | workers, standbys, worker-mode host and Workers |
+| `WARDEN_MODE` | `process` or `worker` | workers |
+| `WARDEN_STANDBY` | `1` in a hot standby until it is promoted | standbys, their `verify_command` |
+| `WARDEN_WORKER_PID`, `WARDEN_WORKER_SOCKET`, `WARDEN_WORKER_SOCKETS` | the new worker's pid and private health socket(s) (space-separated; one per Worker in worker mode) | `verify_command` only |
+| `WARDEN_WORKERS`, `WARDEN_ENTRY`, `WARDEN_SHIM` | how many Workers, the module each imports, the shim | worker-mode host process |
+| `WARDEN_STATIC` | the `[static]` section as JSON | `warden serve` workers |
+| `WARDEN_IPC_FD` | `3`: the shim's channel to Warden (readiness, heartbeat) | every worker |
+| `WARDEN_HEARTBEAT_MS`, `WARDEN_DRAIN_MS`, `WARDEN_LONG_LIVED_MS`, `WARDEN_STOP_SIGNAL`, `WARDEN_WAIT_READY`, `WARDEN_REUSE_PORT`, `WARDEN_HEALTH_DIR`, `WARDEN_INSTANCE_VAR`, `WARDEN_INSTANCE` | settings for the shim: heartbeat period (1000), `shutdown.drain_ms`, `long_lived_timeout` in ms, `shutdown.signal`, `1` with `wait_ready`, `1` with a shared port, where private health sockets go, the instance variable's name, an internal process number (unique per supervisor run) | every worker |
+
+PM2's `pm_id` and `name` are not set: use `WARDEN_WORKER_ID` and
+`WARDEN_APP` (`warden pm2-migrate` leaves them out of the migrated env).
+
 ## CLI
 
 If you know PM2 you know most of it: `warden` in place of `pm2`. `warden help`
@@ -267,12 +305,13 @@ has everything; the differences are in the right column.
 
 | PM2 | Warden | Difference |
 |---|---|---|
-| `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). Any program or command line works, as with PM2 |
+| `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). An app that can't start (every worker crashes before one is ready: a syntax error, a missing module, a port in use) fails at once with exit 1, its last error output and a hint; its workers are stopped and it stays listed as `errored`, as PM2 leaves it, until `warden start` again. Any program or command line works, as with PM2 |
 | `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | ~2 ms instead of ~140-160 ms |
 | `pm2 describe api` | `warden describe api` | Also the last exits and the last rollout |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
-| `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files, pipe-friendly |
+| `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files (every worker's with `per_worker_files`), pipe-friendly |
+| `pm2 flush api` | `warden flush api` | The same: empties the in-memory buffer and the current log files (Warden's, each worker's out and err file), lists them, keeps rotated ones; safe while workers write |
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server as fast as nginx, faster on small files (see Benchmarks) |
 | `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](#surviving-reboots-and-crashes) |
 | `pm2 monit` | `warden top`, `warden events` | `events`: every worker, rollout and supervisor event as it happens (`--json` for scripts, `--logs` for output) |
@@ -314,11 +353,11 @@ Memory:      4.0 MB (supervisor)
 Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
              health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...
 
-Worker   Status      PID      Uptime   Restarts  RSS        CPU     Health   Last exit
-1        RUNNING     8172     25s      1         40.1 MB    0.0%    ok       -
-2        RUNNING     8180     13s      1         40.1 MB    0.0%    ok       -
-3        RUNNING     8188     10s      1         40.2 MB    0.0%    ok       -
-4        RUNNING     8196     8s       1         40.2 MB    0.0%    ok       -
+Worker   Status      PID      Uptime   Restarts  RSS        CPU     Loop p99  Health   Last exit
+1        RUNNING     8172     25s      1         40.1 MB    0.0%    0.21ms    ok       -
+2        RUNNING     8180     13s      1         40.1 MB    0.0%    0.18ms    ok       -
+3        RUNNING     8188     10s      1         40.2 MB    0.0%    0.20ms    ok       -
+4        RUNNING     8196     8s       1         40.2 MB    0.0%    0.19ms    ok       -
 ```
 
 The CLI talks to the running supervisor over a Unix socket with mode 0600.

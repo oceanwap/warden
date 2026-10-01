@@ -46,6 +46,20 @@ Requests are `control::Request`, tagged by `cmd`: `status`, `stop`,
 `control::Response` line (`{"ok":true,"message":…,"status":…}`), except
 `logs` (log lines) and `subscribe` (events).
 
+`config` (`{"cmd":"config","show_secrets":false,"worker":2}`) answers
+`info`: the effective config (`config`, defaults included, `app.env` merged
+from `env_file`), paths, and `worker_env`: the variables worker `worker`
+(default 1; the host in worker mode, `worker_env_of` says which) starts
+with on top of the supervisor's environment, in the order applied, each
+`{"name","value","from"}` with `from` `env_file`, `env` or `warden`. The
+app's values are hidden unless `show_secrets`; Warden's never are.
+`worker` is new: an older supervisor ignores it and sends no `worker_env`.
+
+`flush` empties the in-memory log buffer and the app's current log files
+(rotated ones are kept); its `message` lists the files, one per line after
+the first. `ok` is false when a file could not be emptied (the message
+names it and the error); the others are emptied all the same.
+
 ### `subscribe`
 
 ```json
@@ -123,6 +137,18 @@ What a supervisor sends, one event per transition (next to its log line):
 processes share a number: `pid` tells them apart. In worker mode, `worker` 0
 is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
 1..=count its Worker threads (`ready` when one listens, `crashed`, `hung`).
+
+`status.start_failed` (a string, absent otherwise): since the workers were
+last started, every one crashed and none was ready; the value is the last
+crash's reason (`exit code 1`, `not ready in time`). It stays while the
+workers are stopped after it (`stopped` true: the app is `errored`) and is
+cleared by the next start. `warden start` fails fast on it.
+
+`status.workers[].loop_delay` (`{"p50_ms","p99_ms","max_ms"}`, absent
+without one) is the worker's event-loop delay over its last heartbeat
+interval (about a second), from Warden's shim; in worker mode each
+Worker's own. It is absent without the shim and when the worker sent no
+heartbeat in the last 5 s. An addition: older clients ignore it.
 
 Hot standbys (process mode, `[workers] standby`) are listed in
 `status.standbys` (`WorkerStatus` rows; the field is absent without

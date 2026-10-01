@@ -528,6 +528,7 @@ mod tests {
                 cpu_percent: Some(cpu),
                 last_exit: None,
                 healthy: None,
+                loop_delay: None,
             })
             .collect();
         s

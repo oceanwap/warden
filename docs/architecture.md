@@ -125,7 +125,18 @@ in worker mode. Enabled by default when `command` is `bun`. It:
    (F13), so health checks reach exactly one worker;
 3. reports `listening` (+ the private socket) and a 1 s **heartbeat** from the
    event loop to Warden (fd 3 in process mode, `postMessage` → host → fd 3 in
-   worker mode) — readiness and watchdog signals;
+   worker mode) — readiness and watchdog signals. The heartbeat carries the
+   interval's **event-loop delay** (`"loop":{"p50":…,"p99":…,"max":…}`, ms):
+   `perf_hooks.monitorEventLoopDelay` (Node and Bun) at a 100 ms resolution,
+   a native timer, read and reset once per heartbeat — no work per request,
+   no measurable idle CPU in Node, ~0.05 % in Bun. Node's samples include
+   the resolution and are corrected; where the histogram is missing or stays
+   empty the heartbeat's own lateness stands in. A block of 100 ms or more
+   always shows; shorter ones when a sample falls in them. The heartbeat is
+   sent whether or not the watchdog is on (`WARDEN_HEARTBEAT_MS` is always
+   set); `warden list` (Loop p99), `status --json` (`loop_delay`), the GUI
+   and `warden_worker_event_loop_delay_*_seconds` show it, and
+   `[watchdog] loop_delay_warn` warns when p99 stays high for 10 s;
 4. on SIGTERM (process mode) or a `shutdown` message (worker mode) drains:
    stop listeners, add `Connection: close` (Bun `fetch` handlers and
    `node:http` responses), wait `drain_ms` and for in‑flight requests, exit 0.
@@ -151,6 +162,21 @@ STARTING ─ready─► RUNNING ─stop─► STOPPING ─► STOPPED
    └──exit──► CRASHED ─► RESTARTING (backoff) ─► STARTING
                  └── too many restarts in window ─► FAILED
 ```
+
+**Start attempts.** From `start_all` (the supervisor's start, `start` after
+`stop`, `restart --hard`) until the first worker is ready, the supervisor
+records which slots crashed. Once every slot has, the app can't start as it
+is: one `app cannot start` ERROR, and `Status.start_failed` (the last
+crash's reason). The restart policy is not changed by it: under systemd or
+at boot a dependency may still come up. An interactive `warden start` waits
+for the first worker (bounded by `ready_timeout` + 15 s), and on
+`start_failed` prints the app's last error output and stops the workers
+(`stop`): the app stays listed as `errored`, as PM2 leaves an app that keeps
+crashing, with nothing restarting it, rather than FAILED with its cooldown
+retry going on unseen. A `stop` before the workers were ever ready also
+sends systemd `READY=1`, so a `Type=notify` unit isn't killed and restarted
+(which would start the workers again). `warden resurrect` reports and leaves
+the policy at work.
 
 `READY` is the transition event into `RUNNING`, logged as `worker=N ready`.
 Readiness sources, first one wins: the shim's `listening` message; on Linux, the
@@ -472,12 +498,33 @@ app-level check; their rollout gates fall back to it too.
   "direct"` the bytes go from the worker's pipe into its log file with
   `splice(2)`: no copy through Warden, no parsing, rotation at a line
   boundary (supervisor CPU per 200 MB: 0.72 s captured, 0.14 s direct).
+  `warden flush` (like `pm2 flush`) empties the in-memory rings and every
+  current log file, each on the thread that writes it, between two writes:
+  the writer thread's files are `O_APPEND` and hold whole lines only, so a
+  message in its queue truncates them through its own descriptors and the
+  next line lands at offset 0 (lines queued before the flush go too); the
+  output thread resets each direct file's write offset, keeping the start of
+  a line a worker is in the middle of, so both kinds of file begin with a
+  whole line. Files no running worker writes (a scaled-down worker's, an
+  earlier run's `out-3.log`) are emptied by name; rotated ones are kept.
+- History (`warden logs --history`, `warden search`, `src/logview.rs`):
+  the CLI reads the files itself, so it works while the app is stopped.
+  `logview::sources` picks them: in capture mode `[logging] file` has
+  every line tagged with its worker and stream and answers alone
+  (`--out`/`--err` read the out/err files); in direct mode Warden's file
+  (or journald) has the events and the out/err files the output, so both
+  are read. Per-worker files are found on disk by name (`out-<label>.log`
+  for a worker number, `sN` or `host`, current or rotated), so gone
+  workers' are read too; each file comes with its rotated and gzipped
+  ones, oldest first, workers in order. Lines of several files are
+  labelled `worker=N stream:`, and `--lines N` is per file (as `pm2 logs`).
 - Live events: every worker state change, rollout phase and (on request) log
   line is pushed to `subscribe` clients as it happens, with a full status
   every interval; with no subscriber an event costs one atomic load.
 - Metrics (`warden status`, optional Prometheus endpoint): workers configured /
   running, restarts, crashes, uptime, RSS and CPU per worker from `/proc`,
-  health status.
+  health status, and each worker's event-loop delay (p50/p99/max over the
+  last second, from the shim's heartbeat, §4.3).
 - systemd: `READY=1` once all workers are ready (for `Type=notify`),
   `STOPPING=1`, `RELOADING=1`.
 
@@ -496,7 +543,10 @@ crate (`protocol/`, re-exported from `src/control.rs` and `src/events.rs`).
 ### 4.11 Security
 
 Warden needs no privileges and performs none: workers inherit Warden's user,
-group, environment (plus the configured `env`) and working directory. Run it as
+group, environment and working directory; `env_file`, then `env`, then
+Warden's own variables go on top, each winning over the ones before (one
+function, `worker_env`, builds them for spawning and for `warden env`; the
+list is in the README, "Environment variables"). Run it as
 the service user from systemd. The runtime directory (control socket, the shim
 every worker preloads, per-worker health sockets) must be owned by Warden's
 user, not a symlink, and not group/world-writable, or Warden refuses to start;

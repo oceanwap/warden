@@ -1077,8 +1077,75 @@ function closePrivateSocket() {
 
 if (heartbeatMs > 0) {
   // Stops arriving when the event loop is blocked: Warden's watchdog notices.
-  const t = setInterval(() => report({ ev: "heartbeat" }), heartbeatMs);
+  // Carries the event-loop delay of the interval (next section).
+  const t = setInterval(() => report({ ev: "heartbeat", loop: loopDelay() }), heartbeatMs);
   if (t && typeof t.unref === "function") t.unref();
+}
+
+// ------------------------------------------------------- event-loop delay
+//
+// How late the event loop runs: what a request waits before its handler
+// starts. Reported with each heartbeat as `loop: {p50, p99, max}` (ms, over
+// the heartbeat interval), shown by `warden list` and in the metrics.
+//
+// perf_hooks.monitorEventLoopDelay is a histogram filled by a native timer
+// every LOOP_RESOLUTION_MS (no JavaScript runs per sample, nothing per
+// request); the heartbeat reads and resets it once a second. Measured idle
+// cost: none in Node, ~0.05% of a core in Bun; 100 ms gives ten samples per
+// heartbeat, enough for p50/p99/max (a 20 ms resolution cost 0.2%). A block
+// of 100 ms or more always shows (a sample falls due during it); a shorter
+// one shows when a sample does, which under steady load is most of them. Node
+// records each sample as the timer's whole period, the resolution included;
+// Bun records the delay alone. Where the histogram is missing or never
+// records (an older Bun), the fallback is the heartbeat timer's own lateness
+// (one sample per interval, at no cost at all).
+const LOOP_RESOLUTION_MS = 100;
+let loopHist = null;
+let loopEmpty = 0; // heartbeats in a row that found the histogram empty
+let loopLast = 0;
+
+if (heartbeatMs > 0) {
+  try {
+    const { monitorEventLoopDelay } = require("node:perf_hooks");
+    loopHist = monitorEventLoopDelay({ resolution: LOOP_RESOLUTION_MS });
+    loopHist.enable();
+  } catch {
+    loopHist = null;
+  }
+  loopLast = performance.now();
+}
+
+// The event-loop delay since the last heartbeat: { p50, p99, max } in ms.
+function loopDelay() {
+  const now = performance.now();
+  // The heartbeat runs every heartbeatMs: how much later than that it ran.
+  const drift = Math.max(0, now - loopLast - heartbeatMs);
+  loopLast = now;
+  const ms = (ns) => Math.round(Math.max(0, ns - (isBun ? 0 : LOOP_RESOLUTION_MS * 1e6)) / 1e4) / 100;
+  if (loopHist) {
+    try {
+      const h = loopHist;
+      // `count` is Node 17+ and Bun; before that, an empty histogram's max is 0.
+      if ((typeof h.count === "number" ? h.count : h.max) > 0) {
+        loopEmpty = 0;
+        // A block longer than the interval delays the heartbeat more than
+        // any timer the histogram saw end in it.
+        const max = Math.max(ms(h.max), Math.round(drift * 100) / 100);
+        const out = { p50: ms(h.percentile(50)), p99: Math.min(ms(h.percentile(99)), max), max };
+        h.reset();
+        return out;
+      }
+      // Ten samples were due: three empty intervals in a row mean it doesn't work here.
+      if (++loopEmpty >= 3) {
+        h.disable();
+        loopHist = null;
+      }
+    } catch {
+      loopHist = null;
+    }
+  }
+  const d = Math.round(drift * 100) / 100;
+  return { p50: d, p99: d, max: d };
 }
 
 // PM2 apps call process.send('ready') (wait_ready) and some call process.send

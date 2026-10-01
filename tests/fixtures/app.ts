@@ -10,6 +10,8 @@
 //   FIXTURE_SPAM=1             write stdout lines as fast as possible (stalled-log tests)
 //   FIXTURE_IPC_FLOOD=1        write messages and junk to fd 3 as fast as possible
 //   FIXTURE_STANDBY_EXIT=<ms>  exit 4 after <ms> if still a hot standby (standby crash loop)
+//   FIXTURE_BLOCK_MS=<ms>      block the event loop for <ms> every 400 ms (event-loop delay);
+//                              FIXTURE_BLOCK_WORKER=<n>: only in worker <n>, or Worker <n> in worker mode
 // Endpoints:
 //   /whoami  pid:thread      /health  200 or 503
 //   /throw   uncaught error  /exit    exit 3
@@ -33,6 +35,15 @@ if (process.env.FIXTURE_STANDBY_EXIT) {
 }
 
 const who = `${process.pid}:${threadId}`;
+
+const blockHere = !process.env.FIXTURE_BLOCK_WORKER || process.env.FIXTURE_BLOCK_WORKER === process.env.WARDEN_WORKER_ID;
+if (process.env.FIXTURE_BLOCK_MS && blockHere) {
+  const ms = Number(process.env.FIXTURE_BLOCK_MS);
+  setInterval(() => {
+    const t = Date.now();
+    while (Date.now() - t < ms);
+  }, 400);
+}
 
 if (process.env.FIXTURE_SPAM) {
   const line = `spam ${"x".repeat(200)}\n`.repeat(100);

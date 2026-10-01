@@ -11,6 +11,12 @@ args = ["run", "dist/main.js"]               # example (process mode)
 working_directory = "/srv/apps/travelerwe/api/current"   # example; relative = relative to this file
 port = 3000                                  # example; sets PORT and enables readiness detection
 env = { NODE_ENV = "production" }            # example
+# env_file = "api.env"                       # example; KEY=value lines (dotenv / systemd EnvironmentFile), relative
+                                             # to this file, read again by `warden reload`; keep secrets there (0600).
+                                             # Workers get the supervisor's environment, then env_file, then env, then
+                                             # Warden's variables (PORT, NODE_APP_INSTANCE, WARDEN_*): each wins over
+                                             # the ones before. `warden env <app>` shows the result (README:
+                                             # "Environment variables")
 # shim = true                                # default: true when command is bun or node (reusePort,
                                              # readiness, drain, health socket); false for anything else
 # namespace = "backend"                      # example; a group for `warden restart backend` (default "default")
@@ -87,6 +93,9 @@ max_draining = 4                             # old workers that may still be dra
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
+loop_delay_warn = 0.5                        # s (fractions ok); warn when a worker's event-loop delay (p99, from the
+                                             # shim's heartbeat; `warden list` column Loop) stays at least this high
+                                             # for 10 s; at most once per 10 min per worker (0 = off)
 
 [limits]
 max_memory = 0                               # MB per worker process; recycle gracefully above it (0 = off)
@@ -106,6 +115,9 @@ max_lines_per_sec = 10000                    # worker output kept per worker and
 # err_file = "/var/log/warden/api-err.log"   # example; worker stderr as written (PM2's error_file)
 per_worker_files = false                     # api-out-1.log, api-out-2.log… (PM2 without merge_logs)
 file_timestamps = false                      # prefix out/err lines with a timestamp (PM2's `time`; capture only)
+#
+# `warden flush` empties all of these files that exist now (every worker's too), never the rotated ones;
+# `warden logs --history` reads them back, rotated and .gz ones included, oldest first.
 #
 # worker_output = "direct" is for apps that log heavily and only need the files:
 #   + the kernel moves the bytes from each worker's pipe into its file (splice): no parsing, no copy

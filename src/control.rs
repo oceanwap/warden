@@ -16,7 +16,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 
 pub use warden_protocol::control::{
-    DRAINING, HostStatus, MAX_CONNECTIONS, MAX_STREAMS, REQUEST_TIMEOUT, Request, Response, RolloutOutcome,
+    DRAINING, HostStatus, LoopDelay, MAX_CONNECTIONS, MAX_STREAMS, REQUEST_TIMEOUT, Request, Response, RolloutOutcome,
     RolloutStatus, STANDBY, Status, WARMING, WorkerStatus,
 };
 
@@ -229,9 +229,9 @@ async fn handle(stream: UnixStream, tx: mpsc::UnboundedSender<ControlMsg>, mut s
             subscribe(r, w, tx, interval_ms, logs).await
         }
         Request::Flush => {
-            crate::logging::clear();
-            crate::info!("logs flushed on request");
-            reply(&mut w, &Response::ok("log buffer emptied and log file truncated")).await
+            let done = crate::logging::flush_files().await;
+            log_flush(&done);
+            reply(&mut w, &flush_response(&done)).await
         }
         Request::LogLevel { level } => {
             let old = crate::logging::level();
@@ -412,6 +412,58 @@ pub async fn say_bye(app: &str, reason: &str, min: std::time::Duration, max: std
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+}
+
+/// The log lines of a `warden flush`: one INFO line (the first of the
+/// emptied log file), and a WARN with a hint for each file it could not empty.
+fn log_flush(d: &crate::logging::Flushed) {
+    crate::info!("logs flushed on request", files = d.files.len(), failed = d.failed.len());
+    for (file, error) in &d.failed {
+        crate::warn!(
+            "could not empty a log file on `warden flush`; it keeps its content",
+            file = file.display(),
+            error = error,
+            hint = "Warden must be allowed to write the file: check its owner and permissions (`ls -l`); then run \
+                    `warden flush` again",
+        );
+    }
+    if d.pending {
+        crate::warn!(
+            "log files are still being emptied after `warden flush`",
+            hint = "the thread that writes them is held up (a slow disk, or a log consumer such as journald that \
+                    stopped reading); they are emptied as soon as it catches up, nothing to do",
+        );
+    }
+}
+
+/// What `warden flush` prints: the files emptied (as `pm2 flush` lists
+/// them), failures, and that rotated files stay.
+fn flush_response(d: &crate::logging::Flushed) -> Response {
+    let mut msg = String::from("log buffer emptied");
+    match d.files.len() {
+        0 if d.failed.is_empty() && !d.pending => {
+            msg += "; no log files to empty (this app's log goes to stdout or journald only)";
+        }
+        0 => {}
+        n => {
+            msg += &format!(" and {n} log file{} emptied (rotated files are kept):", if n == 1 { "" } else { "s" });
+            for f in &d.files {
+                msg += &format!("\n  {}", f.display());
+            }
+        }
+    }
+    if d.pending {
+        msg += "\nsome log files are still being emptied: their writer is held up by a slow disk or log consumer, \
+                and empties them when it catches up";
+    }
+    if d.failed.is_empty() {
+        return Response::ok(msg);
+    }
+    msg += "\nnot emptied (check the files' owner and permissions):";
+    for (f, e) in &d.failed {
+        msg += &format!("\n  {}: {e}", f.display());
+    }
+    Response::err(msg)
 }
 
 fn level_name(l: crate::config::Level) -> &'static str {
@@ -612,6 +664,7 @@ mod tests {
             release: None,
             standbys: vec![],
             draining: vec![],
+            start_failed: None,
         }
     }
 

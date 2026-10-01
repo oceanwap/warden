@@ -411,7 +411,7 @@ async fn describe(sels: &[Sel], args: &Args) -> i32 {
             println!();
         }
         let st = status_of(&s.app).await;
-        let info = call_with(&s.app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await;
+        let info = call_with(&s.app, &Request::Config { show_secrets: false, worker: None }, REQUEST_TIMEOUT).await;
         match (st, info) {
             (Ok(st), Ok(info)) => {
                 if args.json {
@@ -437,25 +437,20 @@ async fn describe(sels: &[Sel], args: &Args) -> i32 {
     code
 }
 
+/// `warden env <app>[:N]`: the environment worker N (default 1) starts
+/// with, on top of the supervisor's own: `env_file`, `[app] env`, then
+/// Warden's variables, as `KEY=value` lines (later ones win) with `#`
+/// comments saying where each group comes from.
 async fn env(sels: &[Sel], show_secrets: bool) -> i32 {
     let mut code = 0;
     for s in sels {
-        match call_with(&s.app, &Request::Config { show_secrets }, REQUEST_TIMEOUT).await {
+        let req = Request::Config { show_secrets, worker: s.worker };
+        match call_with(&s.app, &req, REQUEST_TIMEOUT).await {
             Ok(r) => {
                 if sels.len() > 1 {
                     println!("# {}", s.app.name);
                 }
-                let info = r.info.unwrap_or_default();
-                if let Some(env) = info.pointer("/config/app/env").and_then(|e| e.as_object()) {
-                    for (k, v) in env {
-                        println!("{k}={}", v.as_str().unwrap_or_default());
-                    }
-                }
-                println!(
-                    "# also set by Warden for each worker: PORT, WARDEN_APP, WARDEN_WORKER_ID, WARDEN_WORKER_COUNT, \
-                     WARDEN_MODE{}",
-                    if show_secrets { "" } else { "  (values hidden: --show-secrets)" }
-                );
+                print!("{}", render_env(&r.info.unwrap_or_default(), show_secrets));
             }
             Err(e) => {
                 code = 2;
@@ -466,10 +461,59 @@ async fn env(sels: &[Sel], show_secrets: bool) -> i32 {
     code
 }
 
+/// The text of `warden env` from a `config` answer.
+fn render_env(info: &serde_json::Value, show_secrets: bool) -> String {
+    let mut o = String::new();
+    let hidden = if show_secrets { "" } else { "; the app's values are hidden unless --show-secrets" };
+    let Some(vars) = info["worker_env"].as_array() else {
+        // An older supervisor: only the app's own variables.
+        if let Some(env) = info.pointer("/config/app/env").and_then(|e| e.as_object()) {
+            for (k, v) in env {
+                o += &format!("{k}={}\n", v.as_str().unwrap_or_default());
+            }
+        }
+        o += &format!("# also set by Warden for each worker: PORT, WARDEN_APP, WARDEN_WORKER_ID, …{hidden}\n");
+        return o;
+    };
+    let of = info["worker_env_of"].as_str().unwrap_or("1");
+    let who = if of == "host" { "the worker-mode host process".to_string() } else { format!("worker {of}") };
+    o += &format!(
+        "# The environment {who} starts with: the supervisor's own (PATH, HOME, …), then these, a later one \
+         winning{hidden}.\n"
+    );
+    let env_file = info.pointer("/config/app/env_file").and_then(|f| f.as_str()).unwrap_or("env_file");
+    let mut group = "";
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for v in vars {
+        let (Some(name), Some(value), Some(from)) = (v["name"].as_str(), v["value"].as_str(), v["from"].as_str())
+        else {
+            continue;
+        };
+        if from != group {
+            group = from;
+            o += &match from {
+                "env_file" => format!("# from {env_file}\n"),
+                "env" => "# from [app] env\n".to_string(),
+                _ => "# set by Warden (README: Environment variables)\n".to_string(),
+            };
+        }
+        let note = match seen.insert(name, from) {
+            Some(earlier) if earlier != from => format!("   # overrides the value from {earlier}"),
+            _ => String::new(),
+        };
+        o += &format!("{name}={value}{note}\n");
+    }
+    if of != "host" {
+        o += "# per worker: WARDEN_WORKER_ID, the instance variable (NODE_APP_INSTANCE) and, with port_strategy = \
+              \"offset\", PORT; `warden env <app>:N` shows worker N\n";
+    }
+    o
+}
+
 async fn show_config(sels: &[Sel], show_secrets: bool) -> i32 {
     let mut code = 0;
     for s in sels {
-        match call_with(&s.app, &Request::Config { show_secrets }, REQUEST_TIMEOUT).await {
+        match call_with(&s.app, &Request::Config { show_secrets, worker: None }, REQUEST_TIMEOUT).await {
             Ok(r) => println!("{}", serde_json::to_string_pretty(&r.info.unwrap_or_default()).unwrap_or_default()),
             Err(e) => {
                 code = 2;
@@ -669,7 +713,7 @@ async fn logs(
 /// `warden logs --history` / `warden search`: the app's log files (rotated
 /// and gzipped ones too, oldest first) or journald.
 async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview::Query, json: bool) -> i32 {
-    use crate::logview::{file_chain, for_each_line, journal_lines};
+    use crate::logview::{Source, file_chain, for_each_line, journal_lines};
     let multi = sels.len() > 1;
     let width = sels.iter().map(|s| s.app.name.len()).max().unwrap_or(0);
     let mut out = crate::logview::PipeOut::new();
@@ -681,18 +725,19 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
             q.worker = Some(w);
         }
         // Where this app logs: from the running supervisor, else its config.
-        let (cfg, unit) = match call_with(app, &Request::Config { show_secrets: false }, REQUEST_TIMEOUT).await {
-            Ok(r) => {
-                let info = r.info.unwrap_or_default();
-                let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
-                let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
-                let bg = info["log_file"].as_str().map(PathBuf::from);
-                (cfg.map(|c| (c, bg)), unit)
-            }
-            Err(_) => {
-                (app.config.as_ref().and_then(|p| Config::load(p).ok()).map(|c| (c, None)), systemd_unit_for(app))
-            }
-        };
+        let (cfg, unit) =
+            match call_with(app, &Request::Config { show_secrets: false, worker: None }, REQUEST_TIMEOUT).await {
+                Ok(r) => {
+                    let info = r.info.unwrap_or_default();
+                    let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
+                    let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
+                    let bg = info["log_file"].as_str().map(PathBuf::from);
+                    (cfg.map(|c| (c, bg)), unit)
+                }
+                Err(_) => {
+                    (app.config.as_ref().and_then(|p| Config::load(p).ok()).map(|c| (c, None)), systemd_unit_for(app))
+                }
+            };
         let Some((cfg, running_log)) = cfg else {
             eprintln!("warden: {}: cannot read its config to find its log files", app.name);
             worst = 2;
@@ -700,90 +745,92 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
         };
         let l = &cfg.logging;
         let background = Some(log_path(&app.name)).filter(|p| p.exists());
-        // (path, raw): raw = the app's own lines (out/err files), not Warden-framed.
-        let mut sources: Vec<(PathBuf, bool)> = Vec::new();
-        match q.stream.as_deref() {
-            Some("stderr") if l.err_file.is_some() => sources.push((l.err_file.clone().unwrap_or_default(), true)),
-            Some("stdout") if l.out_file.is_some() => sources.push((l.out_file.clone().unwrap_or_default(), true)),
-            _ => {
-                if let Some(f) = l.file.clone().or(running_log).or(background) {
-                    sources.push((f, false));
-                } else {
-                    for f in [l.out_file.clone(), l.err_file.clone()].into_iter().flatten() {
-                        sources.push((f, true));
-                    }
-                }
-            }
-        }
-        let emit_prefix = |line: &str| -> String {
-            if json {
-                crate::logview::to_json(&app.name, line)
-            } else if multi {
-                format!("{:<width$} | {line}", app.name)
-            } else {
-                line.to_string()
+        let setup = crate::logview::Setup {
+            logging: l,
+            framed: l.file.clone().or(running_log).or(background),
+            journal: unit.is_some(),
+            processes: if cfg.workers.mode == config::Mode::Process { cfg.workers.count } else { 0 },
+        };
+        let sources = match crate::logview::sources(&setup, &q) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warden: {}: {e}", app.name);
+                worst = worst.max(1);
+                continue;
             }
         };
-        // Keep only the last N when asked; otherwise stream everything.
-        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        let mut push = |line: String, out: &mut crate::logview::PipeOut| -> bool {
-            match lines {
-                Some(n) => {
-                    tail.push_back(line);
-                    if tail.len() > n {
-                        tail.pop_front();
+        // Lines from several files (per-worker files, Warden's log next to
+        // them) say whose they are; one file's are printed as written.
+        let label = sources.len() > 1;
+        for src in &sources {
+            let emit = |line: &str| -> String {
+                let line = match src {
+                    Source::Raw { worker, stream, .. } if json => {
+                        return crate::logview::raw_to_json(&app.name, worker.as_deref(), stream, line);
                     }
-                    true
+                    Source::Raw { worker, stream, .. } if label => {
+                        std::borrow::Cow::Owned(crate::logview::frame_raw(worker.as_deref(), stream, line))
+                    }
+                    _ if json => return crate::logview::to_json(&app.name, line),
+                    _ => std::borrow::Cow::Borrowed(line),
+                };
+                if multi { format!("{:<width$} | {line}", app.name) } else { line.into_owned() }
+            };
+            // `--lines N`: the last N of each source (as `pm2 logs --lines`
+            // shows each file's); otherwise stream everything.
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            let mut push = |line: String, out: &mut crate::logview::PipeOut| -> bool {
+                match lines {
+                    Some(n) => {
+                        tail.push_back(line);
+                        if tail.len() > n {
+                            tail.pop_front();
+                        }
+                        true
+                    }
+                    None => out.line(&line),
                 }
-                None => out.line(&line),
-            }
-        };
-        if sources.is_empty() {
-            match &unit {
-                Some((scope, u)) => {
+            };
+            let (path, raw) = match src {
+                Source::Journal => {
+                    let Some((scope, u)) = &unit else { continue };
                     let res = journal_lines(u, *scope == Scope::User, &q, &mut |line| {
-                        if q.matches(line) { push(emit_prefix(line), &mut out) } else { true }
+                        if q.matches(line) { push(emit(line), &mut out) } else { true }
                     });
                     if let Err(e) = res {
                         eprintln!("warden: {}: {e}", app.name);
                         worst = 2;
                     }
+                    (None, false)
                 }
-                None => {
-                    eprintln!(
-                        "warden: {}: no log files to read. Set [logging] file (or out_file / err_file) to keep \
-                         history; `warden logs {}` shows the recent lines in memory",
-                        app.name, app.name
-                    );
+                Source::Framed(p) => (Some(p), false),
+                Source::Raw { path, .. } => (Some(path), true),
+            };
+            if let Some(path) = path {
+                let chain = file_chain(path);
+                if chain.is_empty() {
+                    eprintln!("warden: {}: {} does not exist yet", app.name, path.display());
                     worst = worst.max(1);
-                    continue;
                 }
-            }
-        }
-        for (path, raw) in &sources {
-            let chain = file_chain(path);
-            if chain.is_empty() {
-                eprintln!("warden: {}: {} does not exist yet", app.name, path.display());
-                worst = worst.max(1);
-            }
-            for f in chain {
-                let res = for_each_line(&f, &mut |line| {
-                    let keep = if *raw { q.matches_raw(line) } else { q.matches(line) };
-                    if keep { push(emit_prefix(line), &mut out) } else { true }
-                });
-                match res {
-                    Ok(true) => {}
-                    Ok(false) => return 0, // the reader went away (| head)
-                    Err(e) => {
-                        eprintln!("warden: {}: {e}", app.name);
-                        worst = worst.max(1);
+                for f in chain {
+                    let res = for_each_line(&f, &mut |line| {
+                        let keep = if raw { q.matches_raw(line) } else { q.matches(line) };
+                        if keep { push(emit(line), &mut out) } else { true }
+                    });
+                    match res {
+                        Ok(true) => {}
+                        Ok(false) => return 0, // the reader went away (| head)
+                        Err(e) => {
+                            eprintln!("warden: {}: {e}", app.name);
+                            worst = worst.max(1);
+                        }
                     }
                 }
             }
-        }
-        for line in tail {
-            if !out.line(&line) {
-                return 0;
+            for line in tail {
+                if !out.line(&line) {
+                    return 0;
+                }
             }
         }
     }
@@ -955,7 +1002,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     if let Ok(sels) = resolve(&ctx, Some(what), true) {
         let mut worst = 0;
         for s in sels {
-            worst = worst.max(start_app(&ctx, &s.app).await);
+            worst = worst.max(start_app(&ctx, &s.app, OnFailedStart::Stop).await);
         }
         return worst;
     }
@@ -967,7 +1014,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
             eprintln!("warden: {p}");
             return 1;
         }
-        return start_app(&ctx, &app).await;
+        return start_app(&ctx, &app, OnFailedStart::Stop).await;
     }
     // 3. PM2 ecosystem files are imported once.
     let lower = what.to_ascii_lowercase();
@@ -1005,7 +1052,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
                 return 1;
             }
             println!("{name}: wrote {} (edit it for health checks, limits and more)", file.display());
-            start_app(&ctx, &app_from_config(&file)).await
+            start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
         }
         Err(e) => {
             eprintln!("warden: {e}");
@@ -1078,7 +1125,7 @@ pub async fn serve(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
         return 1;
     }
     println!("{name}: serving {} on port {port} (config {})", root.display(), file.display());
-    start_app(&ctx, &app_from_config(&file)).await
+    start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
 }
 
 /// What `warden start <what>` runs when `what` is not an app or a config.
@@ -1147,13 +1194,24 @@ fn sanitize_name(s: &str) -> String {
     if n.is_empty() || n == "all" { "app".into() } else { n }
 }
 
-async fn start_app(ctx: &Ctx, app: &App) -> i32 {
+/// What `warden start` does when every worker crashed before one was ready.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OnFailedStart {
+    /// Report it and stop the workers: an interactive `warden start`.
+    Stop,
+    /// Report it and leave the restart policy at work: `warden resurrect`
+    /// at boot, where a dependency may still be coming up.
+    Report,
+}
+
+async fn start_app(ctx: &Ctx, app: &App, on_fail: OnFailedStart) -> i32 {
     let prefix = format!("{}: ", app.name);
+    let log = format!("see {}", log_path(&app.name).display());
     if reachable(app) {
         return match call_with(app, &Request::Start, REQUEST_TIMEOUT).await {
             Ok(r) if r.ok => {
                 println!("{prefix}{}", r.message.unwrap_or_default());
-                ready_or_not(ctx, app, Duration::from_secs(30)).await
+                ready_or_not(ctx, app, on_fail, &log).await
             }
             Ok(r) => {
                 eprintln!("warden: {prefix}{}", r.message.unwrap_or_default());
@@ -1174,12 +1232,37 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         return 2;
     };
     if let Some((scope, unit)) = systemd_unit_for(app) {
-        if let Err(e) = run_systemctl(scope, &["start", &unit]) {
-            eprintln!("warden: {prefix}{e}\n  see `journalctl {}-u {unit} -n 50`", scope.shown());
-            return 1;
+        let journal = format!("see `journalctl {}-u {unit} -n 50`", scope.shown());
+        if ctx.no_wait {
+            if let Err(e) = run_systemctl(scope, &["start", "--no-block", &unit]) {
+                eprintln!("warden: {prefix}{e}\n  {journal}");
+                return 1;
+            }
+            return ready_or_not(ctx, app, on_fail, &journal).await;
         }
-        println!("{prefix}started {unit}");
-        return ready_or_not(ctx, app, Duration::from_secs(60)).await;
+        println!("{prefix}starting {unit}");
+        // `systemctl start` returns once the unit is ready (Type=notify:
+        // every worker ready, or the workers stopped). Watch the app
+        // meanwhile, so a start that fails is reported (and stopped) at
+        // once rather than after the unit's TimeoutStartSec.
+        let job = {
+            let unit = unit.clone();
+            tokio::task::spawn_blocking(move || run_systemctl(scope, &["start", &unit]))
+        };
+        return tokio::select! {
+            r = job => match r {
+                Ok(Ok(())) => wait_ready(app, on_fail, &journal).await,
+                Ok(Err(e)) => {
+                    eprintln!("warden: {prefix}{e}\n  {journal}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("warden: {prefix}running systemctl failed ({e})\n  {journal}");
+                    1
+                }
+            },
+            code = wait_ready(app, on_fail, &journal) => code,
+        };
     }
     match spawn_background(&app.name, &cfg) {
         Ok(mut child) => {
@@ -1198,7 +1281,7 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
                     return 1;
                 }
                 if reachable(app) {
-                    return ready_or_not(ctx, app, Duration::from_secs(60)).await;
+                    return ready_or_not(ctx, app, on_fail, &format!("see {}", log.display())).await;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1217,20 +1300,39 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
 
 /// `wait_ready`, unless `--no-wait` asked to return as soon as the supervisor
 /// answers (starting many apps at once; `warden list` shows how they came up).
-async fn ready_or_not(ctx: &Ctx, app: &App, limit: Duration) -> i32 {
+/// `log`: where the supervisor's own log is, for when it does not answer.
+async fn ready_or_not(ctx: &Ctx, app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
     if ctx.no_wait {
         println!("{}: starting (not waiting for readiness: `warden list` shows it)", app.name);
         return 0;
     }
-    wait_ready(app, limit).await
+    wait_ready(app, on_fail, log).await
 }
 
-/// Wait until every worker is ready (or the app is stopped), then print one line.
-async fn wait_ready(app: &App, limit: Duration) -> i32 {
-    let t0 = Instant::now();
+/// How long `warden start` waits for the first worker, and then for the
+/// rest: the app's `workers.ready_timeout` (after which Warden kills a
+/// worker that isn't listening, a crash) plus room for a restart.
+fn ready_wait(app: &App) -> Duration {
+    let ready = app.config.as_ref().and_then(|p| Config::load(p).ok()).map_or(30, |c| c.workers.ready_timeout);
+    Duration::from_secs(ready.saturating_add(15))
+}
+
+/// Wait until every worker is ready (or the app is stopped), then print one
+/// line. Fails fast when the supervisor says every worker crashed before
+/// one was ready (`Status.start_failed`): reports why, with the app's last
+/// error output, and with `OnFailedStart::Stop` stops the workers. The
+/// wait is bounded: `ready_wait` for the first worker, as long again for
+/// the rest once one is ready.
+async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
+    let bound = ready_wait(app);
+    let mut deadline = Instant::now() + bound;
+    let mut first_ready = false;
     let mut last = None;
-    while t0.elapsed() < limit {
+    while Instant::now() < deadline {
         if let Ok(st) = status_of(app).await {
+            if let Some(reason) = st.start_failed.clone() {
+                return failed_start(app, &st, &reason, on_fail).await;
+            }
             if st.stopped || (st.workers_ready >= st.workers_configured && st.workers_configured > 0) {
                 println!(
                     "{}: {} ({}/{} workers ready)",
@@ -1245,22 +1347,121 @@ async fn wait_ready(app: &App, limit: Duration) -> i32 {
                 eprintln!("warden: {}: a worker is FAILED; `warden describe {}` shows why", app.name, app.name);
                 return 1;
             }
+            if st.workers_ready > 0 && !first_ready {
+                // The app can start: give the others as long again.
+                first_ready = true;
+                deadline = Instant::now() + bound;
+            }
             last = Some(st);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     match last {
+        Some(st) if st.workers_ready == 0 => {
+            eprintln!(
+                "warden: {}: no worker ready after {} s, and not every one has crashed yet",
+                app.name,
+                bound.as_secs()
+            );
+            print_last_output(app).await;
+            eprintln!(
+                "  hint: the app is still starting: `warden list` shows its progress, `warden logs {}` its output; \
+                 a slow boot needs a higher [workers] ready_timeout",
+                app.name
+            );
+        }
         Some(st) => eprintln!(
             "warden: {}: only {}/{} workers ready after {} s; `warden logs {}` shows why",
             app.name,
             st.workers_ready,
             st.workers_configured,
-            limit.as_secs(),
+            bound.as_secs(),
             app.name
         ),
-        None => eprintln!("warden: {}: not answering; see {}", app.name, log_path(&app.name).display()),
+        None => eprintln!("warden: {}: not answering; {log}", app.name),
     }
     1
+}
+
+/// `warden start` of an app that can't start: every worker crashed before
+/// one was ready. What happened, why (the last crash and the app's last
+/// error output), what Warden did, and what to do; exit 1.
+///
+/// `OnFailedStart::Stop` stops the workers (the supervisor stays up): the
+/// app stays listed, as `errored` with its last exit, nothing restarts in
+/// the background, and `warden start` tries again, as `pm2 start` leaves
+/// an app that keeps crashing `errored`. FAILED with its cooldown retry
+/// would go on restarting every few minutes behind the operator's back.
+async fn failed_start(app: &App, st: &Status, reason: &str, on_fail: OnFailedStart) -> i32 {
+    let name = &app.name;
+    let stopped = on_fail == OnFailedStart::Stop
+        && match call_with(app, &Request::Stop, REQUEST_TIMEOUT).await {
+            Ok(r) => r.ok || st.stopped,
+            Err(_) => false,
+        };
+    eprintln!(
+        "warden: {name}: failed to start: {} crashed before one was ready ({reason})",
+        if st.workers_configured == 1 {
+            "its worker".to_string()
+        } else {
+            format!("all {} workers", st.workers_configured)
+        }
+    );
+    print_last_output(app).await;
+    let port = app.config.as_ref().and_then(|p| Config::load(p).ok()).and_then(|c| c.app.port);
+    let fix = match port {
+        Some(p) if reason == "not ready in time" => format!(
+            "it never listened on port {p} within [workers] ready_timeout: is another program on it (`ss -ltnp \
+             'sport = :{p}'`)? does the app listen on process.env.PORT?"
+        ),
+        _ if reason.starts_with("spawn failed") => {
+            "the command could not be run: check [app] command, args and working_directory (`warden check`)".into()
+        }
+        _ => format!("fix the error above (all of it: `warden logs {name} --err`)"),
+    };
+    let then = if stopped {
+        format!(
+            "Its workers are stopped: {name} stays listed (errored) and nothing restarts it; `warden start {name}` \
+             tries again"
+        )
+    } else {
+        format!("Warden keeps restarting it with backoff; `warden stop {name}` stops it")
+    };
+    eprintln!("  hint: {fix}. {then}");
+    1
+}
+
+/// The app's last error output (stderr; its stdout if it wrote none), each
+/// line once: workers that all fail print the same lines.
+async fn print_last_output(app: &App) {
+    for stream in ["stderr", "stdout"] {
+        let req = Request::Logs { lines: 200, follow: false, worker: None, events: false, stream: Some(stream.into()) };
+        let mut buf: Vec<u8> = Vec::new();
+        if tokio::time::timeout(REQUEST_TIMEOUT, control::call(&app.socket, &req, &mut buf)).await.is_err() {
+            return;
+        }
+        let lines = last_unique_output(&String::from_utf8_lossy(&buf), 15);
+        if !lines.is_empty() {
+            eprintln!("  its last {}:", if stream == "stderr" { "error output" } else { "output" });
+            for l in lines {
+                eprintln!("    {l}");
+            }
+            return;
+        }
+    }
+    eprintln!("  (no output from it in `warden logs {}`)", app.name);
+}
+
+/// The text of the last `n` distinct output lines (`<ts> OUT   worker=1
+/// stderr: text` → `text`), in the order first written.
+fn last_unique_output(text: &str, n: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.split_once(" OUT   worker=")?.1.split_once(": ").map(|(_, t)| t.to_string()))
+        .filter(|t| !t.trim().is_empty() && seen.insert(t.clone()))
+        .collect();
+    unique[unique.len().saturating_sub(n)..].to_vec()
 }
 
 /// Run a supervisor detached from this terminal, logging to a rotated file.
@@ -1863,7 +2064,7 @@ pub async fn resurrect(args: &Args) -> i32 {
             println!("{}: already running", s.name);
             continue;
         }
-        worst = worst.max(start_app(&ctx, &app).await);
+        worst = worst.max(start_app(&ctx, &app, OnFailedStart::Report).await);
     }
     worst
 }
@@ -1950,6 +2151,48 @@ mod tests {
         assert_eq!(path, std::env::var_os("PATH"));
         assert_eq!(me.cwd, std::env::current_dir().ok());
         assert_eq!(Origin::of(u32::MAX / 2), None, "no such process");
+    }
+
+    /// What a failed `warden start` prints of the app's output: each line
+    /// once (every worker prints the same error), the last ones.
+    #[test]
+    fn failed_start_shows_each_output_line_once() {
+        let text = "2026-10-01T10:00:00.000Z OUT   worker=1 stderr: error: Cannot find package 'x'\n\
+                    2026-10-01T10:00:00.001Z OUT   worker=2 stderr: error: Cannot find package 'x'\n\
+                    2026-10-01T10:00:00.002Z OUT   worker=1 stderr: Bun v1.3.13 (Linux x64)\n\
+                    2026-10-01T10:00:00.003Z OUT   worker=1 stderr: \n\
+                    2026-10-01T10:00:00.004Z OUT   worker=2 stderr: Bun v1.3.13 (Linux x64)\n\
+                    2026-10-01T10:00:00.005Z INFO  not output\n";
+        assert_eq!(last_unique_output(text, 15), vec!["error: Cannot find package 'x'", "Bun v1.3.13 (Linux x64)"]);
+        assert_eq!(last_unique_output(text, 1), vec!["Bun v1.3.13 (Linux x64)"]);
+        assert!(last_unique_output("", 15).is_empty());
+    }
+
+    #[test]
+    fn env_output_groups_and_marks_overrides() {
+        let info = serde_json::json!({
+            "config": {"app": {"env_file": "/etc/warden/api.env"}},
+            "worker_env_of": "2",
+            "worker_env": [
+                {"name": "DB", "value": "(hidden, 6 chars)", "from": "env_file"},
+                {"name": "PORT", "value": "9", "from": "env"},
+                {"name": "WARDEN_WORKER_ID", "value": "2", "from": "warden"},
+                {"name": "PORT", "value": "3001", "from": "warden"},
+            ],
+        });
+        let text = render_env(&info, false);
+        assert!(text.starts_with("# The environment worker 2 starts with"), "{text}");
+        assert!(
+            text.contains("# from /etc/warden/api.env\nDB=(hidden, 6 chars)\n# from [app] env\nPORT=9\n"),
+            "{text}"
+        );
+        assert!(text.contains("PORT=3001   # overrides the value from env\n"), "{text}");
+        assert!(text.contains("unless --show-secrets"), "{text}");
+        // Every value line is KEY=value: `grep ^PORT=` works.
+        assert!(text.lines().filter(|l| !l.starts_with('#')).all(|l| l.contains('=')), "{text}");
+        // An older supervisor: its app variables only.
+        let old = serde_json::json!({"config": {"app": {"env": {"A": "b"}}}});
+        assert!(render_env(&old, true).starts_with("A=b\n# also set by Warden"));
     }
 
     #[test]

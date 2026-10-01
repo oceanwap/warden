@@ -19,7 +19,9 @@ USAGE:
 
 APPS (familiar from PM2):
     start <app|config.toml|script>   Start an app. A script gets a config written for
-                     it: `warden start server.js --name api -i 4 --port 3000`
+                     it: `warden start server.js --name api -i 4 --port 3000`.
+                     Waits for it; if every worker crashes first, exits 1 with the
+                     app's errors and leaves it stopped (errored)
     list             Every app and worker (also: ls, ps, status)  [--json]
     describe <app>   Config, paths, restart policy, workers, last rollout (also: show)
     restart <target> Replace the workers one at a time through the health gates (no
@@ -34,12 +36,16 @@ APPS (familiar from PM2):
     logs [target]    Recent lines, then follow on a terminal
                      [--lines N] [--err|--out] [--events] [--nostream] [-f]
                      --worker N: one worker; s1, s2…: one hot standby; standby: all
-                     --history: from the log files (rotated and .gz too) or journald
+                     --history: from the log files (rotated and .gz too, every
+                     worker's with per_worker_files) or journald; --lines N there
+                     is the last N of each file
                      --grep TEXT --exclude TEXT --ignore-case --since 2h --until
                      2026-09-30T12:00 --level warn --json (one object per line)
     search <text> [target]   Search all of an app's logs (= logs --history --grep)
-    flush [target]   Empty the log buffer and truncate log files
-    env <app>        The app's environment (values hidden unless --show-secrets)
+    flush [target]   Empty the log buffer and the current log files ([logging] file, out
+                     and err files, every worker's); rotated files (.1, .gz) are kept
+    env <app>        The environment a worker starts with: env_file, env, then Warden's
+                     variables (app:N for worker N; values hidden unless --show-secrets)
     reset <target>   Zero restart counters and retry FAILED workers now
     signal <SIG> <target>   Send a signal to the workers (SIGUSR2, USR2, 12)
     top              Live view of every app (also: monit)
@@ -766,7 +772,9 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         if let Some(r) = &s.last_rollout {
             o += &format!("Last:        {} {} - {}\n", r.kind, if r.ok { "ok" } else { "FAILED" }, r.message);
         }
-        if s.stopped {
+        if let Some(n) = start_failed_note(s) {
+            o += &format!("State:       {n}\n");
+        } else if s.stopped {
             o += "State:       stopped (`warden start` starts the workers)\n";
         }
         if s.shutting_down {
@@ -775,8 +783,8 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += "\n";
     }
     o += &format!(
-        "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
-        "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Health", "Last exit"
+        "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
+        "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Loop p99", "Health", "Last exit"
     );
     // Workers by number, old processes still draining after a rollout
     // (`2 (old)`), then hot standbys as `s1`, `s2`…
@@ -788,7 +796,7 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         .chain(s.standbys.iter().map(|w| (standby_name(w), w)));
     for (name, w) in rows {
         o += &format!(
-            "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
+            "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
             name,
             w.state,
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
@@ -796,11 +804,30 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
             w.restarts,
             w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
             w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
+            loop_p99(w),
             health_word(w.healthy),
             w.last_exit.as_deref().unwrap_or("-"),
         );
     }
     o
+}
+
+/// What `Status.start_failed` means for this app now: stopped after it
+/// (errored), or still restarting with backoff.
+fn start_failed_note(s: &Status) -> Option<String> {
+    let reason = s.start_failed.as_ref()?;
+    let app = &s.app;
+    Some(if s.stopped {
+        format!(
+            "errored: its last start failed, every worker crashed before it was ready ({reason}); `warden logs {app} \
+             --err` shows why, `warden start {app}` tries again"
+        )
+    } else {
+        format!(
+            "not started: every worker crashed before it was ready ({reason}); restarting with backoff (`warden \
+             logs {app} --err` shows why, `warden stop {app}` stops it)"
+        )
+    })
 }
 
 /// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
@@ -812,6 +839,25 @@ fn standby_name(w: &crate::control::WorkerStatus) -> String {
 /// it (`Status.draining`): `2 (old)`, or `host (old)` in worker mode.
 fn draining_name(s: &Status, w: &crate::control::WorkerStatus) -> String {
     if s.mode == "worker" { "host (old)".into() } else { format!("{} (old)", w.id) }
+}
+
+/// The Loop p99 column: the event-loop delay's 99th percentile over the
+/// last second (`-`: no shim, or no recent heartbeat).
+fn loop_p99(w: &crate::control::WorkerStatus) -> String {
+    w.loop_delay.map(|d| millis(d.p99_ms)).unwrap_or_else(|| "-".into())
+}
+
+/// `0.41ms`, `12.3ms`, `250ms`, `1.20s`.
+pub fn millis(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.2}ms")
+    } else if ms < 100.0 {
+        format!("{ms:.1}ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.2}s", ms / 1000.0)
+    }
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -845,10 +891,23 @@ pub(crate) fn table(rows: &[Vec<String>]) -> String {
 /// `warden list`: one row per worker, like `pm2 list`.
 pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> String {
     let mut rows = vec![
-        ["App", "Namespace", "Worker", "Status", "PID", "Uptime", "Restarts", "CPU", "Memory", "Health", "Last exit"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
+        [
+            "App",
+            "Namespace",
+            "Worker",
+            "Status",
+            "PID",
+            "Uptime",
+            "Restarts",
+            "CPU",
+            "Memory",
+            "Loop p99",
+            "Health",
+            "Last exit",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
     ];
     let mut notes = Vec::new();
     for (app, st) in all {
@@ -860,7 +919,12 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                     .map(|w| (w.id.to_string(), w))
                     .chain(s.draining.iter().map(|w| (draining_name(s, w), w)));
                 for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
-                    let state = if s.stopped && w.state == "STOPPED" { "stopped".to_string() } else { w.state.clone() };
+                    // Stopped after a start that failed: PM2's `errored`.
+                    let state = match (s.stopped && w.state == "STOPPED", &s.start_failed) {
+                        (true, Some(_)) => "errored".to_string(),
+                        (true, None) => "stopped".to_string(),
+                        _ => w.state.clone(),
+                    };
                     rows.push(vec![
                         app.name.clone(),
                         s.namespace.clone(),
@@ -871,6 +935,7 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                         w.restarts.to_string(),
                         w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
                         w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
+                        loop_p99(w),
                         health_word(w.healthy).into(),
                         w.last_exit.clone().unwrap_or_else(|| "-".into()),
                     ]);
@@ -884,6 +949,9 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                         app.name
                     ));
                 }
+                if let Some(n) = start_failed_note(s) {
+                    notes.push(format!("{}: {n}", app.name));
+                }
             }
             Err(e) => {
                 let what = if e == "not running" { "offline" } else { "unreachable" };
@@ -892,6 +960,7 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                     app.namespace.clone(),
                     "-".into(),
                     what.into(),
+                    "-".into(),
                     "-".into(),
                     "-".into(),
                     "-".into(),
@@ -931,7 +1000,9 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         v => v.to_string(),
     };
     let num = |p: &str| c(p).as_u64().unwrap_or(0);
-    let state = if s.stopped {
+    let state = if let Some(n) = start_failed_note(s) {
+        n
+    } else if s.stopped {
         "stopped".to_string()
     } else if s.shutting_down {
         "shutting down".to_string()
@@ -941,7 +1012,10 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     let mut o = format!("{} (namespace {}): {state}\n\n", s.app, s.namespace);
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row = |k: &str, v: String| rows.push(vec![format!("  {k}"), v]);
-    row("config", text(info["config_path"].clone()));
+    row(
+        "config",
+        format!("{} (every setting, defaults included: `warden config {}`)", text(info["config_path"].clone()), s.app),
+    );
     let args: Vec<String> =
         c("/app/args").as_array().map(|a| a.iter().map(|x| text(x.clone())).collect()).unwrap_or_default();
     row("command", format!("{} {}", text(c("/app/command")), args.join(" ")).trim().to_string());
@@ -1016,11 +1090,53 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         ),
     );
     row(
+        "watchdog",
+        match num("/watchdog/timeout") {
+            0 => "off (the heartbeat still reports event-loop delay)".into(),
+            t => format!("hung after {t} s without an event-loop heartbeat"),
+        },
+    );
+    let delays: Vec<String> = s
+        .workers
+        .iter()
+        .filter_map(|w| {
+            w.loop_delay.map(|d| format!("{} {}/{}/{}", w.id, millis(d.p50_ms), millis(d.p99_ms), millis(d.max_ms)))
+        })
+        .collect();
+    let warn = c("/watchdog/loop_delay_warn").as_f64().unwrap_or(0.0);
+    row(
+        "event loop",
+        format!(
+            "delay p50/p99/max over the last second: {}; {}",
+            if delays.is_empty() { "- (needs the shim)".to_string() } else { delays.join(", ") },
+            if warn > 0.0 {
+                format!("warns when p99 stays at {} or more for 10 s", millis(warn * 1000.0))
+            } else {
+                "no warning (loop_delay_warn = 0)".into()
+            }
+        ),
+    );
+    row(
         "logs",
         match &s.log_file {
             Some(f) => format!("{f} (+ `warden logs {}`)", s.app),
             None => format!("stdout / journald (+ `warden logs {}`)", s.app),
         },
+    );
+    let files: Vec<String> =
+        ["/logging/out_file", "/logging/err_file"].iter().filter_map(|p| c(p).as_str().map(String::from)).collect();
+    row(
+        "worker output",
+        format!(
+            "{}{}{}",
+            text(c("/logging/worker_output")),
+            if files.is_empty() { String::new() } else { format!(" → {}", files.join(", ")) },
+            if c("/logging/per_worker_files").as_bool() == Some(true) && !files.is_empty() {
+                " (one file per worker: out-1.log…)"
+            } else {
+                ""
+            }
+        ),
     );
     row("socket", text(info["socket"].clone()));
     row(
@@ -1036,7 +1152,11 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     );
     if let Some(env) = c("/app/env").as_object() {
         let items: Vec<String> = env.iter().map(|(k, v)| format!("{k}={}", text(v.clone()))).collect();
-        row("env", if items.is_empty() { "-".into() } else { items.join(", ") });
+        let from = match c("/app/env_file").as_str() {
+            Some(f) => format!(" (env_file {f}, then env; `warden env {}` adds Warden's)", s.app),
+            None => format!(" (`warden env {}` adds Warden's)", s.app),
+        };
+        row("env", if items.is_empty() { format!("-{from}") } else { items.join(", ") + &from });
     }
     if let Some(r) = &s.last_rollout {
         row("last rollout", format!("{} {}: {}", r.kind, if r.ok { "ok" } else { "FAILED" }, r.message));
@@ -1215,6 +1335,39 @@ mod tests {
         assert!(parse_mb("lots").is_err());
     }
 
+    /// A start that failed: `errored` rows and a note while stopped after
+    /// it, a note while it still restarts; the Loop p99 column.
+    #[test]
+    fn list_shows_errored_apps_and_loop_delay() {
+        let st = |stopped: bool| -> Status {
+            serde_json::from_value(serde_json::json!({
+                "app": "api", "namespace": "default", "mode": "process", "pid": 1, "uptime_secs": 1,
+                "workers_configured": 1, "workers_ready": 0, "healthy": null, "supervisor_rss_bytes": null,
+                "host": null, "reloading": false, "shutting_down": false, "stopped": stopped,
+                "start_failed": "exit code 3",
+                "workers": [{"id": 1, "state": if stopped { "STOPPED" } else { "RESTARTING" }, "pid": null,
+                    "uptime_secs": null, "restarts": 1, "crashes": 1, "rss_bytes": null, "cpu_seconds": null,
+                    "cpu_percent": null, "last_exit": "exit code 3",
+                    "loop_delay": {"p50_ms": 0.1, "p99_ms": 12.34, "max_ms": 20.0}}]
+            }))
+            .unwrap()
+        };
+        let app = crate::fleet::App {
+            name: "api".into(),
+            namespace: "default".into(),
+            config: None,
+            socket: "/run/w/api/control.sock".into(),
+            problem: None,
+        };
+        let text = render_list(&[(app.clone(), Ok(st(true)))]);
+        assert!(text.contains("Loop p99") && text.contains("12.3ms"), "{text}");
+        assert!(text.lines().nth(1).is_some_and(|l| l.contains(" errored ")), "{text}");
+        assert!(text.contains("api: errored: its last start failed"), "{text}");
+        let text = render_list(&[(app, Ok(st(false)))]);
+        assert!(text.contains(" RESTARTING ") && text.contains("api: not started: every worker crashed"), "{text}");
+        assert!(render_status(&st(true), false).contains("State:       errored"));
+    }
+
     #[test]
     fn formatting() {
         assert_eq!(duration(5), "5s");
@@ -1223,6 +1376,10 @@ mod tests {
         assert_eq!(duration(90_000), "1d01h");
         assert_eq!(bytes(64 * 1024 * 1024), "64.0 MB");
         assert_eq!(table(&[vec!["a".into(), "bb".into()], vec!["ccc".into(), "d".into()]]), "a    bb\nccc  d\n");
+        assert_eq!(
+            [millis(0.414), millis(12.34), millis(250.4), millis(1200.0)],
+            ["0.41ms", "12.3ms", "250ms", "1.20s"].map(String::from)
+        );
     }
 
     fn row(id: usize, state: &str, pid: u32) -> crate::control::WorkerStatus {
@@ -1238,6 +1395,7 @@ mod tests {
             cpu_percent: None,
             last_exit: None,
             healthy: None,
+            loop_delay: None,
         }
     }
 

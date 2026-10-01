@@ -34,6 +34,19 @@ pub fn percent(p: f64) -> String {
     format!("{p:.1}%")
 }
 
+/// `0.41ms`, `12.3ms`, `250ms`, `1.20s` (as `warden list` shows event-loop delay).
+pub fn millis(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.2}ms")
+    } else if ms < 100.0 {
+        format!("{ms:.1}ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.2}s", ms / 1000.0)
+    }
+}
+
 pub fn opt<T>(v: Option<T>, f: impl FnOnce(T) -> String) -> String {
     v.map(f).unwrap_or_else(|| "-".into())
 }
@@ -69,6 +82,10 @@ pub fn status_summary(s: &Status) -> String {
     if counts.len() > 1 || counts.first().is_some_and(|(k, _)| *k != "RUNNING") {
         let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
         t += &format!(" ({})", parts.join(", "));
+    }
+    if let Some(reason) = &s.start_failed {
+        // Every worker crashed before one was ready (`warden list`: errored).
+        t += &format!(", failed to start ({reason})");
     }
     if s.stopped {
         t += ", stopped";
@@ -164,6 +181,10 @@ mod tests {
         assert_eq!(duration(7500), "2h05m");
         assert_eq!(duration(4 * 86_400 + 3 * 3600), "4d03h");
         assert_eq!(percent(12.345), "12.3%");
+        assert_eq!(
+            (millis(0.414), millis(12.34), millis(250.4), millis(1200.0)),
+            ("0.41ms".to_string(), "12.3ms".to_string(), "250ms".to_string(), "1.20s".to_string())
+        );
         assert_eq!(opt(None::<u64>, bytes), "-");
         assert_eq!((health(Some(true)), health(Some(false)), health(None)), ("ok", "FAIL", "-"));
         assert_eq!(clock(0).len(), 8);
@@ -252,6 +273,7 @@ mod tests {
             cpu_percent: None,
             last_exit: None,
             healthy: None,
+            loop_delay: None,
         };
         let mut s = crate::model::tests::status("api", 2);
         assert_eq!(status_summary(&s), "2/2 workers ready");
@@ -259,6 +281,9 @@ mod tests {
         s.workers_ready = 1;
         s.stopped = true;
         assert_eq!(status_summary(&s), "1/2 workers ready (1 RUNNING, 1 STARTING), stopped");
+        s.start_failed = Some("exit code 3".into());
+        assert!(status_summary(&s).ends_with(", failed to start (exit code 3), stopped"));
+        s.start_failed = None;
         let a = AppEntry {
             name: "api".into(),
             namespace: String::new(),
