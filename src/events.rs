@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 
 pub use warden_protocol::events::{
     AppEntry, AppState, DaemonReply, DaemonRequest, Event, PROTOCOL, SupervisorEvent, WorkerEvent, interval, now_ms,
+    worker_name,
 };
 
 /// Set by `warden start` (and `wardend`) on supervisors they start in the
@@ -68,10 +69,18 @@ pub fn emit(ev: Event) {
     }
 }
 
-/// A worker changed state.
-pub fn worker(app: &str, worker: usize, event: WorkerEvent, pid: Option<u32>, detail: Option<String>) {
+/// A worker changed state (`standby`: a hot standby's number, `worker` 0;
+/// 0 for the pool).
+pub fn worker(
+    app: &str,
+    worker: usize,
+    standby: Option<usize>,
+    event: WorkerEvent,
+    pid: Option<u32>,
+    detail: Option<String>,
+) {
     if active() {
-        emit(Event::Worker { app: app.to_string(), worker, event, pid, detail, at_ms: now_ms() });
+        emit(Event::Worker { app: app.to_string(), worker, standby, event, pid, detail, at_ms: now_ms() });
     }
 }
 
@@ -86,7 +95,7 @@ mod tests {
         // Other tests may subscribe concurrently; only check our own receiver.
         let mut rx = subscribe();
         assert!(active());
-        worker("bus-test", 1, WorkerEvent::Ready, Some(1), None);
+        worker("bus-test", 1, None, WorkerEvent::Ready, Some(1), None);
         loop {
             match rx.recv().await.unwrap() {
                 Event::Worker { app, event, .. } if app == "bus-test" => {

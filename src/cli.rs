@@ -733,6 +733,12 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
             let up = s.standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
             o += &format!("Standby:     {up}/{} ready to take over a crashed worker\n", s.standbys.len());
         }
+        if !s.draining.is_empty() {
+            o += &format!(
+                "Draining:    {} old process(es) replaced by the rollout, finishing their connections\n",
+                s.draining.len()
+            );
+        }
         o += &format!("PID:         {}\n", s.pid);
         o += &format!("Uptime:      {}\n", duration(s.uptime_secs));
         if let Some(r) = &s.release {
@@ -772,8 +778,14 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
         "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Health", "Last exit"
     );
-    // Workers by number, then hot standbys as `s1`, `s2`…
-    let rows = s.workers.iter().map(|w| (w.id.to_string(), w)).chain(s.standbys.iter().map(|w| (standby_name(w), w)));
+    // Workers by number, old processes still draining after a rollout
+    // (`2 (old)`), then hot standbys as `s1`, `s2`…
+    let rows = s
+        .workers
+        .iter()
+        .map(|w| (w.id.to_string(), w))
+        .chain(s.draining.iter().map(|w| (draining_name(s, w), w)))
+        .chain(s.standbys.iter().map(|w| (standby_name(w), w)));
     for (name, w) in rows {
         o += &format!(
             "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
@@ -794,6 +806,12 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
 /// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
 fn standby_name(w: &crate::control::WorkerStatus) -> String {
     format!("s{}", w.id)
+}
+
+/// The Worker column of an old process draining after a rollout replaced
+/// it (`Status.draining`): `2 (old)`, or `host (old)` in worker mode.
+fn draining_name(s: &Status, w: &crate::control::WorkerStatus) -> String {
+    if s.mode == "worker" { "host (old)".into() } else { format!("{} (old)", w.id) }
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -836,7 +854,11 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
     for (app, st) in all {
         match st {
             Ok(s) => {
-                let all = s.workers.iter().map(|w| (w.id.to_string(), w));
+                let all = s
+                    .workers
+                    .iter()
+                    .map(|w| (w.id.to_string(), w))
+                    .chain(s.draining.iter().map(|w| (draining_name(s, w), w)));
                 for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
                     let state = if s.stopped && w.state == "STOPPED" { "stopped".to_string() } else { w.state.clone() };
                     rows.push(vec![
@@ -1201,5 +1223,51 @@ mod tests {
         assert_eq!(duration(90_000), "1d01h");
         assert_eq!(bytes(64 * 1024 * 1024), "64.0 MB");
         assert_eq!(table(&[vec!["a".into(), "bb".into()], vec!["ccc".into(), "d".into()]]), "a    bb\nccc  d\n");
+    }
+
+    fn row(id: usize, state: &str, pid: u32) -> crate::control::WorkerStatus {
+        crate::control::WorkerStatus {
+            id,
+            state: state.into(),
+            pid: Some(pid),
+            uptime_secs: Some(5),
+            restarts: 1,
+            crashes: 0,
+            rss_bytes: None,
+            cpu_seconds: None,
+            cpu_percent: None,
+            last_exit: None,
+            healthy: None,
+        }
+    }
+
+    /// Old processes draining after a rollout are listed after the workers
+    /// as `N (old)`, never as workers; standbys come last.
+    #[test]
+    fn status_lists_draining_old_processes() {
+        let mut s: Status = serde_json::from_value(serde_json::json!({
+            "app": "api", "mode": "process", "pid": 7, "uptime_secs": 9, "workers_configured": 2, "workers_ready": 2,
+            "healthy": null, "supervisor_rss_bytes": null, "host": null, "reloading": true, "shutting_down": false,
+            "workers": []
+        }))
+        .unwrap();
+        s.workers = vec![row(1, "RUNNING", 101), row(2, "RUNNING", 102)];
+        s.draining = vec![row(1, crate::control::DRAINING, 91), row(2, crate::control::DRAINING, 92)];
+        s.standbys = vec![row(1, crate::control::STANDBY, 103)];
+        let out = render_status(&s, false);
+        assert!(out.contains("Draining:    2 old process(es)"), "{out}");
+        let names: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("Worker   Status"))
+            .skip(1)
+            .map(|l| l.split("  ").next().unwrap_or("").trim())
+            .collect();
+        assert_eq!(names, ["1", "2", "1 (old)", "2 (old)", "s1"], "{out}");
+        assert!(out.lines().any(|l| l.starts_with("2 (old)") && l.contains("DRAINING") && l.contains("92")), "{out}");
+        s.mode = "worker".into();
+        s.draining = vec![row(0, crate::control::DRAINING, 90)];
+        assert!(render_status(&s, true).lines().any(|l| l.starts_with("host (old)") && l.contains("90")));
+        s.draining.clear();
+        assert!(!render_status(&s, false).contains("Draining:"));
     }
 }

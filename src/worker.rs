@@ -172,6 +172,10 @@ pub struct Instance {
     /// `Role::Standby`: the release (pinned working directory) it started
     /// in; it is promoted only while that is still the workers' release.
     pub release: Option<PathBuf>,
+    /// The OOM kill counter of the cgroup it runs in (`exit::OomTracker`):
+    /// Warden's own until it is ready, then its cgroup's (a worker may run
+    /// in one of its own); `None`: no readable counter.
+    pub oom_counter: Option<PathBuf>,
 }
 
 impl Instance {
@@ -181,6 +185,7 @@ impl Instance {
             standby_number: None,
             promoted_at: None,
             release: None,
+            oom_counter: None,
             slot,
             handle,
             started: Instant::now(),

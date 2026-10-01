@@ -307,7 +307,20 @@ pub struct Reload {
     /// for a few seconds.
     #[serde(deserialize_with = "surge_count")]
     pub surge: Surge,
+    /// Old workers that may still be draining (closing WebSockets and SSE
+    /// streams, finishing requests in flight) while the rollout replaces the
+    /// next ones. A drain starts once the replacement passed its gates, so
+    /// capacity never drops; each draining worker holds its memory until it
+    /// exits, so a rollout runs at most max(max_draining, surge) processes
+    /// beyond the worker count. 1: each old worker exits before the next
+    /// replacement starts.
+    pub max_draining: usize,
 }
+
+/// `reload.max_draining` without a value: a 4-worker rolling restart with
+/// long-lived connections overlaps every drain (about one
+/// `long_lived_timeout` in all instead of one per worker).
+pub const DEFAULT_MAX_DRAINING: usize = 4;
 
 /// `[reload] surge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,6 +623,7 @@ impl Default for Reload {
             preflight: None,
             timeout: 120,
             surge: Surge::Count(1),
+            max_draining: DEFAULT_MAX_DRAINING,
         }
     }
 }
@@ -850,6 +864,13 @@ impl Config {
         let rl = &self.reload;
         if rl.health_interval_ms < 50 || rl.timeout == 0 {
             return Err("reload.health_interval_ms must be >= 50 and reload.timeout > 0".into());
+        }
+        if !(1..=1024).contains(&rl.max_draining) {
+            return Err(format!(
+                "reload.max_draining = {} must be between 1 and 1024 (1: each old worker exits before the next \
+                 replacement starts)",
+                rl.max_draining
+            ));
         }
         if !rl.surge.is_one() && !self.overlap() {
             let s = rl.surge;
@@ -1267,6 +1288,7 @@ mod tests {
             ("reload", "canary_soak"),
             ("reload", "pause"),
             ("reload", "timeout"),
+            ("reload", "max_draining"),
             ("watchdog", "timeout"),
             ("limits", "max_memory"),
             ("limits", "max_lifetime"),
@@ -1361,6 +1383,7 @@ mod tests {
         assert_eq!(c.logging.rotate, Rotate::default());
         assert_eq!(c.shutdown.long_lived_timeout, Some(DEFAULT_LONG_LIVED_TIMEOUT));
         assert_eq!(c.reload.surge, Reload::default().surge);
+        assert_eq!(c.reload.max_draining, DEFAULT_MAX_DRAINING);
         assert!(c.app.pin_release);
         // The commented [static] block is valid too.
         let uncommented: String = text
@@ -1600,6 +1623,23 @@ level = "info"
         assert!(Config::parse(py).unwrap_err().contains("can't overlap"));
         let c = Config::parse(&format!("{MIN}pin_release = false\n")).unwrap();
         assert!(!c.app.pin_release);
+    }
+
+    #[test]
+    fn max_draining_default_and_bounds() {
+        assert_eq!(Config::parse(MIN).unwrap().reload.max_draining, DEFAULT_MAX_DRAINING);
+        assert_eq!(DEFAULT_MAX_DRAINING, 4, "warden.example.toml and the README say 4");
+        let c = Config::parse(&format!("{MIN}[reload]\nmax_draining = 1\n")).unwrap();
+        assert_eq!(c.reload.max_draining, 1);
+        assert_eq!(Config::parse(&format!("{MIN}[reload]\nmax_draining = 1024\n")).unwrap().reload.max_draining, 1024);
+        for bad in ["0", "1025", "-1", "\"all\"", "2.5"] {
+            let e = Config::parse(&format!("{MIN}[reload]\nmax_draining = {bad}\n")).unwrap_err();
+            assert!(e.contains("max_draining"), "{bad}: {e}");
+        }
+        // Workers that can't overlap stop before their replacement starts: allowed, it changes nothing there.
+        let offset = "[app]\nname = \"a\"\nargs = [\"s.ts\"]\nport = 3000\n[workers]\ncount = 4\n\
+                      port_strategy = \"offset\"\n[reload]\nmax_draining = 8\n";
+        assert!(Config::parse(offset).is_ok());
     }
 
     #[test]

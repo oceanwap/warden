@@ -89,7 +89,7 @@ Every event has a `type`. Times (`at_ms`) are Unix milliseconds.
 |---|---|---|
 | `hello` | `protocol`, `app` (absent from `wardend`), `pid`, `version` | first line of a stream |
 | `status` | `app`, `status` (`control::Status`) | snapshot, then every interval |
-| `worker` | `app`, `worker`, `event`, `pid`, `detail`, `at_ms` | a worker changed state |
+| `worker` | `app`, `worker`, `standby` (hot standbys only), `event`, `pid`, `detail`, `at_ms` | a worker changed state |
 | `rollout` | `app`, `rollout` (`control::RolloutStatus`) | a rollout started or changed phase |
 | `rollout_done` | `app`, `outcome` (`control::RolloutOutcome`) | a rollout finished or rolled back |
 | `log` | `app`, `line` | with `logs: true` |
@@ -134,21 +134,38 @@ tells them apart), `state` `WARMING` (starting,
 or passing its health gates) then `STANDBY` (can take over), or `STOPPING`;
 a missing one shows as `RESTARTING` (backoff), `FAILED` or `STOPPED`.
 `restarts`, `crashes` and `last_exit` are the pool's. Their events are
-`worker` 0 (process-mode workers are numbered from 1): `starting` (detail
+`worker` 0 (process-mode workers are numbered from 1) with `standby`, the
+standby's number (`"worker":0,"standby":1` is `s1`): `starting` (detail
 `role=standby`), `ready` (`startup_ms=… role=standby`), `unhealthy`,
-`hung`, `crashed` (`… (standby)`), `restarting`, `failed`, `stopping`,
-`stopped`. A promotion is a story of the slot it fills: `crashed` (the dead
+`hung`, `crashed` (`… (standby)`), `stopping`, `stopped`. The pool's own
+decisions have `standby` 0: `restarting` (the next standby starts after a
+backoff) and `failed` (too many standby crashes). `warden events` and the
+GUI print them as `worker s1` and `worker standby`, the names `warden
+status`, the log lines (`worker=s1`, `worker=standby`) and `warden logs
+--worker` use. `standby` is absent on every other event; an older
+supervisor's standby events lack it (clients then show worker 0), and
+older clients ignore it. A promotion is a story of the slot it fills:
+`crashed` (the dead
 worker), `restarting`, then `starting` and `ready` with the standby's
-`pid` and detail `promoted from standby` (`promote_ms=…` on `ready`).
+`pid` and detail `promoted from standby s1` (`promote_ms=…` on `ready`).
 Crash details keep the exit reason first (`killed by the kernel OOM killer
-(out of memory) (standby)`), as alerts match it. These are additions:
-clients that don't know them show a worker 0.
+(out of memory) (standby)`), as alerts match it; an alert about a standby
+names it (`standby s2 was killed for lack of memory: …`, `the standby pool
+is left down: …`).
 
 `rollout` is sent when a rollout starts, before any worker is touched
 (`done` 0, `phase` `starting` or `running preflight`), and whenever its
 `phase` changes, except the soak countdown; `rollout_done` follows when it
 ends (`status.last_rollout` from then on). A supervisor's `lagged` names its
-app.
+app. `done` counts workers whose new process took over. Their old processes
+drain in the background while the rollout goes on (`[reload]
+max_draining`), and the rollout ends, `rollout_done` included, once every
+one of them has exited: until then `phase` reads `every worker replaced; 2
+old workers draining (pid 101, 102)` (`failed; …` after a failure, whose
+log line came at once), and they are listed in `status.draining`: one
+`WorkerStatus` per old process, `id` the worker it served (0: worker mode's
+host), `state` `DRAINING` (`control::DRAINING`), the slot's `restarts` and
+`crashes`. The field is absent when nothing drains; older clients ignore it.
 
 `supervisor.event` (from `wardend` only):
 
@@ -313,15 +330,24 @@ Durations: `500ms`, `30s`, `5m`, `1h30m`, `1d`, or a number of seconds.
 | `recovered` | after any of the above but `rollout_failed` and `recycled`: every worker ready (and no rollout) for 1 minute |
 
 **The OOM marker.** A worker the kernel's OOM killer killed (it died of
-SIGKILL and its cgroup's `oom_kill` count rose) has the exit reason
+SIGKILL and its cgroup's `oom_kill` count rose, by a kill no other dying
+process could own) has the exit reason
 `killed by the kernel OOM killer (out of memory)`: the `crashed` event's
 `detail` and `WorkerStatus.last_exit` start with it, maybe followed by more
 (`… (standby)`, `… (replacement, before taking over)`). `wardend` matches
 exactly that text, anywhere in the detail; it is
 `warden_protocol::events::OOM_KILLED`, shared by the supervisor and
-`wardend`. A SIGKILL from anything else is `killed by another process
-(SIGKILL)`; where Warden can't read the cgroup's OOM counter, an OOM kill
-looks like that too, and no `oom` alert is sent (the log line says so).
+`wardend`. When the attribution is uncertain (other processes of Warden's
+in the same cgroup died of SIGKILL at the same moment, more than the kills
+counted) the reason is `probably killed by the kernel OOM killer (out of
+memory)` (`events::OOM_PROBABLY`), which contains the marker: it raises the
+`oom` alert too, worded `… was probably killed for lack of memory`; check
+for `OOM_PROBABLY` first to tell the two apart. A death that found no kill
+left next to such a one is `killed by another process or the kernel OOM
+killer (SIGKILL)`, with no `oom` alert. A SIGKILL from anything else is
+`killed by another process (SIGKILL)`; where Warden can't read the cgroup's
+OOM counter, an OOM kill looks like that too, and no `oom` alert is sent
+(the log line says so).
 
 ### What a rule gets
 

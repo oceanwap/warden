@@ -118,7 +118,8 @@ warden safe-reload -c /etc/warden/api.toml     # or: systemctl reload warden@api
    then is the old worker drained. **If the canary fails it is stopped, and
    every worker still runs the previous version.**
 4. The remaining workers are replaced one at a time with the same gates, with an
-   optional `pause` between them. The rollout **halts on the first failure**.
+   optional `pause` between them (each old worker drains while the next one is
+   replaced). The rollout **halts on the first failure**.
 
 ```
 $ warden safe-reload                      # 4 workers, canary_soak = 10
@@ -166,12 +167,26 @@ responses, such as downloads, are never cut short: they finish like any
 request in flight, within `grace_period`. Each worker logs what it closed:
 `closed long-lived connections … websockets=3 sse=12`.
 
+**Drains overlap.** A rolling restart doesn't wait for each old worker to
+finish: once its replacement listens and has passed the gates, the old one
+stops taking connections and drains in the background while the next
+worker is replaced. So 4 workers holding WebSocket clients restart in about
+one `long_lived_timeout` plus the startups (~3 s), not one per worker
+(~8.5 s). Up to `[reload] max_draining` (default 4) old workers drain at
+once; past that the next replacement waits for one to exit, since each
+holds its memory until then (`max_draining = 1`: one worker at a time, as
+before). The command returns, and the rollout counts as done, once every
+old worker has exited. `warden status` lists the ones still draining as
+`2 (old)  DRAINING`.
+
 **Faster rollouts**: `[reload] surge = 2` (or `"all"`) starts that many new
 workers at once, each next to the worker it replaces. Once every one of them has
-passed the gates, the old ones drain together, then the next batch starts. If one
+passed the gates, the old ones drain together and the next batch starts. If one
 fails, every new worker of the batch is stopped and the old ones keep serving.
 safe-reload still runs its canary alone first. The cost is memory: surge N runs up
-to N extra workers for a few seconds (`"all"`: twice the workers). It needs
+to N extra workers for a few seconds (`"all"`: twice the workers), and old ones
+still draining count too: a rollout runs at most max(`surge`, `max_draining`)
+processes beyond the worker count. It needs
 workers that can overlap, so not with `port_strategy = "offset"`.
 
 **Release pinning** (`[app] pin_release`, on by default): Warden resolves a
@@ -194,7 +209,7 @@ warning.
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
-| Why it died | `last_exit` and the log line say who ended a worker: a crash (`SIGSEGV`, `SIGABRT`), the kernel's OOM killer (from the cgroup's `oom_kill` count), Warden, or another process, with a hint for the fix | |
+| Why it died | `last_exit` and the log line say who ended a worker: a crash (`SIGSEGV`, `SIGABRT`), the kernel's OOM killer (from its cgroup's `oom_kill` count; `probably …` when other workers of that cgroup died of SIGKILL at the same moment), Warden, or another process, with a hint for the fix | |
 
 ### Hot standbys: crash recovery in milliseconds
 
@@ -239,7 +254,8 @@ against 54-687 ms without a standby and 166-1,182 ms under PM2.
   is the slot's, and `process.on("warden:promote", ...)` runs late setup.
 
 `warden status` lists standbys after the workers as `s1`, `s2`… (`WARMING`
-then `STANDBY`; `standbys` in `--json`), and the GUI counts their memory.
+then `STANDBY`; `standbys` in `--json`), `warden events` and the GUI show
+their events as `worker s1`, and the GUI counts their memory.
 A standby starts in the pinned release (`pin_release`) and is promoted only
 while that is still the workers' release. Process mode only, with
 `app.port`, a shared port and the shim (bun and node commands).

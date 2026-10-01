@@ -124,6 +124,13 @@ Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
 | `worker_output = "direct"` (splice into the file) | flood, every line kept | 332 MB/s, 3.38 CPU s/GB | 823 MB/s, 0.67 CPU s/GB |
 | same | steady 20k lines/s, manager CPU per 10 s | 0.29 s | 0.11 s (PM2 1.23 s) |
 | WebSocket 1001 / SSE end in the drain | abnormal closes in a rolling restart, ~150 clients | all cut (as under PM2) | 0 |
+| Overlapping drains (`[reload] max_draining`, default 4): the next worker is replaced while old ones close their connections | `longlived.ts`, 4 workers, 50 WebSocket + 50 SSE clients, `warden restart` until all new workers answer; debug builds, 3 interleaved runs each on a loaded 2-CPU machine (load average 2-7 from other jobs) | Bun 9.7 / 10.0 / 10.6 s, Node 9.7 / 10.3 / 11.1 s (README run, release, idle: 8.3 / 8.6 s) | Bun 3.8 / 4.4 / 4.2 s, Node 3.9 / 5.4 / 4.7 s; 0 abnormal closes, 0 failed reconnects, 0 of ~550-730 plain requests failed (before: 1 of ~1,700 in one run, `tcp_migrate_req = 0`) |
+
+The overlap also halves the reconnects: each client is closed once (50 of 50
+WebSockets) instead of 67-79 closes for the 50, since its reconnect lands on a new
+worker rather than on an old one that drains next. The cost is memory for
+the drain: up to `max_draining` old workers (here all 4) alive until their
+long-lived connections close.
 
 Tried and dropped (no measurable win, so no code):
 

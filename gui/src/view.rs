@@ -419,8 +419,18 @@ fn rollout(a: &App) -> Option<Element<'_, Message>> {
     (a.rollout.is_some() || a.last_outcome.is_some()).then(|| c.into())
 }
 
-/// A row of the worker table: (a hot standby, its status).
-type WorkerRow<'a> = (bool, &'a WorkerStatus);
+/// What a row of the worker table is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Worker,
+    /// An old process a rollout replaced, draining until it exits.
+    Draining,
+    /// A hot standby.
+    Standby,
+}
+
+/// A row of the worker table: (what it is, its status).
+type WorkerRow<'a> = (RowKind, &'a WorkerStatus);
 
 fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let Some(s) = &a.status else {
@@ -436,10 +446,17 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let cell = |t: String| text(t).size(13);
     let can_restart = g.connected() && a.supervisor_up() && !s.stopped;
     let app = a.name().to_string();
-    // Workers, then hot standbys (`Status.standbys`): `(standby, row)`.
+    // Workers, old processes still draining after a rollout
+    // (`Status.draining`), then hot standbys (`Status.standbys`).
+    let worker_mode = s.mode == "worker";
     let columns = vec![
-        table::column(h("Worker"), |(standby, w): WorkerRow<'a>| {
-            cell(if standby { format!("standby {}", w.id) } else { w.id.to_string() })
+        table::column(h("Worker"), move |(kind, w): WorkerRow<'a>| {
+            cell(match kind {
+                RowKind::Worker => w.id.to_string(),
+                RowKind::Draining if worker_mode => "host (old)".into(),
+                RowKind::Draining => format!("{} (old)", w.id),
+                RowKind::Standby => format!("s{} (standby)", w.id),
+            })
         }),
         table::column(h("State"), |(_, w): WorkerRow<'a>| {
             let t = cell(w.state.clone());
@@ -462,15 +479,20 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             }
         }),
         table::column(h("Last exit"), |(_, w): WorkerRow<'a>| cell(w.last_exit.clone().unwrap_or_else(|| "-".into()))),
-        // A standby is not restarted on its own (it is replaced when it fails).
-        table::column(h(""), move |(standby, w): WorkerRow<'a>| {
-            button(text("restart").size(SMALL))
-                .padding([2, 8])
-                .style(button::secondary)
-                .on_press_maybe((can_restart && !standby).then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))))
+        // A standby is not restarted on its own (it is replaced when it
+        // fails), nor is an old process that drains (it is on its way out).
+        table::column(h(""), move |(kind, w): WorkerRow<'a>| {
+            button(text("restart").size(SMALL)).padding([2, 8]).style(button::secondary).on_press_maybe(
+                (can_restart && kind == RowKind::Worker).then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))),
+            )
         }),
     ];
-    let rows = s.workers.iter().map(|w| (false, w)).chain(s.standbys.iter().map(|w| (true, w)));
+    let rows = s
+        .workers
+        .iter()
+        .map(|w| (RowKind::Worker, w))
+        .chain(s.draining.iter().map(|w| (RowKind::Draining, w)))
+        .chain(s.standbys.iter().map(|w| (RowKind::Standby, w)));
     let t = table(columns, rows).padding_x(10).padding_y(4);
     container(scrollable(t).width(Fill)).max_height(240).into()
 }

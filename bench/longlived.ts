@@ -218,6 +218,30 @@ async function whoami(): Promise<string | null> {
   }
 }
 
+/** Plain requests (a new connection each, 2 s timeout), one every 5 ms or
+ *  so, until `done()`: how many were answered and how many failed. Paced,
+ *  so the load generator doesn't take the CPUs the new workers start on. */
+async function plainRequests(done: () => boolean): Promise<{ ok: number; failed: number }> {
+  let ok = 0;
+  let failed = 0;
+  while (!done()) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/whoami`, {
+        headers: { connection: "close" },
+        keepalive: false,
+        signal: AbortSignal.timeout(2000),
+      });
+      await r.text();
+      if (r.ok) ok++;
+      else failed++;
+    } catch {
+      failed++;
+    }
+    await sleep(5);
+  }
+  return { ok, failed };
+}
+
 /** Polls until `n` distinct workers not in `old` have answered; returns them. */
 async function workersAnswering(n: number, old: Set<string>, timeoutMs: number): Promise<Set<string>> {
   const seen = new Set<string>();
@@ -320,11 +344,15 @@ async function runScenario(name: string) {
     });
     // Connections made before the restart count from here.
     for (const t of [tallies.ws, tallies.sse]) Object.assign(t, newTally());
+    let restarted = false;
     t0 = performance.now();
+    const plain = plainRequests(() => restarted);
     await run.restart();
     const commandMs = performance.now() - t0;
     await workersAnswering(WORKERS, old, 120_000);
     const restartMs = performance.now() - t0;
+    restarted = true;
+    const requests = await plain;
     let allBack = true;
     await waitFor(() => clients.every((c) => c.backAt > 0), BACK_TIMEOUT_MS).catch(() => (allBack = false));
     const backMs = allBack ? Math.max(...clients.map((c) => c.backAt - t0)) : null;
@@ -335,6 +363,7 @@ async function runScenario(name: string) {
       back_ms: backMs === null ? `not all within ${BACK_TIMEOUT_MS / 1000} s (${clients.filter((c) => c.backAt).length}/${clients.length})` : Math.round(backMs),
       ws: structuredClone(tallies.ws),
       sse: structuredClone(tallies.sse),
+      requests,
     };
   } finally {
     clients.forEach((c) => c.stop());
@@ -395,6 +424,7 @@ console.log(
       ["SSE ends: clean / abnormal", (r) => `${r.sse.clean} / ${r.sse.abnormal}`],
       ["SSE ends", (r) => how(r.sse)],
       ["failed reconnects (WebSocket + SSE)", (r) => r.ws.connectErrors + r.sse.connectErrors],
+      ["plain requests during the restart: failed / sent", (r) => `${r.requests.failed} / ${r.requests.ok + r.requests.failed}`],
     ]),
   ].join("\n"),
 );

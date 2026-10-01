@@ -103,15 +103,22 @@ closed these connections).
     EventSource then reconnects quietly) / cut without it, or a reset;
   - *failed reconnects*: connections refused or closed before the first
     message, e.g. while no worker listens;
+  - *plain requests during the restart*: `/whoami` every 5 ms or so, a new
+    connection each (2 s timeout), from the restart until N new workers
+    answered: how many failed (refused, reset, timed out). With
+    `net.ipv4.tcp_migrate_req = 0` a connection queued on a closing listener
+    can be reset under any manager;
   - *rolling restart*: until the command has returned and N new workers have
     answered; *until every client is back*: until every client's connection
     is on a worker that wasn't there before the restart.
 
   The apps are the integration tests' fixtures
   (`tests/fixtures/longlived.ts`, `tests/fixtures/longlived_node.mjs`).
-  Warden runs with its default `[shutdown]` settings, so a worker holding
-  such clients drains in about `long_lived_timeout` (2 s): its restart takes
-  longer than an abrupt one, by design.
+  Warden runs with its default `[shutdown]` and `[reload]` settings, so a
+  worker holding such clients drains in about `long_lived_timeout` (2 s),
+  and up to `max_draining` (4) old workers drain at once while the next
+  ones are replaced: the restart takes about one `long_lived_timeout` more
+  than an abrupt one, not one per worker.
 
 ## Fairness rules
 

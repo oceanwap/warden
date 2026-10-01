@@ -249,6 +249,7 @@ pub(crate) mod tests {
             workers: vec![],
             release: None,
             standbys: vec![],
+            draining: vec![],
         }
     }
 

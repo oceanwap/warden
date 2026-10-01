@@ -3265,7 +3265,12 @@ fn subscribe_streams_worker_rollout_log_and_bye_events() {
     assert_eq!(got[0]["rollout"]["phase"], "starting");
     assert_eq!((&got[0]["rollout"]["done"], &got[0]["rollout"]["total"]), (&0.into(), &2.into()));
     let phases: HashSet<&str> = rollouts.iter().map(|r| r["rollout"]["phase"].as_str().unwrap()).collect();
-    assert!(phases.iter().any(|p| p.contains("draining old process")), "{phases:?}");
+    // Old workers drain in the background, as the next ones are replaced.
+    assert!(
+        phases.iter().any(|p| p.contains("old worker draining (pid ") || p.contains("old workers draining (pid ")),
+        "{phases:?}"
+    );
+    assert!(!phases.iter().any(|p| p.contains("0 old workers") || p.contains("(pid )")), "{phases:?}");
     for old in &before {
         let of_old: Vec<&str> = got.iter().filter(|e| e["pid"] == *old).map(|e| e["event"].as_str().unwrap()).collect();
         assert_eq!(of_old, ["stopping", "stopped"], "old worker {old}: {got:#?}");
@@ -4250,6 +4255,11 @@ struct LongLivedRun {
 /// One client per path (`/ws` or an SSE path) plus a plain-request loop,
 /// held through `warden reload`.
 fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
+    rollout_holding(w, workers, paths, &["reload"])
+}
+
+/// Like `reload_holding`, through the rollout `command` runs (`reload`, `restart`).
+fn rollout_holding(w: &Warden, workers: u64, paths: &[&'static str], command: &[&str]) -> LongLivedRun {
     let port = w.port;
     let before = pid_set(&w.wait_for("ready", T, ready(workers)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -4275,7 +4285,7 @@ fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLived
     };
     std::thread::sleep(Duration::from_millis(200));
     let t0 = Instant::now();
-    let (code, out) = w.cli(&["reload"]);
+    let (code, out) = w.cli(command);
     let took = t0.elapsed();
     assert_eq!(code, 0, "{out}\n{}", w.log());
     let after = pid_set(&w.status().unwrap());
@@ -4354,6 +4364,55 @@ fn long_lived_connections_hand_over_in_a_node_reload() {
     let w = Warden::start("ll-node", port, &long_lived_config("ll-node", port, &app, ""));
     let run = reload_holding(&w, 2, &["/ws", "/sse"]);
     assert_clean_handover(&w, &run, Duration::from_secs(20));
+}
+
+/// The drains of a rolling restart overlap (`[reload] max_draining`, 4 by
+/// default): once a new worker took over, the next one is replaced while
+/// the old one closes its WebSockets and SSE streams. 4 workers holding
+/// long-lived clients restart in about one long_lived_timeout plus the
+/// startups, not one long_lived_timeout per worker; every client still
+/// gets a clean close and lands on a new worker, and `warden restart`
+/// returns only once every old worker has exited.
+#[test]
+fn a_rolling_restart_overlaps_the_long_lived_drains() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 4", fixture("longlived.ts"));
+    let cfg =
+        long_lived_config("ll-overlap", port, &app, "").replace("long_lived_timeout = 1", "long_lived_timeout = 2");
+    let w = Warden::start("ll-overlap", port, &cfg);
+    // Enough clients that every old worker holds some (SO_REUSEPORT spreads them).
+    let paths: Vec<&'static str> = [["/ws"; 8], ["/sse"; 8]].concat();
+    let run = rollout_holding(&w, 4, &paths, &["restart"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(30));
+    let log = w.log();
+    // Old workers drained side by side: some replacement took over while
+    // other old workers were still draining (`draining=` counts them).
+    let most = log
+        .lines()
+        .filter(|l| l.contains("worker replaced; draining old process"))
+        .filter_map(|l| l.split("draining=").nth(1)?.split_whitespace().next()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    assert!(most >= 2, "no drains overlapped\n{log}");
+    // One drain after another took at least 4 x long_lived_timeout (8 s) on
+    // top of the startups; overlapping, about one (2 s) and the closing
+    // handshakes. The startups are counted out (a loaded runner stretches
+    // them to seconds).
+    let startups: u64 = log
+        .lines()
+        .filter(|l| l.contains("replacement listening"))
+        .filter_map(|l| l.split("startup_ms=").nth(1)?.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    let draining = run.took.saturating_sub(Duration::from_millis(startups));
+    eprintln!("restart took {:?}, {startups} ms of it startups; at most {most} old workers drained at once", run.took);
+    assert!(draining < Duration::from_secs(5), "restart took {:?}, {startups} ms of it startups\n{log}", run.took);
+    // The CLI returned after the last old worker exited, not before.
+    let s = w.status().unwrap();
+    assert!(s["draining"].as_array().is_none_or(|d| d.is_empty()), "{s}");
+    assert!(log.contains("every worker replaced; waiting for the old ones to finish draining"), "{log}");
 }
 
 #[test]
@@ -4987,11 +5046,54 @@ fn oom_kill_is_told_apart_from_a_kill_9() {
     let _ = std::fs::remove_file(&events);
 }
 
+/// One OOM kill counted while two workers of the same cgroup die of SIGKILL
+/// at the same moment (the OOM killer took one, someone's kill -9 the
+/// other): the shared count can't say which, so neither is called an OOM
+/// kill for sure, nor "probably not the OOM killer"; both reasons say so.
+#[test]
+fn one_oom_kill_for_two_sigkill_deaths_is_reported_as_uncertain() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let events = std::env::temp_dir().join(format!("warden-it-memory.events-two-{}", std::process::id()));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    let ev = events.display().to_string();
+    let w = Warden::start_env("oomtwo", port, &simple("oomtwo", port, 2, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
+    let s = w.wait_for("ready", T, ready(2));
+    let pids: Vec<u64> = (0..2).map(|i| s["workers"][i]["pid"].as_u64().unwrap()).collect();
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    for p in &pids {
+        unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+    }
+    let s = w.wait_for("both restarted", T, |s| {
+        (0..2).all(|i| {
+            s["workers"][i]["state"] == "RUNNING" && !pids.contains(&s["workers"][i]["pid"].as_u64().unwrap_or(0))
+        })
+    });
+    let mut reasons: Vec<String> =
+        (0..2).map(|i| s["workers"][i]["last_exit"].as_str().unwrap_or_default().to_string()).collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        [
+            "killed by another process or the kernel OOM killer (SIGKILL)".to_string(),
+            "probably killed by the kernel OOM killer (out of memory)".to_string()
+        ],
+        "{}",
+        w.log()
+    );
+    let log = w.wait_log("names the pid the kernel killed", T);
+    assert!(log.contains("the kernel may have killed one of them instead"), "{log}");
+    assert!(!log.contains("Probably not the kernel's OOM killer"), "{log}");
+    let _ = std::fs::remove_file(&events);
+}
+
 /// A child of our own memory cgroup with `limit` bytes (cgroup v1 or v2), if
 /// this machine lets us make one: (its directory, its cgroup.procs).
-fn memory_cgroup(limit: u64) -> Option<(PathBuf, PathBuf)> {
+fn memory_cgroup(test: &str, limit: u64) -> Option<(PathBuf, PathBuf)> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let name = format!("warden-it-{}", std::process::id());
+    let name = format!("warden-it-{test}-{}", std::process::id());
     for line in cgroup.lines() {
         let mut f = line.splitn(3, ':');
         let (Some(_), Some(ctl), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
@@ -5050,7 +5152,7 @@ fn a_real_oom_kill_is_reported_with_its_fix() {
     if !have_bun() {
         return;
     }
-    let Some((cg, procs)) = memory_cgroup(192 << 20) else {
+    let Some((cg, procs)) = memory_cgroup("oomreal", 192 << 20) else {
         eprintln!("skipping: can't create a memory cgroup with a limit here");
         return;
     };
@@ -5063,6 +5165,45 @@ fn a_real_oom_kill_is_reported_with_its_fix() {
     });
     assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
     w.wait_log("raise memory.max / MemoryMax=", T);
+    drop(w);
+    for _ in 0..50 {
+        if std::fs::remove_dir(&cg).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A worker in a memory cgroup of its own, below Warden's (its command
+/// moves it there, as `systemd-run --scope` would): its OOM kill is counted
+/// in that cgroup, not in Warden's, and still told apart. It used to read
+/// as `killed by another process (SIGKILL)`, "probably not the OOM killer".
+#[test]
+fn a_real_oom_kill_in_a_cgroup_of_its_own_is_told_apart() {
+    if !have_bun() {
+        return;
+    }
+    let Some((cg, procs)) = memory_cgroup("oomown", 192 << 20) else {
+        eprintln!("skipping: can't create a memory cgroup with a limit here");
+        return;
+    };
+    let port = free_port();
+    // Without Warden's shim (the command is sh): one worker, ready once it listens.
+    let toml = format!(
+        "[app]\nname = \"oomown\"\ncommand = \"sh\"\nargs = [\"-c\", \"echo $$ > {} && exec bun {}\"]\nport = {port}\n\
+         [restart]\nbackoff_initial = 50\n[shutdown]\ngrace_period = 5\n",
+        procs.display(),
+        fixture("app.ts")
+    );
+    let w = Warden::start("oomown", port, &toml);
+    let pid = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    assert_ne!(own, std::fs::read_to_string("/proc/self/cgroup").unwrap(), "the worker runs in a cgroup of its own");
+    let _ = get(port, "/leak"); // ~200 MB more than the worker had
+    let s = w.wait_for("OOM-killed and restarted", T, |s| {
+        s["workers"][0]["state"] == "RUNNING" && s["workers"][0]["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
     drop(w);
     for _ in 0..50 {
         if std::fs::remove_dir(&cg).is_ok() {
@@ -5172,7 +5313,19 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
     assert_eq!(worker_story(&events, 1), ["crashed", "restarting", "starting", "ready"], "{events:#?}");
     let promoted: Vec<&Value> = events.iter().filter(|e| e["worker"] == 1 && e["pid"] == standby).collect();
     assert_eq!(promoted.len(), 2, "{events:#?}");
-    assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby")));
+    assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby s1")));
+    assert!(promoted.iter().all(|e| e.get("standby").is_none()), "worker 1's events, not a standby's: {events:#?}");
+    // A standby's own events say which standby it is (`s1`, next to worker
+    // 0), as `warden status` and the log lines name it: here the new s1.
+    let fresh = ev.until("the new standby ready", |e| e["standby"] == 1 && e["event"] == "ready");
+    let ready = fresh.last().unwrap();
+    assert_eq!(ready["worker"], 0, "{ready}");
+    assert_ne!(ready["pid"].as_u64(), Some(standby), "{ready}");
+    assert!(ready["detail"].as_str().unwrap().ends_with("role=standby"), "{ready}");
+    assert!(
+        fresh.iter().any(|e| e["standby"] == 1 && e["event"] == "starting" && e["pid"] == ready["pid"]),
+        "{fresh:#?}"
+    );
 
     let s =
         w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && s["workers_ready"] == 1);

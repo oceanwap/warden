@@ -526,16 +526,27 @@ impl Alerts {
     }
 
     pub fn worker(&mut self, app: &Arc<str>, worker: usize, event: WorkerEvent, detail: Option<&str>, now: Instant) {
+        self.process_event(app, &format!("worker {worker}"), event, detail, now)
+    }
+
+    /// A hot standby's event (`Event::Worker::standby`): `standby s1`, or
+    /// for 0 the pool as a whole.
+    pub fn standby(&mut self, app: &Arc<str>, number: usize, event: WorkerEvent, detail: Option<&str>, now: Instant) {
+        let who = if number == 0 { "the standby pool".to_string() } else { format!("standby s{number}") };
+        self.process_event(app, &who, event, detail, now)
+    }
+
+    /// `who`: what the alert names (`worker 2`, `standby s1`).
+    fn process_event(&mut self, app: &Arc<str>, who: &str, event: WorkerEvent, detail: Option<&str>, now: Instant) {
         let detail = detail.unwrap_or("");
         match event {
             WorkerEvent::Crashed => {
                 if is_oom(detail) {
-                    self.raise(
-                        app,
-                        AlertKind::Oom,
-                        format!("worker {worker} was killed for lack of memory: {detail}"),
-                        now,
-                    );
+                    // Uncertain (the cgroup's kill count is shared): it says so.
+                    let probably =
+                        if detail.contains(warden_protocol::events::OOM_PROBABLY) { "probably " } else { "" };
+                    let msg = format!("{who} was {probably}killed for lack of memory: {detail}");
+                    self.raise(app, AlertKind::Oom, msg, now);
                 }
                 let (n, window) = (self.config.crash_loop_crashes, self.config.crash_loop_window);
                 let st = self.apps.entry(app.clone()).or_default();
@@ -556,7 +567,7 @@ impl Alerts {
                 if starts {
                     st.looping = Some(0);
                     let msg = format!(
-                        "{n} worker crashes within {}; the last: worker {worker} {}",
+                        "{n} worker crashes within {}; the last: {who} {}",
                         show_duration(window),
                         if detail.is_empty() { "crashed" } else { detail }
                     );
@@ -565,12 +576,12 @@ impl Alerts {
             }
             WorkerEvent::Failed => {
                 let why = if detail.is_empty() { "too many restarts".to_string() } else { detail.to_string() };
-                let msg = format!("worker {worker} is left down: {why}; `warden reset {app}` retries it now");
+                let msg = format!("{who} is left down: {why}; `warden reset {app}` retries it now");
                 self.raise(app, AlertKind::WorkerFailed, msg, now);
             }
             WorkerEvent::Unhealthy | WorkerEvent::Hung => {
                 let what = if event == WorkerEvent::Hung { "hung" } else { "unhealthy" };
-                let msg = format!("worker {worker} {what}: {detail}; Warden replaces it");
+                let msg = format!("{who} {what}: {detail}; Warden replaces it");
                 self.raise(app, AlertKind::Unhealthy, msg, now);
             }
             _ => {}
@@ -1023,6 +1034,30 @@ on = ["all"]
         assert!(a.outbox[5].payload.detail.starts_with("reload #4: reload failed"), "{:?}", a.outbox[5].payload);
     }
 
+    /// Alerts about hot standbys name them as everything else does (`s1`),
+    /// not as worker 0; the pool's own events name the pool.
+    #[test]
+    fn standby_alerts_name_the_standby() {
+        let text = "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\nmin_interval = \"0\"\n";
+        let mut a = Alerts::new(config(text));
+        let api: Arc<str> = "api".into();
+        let t = Instant::now();
+        let oom = crate::process::exit::Reason::Oom.short();
+        a.standby(&api, 2, WorkerEvent::Crashed, Some(&format!("{oom} (standby)")), t);
+        a.standby(&api, 1, WorkerEvent::Hung, Some("no heartbeat for 10s"), t + secs(1));
+        a.standby(&api, 0, WorkerEvent::Failed, Some("too many standby restarts; retrying in 300s"), t + secs(2));
+        a.worker(&api, 3, WorkerEvent::Unhealthy, Some("failed 3 health checks: HTTP 503"), t + secs(3));
+        let got: Vec<(&str, &str)> = a.outbox.iter().map(|d| (d.payload.kind, d.payload.detail.as_str())).collect();
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(got[0].0 == "oom" && got[0].1.starts_with("standby s2 was killed for lack of memory: "), "{got:?}");
+        assert_eq!(got[1], ("unhealthy", "standby s1 hung: no heartbeat for 10s; Warden replaces it"));
+        assert!(
+            got[2].0 == "worker_failed" && got[2].1.starts_with("the standby pool is left down: too many"),
+            "{got:?}"
+        );
+        assert!(got[3].1.starts_with("worker 3 unhealthy: "), "{got:?}");
+    }
+
     /// The `oom` alert matches what the supervisor writes: if its wording
     /// changes, `OOM_KILLED` (protocol/) must change with it.
     #[test]
@@ -1030,14 +1065,26 @@ on = ["all"]
         let reason = crate::process::exit::Reason::Oom.short();
         assert!(reason.starts_with(warden_protocol::events::OOM_KILLED), "{reason:?}");
         assert!(is_oom(&reason));
+        // Uncertain: still an `oom` alert, which says so.
+        let probable = crate::process::exit::Reason::OomProbable.short();
+        assert!(probable.starts_with(warden_protocol::events::OOM_PROBABLY) && is_oom(&probable));
         for other in [
             crate::process::exit::Reason::Killed(libc::SIGKILL),
+            crate::process::exit::Reason::KilledOrOom,
             crate::process::exit::Reason::KilledByWarden,
             crate::process::exit::Reason::Crashed(libc::SIGSEGV),
             crate::process::exit::Reason::Code(137),
         ] {
             assert!(!is_oom(&other.short()), "{other:?}");
         }
+        let mut a = Alerts::new(config("[[alert]]\non = [\"oom\"]\ncommand = [\"/bin/sh\"]\nmin_interval = \"0\"\n"));
+        let api: Arc<str> = "api".into();
+        let t = Instant::now();
+        a.worker(&api, 2, WorkerEvent::Crashed, Some(&reason), t);
+        a.worker(&api, 3, WorkerEvent::Crashed, Some(&probable), t);
+        let got: Vec<&str> = a.outbox.iter().map(|d| d.payload.detail.as_str()).collect();
+        assert!(got[0].starts_with("worker 2 was killed for lack of memory: killed by"), "{got:?}");
+        assert!(got[1].starts_with("worker 3 was probably killed for lack of memory: probably"), "{got:?}");
     }
 
     #[test]

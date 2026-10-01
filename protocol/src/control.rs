@@ -175,6 +175,14 @@ pub struct Status {
     /// the pool's. Not in `workers`, so older clients don't see them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standbys: Vec<WorkerStatus>,
+    /// Old processes a rollout replaced that are still draining (closing
+    /// WebSockets and SSE streams, finishing requests) until they exit:
+    /// `id` is the worker whose old process it is (0: worker mode's host),
+    /// `state` [`DRAINING`]. They take no new connections; their
+    /// replacements already serve. Absent (empty) when none; not in
+    /// `workers`, so older clients don't see them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub draining: Vec<WorkerStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -210,15 +218,19 @@ pub const STANDBY: &str = "STANDBY";
 /// `Status.standbys[].state` of a standby still starting (initializing, or
 /// passing its health gates).
 pub const WARMING: &str = "WARMING";
+/// `Status.draining[].state`: an old process replaced by a rollout, draining.
+pub const DRAINING: &str = "DRAINING";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerStatus {
     /// The worker number (1..=count). In `Status.standbys`: the standby's
-    /// place in the list (1..=standby), not a worker number.
+    /// place in the list (1..=standby), not a worker number. In
+    /// `Status.draining`: the worker whose old process it is.
     pub id: usize,
     /// `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`, `CRASHED`,
     /// `RESTARTING`, `FAILED`. Standbys: [`WARMING`], [`STANDBY`],
     /// `STOPPING`, and `RESTARTING` / `FAILED` / `STOPPED` for a missing one.
+    /// Draining old processes: [`DRAINING`].
     pub state: String,
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
@@ -284,6 +296,35 @@ mod tests {
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["standbys"][0]["state"], "STANDBY");
         assert_eq!(v["workers"].as_array().map(Vec::len), Some(0));
+        let back: Status = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+    }
+
+    /// `draining` is additive the same way: absent from an older
+    /// supervisor's status and when nothing drains; its rows are old
+    /// processes, never counted as workers.
+    #[test]
+    fn draining_is_additive() {
+        let old = r#"{"app":"api","mode":"process","pid":1,"uptime_secs":1,"workers_configured":2,"workers_ready":2,
+            "healthy":null,"supervisor_rss_bytes":null,"host":null,"reloading":true,"shutting_down":false,"workers":[]}"#;
+        let mut s: Status = serde_json::from_str(old).unwrap();
+        assert!(s.draining.is_empty());
+        assert!(!serde_json::to_string(&s).unwrap().contains("draining"), "not sent when nothing drains");
+        s.draining.push(WorkerStatus {
+            id: 2,
+            state: DRAINING.into(),
+            pid: Some(8),
+            uptime_secs: Some(60),
+            restarts: 0,
+            crashes: 0,
+            rss_bytes: Some(40 << 20),
+            cpu_seconds: None,
+            cpu_percent: None,
+            last_exit: None,
+            healthy: None,
+        });
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!((v["draining"][0]["id"].as_u64(), v["draining"][0]["state"].as_str()), (Some(2), Some("DRAINING")));
         let back: Status = serde_json::from_value(v).unwrap();
         assert_eq!(back, s);
     }

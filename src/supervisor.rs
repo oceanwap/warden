@@ -11,6 +11,8 @@
 //! - `release.rs`: release pinning (`[app] pin_release`).
 
 mod release;
+#[cfg(test)]
+mod rig;
 mod rollout;
 mod standby;
 mod upkeep;
@@ -128,8 +130,9 @@ pub struct Supervisor {
     pool: standby::Pool,
     /// `[app] pin_release`: the release workers start in.
     release: Option<release::Pin>,
-    /// The cgroup's OOM kill counter, to tell OOM kills from other SIGKILLs.
-    oom: process::exit::OomCounter,
+    /// The OOM kill counters of the cgroups workers run in, to tell OOM
+    /// kills from other SIGKILLs.
+    oom: process::exit::OomTracker,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -241,7 +244,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
-    match sup.oom.path() {
+    match sup.oom.own() {
         Some(p) => debug!("OOM kills are told apart through the cgroup's counter", file = p.display()),
         None => debug!("no cgroup OOM kill counter found: a SIGKILL's sender can't be told apart from an OOM kill"),
     }
@@ -381,7 +384,7 @@ impl Supervisor {
             rollout_published: None,
             pool: standby::Pool::default(),
             release: None,
-            oom: process::exit::OomCounter::new(),
+            oom: process::exit::OomTracker::new(),
             cfg,
             cfg_path,
         }
@@ -427,6 +430,27 @@ impl Supervisor {
     /// A worker event for `slot` (see `emit`).
     fn emit_worker(&self, slot: usize, event: WorkerEvent, pid: Option<u32>, detail: impl FnOnce() -> Option<String>) {
         emit(&self.cfg.app.name, self.event_worker(slot), event, pid, detail);
+    }
+
+    /// An event about hot standby `number` (`s1`…; 0: the pool as a whole):
+    /// worker 0, with the standby's number (`Event::Worker::standby`).
+    fn emit_standby(
+        &self,
+        number: usize,
+        event: WorkerEvent,
+        pid: Option<u32>,
+        detail: impl FnOnce() -> Option<String>,
+    ) {
+        emit_to(&self.cfg.app.name, (STANDBY_SLOT, Some(number)), event, pid, detail);
+    }
+
+    /// `(worker, standby)` of an event about process `i`: its slot's worker
+    /// (`event_worker`), or a standby's own number until it is promoted.
+    fn event_who(&self, i: &Instance) -> (usize, Option<usize>) {
+        match i.standby_number.filter(|_| i.role == Role::Standby) {
+            Some(n) => (STANDBY_SLOT, Some(n)),
+            None => (self.event_worker(i.slot), None),
+        }
     }
 
     /// A `rollout` event when a rollout started or its phase changed since
@@ -518,6 +542,8 @@ impl Supervisor {
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
         let mut inst = Instance::new(slot_id, handle, role);
+        // It starts in Warden's cgroup; `attach_oom` looks again once it is ready.
+        inst.oom_counter = self.oom.own();
         let number = standby.map(|(n, _)| n);
         inst.standby_number = number;
         if let (Some(st), Some((_, instance))) = (inst.standby.as_mut(), standby) {
@@ -531,9 +557,11 @@ impl Supervisor {
         } else {
             info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
         }
-        self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || {
-            (role != Role::Current).then(|| format!("role={}", role_name(role)))
-        });
+        let detail = || (role != Role::Current).then(|| format!("role={}", role_name(role)));
+        match number {
+            Some(n) => self.emit_standby(n, WorkerEvent::Starting, Some(pid), detail),
+            None => self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), detail),
+        }
         if role == Role::Standby {
             // Ready = initialized (`standby_ready`); it never listens before promotion.
             self.send_later(self.cfg.ready_timeout(), Event::ReadyTimeout { inst: inst_id });
@@ -919,7 +947,7 @@ impl Supervisor {
                     info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
                 }
                 self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
-                    Some(pms) => Some(format!("promoted from standby promote_ms={pms}")),
+                    Some(pms) => Some(format!("promoted from standby {was} promote_ms={pms}")),
                     None => Some(format!("startup_ms={ms}")),
                 });
             }
@@ -936,16 +964,45 @@ impl Supervisor {
                     info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
                 }
                 self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
-                    Some(pms) => Some(format!("promoted from standby promote_ms={pms} role=replacement")),
+                    Some(pms) => Some(format!("promoted from standby {was} promote_ms={pms} role=replacement")),
                     None => Some(format!("startup_ms={ms} role=replacement")),
                 });
             }
             Role::Retiring | Role::Standby => {}
         }
+        self.attach_oom(inst_id);
         self.rollout_on_ready(inst_id);
         self.check_all_ready();
         // A worker listens: start the standbys that waited for it.
         self.fill_pool();
+    }
+
+    /// Where this process's OOM kills are counted: in Warden's cgroup, or a
+    /// cgroup of its own it runs in once ready (a `command` that wraps the
+    /// app in `systemd-run --scope`, a runtime that moves it). Warden makes
+    /// no cgroups; this finds the one it is in.
+    fn attach_oom(&mut self, inst_id: u64) {
+        let Some(i) = self.insts.get(&inst_id) else { return };
+        let (pid, label) = (i.handle.pid, self.inst_label(i));
+        let counter = self.oom.attach(pid);
+        if counter != self.oom.own() {
+            match &counter {
+                Some(file) => debug!(
+                    "this process runs in a cgroup of its own: its OOM kills are counted there",
+                    worker = label,
+                    pid = pid,
+                    file = file.display(),
+                ),
+                None => debug!(
+                    "this process runs in a cgroup whose OOM kill count can't be read: its OOM kills read as SIGKILLs",
+                    worker = label,
+                    pid = pid,
+                ),
+            }
+        }
+        if let Some(i) = self.insts.get_mut(&inst_id) {
+            i.oom_counter = counter;
+        }
     }
 
     fn check_all_ready(&mut self) {
@@ -969,11 +1026,17 @@ impl Supervisor {
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
-        // Who ended it: Warden, the OOM killer (just before), someone else, a crash.
-        let oom = self.oom.oom_killed(signal, sent, Instant::now());
-        let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), oom);
+        // Who ended it: Warden, the OOM killer (just before), someone else, a
+        // crash. Its cgroup's OOM kill is its own only if no other process of
+        // Warden's there is dying of SIGKILL at this moment to share it.
+        let counter = inst.oom_counter.clone();
+        let (oom, insts) = (&mut self.oom, &self.insts);
+        let verdict = oom.verdict(counter.as_deref(), signal, sent, Instant::now(), || {
+            insts.values().filter(|o| o.oom_counter == counter && o.handle.dying_of_sigkill()).count()
+        });
+        let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), verdict);
         // A `note` (Warden lost track of it) is the whole story.
-        let hint = if note.is_some() { None } else { cause.hint(self.oom.available()) };
+        let hint = if note.is_some() { None } else { cause.hint(counter.is_some()) };
         // The WARN/ERROR line of a crash always says what to do, even when
         // the cause alone has nothing to add (an exit code, Warden's kill).
         let crash_hint = hint.unwrap_or(if inst.hung {
@@ -1247,7 +1310,8 @@ impl Supervisor {
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
         let stop_signal = self.cfg.stop_signal();
-        let worker_mode = self.is_worker_mode();
+        let Some(i) = self.insts.get(&inst_id) else { return };
+        let who = self.event_who(i);
         let Some(i) = self.insts.get_mut(&inst_id) else { return };
         if i.stopping {
             return;
@@ -1259,8 +1323,7 @@ impl Supervisor {
             // (EOF), so nothing it runs on can hold up the exit.
             i.handle.close_input();
         }
-        let wid = if worker_mode { 0 } else { i.slot };
-        emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || {
+        emit_to(&self.cfg.app.name, who, WorkerEvent::Stopping, Some(i.handle.pid), || {
             Some(format!("{} grace_s={}", crate::signals::name(stop_signal), grace.as_secs()))
         });
         if let Some(s) = self.slots.get_mut(&i.slot) {
@@ -1272,12 +1335,11 @@ impl Supervisor {
     }
 
     fn kill_instance(&mut self, inst_id: u64) {
-        let worker_mode = self.is_worker_mode();
+        let Some(who) = self.insts.get(&inst_id).map(|i| self.event_who(i)) else { return };
         if let Some(i) = self.insts.get_mut(&inst_id) {
             i.stopping = true;
             i.handle.signal(libc::SIGKILL);
-            let wid = if worker_mode { 0 } else { i.slot };
-            emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || Some("SIGKILL".into()));
+            emit_to(&self.cfg.app.name, who, WorkerEvent::Stopping, Some(i.handle.pid), || Some("SIGKILL".into()));
         }
     }
 
@@ -1898,6 +1960,32 @@ impl Supervisor {
             // Hot standbys: their own list (`Status.standbys`).
             self.standby_rows(&mut standbys, &sample);
         }
+        // Old processes a rollout replaced, still draining (`Status.draining`).
+        let mut draining = Vec::new();
+        let worker_mode = self.is_worker_mode();
+        let mut retiring: Vec<u64> =
+            self.insts.iter().filter(|(_, i)| i.role == Role::Retiring).map(|(id, _)| *id).collect();
+        retiring.sort_unstable();
+        for id in retiring {
+            let Some(i) = self.insts.get_mut(&id) else { continue };
+            let (pid, started, slot) = (i.handle.pid, i.started, i.slot);
+            let stats = sample(pid, &mut i.cpu_prev, started);
+            let (restarts, crashes) = self.slots.get(&slot).map(|s| (s.restarts, s.crashes)).unwrap_or((0, 0));
+            draining.push(WorkerStatus {
+                id: if worker_mode { 0 } else { slot },
+                state: control::DRAINING.into(),
+                pid: Some(pid),
+                uptime_secs: Some(started.elapsed().as_secs()),
+                restarts,
+                crashes,
+                rss_bytes: stats.map(|x| x.0.rss_bytes),
+                cpu_seconds: stats.map(|x| x.0.cpu_seconds),
+                cpu_percent: stats.map(|x| x.1),
+                last_exit: None,
+                healthy: None,
+            });
+        }
+        draining.sort_by_key(|w| w.id);
         let me = std::process::id();
         let started = self.started;
         let sup = sample(me, &mut self.supervisor_cpu_prev, started);
@@ -1935,6 +2023,7 @@ impl Supervisor {
             workers,
             release: self.release_text(),
             standbys,
+            draining,
         }
     }
 }
@@ -1987,8 +2076,19 @@ fn with_preload(command: &str, args: &[String], shim: Option<&Path>) -> Vec<Stri
 /// is only built when someone is subscribed: without subscribers this costs
 /// one atomic load.
 fn emit(app: &str, worker: usize, event: WorkerEvent, pid: Option<u32>, detail: impl FnOnce() -> Option<String>) {
+    emit_to(app, (worker, None), event, pid, detail);
+}
+
+/// `emit` for any process: `(worker, standby)` from `Supervisor::event_who`.
+fn emit_to(
+    app: &str,
+    (worker, standby): (usize, Option<usize>),
+    event: WorkerEvent,
+    pid: Option<u32>,
+    detail: impl FnOnce() -> Option<String>,
+) {
     if events::active() {
-        events::worker(app, worker, event, pid, detail());
+        events::worker(app, worker, standby, event, pid, detail());
     }
 }
 

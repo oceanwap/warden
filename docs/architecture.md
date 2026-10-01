@@ -164,17 +164,47 @@ log line, with a `hint=`), not just the wait status. The task that owns each
 worker records the signals it delivered, so a SIGKILL is either *Warden's*
 (grace period over, hung, not ready in time) or *another process's*; an exit
 after Warden's stop signal is a normal stop. A SIGKILL Warden did not send
-is the kernel's *OOM killer* when the `oom_kill` counter of Warden's cgroup
-(cgroup v2 `memory.events`, or v1 `memory.oom_control`, found through
-`/proc/self/cgroup` and `/proc/self/mountinfo`) rose in the 2 s before the
-death: Warden reads it every second (the tick) and at each death, stamping
-each rise with when it was seen. Everything in the cgroup shares the
-counter, so each SIGKILL death takes at most one recent rise; an older one
-was something else's (a helper process, a `verify_command`) and is
-forgotten. A SIGKILL Warden sent stays Warden's even if the counter moved
-meanwhile. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
-Without a readable counter (macOS, no memory controller) an OOM kill reads as
-another process's SIGKILL, and the hint says it may be either.
+is the kernel's *OOM killer* when the `oom_kill` counter of the worker's
+cgroup rose in the 2 s before the death (`src/process/exit.rs`):
+
+- **Which counter.** The kernel counts OOM kills per cgroup, not per
+  process: cgroup v2 `memory.events.local` (kills of processes in that
+  cgroup only; `memory.events` before Linux 5.2), or v1
+  `memory.oom_control` (local too), found through `/proc/<pid>/cgroup` and
+  `/proc/self/mountinfo`. Warden creates no cgroups: under systemd or in a
+  container every worker shares Warden's. Once a worker is ready Warden
+  reads its `/proc/<pid>/cgroup`; a worker found in a cgroup of its own (a
+  `command` wrapping the app in `systemd-run --scope`, a runtime that moved
+  it) is counted there, where its kills are its own (v1 and v2's local
+  counts don't add a child's kills to Warden's).
+- **When.** Warden reads each counter every second (the tick) and at each
+  death, stamping each rise with when it was seen. The kernel counts a kill
+  once the victim's SIGKILL is sent, before it can exit, so a worker's own
+  kill is seen by its death; a rise older than 2 s was something else's (a
+  helper process, a `verify_command`) and is forgotten.
+- **Whose.** Each rise is charged to at most one SIGKILL death, and never
+  to Warden's own SIGKILL (that death stays `killed by Warden`, even if the
+  counter moved meanwhile). When the death comes, Warden counts the other
+  processes of its own in the same cgroup dying of SIGKILL at that moment:
+  reaped with their death not handled yet (the waiter records each exit on
+  the `Handle` before its event), or not reaped (their pid still theirs) and
+  a zombie of it, exiting from it (`/proc/<pid>/stat` flags and
+  `exit_code`) or with it pending (`/proc/<pid>/status`), plus Warden's own
+  SIGKILLs there while a kill was waiting. With as many kills as such
+  deaths the attribution is certain: `killed by the kernel OOM killer`
+  (`warden_protocol::events::OOM_KILLED`). With fewer it is not, and the
+  reason says so: `probably killed by the kernel OOM killer` for the death
+  that takes the kill, `killed by another process or the kernel OOM killer`
+  for one that finds none left within those 2 s. One kill and two SIGKILL
+  deaths used to read as "OOM" for whichever was handled first and
+  "probably not the OOM killer" for the other, whatever the truth.
+- **Limits.** A process the app spawned (not Warden's) OOM-killed at the
+  very moment someone kill -9s a worker still reads as that worker's OOM
+  kill. Without a readable counter (macOS, no memory controller, a worker's
+  own cgroup Warden can't read) an OOM kill reads as another process's
+  SIGKILL, and the hint says it may be either.
+
+SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
 
 ### 4.5 Restart protection
 
@@ -224,7 +254,9 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
   shim listens for real and takes worker id k (`WARDEN_WORKER_ID`,
   `NODE_APP_INSTANCE`, `process.emit("warden:promote")`), Warden relabels its
   output `worker=k` and gives it `PROMOTE_TIMEOUT` (5 s) to listen. Events:
-  `starting` and `ready` of worker k with detail `promoted from standby`; log
+  `starting` and `ready` of worker k with detail `promoted from standby sN`
+  (before that, the standby's own events carry `standby: N` next to worker
+  0, so `warden events` shows `worker sN`); log
   `worker promoted from standby worker=k pid=… standby=sN promote_ms=…`. A new standby
   starts once the promoted one listens.
 - **Crash loops.** Standby exits (and failed gates) share one restart
@@ -308,7 +340,8 @@ worker.
   3. **canary**: the first replacement soaks `canary_soak` seconds next to the
      worker it replaces, taking 1/(N+1) of new connections while its health is
      watched. Failure → rollback, every worker still on the previous version;
-  4. the rest one at a time with the same gates and an optional `pause`;
+  4. the rest one at a time with the same gates and an optional `pause`
+     (it starts when the previous old worker begins its drain);
      **halt on the first failure** (reporting how many workers were replaced).
 - `warden restart N`: one worker through the gates.
 - Recycling (health, memory, lifetime, hang) queues one-worker rollouts.
@@ -318,11 +351,55 @@ failure — usable as systemd `ExecReload=` or in a deploy script. With
 `port_strategy = "offset"` workers can't overlap, so each is stopped and then
 started. In worker mode the unit is the whole host process.
 
+**Overlapping drains** (`[reload] max_draining`, default 4). A drain can take
+a while: `long_lived_timeout` (2 s) when the old worker holds WebSockets or
+SSE streams, up to `grace_period` for slow requests. Waiting for each one
+before the next replacement made a 4-worker restart with long-lived clients
+take ~8.5 s. Instead, once a batch's new workers have taken over (they
+listen and passed the gates, so capacity never drops below the worker
+count), their old ones are told to stop and drain in the background
+(`Role::Retiring`, `Roll::draining`) while the next batch starts: ~3 s for
+the same restart (benchmarks in [`benchmarks.md`](benchmarks.md)).
+
+```
+worker 1: new ─gates─► old 1 drains ─────────────► exits
+worker 2:              new ─gates─► old 2 drains ─────────────► exits
+worker 3:                           new ─gates─► old 3 drains ──────► exits
+                                                                        └─► rollout done, CLI returns
+```
+
+- **Memory cap.** A batch starts only while its old workers fit next to
+  the ones still draining: draining + batch ≤ max(`max_draining`, batch).
+  So a rollout runs at most max(`max_draining`, `surge`) processes beyond
+  the worker count; when the cap is reached the rollout waits (logged once:
+  `waiting for old workers to finish draining before replacing the next
+  ones`) and goes on as soon as one exits. `max_draining = 1` is the old
+  behaviour, one drain at a time.
+- **End.** The rollout (and the CLI, systemd's `READY=1`, `rollout_done`)
+  ends once every old worker it stopped has exited, by itself or by SIGKILL
+  at `grace_period`; until then its phase reads `every worker replaced; 2
+  old workers draining (pid …)`. One still there 10 s after its SIGKILL is
+  held by the kernel: the rollout stops waiting for it (logged once) and it
+  stays listed as draining until it is reaped. `done` counts workers whose new process
+  took over (their old one may still be draining).
+- **Failures.** A gate failure rolls back the batch in progress at once (its
+  old workers never stopped) and logs the failure; old workers of earlier
+  batches are already replaced, so they finish their drain, and the
+  rollout's outcome follows when they have exited. A stop or shutdown ends
+  the rollout at once (everything is stopped anyway), keeping an outcome
+  already decided.
+- **Status.** `status.draining` lists the old processes (`2 (old)
+  DRAINING` in `warden status`), the rollout phase says how many drain, and
+  Prometheus has `warden_workers_draining`. Each transition is one log line:
+  `worker replaced; draining old process … draining=N` when a drain starts,
+  `worker stopped … reason=exit code 0 after Warden's SIGTERM` when it ends.
+
 **Surge** (`[reload] surge = N | "all"`, like Kubernetes' `maxSurge`; default
 1): reload, safe-reload and restart replace workers in batches of N. Each worker
 of a batch starts next to the one it replaces and goes through the gates on
-its own; when all have passed, the batch's old workers drain together, and the
-next batch starts once they have exited. A failure in any of them stops every
+its own; when all have passed, the batch's old workers drain together while
+the next batch starts (within `max_draining`, above). A failure in any of
+them stops every
 new worker of the batch (a free rollback: the old ones still serve), so a
 batch is all-or-nothing. safe-reload's canary is still a batch of one with its
 soak, then the rest go N at a time. A slot that isn't serving (starting,
@@ -330,8 +407,7 @@ stopping, down) is a batch of its own, since it has no old worker to fall back
 on. Memory: surge N runs up to N extra workers while a batch overlaps (`"all"`:
 twice the fleet for a few seconds). It requires workers that can overlap, so
 config validation refuses it with `port_strategy = "offset"`. Status shows the
-batch as `workers 1, 2: health checks 1/3`, from its slowest worker; `done`
-counts workers whose old process has exited.
+batch as `workers 1, 2: health checks 1/3`, from its slowest worker.
 
 **Release pinning** (`[app] pin_release`, default on;
 `src/supervisor/release.rs`): deploys swap a `current` symlink, then reload.
