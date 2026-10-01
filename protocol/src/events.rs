@@ -112,6 +112,14 @@ impl WorkerEvent {
     }
 }
 
+/// The exit reason of a worker the kernel's OOM killer killed (it died of
+/// SIGKILL and the cgroup's `oom_kill` count rose): the supervisor writes it
+/// at the start of the `crashed` event's `detail` and of
+/// `WorkerStatus.last_exit`, maybe followed by more (` (standby)`), and
+/// wardend's `oom` alert matches it anywhere in the detail
+/// (docs/protocol.md, "The OOM marker").
+pub const OOM_KILLED: &str = "killed by the kernel OOM killer (out of memory)";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SupervisorEvent {

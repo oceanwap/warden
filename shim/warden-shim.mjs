@@ -812,7 +812,56 @@ function reportLongLived() {
 // `type: "direct"` streams: reading one through a reader breaks it (Bun 1.3
 // calls its pull() again for every read), so those are ended through the
 // controller Bun gives their pull() instead. Everything else is constructed
-// natively, so instanceof, subclasses and statics behave as before.
+// natively, and both wrappers pass for the native constructors
+// (passAsNative), so instanceof, subclasses and statics behave as before.
+//
+// A function, not a Proxy or a class: a Proxy's construct trap costs ~300 ns
+// per `new Response` in Bun 1.3 (this costs ~20 ns, one call frame), and a
+// class's `prototype` can't be the native one.
+
+// wrapper -> the native function whose source text it shows.
+const nativeSource = new WeakMap();
+
+// `wrapper` passes for `native`: the same prototype (so instanceof works,
+// for fetch()'s responses too, and the instances' `constructor` names the
+// wrapper), name, length, statics, a read-only `prototype`, and the native
+// source text, also through Function.prototype.toString.call (lodash's
+// isNative, core-js). What still tells them apart: it is another function
+// object, Bun.inspect shows `[Function: Response]` instead of
+// `[class Response]`, and `prototype` comes before the statics in its own
+// property names (README, "Limitations").
+function passAsNative(wrapper, native) {
+  for (const key of Reflect.ownKeys(native)) {
+    if (key !== "prototype") Object.defineProperty(wrapper, key, Object.getOwnPropertyDescriptor(native, key));
+  }
+  Object.defineProperty(wrapper, "prototype", {
+    value: native.prototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+  const ctor = Object.getOwnPropertyDescriptor(native.prototype, "constructor");
+  if (ctor && ctor.configurable) Object.defineProperty(native.prototype, "constructor", { ...ctor, value: wrapper });
+  if (nativeSource.has(Function.prototype.toString) === false) maskSources();
+  nativeSource.set(wrapper, native);
+}
+
+// Function.prototype.toString shows a wrapper's native source text, and its
+// own. One WeakMap lookup per call; nothing else changes.
+function maskSources() {
+  const d = Object.getOwnPropertyDescriptor(Function.prototype, "toString");
+  if (!d || !d.configurable || typeof d.value !== "function") return;
+  const original = d.value;
+  // A method: like the native one, it has no `prototype` and can't be `new`ed.
+  const toString = {
+    toString() {
+      return Reflect.apply(original, nativeSource.get(this) ?? this, []);
+    },
+  }.toString;
+  nativeSource.set(toString, original);
+  Object.defineProperty(Function.prototype, "toString", { ...d, value: toString });
+}
+
 function installBunStreamHooks() {
   const NativeResponse = globalThis.Response;
   const NativeStream = globalThis.ReadableStream;
@@ -904,7 +953,8 @@ function installBunStreamHooks() {
   }
 
   function Response(body, init) {
-    if (new.target === undefined) throw new TypeError("Class constructor Response cannot be invoked without 'new'");
+    // Throws the native TypeError.
+    if (new.target === undefined) return NativeResponse(body, init);
     if (
       body !== null &&
       typeof body === "object" &&
@@ -917,13 +967,11 @@ function installBunStreamHooks() {
       ? new NativeResponse(body, init)
       : Reflect.construct(NativeResponse, [body, init], new.target);
   }
-  Response.prototype = NativeResponse.prototype;
-  Object.setPrototypeOf(Response, NativeResponse);
+  passAsNative(Response, NativeResponse);
 
   function ReadableStream(source, strategy) {
-    if (new.target === undefined) {
-      throw new TypeError("Class constructor ReadableStream cannot be invoked without 'new'");
-    }
+    // Throws the native TypeError.
+    if (new.target === undefined) return NativeStream(source, strategy);
     const target = new.target === ReadableStream ? NativeStream : new.target;
     if (source == null || typeof source !== "object" || source.type !== "direct" || typeof source.pull !== "function") {
       return target === NativeStream ? new NativeStream(source, strategy) : Reflect.construct(NativeStream, [source, strategy], target);
@@ -961,8 +1009,7 @@ function installBunStreamHooks() {
     direct.set(s, info);
     return s;
   }
-  ReadableStream.prototype = NativeStream.prototype;
-  Object.setPrototypeOf(ReadableStream, NativeStream);
+  passAsNative(ReadableStream, NativeStream);
 
   globalThis.Response = Response;
   globalThis.ReadableStream = ReadableStream;

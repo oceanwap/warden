@@ -50,16 +50,26 @@ commit, a failure undoes the version edit, so the tree is as it was.
    `cargo test --test integration` (needs `bun` and `node`).
 5. **Confirmation.** What will be committed, tagged and pushed, and what the
    workflow then does; `Release v<version>? [y/N]` unless `--yes`.
-6. **Commit and tag.** The version files are committed as
-   `Release v<version>` (none when the version was already right), then the
-   annotated tag `v<version>`, "Warden <version>". Trailers: `--trailer
-   "Key: value"` (repeatable), plus any configured with git's
-   `trailer.<key>.cmd`; commit hooks run as usual.
-7. **Push**: `git push --atomic origin main v<version>`, both or neither.
-   If origin refuses (no right to push tags from this environment), the
-   commit and tag stay in the checkout and the exact command to run where
-   pushing is allowed is printed. Running `cargo release` again sees the
-   unpushed tag and says the same.
+6. **Commit and tag.** First, the checkout must still be what CI and the
+   checks ran on: HEAD on the same commit and branch, nothing changed but
+   the version files. If something committed meanwhile (an editor, a hook,
+   another terminal), the release stops and the version edit is undone.
+   The version files are committed as `Release v<version>` (none when the
+   version was already right), with exactly the checked commit as its
+   parent (`git commit-tree`, then `git update-ref`, which refuses if the
+   branch moved; commit hooks don't run, `commit.gpgsign` is honoured),
+   then the annotated tag `v<version>`, "Warden <version>", on that commit's
+   sha. Trailers: `--trailer "Key: value"` (repeatable), plus any configured
+   with git's `trailer.<key>.cmd`.
+7. **Push**: `git push --atomic --force-with-lease=refs/heads/main:<origin's
+   sha from step 1> origin <sha>:refs/heads/main refs/tags/v<version>`:
+   exactly the tagged commit and the tag, both or neither, and only while
+   origin's `main` is still where step 1 saw it, so a push to origin in the
+   meantime is refused, never overwritten. If origin refuses (no right to
+   push tags from this environment), the commit and tag stay in the
+   checkout and the exact command to run where pushing is allowed is
+   printed. Running `cargo release` again sees the unpushed tag and says
+   the same.
 8. **Release workflow** (`--no-wait` skips following it). The run for the
    tag, polled about every 30 s (slower if the API's rate limit would run
    out), each job printed as its state changes; at the end the release URL
@@ -114,7 +124,7 @@ repository (and, if a ruleset protects `v*` tags, the right to create them).
 The workflow needs nothing more: its `publish` job uses the run's own token.
 From an environment that may push to branches but not tags, the release
 stops at step 7 with the commit and the tag kept: run the printed
-`git push --atomic origin main v<version>` where you can push tags.
+`git push --atomic …` where you can push tags.
 
 ## When something fails
 

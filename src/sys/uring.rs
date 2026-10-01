@@ -273,6 +273,13 @@ impl Ring {
         self.start(Held::Poll { _sock: sock }, |_| opcode::PollAdd::new(fd, libc::POLLOUT as u32).build())
     }
 
+    /// Completes once `sock` is readable (for a listener: a connection is
+    /// waiting), or has an error.
+    pub fn poll_readable(&mut self, sock: Sock) -> io::Result<OpId> {
+        let fd = types::Fd(sock.raw());
+        self.start(Held::Poll { _sock: sock }, |_| opcode::PollAdd::new(fd, libc::POLLIN as u32).build())
+    }
+
     /// Ask the kernel to cancel `id` if it is still pending. Its completion
     /// still arrives (with ECANCELED, or its result if it finished first).
     pub fn cancel(&mut self, id: OpId) {
@@ -414,13 +421,38 @@ mod tests {
         (Arc::new(s), c)
     }
 
-    /// Run the ring until `n` completions arrived (5 s at most).
+    /// How much longer than usual a test may wait: `WARDEN_TEST_TIMEOUT_SCALE`
+    /// if set, else 20 under Valgrind (its preload is in LD_PRELOAD; the
+    /// 3 MB send to a slow reader takes ~10× longer there), else 1.
+    fn time_scale() -> u32 {
+        if let Some(n) = std::env::var("WARDEN_TEST_TIMEOUT_SCALE").ok().and_then(|v| v.parse().ok()) {
+            return n;
+        }
+        if std::env::var("LD_PRELOAD").is_ok_and(|p| p.contains("vgpreload")) { 20 } else { 1 }
+    }
+
+    #[test]
+    fn timeouts_scale_under_valgrind() {
+        let valgrind = std::env::var("LD_PRELOAD").is_ok_and(|p| p.contains("vgpreload"));
+        if std::env::var_os("WARDEN_TEST_TIMEOUT_SCALE").is_none() {
+            assert_eq!(time_scale(), if valgrind { 20 } else { 1 });
+        }
+    }
+
+    /// Run the ring until `n` completions arrived (5 s at most, scaled).
     fn collect(r: &mut Ring, n: usize) -> Vec<(OpId, Done)> {
         let mut out = Vec::new();
         let t0 = Instant::now();
+        let scale = time_scale();
+        let limit = Duration::from_secs(5) * scale;
         while out.len() < n {
-            assert!(t0.elapsed() < Duration::from_secs(5), "only {} of {n} completions", out.len());
-            r.wait(Duration::from_millis(20)).unwrap();
+            assert!(t0.elapsed() < limit, "only {} of {n} completions within {limit:?}", out.len());
+            // Valgrind runs one thread at a time and does not switch during
+            // io_uring_enter: a test's reader thread runs only after it, at
+            // the yield (without which a send to it never completes). Shorter
+            // waits there let it run more often.
+            r.wait(Duration::from_millis(20) / scale.max(1)).unwrap();
+            std::thread::yield_now();
             r.complete(|id, d| out.push((id, d)));
         }
         out
@@ -540,6 +572,19 @@ mod tests {
         r.poll_writable(Sock::Stream(s)).unwrap();
         let Done::Poll(Ok(mask)) = collect(&mut r, 1).remove(0).1 else { panic!("poll failed") };
         assert!(mask & libc::POLLOUT as u32 != 0, "{mask:#x}");
+    }
+
+    #[test]
+    fn a_listener_polls_readable_when_a_connection_waits() {
+        let Some(mut r) = ring() else { return };
+        let l = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        r.poll_readable(Sock::Listener(l.clone())).unwrap();
+        r.submit().unwrap();
+        r.wait(Duration::from_millis(30)).unwrap();
+        assert_eq!(r.complete(|_, _| panic!("readable with no connection")), 0);
+        let _c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let Done::Poll(Ok(mask)) = collect(&mut r, 1).remove(0).1 else { panic!("poll failed") };
+        assert!(mask & libc::POLLIN as u32 != 0, "{mask:#x}");
     }
 
     #[test]

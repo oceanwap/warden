@@ -137,8 +137,9 @@ a missing one shows as `RESTARTING` (backoff), `FAILED` or `STOPPED`.
 `stopped`. A promotion is a story of the slot it fills: `crashed` (the dead
 worker), `restarting`, then `starting` and `ready` with the standby's
 `pid` and detail `promoted from standby` (`promote_ms=…` on `ready`).
-Crash details keep the exit reason first (`oom-killed …`), as alerts match
-it. These are additions: clients that don't know them show a worker 0.
+Crash details keep the exit reason first (`killed by the kernel OOM killer
+(out of memory) (standby)`), as alerts match it. These are additions:
+clients that don't know them show a worker 0.
 
 `rollout` is sent when a rollout starts, before any worker is touched
 (`done` 0, `phase` `starting` or `running preflight`), and whenever its
@@ -298,7 +299,7 @@ Durations: `500ms`, `30s`, `5m`, `1h30m`, `1d`, or a number of seconds.
 | `kind` | When |
 |---|---|
 | `crash_loop` | `crashes` worker `crashed` events of one app within `window`. Once per loop: crashes meanwhile are counted (in `recovered`); the loop ends after `window` without a crash |
-| `oom` | a worker `crashed` event whose `detail` holds the word `oom-killed` (see below); it counts as a crash too |
+| `oom` | a worker `crashed` event whose `detail` holds the OOM marker (see below); it counts as a crash too |
 | `worker_failed` | a worker `failed` event (too many restarts), or a worker already `FAILED` in the status `wardend` sees when it begins watching an app |
 | `unhealthy` | a worker `unhealthy` or `hung` event |
 | `rollout_failed` | `rollout_done` with `ok: false` |
@@ -308,11 +309,16 @@ Durations: `500ms`, `30s`, `5m`, `1h30m`, `1d`, or a number of seconds.
 | `unresponsive` | `supervisor` `unresponsive` |
 | `recovered` | after any of the above but `rollout_failed` and `recycled`: every worker ready (and no rollout) for 1 minute |
 
-**The OOM marker.** A worker's exit reason (the `crashed` event's `detail`,
-`WorkerStatus.last_exit`) that starts with `oom-killed` marks an OOM kill:
-`oom-killed (memory.max 512M): signal 9 (SIGKILL)`. `wardend` matches the
-word `oom-killed` anywhere in the detail (case-insensitive, as a whole word),
-so a supervisor that writes `signal 9 (SIGKILL), oom-killed` is matched as well.
+**The OOM marker.** A worker the kernel's OOM killer killed (it died of
+SIGKILL and its cgroup's `oom_kill` count rose) has the exit reason
+`killed by the kernel OOM killer (out of memory)`: the `crashed` event's
+`detail` and `WorkerStatus.last_exit` start with it, maybe followed by more
+(`… (standby)`, `… (replacement, before taking over)`). `wardend` matches
+exactly that text, anywhere in the detail; it is
+`warden_protocol::events::OOM_KILLED`, shared by the supervisor and
+`wardend`. A SIGKILL from anything else is `killed by another process
+(SIGKILL)`; where Warden can't read the cgroup's OOM counter, an OOM kill
+looks like that too, and no `oom` alert is sent (the log line says so).
 
 ### What a rule gets
 
@@ -326,9 +332,13 @@ so a supervisor that writes `signal 9 (SIGKILL), oom-killed` is matched as well.
 - `command`: run with that JSON on stdin and `WARDEN_ALERT_KIND`, `_APP`,
   `_HOST`, `_TEXT`, `_DETAIL`, `_COUNT`, `_AT_MS`, `_RULE` in its
   environment (and `wardend`'s). It runs as `wardend`'s user (root for the
-  system `wardend`), in a process group of its own; a non-zero exit is a
-  failure. The program is checked when the file is read: an absolute path,
-  or a name on `wardend`'s PATH.
+  system `wardend`), in a process group of its own. Its exit status alone
+  decides: 0 is sent, anything else a failure (with the first line of its
+  stderr, read for at most 200 ms after it exits). A process it leaves in
+  the background is its own business and is not waited for; if it writes
+  to stderr later, redirect that (`… 2>/dev/null &`), as wardend no longer
+  reads it. The program is checked when the file is read: an absolute
+  path, or a name on `wardend`'s PATH.
 - `webhook`: `curl -fsS --max-time 10 --proto =http,https -K -`, which reads
   the URL, the `Content-Type: application/json` header and the body from
   its stdin, so neither the URL (often a secret) nor the alert ever appear
@@ -343,7 +353,8 @@ so a supervisor that writes `signal 9 (SIGKILL), oom-killed` is matched as well.
 
 Alerts never make `wardend` wait. They go into a queue of 64 (more are
 dropped, counted and logged once a minute); at most 4 deliveries run at
-once; each is killed after 10 s (the command's whole process group); a
+once; each still running after 10 s is killed (the command's whole
+process group); a
 failed one is tried once more after 5 s, then logged as lost. Every failure
 is logged with the rule, the kind, the app, the target (a command's program
 only, a webhook's host only: never its path or token) and the fix.

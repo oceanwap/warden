@@ -383,6 +383,27 @@ fn stuck_worker_is_killed_after_grace_period() {
     assert!(w.log().contains("SIGKILL"));
 }
 
+/// The shim's Response and ReadableStream wrappers (Bun, for SSE drains)
+/// pass for the native constructors: `constructor`, `toString`, `name`,
+/// `length`, statics, `Symbol.hasInstance`, subclasses, the TypeError
+/// without `new` (tests/fixtures/shim_response.ts lists every check).
+#[test]
+fn shim_response_wrapper_passes_for_the_native_one() {
+    if !have_bun() {
+        return;
+    }
+    let shim = format!("{}/shim/warden-shim.mjs", env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new("bun").args(["--preload", &shim, &fixture("shim_response.ts")]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{text}");
+    let checks: Value =
+        serde_json::from_str(text.lines().last().unwrap_or("")).unwrap_or_else(|e| panic!("{e}: {text}"));
+    assert_eq!(checks["hooked"], true, "the wrappers are not installed: {checks:#}");
+    let failed: Vec<&String> =
+        checks.as_object().unwrap().iter().filter(|(_, v)| **v != true).map(|(k, _)| k).collect();
+    assert!(failed.is_empty(), "the wrapper shows through: {failed:?}\n{checks:#}");
+}
+
 #[test]
 fn shim_lets_node_http_share_the_port() {
     if !have_bun() {
@@ -1797,6 +1818,97 @@ fn static_io_used(w: &Warden, io: &str) -> &'static str {
 /// an uncached server's (`cache_size = 0` behaves as before), in both I/O
 /// modes; an edited or deleted file shows within cache_valid_ms; a cached
 /// path swapped for a symlink out of the root is refused, not served.
+/// CPU time (user + system, in clock ticks) `pid` has used.
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // After "(comm)": the state is field 3, utime 14, stime 15.
+    let f: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// A static worker out of file descriptors (EMFILE) neither spins nor goes
+/// quiet: it backs off, says why and how to fix it, and serves again once
+/// descriptors are free. Both I/O modes.
+#[test]
+fn static_accept_errors_back_off_and_say_why() {
+    for io in ["epoll", "uring"] {
+        static_emfile_case(io);
+    }
+}
+
+fn static_emfile_case(io: &str) {
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("warden-it-emfile-{io}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi").unwrap();
+    let out = dir.join("out.log");
+    let file = std::fs::File::create(&out).unwrap();
+    let port = free_port();
+    // The worker itself, with few descriptors: a few dozen idle connections use them up.
+    let child = Command::new("sh")
+        .args(["-c", "ulimit -n 48 && exec \"$0\" serve-static", BIN])
+        .env("WARDEN_STATIC", serde_json::json!({ "root": dir.join("site") }).to_string())
+        .env("PORT", port.to_string())
+        .env("WARDEN_STATIC_IO", io)
+        .stdout(Stdio::from(file.try_clone().unwrap()))
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let w = Kill(child);
+    let log = || std::fs::read_to_string(&out).unwrap_or_default();
+    let t0 = Instant::now();
+    while get(port, "/index.html").is_none() {
+        assert!(t0.elapsed() < T, "the static worker does not serve:\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let via = if log().contains("via io_uring") { "io_uring" } else { "epoll" };
+    assert!(io == "uring" || via == "epoll", "{}", log());
+
+    // Half a request head each: every connection holds a descriptor of the
+    // worker until the head timeout (10 s).
+    let held: Vec<std::net::TcpStream> = (0..80)
+        .map(|_| {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"GET /index.html HTTP/1.1\r\n").unwrap();
+            c
+        })
+        .collect();
+    let t0 = Instant::now();
+    while !log().contains("cannot accept connections") {
+        assert!(t0.elapsed() < Duration::from_secs(5), "no accept error logged ({via}):\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Backing off, not spinning on the error.
+    let pid = w.0.id();
+    let before = cpu_ticks(pid);
+    std::thread::sleep(Duration::from_secs(1));
+    let used = cpu_ticks(pid) - before;
+    let text = log();
+    assert!(used < 20, "{used} ticks of CPU within 1 s with {via}: spinning on EMFILE\n{text}");
+    let line = text.lines().find(|l| l.contains("cannot accept connections")).unwrap();
+    assert!(line.contains("Too many open files") && line.contains(&format!("via={via}")), "{line}");
+    assert!(line.contains("retry_in_ms=") && line.contains("LimitNOFILE=65536"), "{line}");
+    assert_eq!(text.matches("cannot accept connections").count(), 1, "logged at most every 10 s:\n{text}");
+
+    // Descriptors free again: it accepts and serves.
+    drop(held);
+    let t0 = Instant::now();
+    while get(port, "/index.html").is_none() {
+        assert!(t0.elapsed() < T, "it does not serve again ({via}):\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(log().contains("accepting connections again"), "{}", log());
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn static_cache_hits_match_and_stay_fresh() {
     for io in ["epoll", "uring"] {
@@ -2961,6 +3073,62 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     assert!((1440..=1442).contains(&n), "24 h at one point a minute: {n}");
     assert_eq!(h["history"]["host"]["load1"].as_array().unwrap().len() as u64, n);
     assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
+}
+
+/// `on = ["oom"]` fires on the supervisor's own OOM exit reason, once per OOM
+/// kill, and never for a plain kill -9. A fake `memory.events` (debug builds
+/// only) stands in for the kernel's OOM kill counter.
+#[test]
+fn wardend_alerts_an_oom_kill_once() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-oom");
+    let out = f.home.join("alerts.jsonl");
+    let events = f.home.join("memory.events");
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    std::fs::write(
+        f.home.join("wardend.toml"),
+        format!(
+            "[[alert]]\nname = \"oom\"\non = [\"oom\"]\ncommand = [\"/bin/sh\", \"-c\", \"cat >> '{out}'; echo >> \
+             '{out}'\"]\nmin_interval = \"0s\"\n",
+            out = out.display()
+        ),
+    )
+    .unwrap();
+    let port = free_port().to_string();
+    let (code, text) = f.cli_env(
+        &["start", &fixture("app.ts"), "--name", "api", "--port", &port],
+        &[("WARDEN_TEST_MEMORY_EVENTS", events.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{text}");
+    let d = Wardend::start(&f, &[]);
+    wait_log(&d, "alert rules read rules=1");
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+    ev.wait("api status", |v| v["type"] == "status" && v["app"] == "api");
+    let crashed = |v: &Value| v["type"] == "worker" && v["app"] == "api" && v["event"] == "crashed";
+
+    // The OOM killer's kill: the counter rose, the worker died of SIGKILL.
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    let pid = f.pids("api")[0];
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let c = ev.wait("the OOM crash", crashed);
+    assert_eq!(c["detail"], "killed by the kernel OOM killer (out of memory)", "{c}");
+    let got = wait_for_alerts(&out, "the oom alert", |a| !a.is_empty());
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert_eq!((got[0]["kind"].as_str(), got[0]["app"].as_str()), (Some("oom"), Some("api")), "{got:#?}");
+    assert!(got[0]["detail"].as_str().unwrap().contains("killed for lack of memory"), "{got:#?}");
+
+    // A kill -9 that is not the OOM killer (the counter didn't move): no alert.
+    f.wait("api restarted", |f| f.pids("api").first().is_some_and(|p| *p != pid));
+    d.wait_app("api ready", "api", |a| a["status"]["workers_ready"] == 1);
+    let pid = f.pids("api")[0];
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let c = ev.wait("the kill -9 crash", crashed);
+    assert_eq!(c["detail"], "killed by another process (SIGKILL)", "{c}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let got = alerts_in(&out);
+    assert_eq!(got.len(), 1, "one OOM kill, one alert: {got:#?}");
 }
 
 // ---- subscribe (event stream)

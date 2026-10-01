@@ -219,6 +219,137 @@ impl Listener {
     }
 }
 
+/// After a failed accept, the next comes at once for the first two in a
+/// row, then after a pause that doubles from this …
+const ACCEPT_PAUSE_MIN: Duration = Duration::from_millis(5);
+/// … to this: a lack of descriptors or memory must not spin a CPU (the
+/// listener stays ready, the connection waiting in its backlog).
+const ACCEPT_PAUSE_MAX: Duration = Duration::from_secs(1);
+/// Failed accepts are logged at most this often, with how many there were.
+const ACCEPT_LOG_EVERY: Duration = Duration::from_secs(10);
+
+/// Failed accepts on one listener (both I/O modes, and the health socket).
+struct AcceptErrors {
+    /// What it accepts ("connections").
+    what: &'static str,
+    /// How ("epoll", "io_uring").
+    via: &'static str,
+    /// Failures in a row.
+    streak: u32,
+    /// Failures since the last log line.
+    unlogged: u64,
+    logged_at: Option<Instant>,
+    /// A failure of this streak was logged: say when it ends.
+    told: bool,
+    /// Accepting is paused until then.
+    resume_at: Option<tokio::time::Instant>,
+}
+
+impl AcceptErrors {
+    fn new(what: &'static str, via: &'static str) -> AcceptErrors {
+        AcceptErrors { what, via, streak: 0, unlogged: 0, logged_at: None, told: false, resume_at: None }
+    }
+
+    /// Until `until` (never, without one).
+    async fn pause(until: Option<tokio::time::Instant>) {
+        match until {
+            Some(t) => tokio::time::sleep_until(t).await,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn accepted(&mut self) {
+        if self.told {
+            crate::info!(
+                format!("accepting {} again", self.what),
+                via = self.via,
+                after_failures = self.streak,
+                pid = std::process::id()
+            );
+            self.told = false;
+        }
+        self.streak = 0;
+    }
+
+    fn failed(&mut self, e: &std::io::Error) {
+        self.streak = self.streak.saturating_add(1);
+        let pause = accept_pause(self.streak);
+        if !pause.is_zero() {
+            self.resume_at = Some(tokio::time::Instant::now() + pause);
+        }
+        // A client that left before it was accepted is routine, unless it
+        // keeps happening.
+        if accept_error_is_transient(e) && self.streak < 10 {
+            return;
+        }
+        self.unlogged += 1;
+        if self.logged_at.is_some_and(|t| t.elapsed() < ACCEPT_LOG_EVERY) {
+            return;
+        }
+        crate::warn!(
+            format!("cannot accept {}; they wait in the listen backlog while this worker retries", self.what),
+            error = e,
+            via = self.via,
+            failed = self.unlogged,
+            retry_in_ms = pause.as_millis(),
+            open_files_limit = crate::sys::nofile_limit().0,
+            pid = std::process::id(),
+            hint = accept_hint(e),
+        );
+        self.unlogged = 0;
+        self.logged_at = Some(Instant::now());
+        self.told = true;
+    }
+}
+
+/// The pause before accepting again after `streak` failures in a row.
+fn accept_pause(streak: u32) -> Duration {
+    if streak <= 2 {
+        return Duration::ZERO;
+    }
+    (ACCEPT_PAUSE_MIN * (1u32 << (streak - 3).min(16))).min(ACCEPT_PAUSE_MAX)
+}
+
+/// accept(2) errors about one connection, not the listener (Linux passes
+/// on the new socket's pending network errors): the next one may well work.
+fn accept_error_is_transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::ECONNABORTED
+                | libc::EINTR
+                | libc::EAGAIN
+                | libc::EPROTO
+                | libc::EPERM
+                | libc::ENETDOWN
+                | libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+                | libc::ENOPROTOOPT
+                | libc::EOPNOTSUPP
+        )
+    )
+}
+
+fn accept_hint(e: &std::io::Error) -> &'static str {
+    match e.raw_os_error() {
+        Some(libc::EMFILE) => {
+            "this worker has used up its open-file limit (each connection takes a descriptor; up to 10000 per \
+             worker): raise the limit Warden and its workers run with, LimitNOFILE=65536 in the systemd unit \
+             (`systemctl edit <unit>`) or `ulimit -n 65536` in the shell that runs `warden start`; `warden doctor` \
+             shows it"
+        }
+        Some(libc::ENFILE) => {
+            "the whole system is out of file descriptors: raise fs.file-max (`sysctl fs.file-max`), or find what \
+             holds them (`lsof -n | wc -l`)"
+        }
+        Some(libc::ENOBUFS | libc::ENOMEM) => {
+            "the kernel is short of memory for sockets: check the host's and the cgroup's memory (`free -m`, \
+             memory.max) and `sysctl net.ipv4.tcp_mem`"
+        }
+        _ => "accept(2) keeps failing on this listener; if it persists, `warden restart <app>` starts fresh workers",
+    }
+}
+
 async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
     let reuse = std::env::var("WARDEN_REUSE_PORT").is_ok_and(|v| v == "1");
     let std_listener = reuseport_listener(&site.cfg.host, port, reuse)?;
@@ -280,11 +411,24 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let unix_listener = unix.as_ref().map(|(l, _)| l);
+    let mut tcp_errors = AcceptErrors::new("connections", listener.name());
+    let mut unix_errors = AcceptErrors::new("health checks", "its health socket");
     loop {
         tokio::select! {
             _ = stop.recv() => break,
-            acc = listener.accept() => {
-                let Ok(accepted) = acc else { continue };
+            _ = AcceptErrors::pause(tcp_errors.resume_at), if tcp_errors.resume_at.is_some() => tcp_errors.resume_at = None,
+            _ = AcceptErrors::pause(unix_errors.resume_at), if unix_errors.resume_at.is_some() => unix_errors.resume_at = None,
+            acc = listener.accept(), if tcp_errors.resume_at.is_none() => {
+                let accepted = match acc {
+                    Ok(a) => {
+                        tcp_errors.accepted();
+                        a
+                    }
+                    Err(e) => {
+                        tcp_errors.failed(&e);
+                        continue;
+                    }
+                };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let site = site.clone();
                 match accepted {
@@ -306,8 +450,17 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
                     }
                 }
             }
-            acc = async { match unix_listener { Some(l) => l.accept().await.map(|(s, _)| s), None => std::future::pending().await } } => {
-                let Ok(stream) = acc else { continue };
+            acc = async { match unix_listener { Some(l) => l.accept().await.map(|(s, _)| s), None => std::future::pending().await } }, if unix_errors.resume_at.is_none() => {
+                let stream = match acc {
+                    Ok(s) => {
+                        unix_errors.accepted();
+                        s
+                    }
+                    Err(e) => {
+                        unix_errors.failed(&e);
+                        continue;
+                    }
+                };
                 let site = site.clone();
                 tokio::spawn(async move {
                     let (r, w) = stream.into_split();
@@ -1403,6 +1556,35 @@ pub fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_accepts_back_off_and_are_logged_sparingly() {
+        let ms = |n| accept_pause(n).as_millis();
+        assert_eq!([ms(1), ms(2), ms(3), ms(4), ms(5), ms(9)], [0, 0, 5, 10, 20, 320]);
+        assert_eq!((ms(10), ms(11), ms(u32::MAX)), (640, 1000, 1000));
+        let e = |n| std::io::Error::from_raw_os_error(n);
+        assert!(accept_error_is_transient(&e(libc::ECONNABORTED)));
+        assert!(!accept_error_is_transient(&e(libc::EMFILE)));
+        assert!(accept_hint(&e(libc::EMFILE)).contains("LimitNOFILE=65536"));
+        assert!(accept_hint(&e(libc::ENFILE)).contains("fs.file-max"));
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut a = AcceptErrors::new("connections", "epoll");
+            a.failed(&e(libc::EMFILE));
+            assert!(a.resume_at.is_none(), "the first retry is at once");
+            a.failed(&e(libc::EMFILE));
+            a.failed(&e(libc::EMFILE));
+            assert!(a.resume_at.is_some(), "then it pauses");
+            assert_eq!((a.unlogged, a.told), (2, true), "logged once, the rest counted for the next line");
+            a.accepted();
+            assert_eq!((a.streak, a.told), (0, false));
+            // A client gone before its accept: retried at once, not logged.
+            let mut b = AcceptErrors::new("connections", "epoll");
+            b.failed(&e(libc::ECONNABORTED));
+            assert!(b.resume_at.is_none() && b.logged_at.is_none());
+        });
+    }
 
     #[test]
     fn paths_stay_inside_root() {
