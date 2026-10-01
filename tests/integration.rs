@@ -1642,6 +1642,9 @@ fn log_history_search_and_pipes() {
         f.cli(&["logs", "chatty", "--nostream", "--lines", "5"]).1.contains("line 400 padding")
     });
     f.wait("rotated and gzipped", |f| f.home.join("logs/chatty.log.1.gz").exists());
+    // "worker ready" comes min_uptime (300 ms) after the start; a fast flood
+    // can be written, rotated and gzipped before that.
+    f.wait("worker ready", |f| f.app("chatty")["status"]["workers_ready"] == 1);
 
     // History: every retained line, oldest first, across .gz and current.
     let out = f.ok(&["logs", "chatty", "--history"]);
