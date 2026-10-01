@@ -56,6 +56,8 @@ const MAGIC: [u8; 8] = *b"WDHIST\r\n";
 pub(crate) const VERSION: u32 = 1;
 /// How often a snapshot is written.
 const SAVE_EVERY: Duration = Duration::from_secs(60);
+/// A save still running after this is reported (a hung disk or mount).
+const SAVE_HUNG: Duration = Duration::from_secs(300);
 /// App names longer than this are not saved (socket path limits keep real
 /// names far shorter).
 const MAX_NAME: usize = 255;
@@ -642,11 +644,35 @@ impl Pending {
 
 #[derive(Default)]
 struct SaveState {
-    /// A snapshot is being synced and renamed.
+    /// A snapshot is being synced and renamed, since then.
     busy: Cell<bool>,
+    since: Cell<Option<Instant>>,
+    /// A save running for `SAVE_HUNG` was reported.
+    hung_logged: Cell<bool>,
     /// A failure was logged; the next success says so.
     failing: Cell<bool>,
     done: tokio::sync::Notify,
+}
+
+/// The running save: `busy` until dropped, whatever ends the task (a panic
+/// included), so saves never stop for good.
+struct Running(Rc<SaveState>);
+
+impl Running {
+    fn new(state: &Rc<SaveState>) -> Running {
+        state.busy.set(true);
+        state.since.set(Some(Instant::now()));
+        Running(state.clone())
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.busy.set(false);
+        self.0.since.set(None);
+        self.0.hung_logged.set(false);
+        self.0.done.notify_waiters();
+    }
 }
 
 impl SaveState {
@@ -755,19 +781,34 @@ impl Saver {
     /// The periodic save: nothing when nothing was committed since the last
     /// snapshot, or while the last one is still being synced.
     pub fn periodic(&mut self, store: &Store, now_s: u64) {
-        if self.state.busy.get() || self.saved_seq == Some(store.seq) {
+        if self.state.busy.get() {
+            let running = self.state.since.get().map(|t| t.elapsed()).unwrap_or_default();
+            if running >= SAVE_HUNG && !self.state.hung_logged.replace(true) {
+                let dir = self.path.parent().unwrap_or(&self.path).display().to_string();
+                crate::warn!(
+                    "saving the resource history has not finished; no new snapshot until it does",
+                    file = self.path.display(),
+                    running_s = running.as_secs(),
+                    hint = format!(
+                        "fsync or rename in {dir} is stuck: a hung disk or network mount (`dmesg`); wardend keeps the \
+                         history in memory meanwhile"
+                    ),
+                );
+            }
+            return;
+        }
+        if self.saved_seq == Some(store.seq) {
             return;
         }
         match self.start(store, now_s) {
             Ok(p) => {
-                self.state.busy.set(true);
-                let (state, path) = (self.state.clone(), self.path.clone());
+                let running = Running::new(&self.state);
+                let path = self.path.clone();
                 let stats = (p.bytes, p.apps, p.encode_ms);
                 crate::guard::spawn_request("wardend history save", async move {
                     let r = p.finish().await;
-                    state.busy.set(false);
-                    state.report(&path, r, Some(stats));
-                    state.done.notify_waiters();
+                    running.0.report(&path, r, Some(stats));
+                    drop(running);
                 });
             }
             Err(e) => self.state.report(&self.path, Err(e), None),
@@ -1098,6 +1139,28 @@ mod tests {
         let s = load(&path, now);
         same_rings(&st, &s);
         assert!(path.exists(), "a good file stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stuck_save_is_reported_once_and_a_dropped_one_frees_the_saver() {
+        let dir = tmpdir("stuck");
+        let (st, now) = sample_store();
+        let mut saver = Saver::new(dir.join(FILE), &Store::default());
+        // A save that ended any way at all (finished, failed, its task
+        // dropped or panicked) lets the next one run.
+        let running = Running::new(&saver.state);
+        assert!(saver.busy());
+        drop(running);
+        assert!(!saver.busy() && saver.state.since.get().is_none());
+        // One running for more than SAVE_HUNG: said once; nothing else starts.
+        let running = Running::new(&saver.state);
+        saver.state.since.set(Instant::now().checked_sub(SAVE_HUNG + Duration::from_secs(1)));
+        saver.periodic(&st, now);
+        assert!(saver.state.hung_logged.get() && !dir.join(FILE).exists());
+        saver.periodic(&st, now);
+        drop(running);
+        assert!(!saver.state.hung_logged.get(), "reset for the next one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
