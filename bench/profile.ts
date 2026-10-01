@@ -28,6 +28,8 @@
 //   --workers N          server processes (default 1: one process, the cleanest per-request numbers)
 //   --rounds N           interleaved repetitions; medians are reported (default 1)
 //   --new-connections    a new connection per request (default: keep-alive)
+//   --pin-servers        pin server process i (all its threads) to CPU i mod n of the app CPUs
+//                        (taskset -a -p): what a per-worker CPU affinity would do, for any target
 //   --strace             also count system calls per request (a separate pass of requests/10: strace slows the server)
 //   --perf               also sample where the CPU time goes (perf record -e cpu-clock; a separate pass), top
 //                        symbols per target; --top N lines (default 25), --call-graph (with -g)
@@ -42,7 +44,7 @@ import { spawn, spawnSync, type Subprocess } from "bun";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  ROOT, SHIM, TMP, baseEnv, cpuNs, listenersOnPort, machine, median, oha, onAppCpus, parseArgs, sleep, sum, table,
+  APP_CPUS, ROOT, SHIM, TMP, baseEnv, cpuNs, listenersOnPort, machine, median, oha, onAppCpus, parseArgs, sleep, sum, table,
   uniq, waitFor, type LoadResult,
 } from "./lib.ts";
 import type { Running } from "./static.ts";
@@ -58,6 +60,7 @@ const CONNECTIONS = Number(args.connections ?? 64);
 const WORKERS = Number(args.workers);
 const ROUNDS = Math.max(1, Number(args.rounds ?? 1));
 const KEEPALIVE = !process.argv.includes("--new-connections");
+const PIN_SERVERS = process.argv.includes("--pin-servers");
 const STRACE = process.argv.includes("--strace");
 const PERF = process.argv.includes("--perf");
 const CALL_GRAPH = process.argv.includes("--call-graph");
@@ -238,8 +241,24 @@ async function attached(cmd: string[], t: Target, requests: number): Promise<Loa
 let perfBin: string | null | undefined;
 let hwCounters: boolean | undefined;
 
+/** CPUs in a taskset list like "0-3,6" (all of this machine's without one). */
+function cpuList(list: string | undefined): number[] {
+  if (!list) return Array.from({ length: navigator.hardwareConcurrency }, (_, i) => i);
+  return list.split(",").flatMap((part) => {
+    const [a, b] = part.split("-").map(Number);
+    return b === undefined ? [a] : Array.from({ length: b - a + 1 }, (_, i) => a + i);
+  });
+}
+
 async function measure(t: Target, withProfile: boolean): Promise<Measure> {
   const run = await t.start();
+  if (PIN_SERVERS) {
+    const cpus = cpuList(APP_CPUS);
+    run.servers.forEach((pid, i) => {
+      const r = spawnSync(["taskset", "-a", "-p", "-c", String(cpus[i % cpus.length]), String(pid)], { stdout: "ignore", stderr: "pipe" });
+      if (r.exitCode !== 0) throw new Error(`taskset -p ${pid}: ${r.stderr.toString()}`);
+    });
+  }
   try {
     load(t, Math.max(2000, Math.round(REQUESTS / 5))); // warm-up
     const c0 = sum(run.pids, cpuNs);
@@ -368,7 +387,7 @@ if (STRACE) {
 console.log(
   `${REQUESTS} requests to ${[...new Set(targets.map((t) => t.path))].join(", ")}, ${CONNECTIONS} ${KEEPALIVE ? "keep-alive" : "new"} connections, ` +
     `${WORKERS} server process(es), ${meta.loadgen}; ${ROUNDS > 1 ? `median of ${ROUNDS} interleaved rounds` : "one round"}; ` +
-    `app CPUs ${meta.app_cpus}, load generator CPUs ${meta.loadgen_cpus}`,
+    `app CPUs ${meta.app_cpus}${PIN_SERVERS ? " (servers pinned one per CPU)" : ""}, load generator CPUs ${meta.loadgen_cpus}`,
 );
 console.log("");
 console.log(table(TARGETS, (s) => s, rows));

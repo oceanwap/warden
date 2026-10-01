@@ -1,0 +1,54 @@
+diff --git a/src/static_server.rs b/src/static_server.rs
+index ff82249..21c24ad 100644
+--- a/src/static_server.rs
++++ b/src/static_server.rs
+@@ -297,6 +297,12 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
+     // Wake up for a connection only once its request has arrived. Optional:
+     // without it the server is just as correct, a little busier.
+     let _ = crate::sys::tcp_defer_accept(std_listener.as_fd(), HEAD_TIMEOUT.as_secs() as i32);
++    // EXPERIMENT (research/static-cpu-steering): WARDEN_EXP_CBPF=<workers>
++    // steers each new connection to the worker on the CPU it came in on.
++    if let Some(n) = std::env::var("WARDEN_EXP_CBPF").ok().and_then(|v| v.parse::<u32>().ok()) {
++        crate::sys::reuseport_cbpf_by_cpu(std_listener.as_fd(), n).map_err(|e| format!("cbpf: {e}"))?;
++        eprintln!("EXPERIMENT: reuseport CBPF steering by cpu % {n}");
++    }
+     let mut listener = Listener::new(std_listener)?;
+     let worker: u64 = std::env::var("WARDEN_WORKER_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+ 
+diff --git a/src/sys.rs b/src/sys.rs
+index 815384d..30d076c 100644
+--- a/src/sys.rs
++++ b/src/sys.rs
+@@ -494,6 +494,32 @@ pub fn tcp_defer_accept(listener: BorrowedFd<'_>, secs: i32) -> io::Result<()> {
+     setsockopt_int(listener, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, secs)
+ }
+ 
++/// EXPERIMENT (research/static-cpu-steering): steer new connections of the
++/// reuseport group to socket index `cpu % groups` (SO_ATTACH_REUSEPORT_CBPF),
++/// i.e. to the worker pinned to the CPU the connection came in on, when the
++/// workers bound in order and worker i runs on CPU i-1.
++#[cfg(target_os = "linux")]
++pub fn reuseport_cbpf_by_cpu(sock: BorrowedFd<'_>, groups: u32) -> io::Result<()> {
++    // ld [SKF_AD_OFF + SKF_AD_CPU]; alu mod #groups; ret a
++    let prog = [
++        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: (-0x1000i32 + 36) as u32 },
++        libc::sock_filter { code: 0x94, jt: 0, jf: 0, k: groups },
++        libc::sock_filter { code: 0x16, jt: 0, jf: 0, k: 0 },
++    ];
++    let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_ptr() as *mut libc::sock_filter };
++    // SAFETY: a valid sock_fprog pointing at `prog`, both alive for the call.
++    check(unsafe {
++        libc::setsockopt(
++            sock.as_raw_fd(),
++            libc::SOL_SOCKET,
++            libc::SO_ATTACH_REUSEPORT_CBPF,
++            &fprog as *const libc::sock_fprog as *const libc::c_void,
++            std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
++        )
++    })
++    .map(|_| ())
++}
++
+ /// Not Linux: no TCP_DEFER_ACCEPT, so a no-op: accept(2) wakes on the bare
+ /// handshake, which is just as correct, a little busier.
+ #[cfg(not(target_os = "linux"))]

@@ -185,6 +185,12 @@ binary or shim; `warden:key=value,…` sets `[static]` keys. Per target:
 - with `--perf`: the top symbols of the server processes (`perf record -e
   cpu-clock`, a separate pass; `--call-graph` adds call chains, `--top N`).
 
+`--file-size N` adds an N-byte file to the static site and requests it
+(where the cache's memfd starts paying was found this way);
+`--pin-servers` pins server process i to CPU i mod n (`taskset -a -p`),
+what a per-worker CPU affinity would do, for any target
+(`research/static-cpu-steering/run.sh` uses it).
+
 `--rounds N` interleaves the targets N times and reports medians. Ubuntu's
 `/usr/bin/perf` is a wrapper that refuses to run without the kernel's own
 linux-tools package; the script then uses any `/usr/lib/linux-tools*/perf`

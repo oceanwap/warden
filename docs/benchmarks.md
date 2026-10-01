@@ -171,6 +171,33 @@ Tried and dropped (no measurable win, so no code):
 - New connection per request (1.5 KB page, 1 worker, 3 rounds): Warden and
   nginx are level (17.6k vs 18.4k req/s, 19.2 vs 19.2 µs per request, 8.1
   vs 11.0 syscalls); nothing to change there.
+- **Per-worker CPU affinity** (`sched_setaffinity`, worker i on CPU i-1,
+  emulated with `bench/profile.ts --pin-servers`) and, for `warden serve`,
+  **`SO_ATTACH_REUSEPORT_CBPF` steering** (`return cpu % workers`: a new
+  connection goes to the worker on the CPU it came in on). 2 workers on the
+  2 CPUs, oha unpinned (as a front proxy would be), 1.5 KB page, 9–10
+  interleaved rounds (`research/static-cpu-steering/run.sh`):
+  - pinned alone: no gain. New connection per request 34.1k vs 34.4k req/s
+    unpinned, 19.74 vs 19.39 µs per request; keep-alive 114.2k vs 113.9k,
+    7.55 µs both.
+  - pinned + CBPF, new connection per request: 37.0k req/s and 18.37 µs per
+    request (medians; unpinned 34.4k, 19.39 µs), but better in only 7 of
+    10 rounds, the ranges overlap (CPU per request 17.5–19.5 vs 18.2–21.3
+    µs), and context switches double (0.45 vs 0.23 per request: client and
+    server now take turns on one CPU).
+  - pinned + CBPF, keep-alive: 110k to 159k req/s from round to round, by
+    which worker got the client's connections: steering by the connecting
+    CPU puts every connection made from one CPU on one worker.
+
+  Not shipped: no win this machine can show apart from its noise, and
+  steering has a failure mode a win would have to outweigh (a front proxy
+  that connects from fewer CPUs than there are workers, such as a single
+  nginx worker or a tunnel daemon, funnels into fewer workers; restarts and
+  surges reorder the reuseport group's sockets, which loses the CPU match).
+  **Re-measure on many-core hardware** (the 4-vCPU ARM64 and x86 CI
+  benchmark runners): `research/static-cpu-steering/run.sh` builds the
+  experiment (`cbpf.patch`) and prints the same rows; the steering program
+  assumes one worker per CPU.
 
 - **io_uring for the static server** (accept/recv/send through one ring per
   worker, about 1,500 lines with its `unsafe` driver): fewer syscalls per
