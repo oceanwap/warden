@@ -51,7 +51,10 @@ jobs:
       - run: cargo fmt --all --check
       - run: shellcheck install.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --bin warden
+      - name: cargo test --bin warden
+        run: |
+          set -o pipefail
+          cargo test --bin warden 2>&1 | tee unit.log
       # The GUI's integration test drives target/debug/warden.
       - name: GUI and protocol tests
         run: |
@@ -77,14 +80,7 @@ jobs:
       # tests and their panic messages there.
       - name: annotate failing tests
         if: failure()
-        run: |
-          for log in gui.log integration.log; do
-            [ -f "$log" ] || continue
-            grep -E "^test .* FAILED$|panicked at|^---- |^error(\[|:)" "$log" | head -30 |
-              while IFS= read -r line; do echo "::error title=${log%.log}::${line}"; done
-            awk '/^---- .* stdout ----/{p=1} p' "$log" | grep -vE "^\s*$" | head -60 |
-              while IFS= read -r line; do echo "::error title=${log%.log} output::${line}"; done
-          done
+        run: python3 .github/annotate-test-failures.py unit.log gui.log integration.log
 
   linux-arm64:
     runs-on: ubuntu-24.04-arm
@@ -108,22 +104,21 @@ jobs:
         run: npm ci --no-audit --no-fund
       - run: cargo build --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --bin warden
+      - name: cargo test --bin warden
+        run: |
+          set -o pipefail
+          cargo test --bin warden 2>&1 | tee unit.log
       - run: cargo test -p warden-protocol
       - name: cargo test --test integration
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
           cargo test --test integration 2>&1 | tee integration.log
-      # Job logs need a login to read; annotations don't: name the failing
-      # tests and their panic messages there.
+      # Job logs need a login to read; annotations don't: one per failed
+      # test, with its captured output.
       - name: annotate failing tests
         if: failure()
-        run: |
-          grep -E "^test .* FAILED$|panicked at|^---- " integration.log | head -30 |
-            while IFS= read -r line; do echo "::error title=integration::${line}"; done
-          awk '/^---- .* stdout ----/{p=1} p' integration.log | grep -vE "^\s*$" | head -60 |
-            while IFS= read -r line; do echo "::error title=output::${line}"; done
+        run: python3 .github/annotate-test-failures.py unit.log integration.log
 
   macos:
     runs-on: macos-latest
