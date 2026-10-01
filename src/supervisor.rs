@@ -952,8 +952,7 @@ impl Supervisor {
         } else if note.is_some() {
             "Warden lost track of this process (the reason says how); it starts a new one"
         } else {
-            "the app exited by itself: its last output lines say why (`warden logs <app> --worker N`). Warden \
-             restarts it with backoff; after restart.max_restarts within restart.restart_window it is FAILED"
+            cause.plain_hint()
         });
         let why = cause.short();
         let slot_id = inst.slot;

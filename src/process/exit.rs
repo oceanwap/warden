@@ -113,6 +113,27 @@ impl Reason {
     }
 }
 
+impl Reason {
+    /// What to do about a death [`Reason::hint`] has nothing to add to: the
+    /// WARN/ERROR line of a crash always says it.
+    pub fn plain_hint(self) -> &'static str {
+        match self {
+            Reason::Code(_) => {
+                "the app exited by itself: its last output lines say why (`warden logs <app> --worker N`). Warden \
+                 restarts it with backoff; after restart.max_restarts within restart.restart_window it is FAILED"
+            }
+            Reason::KilledByWarden => {
+                "Warden killed it; the line before says why (not ready in time, hung, or still running after \
+                 shutdown.grace_period). It starts a new one"
+            }
+            Reason::AfterStop { .. } | Reason::SignalFromWarden(_) => {
+                "it ended on a signal Warden sent (a stop, `warden signal`); Warden starts it again"
+            }
+            _ => "its last output lines may say why (`warden logs <app> --worker N`); Warden restarts it with backoff",
+        }
+    }
+}
+
 pub const OOM_HINT: &str = "raise memory.max / MemoryMax= or lower `[limits] max_memory` so Warden recycles it \
                             before the kernel kills it";
 
@@ -303,6 +324,18 @@ mod tests {
         assert!(Reason::Crashed(libc::SIGSEGV).hint(true).unwrap().contains("coredumpctl"));
         assert_eq!(Reason::Code(1).hint(true), None);
         assert_eq!(Reason::KilledByWarden.hint(true), None);
+    }
+
+    /// The crash line's hint when `hint` has none follows the cause: Warden's
+    /// own SIGKILL is not "the app exited by itself".
+    #[test]
+    fn plain_hints_follow_the_cause() {
+        assert!(Reason::Code(1).plain_hint().contains("exited by itself"));
+        assert!(Reason::KilledByWarden.plain_hint().starts_with("Warden killed it"));
+        assert!(Reason::SignalFromWarden(libc::SIGUSR2).plain_hint().contains("signal Warden sent"));
+        assert!(Reason::AfterStop { stop: TERM, code: Some(1) }.plain_hint().contains("signal Warden sent"));
+        assert!(Reason::Unknown.plain_hint().contains("warden logs"));
+        assert!(!Reason::KilledByWarden.plain_hint().contains("exited by itself"));
     }
 
     #[test]
