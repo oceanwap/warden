@@ -5,7 +5,9 @@ Job logs and artifacts need a GitHub login to read; annotations don't. Three
 notices (the verdict with the run's settings, recovery per fault kind,
 requests and CLI latency) and one error per invariant violation (at most 7:
 GitHub keeps 10 of each kind per step).
-Usage: chaos-annotations.py LABEL REPORT.json
+Usage: chaos-annotations.py LABEL REPORT.json [LOG]
+Without a report (the run stopped before writing it), the last lines of LOG
+are the error annotation: they hold the reason.
 """
 import json
 import sys
@@ -34,10 +36,18 @@ def ms(v) -> str:
 
 def main() -> int:
     label, path = sys.argv[1], sys.argv[2]
+    log = sys.argv[3] if len(sys.argv) > 3 else None
     try:
         r = json.load(open(path, encoding="utf-8"))
     except (OSError, ValueError) as e:
-        emit("error", f"{label}: no report", f"{path}: {e} (the run failed before writing it; see the log)")
+        tail = ""
+        if log:
+            try:
+                lines = open(log, encoding="utf-8", errors="replace").read().splitlines()
+                tail = "\n".join(l[:300] for l in lines[-45:])
+            except OSError as le:
+                tail = f"(no log either: {le})"
+        emit("error", f"{label}: no report", f"{path}: {e}; the run stopped before writing it. Its last lines:\n{tail}")
         return 0
     inv = r.get("invariants", {})
     failed = [k for k, v in inv.items() if not v.get("pass")]

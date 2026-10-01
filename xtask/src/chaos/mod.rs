@@ -414,7 +414,11 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     let migrate_req = procfs::sysctl("net/ipv4/tcp_migrate_req");
     println!("chaos: net.ipv4.tcp_migrate_req = {}", migrate_req.as_deref().unwrap_or("unknown"));
     let mut rng = Rng::new(seed);
-    let home = std::env::temp_dir().join(format!("wc-{}-{}", std::process::id(), seed % 100_000));
+    // Not macOS's per-user $TMPDIR (/var/folders/…/T/): the workers' health
+    // sockets in <home>/run/<app>/ would pass the ~104-byte limit of a Unix
+    // socket path, and Warden rejects such a config.
+    let tmp = if cfg!(target_os = "linux") { std::env::temp_dir() } else { PathBuf::from("/tmp") };
+    let home = tmp.join(format!("wc-{}-{}", std::process::id(), seed % 100_000));
     let tmpfs = prepare(root, &home, in_ns)?;
     let mut notes = Vec::new();
     if !tmpfs {

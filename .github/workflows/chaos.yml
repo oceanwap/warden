@@ -84,7 +84,7 @@ jobs:
             --minutes "$MINUTES" --seed "$SEED" --out "$PWD/chaos.json" 2>&1 | tee chaos.log
       - name: Annotations
         if: ${{ !cancelled() }}
-        run: python3 .github/chaos-annotations.py "chaos ${{ matrix.os }}" chaos.json
+        run: python3 .github/chaos-annotations.py "chaos ${{ matrix.os }}" chaos.json chaos.log
       - name: Upload the report
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
