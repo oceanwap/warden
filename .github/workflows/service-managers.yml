@@ -78,6 +78,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # Node 22.12+ has reusePort on Linux only; the Node app checks that the
+      # shim lets it listen on macOS anyway.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
       - name: Build warden (release)
         run: cargo build --release --bin warden
       - name: Install warden and bun into /usr/local/bin

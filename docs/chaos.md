@@ -154,6 +154,7 @@ Each fix has its own commit and a regression test that fails without it.
 | 3 | surge reloads of `api-node` | The same on Node, twice over: `http.Server#close()` closes idle connections at once since Node 19, and the shim swept served idle sockets every 20 ms from the start of the drain | `net.Server#close()` to stop accepting; the sweep starts after `drain_ms` (`node_drain_answers_keep_alive_requests_instead_of_cutting_them`) |
 | 4 | the hint invariant | `worker crashed` and `replacement exited before taking over` had a hint only for some causes (not an app's own exit, a hang, not ready in time), and `worker thread crashed`, `worker thread error`, the rollout-restart line and the `tcp_migrate_req` warning (`fix=`) had none | A hint on every one, chosen by the cause (`every_warning_has_a_hint` on three tests' logs, `plain_hints_follow_the_cause`) |
 | 5 | `overlap` (reload, then `restart --hard`) | No failed or aborted rollout's ERROR line had a hint | A hint saying what to do next (`an_aborted_rollout_says_what_to_do`) |
+| 6 | the first macOS run (CI) | No Node app could listen on macOS: the shim forced `reusePort`, which Node (libuv) has only where the kernel spreads connections, so `listen()` failed with ENOTSUP and every worker crash-looped to FAILED | The shim adds `reusePort` only where Node has it, and Warden warns at start on macOS that one Node worker can hold the port (regression check: a Node app in the launchd checks of `service-managers.yml`, Node 22) |
 
 Harness artifacts found and fixed on the way (not Warden bugs): the
 supervisors' own lines went to the `[logging] file` on the tmpfs, which
@@ -238,8 +239,10 @@ tmpfs (`disk-full`), memory cgroups (`oom` app, `oom-kill`), `memhog` and
 `memory-recycle` (Warden reads workers' RSS from `/proc`), and
 `kill-supervisor` (no parent-death signal: the workers of a SIGKILLed
 supervisor keep running next to the new ones, as the README's Platforms
-section says). Connections are not spread across `SO_REUSEPORT` listeners
-there, which changes which worker answers, not what may fail.
+section says), and `api-node` (Node has no `reusePort` on macOS, so its 3
+workers cannot share the port). Connections are not spread across
+`SO_REUSEPORT` listeners there, which changes which worker answers, not
+what may fail.
 
 ## In CI
 

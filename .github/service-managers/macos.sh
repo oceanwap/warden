@@ -29,7 +29,7 @@ if [ "$MODE" = agent ]; then
   DOMAIN=gui/$(id -u)
   PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
   APPS=$HOME/warden-ci
-  API=mapi SITE=msite PORT_API=3301 PORT_SITE=3302
+  API=mapi SITE=msite PORT_API=3301 PORT_SITE=3302 NODE=mnode PORT_NODE=3303
 else
   GROUP="launchd LaunchDaemon (root)"
   SUDO=sudo
@@ -37,7 +37,7 @@ else
   DOMAIN=system
   PLIST=/Library/LaunchDaemons/$LABEL.plist
   APPS=/opt/warden-ci
-  API=rapi SITE=rsite PORT_API=3311 PORT_SITE=3312
+  API=rapi SITE=rsite PORT_API=3311 PORT_SITE=3312 NODE=rnode PORT_NODE=3313
 fi
 TARGET=$DOMAIN/$LABEL
 
@@ -81,13 +81,13 @@ runtime_dir() {
 none_left() {
   local left
   left=$(ps -axo user,pid,command | awk -v u="$RUN_AS" '$1 == u' |
-    grep -E " $W( |$)| [^ ]*bun .*$APPS/server\.ts" | grep -v grep)
+    grep -E " $W( |$)| [^ ]*bun .*$APPS/server\.ts| [^ ]*node .*$APPS/server\.mjs" | grep -v grep)
   if [ -n "$left" ]; then
     echo "still running:"
     echo "$left"
     return 1
   fi
-  http_down "$PORT_API" && http_down "$PORT_SITE"
+  http_down "$PORT_API" && http_down "$PORT_SITE" && http_down "$PORT_NODE"
 }
 
 diag() {
@@ -117,21 +117,33 @@ Bun.serve({
   },
 });
 EOF
+  $SUDO tee "$APPS/server.mjs" >/dev/null <<'EOF'
+// A Node app (node:http) for the service-manager checks.
+import http from "node:http";
+http
+  .createServer((req, res) => res.end(JSON.stringify({ app: process.env.WARDEN_APP, pid: process.pid })))
+  .listen(Number(process.env.PORT));
+EOF
   echo "<h1>warden ci</h1>" | $SUDO tee "$APPS/site/index.html" >/dev/null
   $SUDO chmod -R a+rX "$APPS"
 }
 
-note "environment: $(sw_vers -productVersion 2>/dev/null), uid $(id -u), sudo PATH: $(sudo sh -c 'echo $PATH')"
+note "environment: $(sw_vers -productVersion 2>/dev/null), uid $(id -u), node $(node --version), sudo PATH: $(sudo sh -c 'echo $PATH')"
 
 # ------------------------------------------------------------------ the apps
 
-note "start and save two apps"
+note "start and save three apps"
 setup_apps
 # macOS does not spread connections across SO_REUSEPORT listeners: one worker each.
 run_ok "warden start $API" w start "$APPS/server.ts" --name "$API" --port "$PORT_API"
 check "$API answers" http_ok "$PORT_API"
 run_ok "warden serve (the $SITE app)" w serve "$APPS/site" "$PORT_SITE" --name "$SITE"
 check "$SITE answers" http_ok "$PORT_SITE"
+# Node has no reusePort on macOS: the shim must not ask for it (listen() would fail with ENOTSUP).
+run_ok "warden start $NODE (node:http, through the shim)" w start "$APPS/server.mjs" --name "$NODE" --port "$PORT_NODE"
+check "$NODE answers" http_ok "$PORT_NODE"
+check "$NODE's log says one Node worker can hold the port here" \
+  $SUDO grep -q "Node cannot share a port on this OS" "$(state_dir)/logs/$NODE.log"
 run_ok "warden save" w save
 API_SUP=$(sup_pid "$API")
 SITE_SUP=$(sup_pid "$SITE")
@@ -200,6 +212,7 @@ run_ok "launchctl bootstrap $DOMAIN $PLIST" lc bootstrap "$DOMAIN" "$PLIST"
 wait_for "wardend runs for the job again" 30 wardend_is_job
 wait_for "$API resurrected and answering" 40 http_ok "$PORT_API"
 wait_for "$SITE resurrected and answering" 30 http_ok "$PORT_SITE"
+wait_for "$NODE resurrected and answering" 30 http_ok "$PORT_NODE"
 wait_for "$API 1/1 ready" 30 app_ready "$API" 1
 check "wardend's log says it resurrected $API" $SUDO grep -q "resurrected a saved app app=$API" "$(state_dir)/logs/wardend.log"
 
