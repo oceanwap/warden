@@ -325,7 +325,8 @@ fn warn_if_no_migrate_req(cfg: &Config) {
         if v.trim() == "0" {
             warn!(
                 "net.ipv4.tcp_migrate_req is 0: a few queued connections may be reset when a worker stops",
-                fix = "sysctl -w net.ipv4.tcp_migrate_req=1",
+                hint = "sysctl -w net.ipv4.tcp_migrate_req=1, and contrib/99-warden.conf to keep it after a reboot \
+                        (`warden startup` installs it)",
             );
         }
     }
@@ -818,7 +819,15 @@ impl Supervisor {
                     t.crashed = true;
                     t.crashes += 1;
                     let (slot, role, pid) = (inst.slot, inst.role, inst.handle.pid);
-                    warn!("worker thread crashed", worker = worker, reason = why, host_pid = pid);
+                    warn!(
+                        "worker thread crashed",
+                        worker = worker,
+                        reason = why,
+                        host_pid = pid,
+                        hint = "an uncaught error or process.exit() in that Worker (the `worker thread error` line \
+                                before it, or `warden logs <app>`); the host keeps serving with its other Workers \
+                                while Warden starts a replacement host",
+                    );
                     emit(&self.cfg.app.name, worker, WorkerEvent::Crashed, Some(pid), || Some(why.clone()));
                     if role == Role::Current && !self.shutting_down && !self.stopped {
                         self.on_thread_crash(slot, false);
@@ -828,7 +837,13 @@ impl Supervisor {
                 }
             }
             "error" if worker_mode => {
-                warn!("worker thread error", worker = worker, message = msg.message.unwrap_or_default());
+                warn!(
+                    "worker thread error",
+                    worker = worker,
+                    message = msg.message.unwrap_or_default(),
+                    hint = "an uncaught exception in the app's code (message= has it); the Worker dies with it and \
+                            Warden replaces the host. Fix the error, or catch it in the app",
+                );
             }
             "draining" => debug!("draining", worker = worker),
             "long_lived_closed" => info!(
@@ -926,6 +941,20 @@ impl Supervisor {
         let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), oom);
         // A `note` (Warden lost track of it) is the whole story.
         let hint = if note.is_some() { None } else { cause.hint(self.oom.available()) };
+        // The WARN/ERROR line of a crash always says what to do, even when
+        // the cause alone has nothing to add (an exit code, Warden's kill).
+        let crash_hint = hint.unwrap_or(if inst.hung {
+            "its event loop stopped (the `worker hung` line before it); Warden restarts it. Its last output is in \
+             `warden logs <app> --worker N`"
+        } else if inst.timed_out {
+            "it did not listen on its port within workers.ready_timeout (the `not ready in time` line before it); \
+             Warden restarts it with backoff"
+        } else if note.is_some() {
+            "Warden lost track of this process (the reason says how); it starts a new one"
+        } else {
+            "the app exited by itself: its last output lines say why (`warden logs <app> --worker N`). Warden \
+             restarts it with backoff; after restart.max_restarts within restart.restart_window it is FAILED"
+        });
         let why = cause.short();
         let slot_id = inst.slot;
         let label = self.label(slot_id);
@@ -949,7 +978,8 @@ impl Supervisor {
             warn!(
                 "worker started by a rollout that failed has stopped; restarting it with the previous config",
                 worker = label,
-                pid = inst.handle.pid
+                pid = inst.handle.pid,
+                hint = "nothing to undo: the rollout's failure is reported above; fix what it says and deploy again",
             );
             self.emit_worker(slot_id, WorkerEvent::Restarting, Some(inst.handle.pid), || {
                 Some("its rollout failed; restarting now".into())
@@ -982,23 +1012,13 @@ impl Supervisor {
                 }
             }
         } else if inst.role == Role::Replacement {
-            match hint {
-                Some(h) => error!(
-                    "replacement exited before taking over",
-                    worker = label,
-                    pid = inst.handle.pid,
-                    reason = reason,
-                    hint = h
-                ),
-                None => {
-                    error!(
-                        "replacement exited before taking over",
-                        worker = label,
-                        pid = inst.handle.pid,
-                        reason = reason
-                    )
-                }
-            }
+            error!(
+                "replacement exited before taking over",
+                worker = label,
+                pid = inst.handle.pid,
+                reason = reason,
+                hint = crash_hint
+            );
             self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || {
                 Some(format!("{reason} (replacement, before taking over)"))
             });
@@ -1032,23 +1052,14 @@ impl Supervisor {
                 info!("worker exited", worker = label, pid = inst.handle.pid, reason = reason);
                 self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(reason.clone()));
             } else {
-                match hint {
-                    Some(h) => warn!(
-                        "worker crashed",
-                        worker = label,
-                        pid = inst.handle.pid,
-                        reason = reason,
-                        uptime_s = uptime.as_secs(),
-                        hint = h
-                    ),
-                    None => warn!(
-                        "worker crashed",
-                        worker = label,
-                        pid = inst.handle.pid,
-                        reason = reason,
-                        uptime_s = uptime.as_secs()
-                    ),
-                }
+                warn!(
+                    "worker crashed",
+                    worker = label,
+                    pid = inst.handle.pid,
+                    reason = reason,
+                    uptime_s = uptime.as_secs(),
+                    hint = crash_hint
+                );
                 self.emit_worker(slot_id, WorkerEvent::Crashed, Some(inst.handle.pid), || Some(reason.clone()));
                 self.on_slot_crash(slot_id, uptime);
             }

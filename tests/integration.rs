@@ -331,6 +331,7 @@ fn crash_loop_ends_in_failed() {
     assert_eq!(s["workers"][0]["crashes"], 4);
     assert_eq!(s["workers"][0]["last_exit"], "exit code 1");
     assert!(w.log().contains("too many restarts"));
+    every_warning_has_a_hint(&w.log());
     // The supervisor stays up; a manual restart is attempted, waited for, and
     // reported as failed (exit 1) because the app still crashes.
     let (code, out) = w.cli(&["restart", "1"]);
@@ -478,6 +479,19 @@ fn worker_mode_threads_and_recovery() {
     for _ in 0..60 {
         assert!(get(port, "/whoami").is_some());
     }
+    every_warning_has_a_hint(&w.log());
+}
+
+/// Every WARN and ERROR line Warden wrote says what to do about it (a
+/// `hint=`), as docs/review-process.md (C4) asks. Found missing on several
+/// lines by `cargo xtask chaos`. Worker output is the app's, not Warden's.
+fn every_warning_has_a_hint(log: &str) {
+    let bad: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.contains(" OUT ") && (l.contains(" WARN ") || l.contains(" ERROR ")))
+        .filter(|l| !l.contains(" hint=") && !l.contains("panicked at"))
+        .collect();
+    assert!(bad.is_empty(), "WARN/ERROR lines without hint=:\n{}", bad.join("\n"));
 }
 
 #[test]
@@ -632,6 +646,7 @@ fn watchdog_kills_a_hung_worker() {
     });
     assert!(s["workers"][0]["last_exit"].as_str().unwrap().contains("hung"), "{s:#?}");
     assert!(!alive(before));
+    every_warning_has_a_hint(&w.log());
 }
 
 /// Found by `cargo xtask chaos` (stop-supervisor): Warden frozen (SIGSTOP)
