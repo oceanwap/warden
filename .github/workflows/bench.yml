@@ -1,8 +1,10 @@
-# `cargo xtask bench` (bench/README.md) on GitHub's 4-vCPU Linux runners,
+# `cargo xtask bench` (bench/README.md) on GitHub's hosted Linux runners,
 # x86_64 and ARM64: the published numbers come from one 2-CPU x86 VM where
 # the load generator shares the CPUs with the apps, while production runs on
 # many-core ARM64. Every suite runs (release build of Warden) against PM2,
-# Watt, nginx and `serve`.
+# Watt, nginx and `serve`. The runners' size depends on the repository's
+# plan (4 vCPUs for public repositories, 2 otherwise): the first annotation
+# says what the job got.
 #
 # Results: the job summary (bench/results/latest.md), an artifact with the
 # raw JSON, and one notice annotation per suite (readable through the public
@@ -129,6 +131,12 @@ jobs:
         run: |
           { echo "## Benchmarks: ${{ matrix.arch }} (${{ matrix.runner }})"; echo
             cat bench/results/latest.md 2>/dev/null || echo "no results: see the step above"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Annotation (the runner)
+        if: ${{ !cancelled() }}
+        run: |
+          model=$(LC_ALL=C lscpu | sed -n 's/^Model name: *//p' | head -1)
+          mem=$(awk '/MemTotal/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)
+          echo "::notice title=bench ${{ matrix.arch }}%3A runner::${{ matrix.runner }}: $(nproc) vCPUs ($model), $mem RAM, $(uname -r)"
       - name: Annotations (one per suite)
         if: ${{ !cancelled() }}
         run: python3 .github/bench-annotations.py "bench ${{ matrix.arch }}" bench/results/latest.md

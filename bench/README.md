@@ -37,11 +37,13 @@ the README.
 ## In CI: x86_64 and ARM64
 
 `.github/workflows/bench.yml` runs `cargo xtask bench --no-readme` on
-GitHub's 4-vCPU runners, `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`
-(ARM64), with everything above installed (oha from its release binaries,
-nginx and wrk from apt, the npm packages with `npm ci`) and
-`net.ipv4.tcp_migrate_req = 1`. Push to the `bench` branch, or "Run
-workflow" (Actions → Benchmarks) with:
+GitHub's hosted runners, `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`
+(ARM64): 4 vCPUs for public repositories, 2 otherwise (the first run, on
+2026-10-01, got 2 vCPUs and 8 GB on both, a Xeon 6973P-C and an ARM64
+part); the job's first annotation says what it got. Everything above is
+installed (oha from its release binaries, nginx and wrk from apt, the npm
+packages with `npm ci`), and `net.ipv4.tcp_migrate_req = 1`. Push to the
+`bench` branch, or "Run workflow" (Actions → Benchmarks) with:
 
 - `only`, `quick`, `duration`: as the options below;
 - `app_cpus`, `loadgen_cpus` (taskset lists, e.g. `0-1` and `2-3`) and

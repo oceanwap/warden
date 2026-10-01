@@ -267,16 +267,26 @@ fn newest_result(root: &Path, name: &str, since: SystemTime) -> Option<PathBuf> 
         .map(|(_, p)| p)
 }
 
+/// The CPU's name: /proc/cpuinfo's "model name" (x86), else lscpu's "Model
+/// name" (ARM's /proc/cpuinfo has none: lscpu decodes the part number,
+/// e.g. Neoverse-N2).
+fn cpu_model() -> Option<String> {
+    let field = |text: &str, key: &str| {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(key))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != "-")
+    };
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    field(&cpuinfo, "model name").or_else(|| {
+        let out = Command::new("lscpu").env("LC_ALL", "C").output().ok()?;
+        field(&String::from_utf8_lossy(&out.stdout), "Model name")
+    })
+}
+
 fn machine() -> String {
-    let cpu = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|t| {
-            t.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "unknown CPU".into());
+    let cpu = cpu_model().unwrap_or_else(|| "unknown CPU".into());
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
     let mem = std::fs::read_to_string("/proc/meminfo")
         .ok()

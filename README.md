@@ -490,7 +490,7 @@ What each suite does, what each number means and the fairness rules are in
 [`bench/README.md`](bench/README.md); findings, caveats and the before/after
 log of every optimisation are in [`docs/benchmarks.md`](docs/benchmarks.md).
 The machine is small (2 CPUs shared with the load generator), so compare
-columns, not absolute numbers. The same suites also run on GitHub's 4-vCPU
+columns, not absolute numbers. The same suites also run on GitHub's hosted
 x86_64 and ARM64 runners (`.github/workflows/bench.yml`: push to the
 `bench` branch or run it by hand), each suite's table an annotation on the
 run.
