@@ -44,8 +44,9 @@ supervisor latencies it reports are a debug build's). Needs Linux, `bun`,
 | `crashy` | `bench/chaos/app.ts`, 1 worker, `max_restarts = 3` | a crash loop to FAILED and `warden reset` |
 | wardend | `warden daemon --background`, an alert rule writing to a file | supervisor restarts, alerts, its own death |
 
-Every app has the health gates on (`/health`), `[watchdog] timeout = 4`,
-`grace_period = 10`, `long_lived_timeout = 1`. Load, all the time, without
+Every app runs with `[watchdog] timeout = 4`, `grace_period = 10` and
+`long_lived_timeout = 1`, and all but `site` and `crashy` with health
+checks and gates on `/health`. Load, all the time, without
 retries: for each app but `crashy`, one keep-alive client (a request every
 20 ms on one connection; a new one after `Connection: close` or a failure)
 and one new-connection client (every 40 ms); two WebSocket clients and
@@ -93,7 +94,7 @@ Checked continuously and at the end; any violation fails the run.
 | WebSocket/SSE clients see 1001 or a clean end | Every ended connection: a close frame with 1001, or the chunked stream's last chunk after a whole event, unless its worker was killed (then any end is allowed) |
 | No zombies | `/proc` every 2 s: a zombie seen three scans in a row (4+ s) |
 | No orphans | A process of the run whose parent is gone, still alive `grace_period` + 10 s later |
-| No fd leak, no RSS growth | Open fds and RSS of every supervisor and wardend every 4 s while the fleet is quiet (recovered, no fault running); per process, the lowest of the first third against the lowest of the last third: growth above max(4 fds, 10 %) or max(4 MB, 25 %) fails. Processes with under 2 minutes of quiet samples are not judged |
+| No fd leak, no RSS growth | Open fds and RSS of every supervisor and wardend every 4 s while the fleet is quiet (recovered, no fault running); per process, the lowest of the first third against the lowest of the last third: growth above max(4 fds, 10 %) or max(4 MB, 25 %) fails. A process with under 2 minutes or 9 quiet samples (one that was killed and restarted late) is not judged |
 | No panics | `panicked at` or `essential task failed` in any supervisor's or wardend's log |
 | Every WARN/ERROR has a `hint=` | Every Warden line at WARN or ERROR in those logs (the static server's own lines included, the apps' output not) |
 | `warden list` and `status` answer in 100 ms (p99) | `warden list`, `warden status <app>`, `warden list --json`, timed every 0.5 s. Samples taken while a supervisor was frozen on purpose are left out (a frozen app costs `list` its 1 s timeout by design) |
@@ -127,7 +128,7 @@ Each fix has its own commit and a regression test that fails without it.
 | 1 | `stop-supervisor` | A supervisor frozen longer than `watchdog.timeout` (SIGSTOP, a paused VM, a starved host) killed **every** worker and standby as hung when it resumed: an outage of an app that had served all along. A heartbeat's time is when Warden reads it, and those sent during the freeze were still unread when the first tick judged them | A tick that comes over 1.5 s late moves every heartbeat forward by the stall, so the watchdog counts only silence Warden was awake to hear (`a_frozen_supervisor_does_not_kill_its_workers_as_hung`) |
 | 2 | `reload` of `site` | A draining static worker closed its idle keep-alive connections at once: a client sending its next request on one lost it (EOF) | Idle connections stay open through the drain; what arrives gets `Connection: close` (`static_drain_answers_keep_alive_requests_instead_of_cutting_them`) |
 | 3 | surge reloads of `api-node` | The same on Node, twice over: `http.Server#close()` closes idle connections at once since Node 19, and the shim swept served idle sockets every 20 ms from the start of the drain | `net.Server#close()` to stop accepting; the sweep starts after `drain_ms` (`node_drain_answers_keep_alive_requests_instead_of_cutting_them`) |
-| 4 | the hint invariant | `worker crashed` and `replacement exited before taking over` had a hint only for some causes (not an app's own exit, a hang, not ready in time), and `worker thread crashed`, `worker thread error`, the rollout-restart line and the `tcp_migrate_req` warning (`fix=`) had none | A hint by context on every one (`every_warning_has_a_hint` on three tests' logs) |
+| 4 | the hint invariant | `worker crashed` and `replacement exited before taking over` had a hint only for some causes (not an app's own exit, a hang, not ready in time), and `worker thread crashed`, `worker thread error`, the rollout-restart line and the `tcp_migrate_req` warning (`fix=`) had none | A hint on every one, chosen by the cause (`every_warning_has_a_hint` on three tests' logs, `plain_hints_follow_the_cause`) |
 | 5 | `overlap` (reload, then `restart --hard`) | No failed or aborted rollout's ERROR line had a hint | A hint saying what to do next (`an_aborted_rollout_says_what_to_do`) |
 
 Harness artifacts found and fixed on the way (not Warden bugs): the
