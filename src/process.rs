@@ -524,7 +524,9 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
                 stream = stream,
                 dropped = n,
                 limit_per_s = limit,
-                hint = "lower the app's log level, raise [logging] max_lines_per_sec (0 = no limit), or set [logging] worker_output = \"inherit\"",
+                hint = "lower the app's log level, raise [logging] max_lines_per_sec (0 = no limit), or set [logging] \
+                        worker_output = \"inherit\" (straight to Warden's stdout, not in `warden logs`) or \"direct\" \
+                        (into out_file, no budget)",
             );
         }
     }
