@@ -158,7 +158,7 @@ pub async fn run(
     })
 }
 
-/// `warden <args>` on `host`.
+/// `warden <args>` on `host`. Err also when ssh could not run it there.
 pub async fn run_warden(
     host: &Host,
     args: &[String],
@@ -167,7 +167,30 @@ pub async fn run_warden(
     limit: Duration,
 ) -> Result<Output, String> {
     let (prog, argv) = warden_command(host, args)?;
-    run(&prog, &argv, stdin, env, limit).await
+    let out = run(&prog, &argv, stdin, env, limit).await?;
+    match host {
+        Host::Ssh { warden, .. } => remote_failure(host, &out, warden).map_or(Ok(out), Err),
+        Host::Local => Ok(out),
+    }
+}
+
+/// A remote command that did not get to answer: ssh exits 255 when it
+/// fails itself (connect, host key, login), and the remote shell 127 when
+/// it does not find `program`. The error to show instead of the output.
+pub fn remote_failure(host: &Host, out: &Output, program: &str) -> Option<String> {
+    let Host::Ssh { dest, .. } = host else { return None };
+    match out.code {
+        Some(255) => Some(ssh::explain(dest, &out.stderr, Some(255))),
+        Some(127) => {
+            let said = out.stderr.trim().lines().last().unwrap_or("").trim();
+            Some(format!(
+                "{program} was not found on {dest} ({said}): install warden there, or set the remote warden to its \
+                 full path (Connection…, or --remote-warden; e.g. ~/.local/bin/warden). Commands over ssh run \
+                 without your login profile, so their PATH may not have it"
+            ))
+        }
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------ start wardend
@@ -404,6 +427,9 @@ pub async fn read_config(host: &Host, path: &str) -> Result<String, String> {
             let argv = vec!["cat".to_string(), "--".into(), path.to_string()];
             let (prog, args) = host_command(host, &argv)?;
             let out = run(&prog, &args, None, &[], Duration::from_secs(30)).await?;
+            if let Some(e) = remote_failure(host, &out, "cat") {
+                return Err(e);
+            }
             if out.ok { Ok(out.stdout) } else { Err(format!("cannot read {path} on {dest}: {}", out.text())) }
         }
     }
@@ -456,6 +482,9 @@ async fn config_script(host: &Host, path: &str, text: &str, save: bool) -> Resul
             let script = remote_config_script(&tmp, warden, path, save);
             let (prog, args) = host_command(host, &["sh".into(), "-c".into(), script])?;
             let out = run(&prog, &args, Some(text), &[], Duration::from_secs(30)).await?;
+            if let Some(e) = remote_failure(host, &out, warden) {
+                return Err(e);
+            }
             match out.code {
                 Some(0) => Ok(summary(&out, &tmp, path)),
                 Some(125) => Err(format!("cannot write a temporary file beside {path}: {}", out.text())),
@@ -559,6 +588,25 @@ mod tests {
             argv.last().unwrap(),
             r"/home/deploy/.local/bin/warden start 'node server.js --flag '\''x'\''' --name api -i 2 --port 3000"
         );
+    }
+
+    #[test]
+    fn remote_failures_are_errors_with_the_fix() {
+        let out = |code: i32, stderr: &str| Output {
+            command: "ssh".into(),
+            ok: code == 0,
+            code: Some(code),
+            stdout: String::new(),
+            stderr: stderr.into(),
+        };
+        let ssh = Host::Ssh { dest: "web-1".into(), warden: "warden".into() };
+        let e = remote_failure(&ssh, &out(255, "web-1: Permission denied (publickey)."), "warden").unwrap();
+        assert!(e.contains("Permission denied") && e.contains("ssh-add"), "{e}");
+        let e = remote_failure(&ssh, &out(127, "bash: line 1: warden: command not found\n"), "warden").unwrap();
+        assert!(e.contains("warden was not found on web-1 (bash: line 1: warden: command not found)"), "{e}");
+        assert!(e.contains("--remote-warden"), "{e}");
+        assert_eq!(remote_failure(&ssh, &out(1, "warden: bad config"), "warden"), None, "warden's own answer");
+        assert_eq!(remote_failure(&Host::Local, &out(255, ""), "warden"), None);
     }
 
     #[test]

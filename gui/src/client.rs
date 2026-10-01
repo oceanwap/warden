@@ -174,6 +174,9 @@ pub struct Backoff {
 
 impl Backoff {
     const STEPS_MS: [u64; 6] = [250, 500, 1000, 2000, 4000, 5000];
+    /// After a failure only the user can fix (`ssh::needs_you`): a login
+    /// the server refuses, retried every 5 s, gets the address banned.
+    pub const NEEDS_YOU: Duration = Duration::from_secs(600);
 
     pub fn next_delay(&mut self) -> Duration {
         let i = (self.attempt as usize).min(Self::STEPS_MS.len() - 1);
@@ -411,8 +414,18 @@ async fn run_feed(endpoint: Endpoint, opts: FeedOptions, mut out: mpsc::Sender<F
                     }
                     match ssh::Tunnel::open(t).await {
                         Ok(open) => tunnel = Some(open),
-                        Err(error) => {
-                            if !retry(&mut out, &mut backoff, error, false).await {
+                        Err(e) => {
+                            let (error, wait) = if e.needs_you {
+                                let error = format!(
+                                    "{}. Trying again in {} min (Connection… → Connect tries at once)",
+                                    e.message,
+                                    Backoff::NEEDS_YOU.as_secs() / 60
+                                );
+                                (error, Some(Backoff::NEEDS_YOU))
+                            } else {
+                                (e.message, None)
+                            };
+                            if !retry(&mut out, &mut backoff, error, false, wait).await {
                                 return;
                             }
                             continue;
@@ -433,15 +446,23 @@ async fn run_feed(endpoint: Endpoint, opts: FeedOptions, mut out: mpsc::Sender<F
             End::Closed => return,
             End::Failed { error, not_running } => (error, not_running),
         };
-        if !retry(&mut out, &mut backoff, error, not_running).await {
+        if !retry(&mut out, &mut backoff, error, not_running, None).await {
             return;
         }
     }
 }
 
-/// Say why the connection is gone, then wait. False: the UI went away.
-async fn retry(out: &mut mpsc::Sender<FeedMsg>, backoff: &mut Backoff, error: String, not_running: bool) -> bool {
-    let retry_in = backoff.next_delay();
+/// Say why the connection is gone, then wait (`wait`, or the backoff's
+/// next delay). False: the UI went away.
+async fn retry(
+    out: &mut mpsc::Sender<FeedMsg>,
+    backoff: &mut Backoff,
+    error: String,
+    not_running: bool,
+    wait: Option<Duration>,
+) -> bool {
+    let next = backoff.next_delay();
+    let retry_in = wait.unwrap_or(next);
     let msg = FeedMsg::Disconnected { error, not_running, retry_in, attempt: backoff.attempt };
     if out.send(msg).await.is_err() {
         return false;
@@ -465,7 +486,8 @@ async fn session(
     mut tunnel: Option<&mut ssh::Tunnel>,
     backoff: &mut Backoff,
 ) -> End {
-    let remote = tunnel.as_ref().map(|t| t.dest.clone());
+    // What ssh says from now on is about this connection.
+    let ssh_from = tunnel.as_ref().map_or(0, |t| t.stderr_lines());
     let stream = match connect(socket).await {
         Ok(s) => s,
         Err((error, not_running)) => return End::Failed { error, not_running },
@@ -486,23 +508,21 @@ async fn session(
     loop {
         tokio::select! {
             got = read_line(&mut reader, &mut buf) => {
-                let more = match got {
-                    Ok(more) => more,
+                let (more, read_error) = match got {
+                    Ok(more) => (more, None),
+                    // Through a tunnel ssh says why: a channel it could not
+                    // open is closed with a reset.
+                    Err(error) if tunnel.is_some() => (false, Some(error)),
                     Err(error) => return End::Failed { error, not_running: false },
                 };
                 if !more {
                     if !batch.is_empty() && out.send(FeedMsg::Batch(std::mem::take(&mut batch))).await.is_err() {
                         return End::Closed;
                     }
-                    let tail = match tunnel.as_mut() {
-                        Some(t) => {
-                            // Let ssh's reader catch its message about the failed channel.
-                            tokio::time::sleep(Duration::from_millis(150)).await;
-                            t.stderr_text().lines().last().unwrap_or("").to_string()
-                        }
-                        None => String::new(),
+                    return match tunnel.as_deref_mut() {
+                        Some(t) => through_tunnel(t, ssh_from, connected, bye.as_deref(), read_error).await,
+                        None => End::Failed { error: ended(connected, bye.as_deref()), not_running: false },
                     };
-                    return End::Failed { error: ended(connected, bye.as_deref(), remote.as_deref(), &tail), not_running: !connected && remote.is_some() };
                 }
                 let line = std::mem::take(&mut buf);
                 if !connected {
@@ -576,27 +596,53 @@ async fn session(
     }
 }
 
-/// Why a stream ended at EOF.
-fn ended(connected: bool, bye: Option<&str>, remote: Option<&str>, ssh_said: &str) -> String {
-    match (connected, bye, remote) {
-        (true, Some(reason), _) => format!("wardend exited ({reason}); every app keeps running"),
-        (true, None, None) => "wardend closed the connection without saying bye: it died or was killed. Apps keep \
-                               running; `warden daemon --background` (or Start wardend) starts it again"
+/// Why a stream on this machine ended at EOF.
+fn ended(connected: bool, bye: Option<&str>) -> String {
+    match (connected, bye) {
+        (true, Some(reason)) => format!("wardend exited ({reason}); every app keeps running"),
+        (true, None) => "wardend closed the connection without saying bye: it died or was killed. Apps keep \
+                         running; `warden daemon --background` (or Start wardend) starts it again"
             .into(),
-        (true, None, Some(dest)) => format!(
-            "the connection to wardend on {dest} ended without a bye: wardend died there, or the SSH connection \
-             dropped{}",
-            if ssh_said.is_empty() { String::new() } else { format!(" (ssh: {ssh_said})") }
-        ),
-        (false, _, None) => "wardend closed the connection before answering; it may be exiting (`warden daemon \
-                             status`)"
-            .into(),
-        (false, _, Some(dest)) => format!(
-            "no answer from wardend through the SSH tunnel to {dest}{}: is it running there? Start it on that host \
-             (`warden daemon --background`, or Start wardend), or fix the remote socket path",
-            if ssh_said.is_empty() { String::new() } else { format!(" (ssh: {ssh_said})") }
-        ),
+        (false, _) => {
+            "wardend closed the connection before answering; it may be exiting (`warden daemon status`)".into()
+        }
     }
+}
+
+/// Why a stream through the SSH tunnel `t` ended (EOF, or `read_error`):
+/// ssh is gone, or what it said since the connection began (`ssh_from`).
+async fn through_tunnel(
+    t: &mut ssh::Tunnel,
+    ssh_from: u64,
+    connected: bool,
+    bye: Option<&str>,
+    read_error: Option<String>,
+) -> End {
+    // Let ssh's reader take its words about the channel (or its exit).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    if let Some(error) = t.ended() {
+        return End::Failed { error, not_running: false };
+    }
+    let said = t.stderr_since(ssh_from);
+    let said = said.last().map(String::as_str).unwrap_or("");
+    let dest = &t.dest;
+    let error = match (connected, bye) {
+        (true, Some(reason)) => format!("wardend on {dest} exited ({reason}); every app keeps running"),
+        (true, None) => {
+            let why = match (said.is_empty(), read_error) {
+                (false, _) => format!(" (ssh: {said})"),
+                (true, Some(e)) => format!(" ({e})"),
+                (true, None) => String::new(),
+            };
+            format!(
+                "the connection to wardend on {dest} ended without a bye{why}: wardend died there, or the SSH \
+                 connection dropped. Apps keep running"
+            )
+        }
+        // Most likely wardend is not running there: say so (Start wardend).
+        (false, _) => return End::Failed { error: ssh::explain_channel(dest, &t.remote, said), not_running: true },
+    };
+    End::Failed { error, not_running: false }
 }
 
 #[cfg(test)]
@@ -674,10 +720,9 @@ mod tests {
 
     #[test]
     fn end_of_stream_reasons() {
-        assert!(ended(true, Some("SIGTERM"), None, "").contains("exited (SIGTERM)"));
-        assert!(ended(true, None, None, "").contains("died or was killed"));
-        let r = ended(false, None, Some("u@h"), "channel 2: open failed");
-        assert!(r.contains("u@h") && r.contains("open failed") && r.contains("remote socket"), "{r}");
+        assert!(ended(true, Some("SIGTERM")).contains("exited (SIGTERM)"));
+        assert!(ended(true, None).contains("died or was killed"));
+        assert!(ended(false, None).contains("before answering"));
     }
 
     #[test]

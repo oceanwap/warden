@@ -48,6 +48,13 @@ jobs:
       - name: npm ci (bench/)
         working-directory: bench
         run: npm ci --no-audit --no-fund
+      # The GUI's SSH test (gui/tests/ssh.rs) runs an sshd of its own, and the
+      # proxy test (tests/integration.rs) an nginx of its own, each on a free
+      # port with its own config; both skip without them.
+      - name: apt-get install openssh-server nginx
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends openssh-server nginx
       - run: cargo fmt --all --check
       - run: shellcheck install.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings

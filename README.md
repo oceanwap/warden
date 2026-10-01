@@ -43,7 +43,7 @@ Every release on [GitHub Releases](https://github.com/oceanwap/warden/releases)
 has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
 
 - **CLI only**: `warden-<version>-<os>-<arch>.tar.gz` with the `warden`
-  binary, this README and `contrib/` (systemd units, sysctl file). The Linux
+  binary, this README and `contrib/` (systemd units, sysctl file, nginx site). The Linux
   binaries need glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10+).
 - **GUI + CLI**: `warden-gui-<version>-<os>-<arch>` (`.tar.gz` on Linux, a
   zipped `Warden.app` on macOS) with `warden-gui` next to `warden` (see
@@ -400,8 +400,13 @@ cache. With `access_log = true` each line ends in `cache=hit` or
   `net.ipv4.tcp_migrate_req = 1`. Without it, a few connections queued on a
   closing listener get reset during reloads. Measured: 9–15 per worker-mode
   reload, 0 with the setting. Warden logs a warning at startup when it's off.
-- nginx: `upstream api { server 127.0.0.1:3000; keepalive 64; }` A single
-  upstream entry is enough; the kernel does the balancing.
+- nginx: [`contrib/nginx.conf`](contrib/nginx.conf), a commented site file:
+  one upstream address (the kernel does the balancing) with keep-alive,
+  retries for idempotent requests only, WebSockets and SSE, X-Forwarded-*
+  headers, a `/health` for a load balancer. A test restarts the workers
+  under load through it without a failed request. Load balancers (AWS
+  ALB/NLB, GCP, Cloudflare), no proxy at all, and the timeouts that must
+  agree with Warden's drain: [`docs/proxies.md`](docs/proxies.md).
 - Logs go to stdout in journald format (timestamps dropped, priority prefixes
   added). Use `journalctl -u warden@api`.
 - Metrics: set `[metrics] listen = "127.0.0.1:9464"` to get Prometheus text at `/metrics`.
@@ -494,6 +499,9 @@ never in a process list or a log line. Details:
 **History.** wardend keeps the last 24 hours of every app's CPU, memory,
 workers ready and restarts, and the host's CPU, memory and load, from the
 statuses it already receives (a sample per 10 s; at most 135 KiB per app).
+It saves them every minute and when it stops (`<state dir>/wardend-history.bin`,
+written atomically), so a restart of wardend (an upgrade, a crash, a
+reboot) keeps the charts; a damaged file is moved aside with a warning.
 The GUI charts them; scripts ask `{"cmd":"history"}`
 ([Resource history](docs/protocol.md#resource-history)).
 

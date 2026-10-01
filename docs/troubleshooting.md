@@ -174,6 +174,39 @@ carries the same reason with a `hint=`.
 | `alert queue is full; dropping alerts` | More than 64 alerts wait: deliveries are slow (each may take 10 s, one retry) and many alerts fire | Make the command or webhook answer fast; raise `min_interval`; narrow `on` / `apps` |
 | `alert rules: a warning` | The file is valid, but: a plain `http://` webhook to another host (the token crosses the network unencrypted), or curl missing | Use `https://`; install curl |
 | `resource history is full; new apps get none` | 128 apps have a series and none has been gone 10 minutes | Unusual; the history of an app gone for 10 minutes makes room |
+| `cannot use the resource history on disk; starting with an empty one` (`reason=`, `moved_to=`) | At start, `<state dir>/wardend-history.bin` was truncated (a full disk, an incomplete copy), corrupt (checksum or structure), of another format version (a downgrade), bigger than any wardend writes, or not a history or not a regular file | Nothing to do: the file was moved to `wardend-history.bin.bad` and wardend writes a new one within a minute; the charts before this start are lost. If it repeats, check the disk (`df -h`, `dmesg`) and report it with the `.bad` file |
+| `cannot read the resource history; starting with an empty one` | The file exists but reading it failed (`error=`: permissions, an I/O error); it is left in place | Check the file's owner and mode (wardend's user, 0600) and the disk; the next save (every minute) replaces it |
+| `cannot save the resource history; it is kept in memory only until a save works` | Writing the snapshot failed (`error=`: the state directory is missing or not writable, the disk is full, fsync or rename failed); said once until a save works again (`resource history saved again`) | Make the state directory writable by wardend's user (`/var/lib/warden` for root, `~/.local/state/warden` for a user) and free space (`df -h`); wardend retries every minute and keeps the history in memory meanwhile |
+| `the resource history on disk is newer than the clock; dropping the samples from the future` | The system clock is behind the newest saved sample (it went back, or was not set yet at boot) | Check the clock (`timedatectl`, NTP); the charts continue from now |
+| `saving the resource history has not finished; no new snapshot until it does` (`running_s=`) | A snapshot's fsync or rename has been running for 5 minutes: a hung disk or network mount under the state directory | Check the disk or mount (`dmesg`); saves resume once it returns, and the history is kept in memory meanwhile |
+| `the last save of the resource history is still running; not saving it again at exit` | At a clean exit the previous snapshot's fsync had not finished within 2 s: the disk is very slow or hung | The file on disk is the previous snapshot (up to a minute old); check the disk (`dmesg`) |
+
+## Behind nginx or a load balancer
+
+[`docs/proxies.md`](proxies.md) has the timeouts that must agree; the usual symptoms:
+
+| You see | Why | Fix |
+|---|---|---|
+| A few 502s during a deploy (nginx: `recv() failed (104: Connection reset by peer) while reading response header from upstream`) | Connections queued on a closing worker's listener are reset (`net.ipv4.tcp_migrate_req` is 0; Warden warns at start), and nginx does not retry them | `contrib/99-warden.conf` (`sysctl -w net.ipv4.tcp_migrate_req=1`); use `contrib/nginx.conf`, whose backup entry lets nginx retry idempotent requests |
+| Occasional 502s at any time, not only during deploys | The proxy or load balancer keeps idle connections to the app longer than the app does (Node 5 s, Bun 10 s), and sends a request on one the app is closing | nginx: upstream `keepalive_timeout` below the app's (4 s in `contrib/nginx.conf`); a load balancer straight to the app: raise the app's idle timeout above the load balancer's (ALB 60 s, GCP 600 s), or put nginx between |
+| WebSocket clients see 1006 (or a reset) after a restart through nginx, instead of 1001 | nginx closed the client connection before reading the client's close reply | `lingering_close always;` in the WebSocket location (in `contrib/nginx.conf`) |
+| SSE events arrive in bursts, or only when the stream ends | The proxy buffers the response | nginx: `proxy_buffering off` for the SSE location, or the app sends `X-Accel-Buffering: no` |
+| WebSockets or SSE streams end after 60 s (ALB), 100 s (Cloudflare) or 30 s (GCP) | The load balancer's idle or backend timeout | Ping (or send an SSE comment) more often than the idle timeout; GCP: raise the backend service timeout |
+| Requests fail for a while after `systemctl stop warden@api` on a host behind a load balancer | The load balancer still sends to the host until its health check fails | Deregister the host first, wait for the deregistration delay (≥ `grace_period`), then stop Warden. Deploys (`reload`, `safe-reload`) need no deregistration |
+
+## The GUI over SSH (`warden-gui --ssh`)
+
+The GUI shows ssh's own message with the fix; the usual ones:
+
+| You see | Why | Fix |
+|---|---|---|
+| `Permission denied (publickey)` | The server refused every key the GUI's ssh offered (it never asks for a password) | `ssh-add` your key; `ssh user@host` in a terminal must work without a prompt. The GUI then tries again only every 10 minutes (Connection… → Connect tries at once) |
+| `Host key verification failed` | The host's key is not in `known_hosts` yet | Connect once with `ssh user@host` in a terminal and check the fingerprint |
+| `…'s host key has changed since you last connected` | The key differs from the one in `known_hosts`: a reinstalled host, or someone in between | Check the new fingerprint with the host's administrator, then run the `ssh-keygen -R` line shown; if the change is unexpected, do not connect |
+| `nothing answers on <socket> on <host>` (`ssh: channel N: open failed: connect failed`) | wardend is not running there, runs as another user or with another socket, or that sshd does not forward Unix sockets | Start wardend (the button, or `warden daemon --background` there); fix the remote socket (`/run/warden/wardend.sock` for root's, `/run/user/<uid>/warden/wardend.sock` for a user's); in the remote `sshd_config`, `AllowStreamLocalForwarding yes` and neither `AllowTcpForwarding no` nor `DisableForwarding yes` |
+| `warden was not found on <host>` | The remote shell has no `warden` on its PATH (ssh runs commands without your login profile) | Install it there, or give its path: `--remote-warden ~/.local/bin/warden`, or in Connection… |
+| `the SSH tunnel to <host> ended: its ssh process was killed` | Something killed the GUI's ssh | Nothing to do: the GUI opens a new tunnel |
+| `Connection refused`, `timed out`, `No route to host`, `Could not resolve hostname` | The host or its sshd is down or unreachable, or the name is wrong | Check the host and its port (`~/.ssh/config`); the GUI keeps retrying |
 
 ## Containers
 

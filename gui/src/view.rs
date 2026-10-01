@@ -151,13 +151,11 @@ fn connection_bar(g: &Gui) -> Element<'_, Message> {
         }
         (Conn::Down { not_running, attempt, retry_in, .. }, _) => {
             let what = if *not_running { "wardend is not running" } else { "disconnected" };
-            row![
-                text("●").style(text::danger),
-                text(format!("{what}; reconnecting… (attempt {attempt}, every {:.1} s)", retry_in.as_secs_f32())),
-            ]
-            .spacing(6)
-            .align_y(Center)
-            .into()
+            let when = match retry_in.as_secs() {
+                s if s >= 60 => format!("next try in {} min; Connection… tries now", s / 60),
+                _ => format!("reconnecting… (attempt {attempt}, every {:.1} s)", retry_in.as_secs_f32()),
+            };
+            row![text("●").style(text::danger), text(format!("{what}; {when}"))].spacing(6).align_y(Center).into()
         }
     };
     let host: Element<'_, Message> = match &g.model.host {
@@ -199,11 +197,16 @@ fn body(g: &Gui) -> Element<'_, Message> {
     if g.model.apps.is_empty() {
         return match &g.conn {
             Conn::Down { error, not_running: true, attempt, .. } => not_running(g, error, *attempt),
-            Conn::Down { error, attempt, .. } => center(
+            Conn::Down { error, attempt, retry_in, .. } => center(
                 column![
                     text("Cannot reach wardend").size(20),
                     text(error.as_str()),
-                    text(format!("Trying again (attempt {attempt}).")).size(SMALL).style(muted),
+                    text(match retry_in.as_secs() {
+                        s if s >= 60 => format!("Next try in {} min (attempt {attempt}).", s / 60),
+                        _ => format!("Trying again (attempt {attempt})."),
+                    })
+                    .size(SMALL)
+                    .style(muted),
                 ]
                 .spacing(12)
                 .max_width(640),

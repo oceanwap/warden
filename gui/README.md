@@ -40,7 +40,8 @@ one ~8 MB binary, no web view, no GPU driver.
   with the supervisor, max per point), restarts (per point) and workers ready
   (the fewest per point), each with its average, peak or total. A point is
   10 s, 1 min or 4 min (360 per chart). The series come from wardend's
-  `history` request when the tab opens (or the app or range changes, or the
+  `history` request (wardend keeps them on disk across its own restarts)
+  when the tab opens (or the app or range changes, or the
   connection comes back), then grow live from the statuses already
   streaming, counted the way wardend counts them. Gaps (wardend was not
   running, the app was not watched) stay gaps. Hovering a chart shows a
@@ -109,14 +110,29 @@ warden-gui --ssh deploy@web-1 --remote-warden '~/.local/bin/warden'   # for Add 
   uses your agent and keys (`ssh-add`), your `~/.ssh/config` (aliases, ports,
   jump hosts) and `known_hosts`. Connect once with `ssh user@host` in a
   terminal to accept a new host key.
-- When ssh fails, its own message is shown, with the usual fix (key not
-  loaded, host key, name, wardend not running there).
+- The remote sshd must forward Unix sockets: `AllowStreamLocalForwarding yes`
+  (the default) for your user, and neither `AllowTcpForwarding no` nor
+  `DisableForwarding yes`, which stop socket forwarding too. sshd answers a
+  forward it does not allow like a socket nobody listens on, so the GUI's
+  "nothing answers" error names both.
+- When ssh fails, its own message is shown, with the usual fix: key not
+  loaded or refused, an unknown host key, a changed host key (with the
+  `ssh-keygen -R` line ssh prints, and the warning not to connect if the
+  change is unexpected), an unknown name, a host that does not answer,
+  wardend not running there, `warden` not found there.
+- The connection is retried with backoff (up to every 5 s), except after a
+  refused login or a host key problem, which only you can fix: then every
+  10 minutes, so the server's auth log and tools like fail2ban are not
+  flooded. **Connection…** → **Connect** tries again at once.
 - Add app, Edit config and Start wardend run `warden` on the remote host
   through `ssh user@host '<command>'`, every argument quoted for its shell
-  (a POSIX shell: sh, bash, zsh). An env file for Add app must be on this
-  machine; on a remote host add `env_file` with Edit config.
-- The tunnel is dropped with the connection, and re-opened (with backoff) if
-  ssh exits.
+  (a POSIX shell: sh, bash, zsh). ssh runs them without your login profile,
+  so a `warden` in `~/.local/bin` may not be on their PATH: give its path
+  with `--remote-warden` (or in Connection…). An env file for Add app must be
+  on this machine; on a remote host add `env_file` with Edit config.
+- The tunnel is dropped with the connection (its ssh is killed and the local
+  socket removed), and re-opened (with backoff) if ssh exits or is killed;
+  the window says which.
 
 ## How it works
 
@@ -210,5 +226,18 @@ cargo build --bin warden && cargo test -p warden-gui
   connected with bounded batches and the loss counted; Add app with an env
   file and Edit config's check and save run the real CLI. It stops
   everything it started.
-- The SSH tunnel is covered by its command line and error tests; it is not
-  run end to end in CI (no sshd there).
+- `tests/ssh.rs`: the SSH code end to end against a real OpenSSH server
+  the test runs on 127.0.0.1 (a free port, throwaway host and client keys,
+  its own `sshd_config`; nothing of the system's is used) and a real
+  wardend behind it: connect through the tunnel, the apps and their live
+  events, a rolling restart followed to its end, `history`, a second
+  stream (logs) through the same tunnel, remote `warden list`, Add app and
+  Edit config through `ssh <host> '<command>'`, the tunnel's ssh killed
+  (reported, then reopened), disconnect (ssh gone, socket removed), wardend
+  not running there and started over SSH, `warden` not found there, and the
+  errors for a refused connection, an unknown and a changed host key, a
+  refused key, an unknown name and an sshd that does not forward sockets.
+  The GUI's `ssh` is a wrapper first on PATH that adds `-F <the test's
+  ssh_config>`. Skipped, with the reason printed, without `sshd`, `ssh` and
+  `ssh-keygen` (CI installs openssh-server), or as root without `/run/sshd`
+  (sshd's privilege separation directory, which the ssh service creates).

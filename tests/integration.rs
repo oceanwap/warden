@@ -3039,6 +3039,130 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
 }
 
+/// `history` of `app` on a fixed grid (10 s points from `since_ms`).
+fn history_of(d: &Wardend, app: &str, since_ms: u64) -> Value {
+    let h = d.request(&format!(r#"{{"cmd":"history","app":"{app}","since_ms":{since_ms},"step_s":10}}"#));
+    assert_eq!(h["ok"], true, "{h}");
+    h["history"].clone()
+}
+
+/// The points of `app`'s `key` series that have a value: (index, value).
+fn points(h: &Value, key: &str) -> Vec<(usize, Value)> {
+    let Some(a) = h["apps"].as_array().and_then(|a| a.first()) else { return Vec::new() };
+    a[key].as_array().unwrap().iter().cloned().enumerate().filter(|(_, v)| !v.is_null()).collect()
+}
+
+/// The history file's modification time (a snapshot is renamed into place).
+fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+/// wardend's resource history survives its restarts: a clean stop (SIGTERM)
+/// saves it, a kill -9 keeps the last periodic snapshot, and a damaged file
+/// is moved aside with a warning while wardend starts with an empty history.
+#[test]
+fn wardend_history_survives_restarts_and_a_bad_file_is_moved_aside() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fleet::new("wd-history");
+    f.ok(&["start", "sleep 300", "--name", "napper"]);
+    let file = f.home.join("state/wardend-history.bin");
+    // A snapshot every half second instead of every minute (debug builds only).
+    let env = [("WARDEN_HISTORY_SAVE_MS", "500")];
+    let since = Instant::now();
+    let since_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - 60_000;
+    let d = Wardend::start(&f, &env);
+    // Two committed samples of napper (a sample per 10 s of wall-clock time).
+    let before = loop {
+        let h = history_of(&d, "napper", since_ms);
+        if points(&h, "rss_bytes").len() >= 2 {
+            break h;
+        }
+        assert!(since.elapsed() < Duration::from_secs(45), "no samples of napper: {h}\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let n = before["points"].as_u64().unwrap() as usize;
+    let keys = ["cpu_percent", "rss_bytes", "workers_ready", "workers_configured", "restarts"];
+
+    // A clean stop saves it, privately; the next wardend loads it and
+    // answers the same for those points.
+    let pid = d.child.id();
+    drop(d);
+    assert!(!alive(pid as u64));
+    let log = std::fs::read_to_string(f.home.join("wardend.out")).unwrap();
+    assert!(log.contains("resource history saved file="), "{log}");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!f.home.join("state/.wardend-history.bin.tmp").exists(), "no temporary file left");
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "resource history loaded file=");
+    assert!(d.log().contains(" apps=1 "), "{}", d.log());
+    let after = history_of(&d, "napper", since_ms);
+    for key in keys {
+        let old: Vec<(usize, Value)> = points(&before, key).into_iter().filter(|(i, _)| *i < n - 1).collect();
+        let new: Vec<(usize, Value)> = points(&after, key).into_iter().filter(|(i, _)| *i < n - 1).collect();
+        assert!(!old.is_empty(), "{key}: {before}");
+        assert_eq!(old, new, "{key} before and after the restart");
+    }
+    assert_eq!(points(&after, "workers_ready")[0].1, 1, "{after}");
+
+    // kill -9: the last periodic snapshot is there. Wait for a sample after
+    // the restart, then for a snapshot written after it.
+    let committed = points(&after, "rss_bytes").len();
+    let t0 = Instant::now();
+    let newer = loop {
+        let h = history_of(&d, "napper", since_ms);
+        if points(&h, "rss_bytes").len() > committed {
+            break h;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(30), "no new sample:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    // A file modified after this holds every sample `newer` has (the kernel's
+    // file times lag the clock a little, never lead it).
+    let seen = std::time::SystemTime::now();
+    let t0 = Instant::now();
+    while mtime(&file).is_none_or(|m| m <= seen) {
+        assert!(t0.elapsed() < T, "no snapshot after the new sample:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut d = d;
+    d.child.kill().unwrap();
+    d.child.wait().unwrap();
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "resource history loaded file=");
+    let back = history_of(&d, "napper", since_ms);
+    let saved = points(&newer, "rss_bytes");
+    let last = saved.last().unwrap().0;
+    assert_eq!(
+        points(&back, "rss_bytes").into_iter().filter(|(i, _)| *i <= last).collect::<Vec<_>>(),
+        saved,
+        "every sample up to the last snapshot survives a kill -9"
+    );
+
+    // A damaged file: a warning with the fix, the file moved aside, an
+    // empty history (nothing before this start), and wardend runs on.
+    drop(d);
+    let bytes = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &bytes[..bytes.len() - 10]).unwrap();
+    let started_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let d = Wardend::start(&f, &env);
+    wait_log(&d, "cannot use the resource history on disk; starting with an empty one");
+    let log = d.log();
+    assert!(log.contains("it is truncated") && log.contains("moved_to="), "{log}");
+    every_warning_has_a_hint(&log);
+    assert_eq!(std::fs::read(f.home.join("state/wardend-history.bin.bad")).unwrap(), &bytes[..bytes.len() - 10]);
+    let fresh = history_of(&d, "napper", since_ms);
+    let first_new = ((started_ms / 1000 - since_ms / 1000) / 10).saturating_sub(1) as usize;
+    assert!(points(&fresh, "rss_bytes").iter().all(|(i, _)| *i >= first_new), "nothing from before: {fresh}");
+    // The next snapshot is a good one again.
+    let t0 = Instant::now();
+    while !file.exists() {
+        assert!(t0.elapsed() < Duration::from_secs(30), "no new snapshot:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(d.request(r#"{"cmd":"hello"}"#)["ok"] == true);
+}
+
 /// `on = ["oom"]` fires on the supervisor's own OOM exit reason, once per OOM
 /// kill, and never for a plain kill -9. A fake `memory.events` (debug builds
 /// only) stands in for the kernel's OOM kill counter.
@@ -4599,12 +4723,21 @@ struct LongLivedRun {
 /// One client per path (`/ws` or an SSE path) plus a plain-request loop,
 /// held through `warden reload`.
 fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
-    rollout_holding(w, workers, paths, &["reload"])
+    reload_holding_via(w, w.port, workers, paths)
+}
+
+/// `reload_holding`, the clients connecting to `port` (a proxy in front).
+fn reload_holding_via(w: &Warden, port: u16, workers: u64, paths: &[&'static str]) -> LongLivedRun {
+    rollout_holding_via(w, port, workers, paths, &["reload"])
 }
 
 /// Like `reload_holding`, through the rollout `command` runs (`reload`, `restart`).
 fn rollout_holding(w: &Warden, workers: u64, paths: &[&'static str], command: &[&str]) -> LongLivedRun {
-    let port = w.port;
+    rollout_holding_via(w, w.port, workers, paths, command)
+}
+
+/// `rollout_holding`, the clients connecting to `port`.
+fn rollout_holding_via(w: &Warden, port: u16, workers: u64, paths: &[&'static str], command: &[&str]) -> LongLivedRun {
     let before = pid_set(&w.wait_for("ready", T, ready(workers)));
     let stop = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(AtomicUsize::new(0));
@@ -4835,6 +4968,153 @@ fn drain_without_long_lived_connections_is_unchanged() {
     assert!(!log.contains("closed long-lived connections"), "{log}");
 }
 
+// ------------------------------------------------------------ behind nginx
+
+/// nginx run by this test in front of `app_port`, with the site file Warden
+/// ships (contrib/nginx.conf): its own prefix, temp directories, logs, pid
+/// file and a free port; nothing of the system's nginx is used. As root it
+/// runs as nobody (setpriv), like any user. None (with the reason printed)
+/// without nginx.
+struct Nginx {
+    child: Child,
+    dir: PathBuf,
+    port: u16,
+}
+
+impl Nginx {
+    fn start(name: &str, app_port: u16) -> Option<Nginx> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let bin = ["/usr/sbin", "/usr/local/sbin", "/usr/local/nginx/sbin"]
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::env::split_paths(&path))
+            .map(|d| d.join("nginx"))
+            .find(|p| p.is_file());
+        let Some(bin) = bin else {
+            eprintln!("skipping: nginx is not installed (`apt-get install nginx`)");
+            return None;
+        };
+        let dir = std::env::temp_dir().join(format!("warden-it-nginx-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = free_port();
+        // The shipped file, with the test's ports, the fixture's SSE path, and
+        // no IPv6 listener (a CI runner may have none).
+        let site = std::fs::read_to_string(format!("{}/contrib/nginx.conf", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .replace("server 127.0.0.1:3000 ", &format!("server 127.0.0.1:{app_port} "))
+            .replace("    listen 80;\n", &format!("    listen 127.0.0.1:{port};\n"))
+            .replace("    listen [::]:80;\n", "")
+            .replace("location /events {", "location /sse {");
+        assert_eq!(site.matches(&format!("127.0.0.1:{app_port} max_fails=0")).count(), 2, "{site}");
+        assert!(site.contains(&format!("listen 127.0.0.1:{port};")) && site.contains("location /sse {"), "{site}");
+        std::fs::write(dir.join("site.conf"), site).unwrap();
+        let d = dir.display();
+        let main = format!(
+            "worker_processes 2;\npid {d}/nginx.pid;\nerror_log {d}/error.log info;\n\
+             events {{ worker_connections 1024; }}\n\
+             http {{\n    access_log {d}/access.log;\n    client_body_temp_path {d}/client_body;\n    \
+             proxy_temp_path {d}/proxy;\n    fastcgi_temp_path {d}/fastcgi;\n    uwsgi_temp_path {d}/uwsgi;\n    \
+             scgi_temp_path {d}/scgi;\n    include {d}/site.conf;\n}}\n"
+        );
+        std::fs::write(dir.join("nginx.conf"), main).unwrap();
+        let out = std::fs::File::create(dir.join("nginx.out")).unwrap();
+        let mut cmd = Command::new(&bin);
+        let root = unsafe { libc::geteuid() } == 0;
+        if root && std::path::Path::new("/usr/bin/setpriv").is_file() {
+            std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+            for f in ["site.conf", "nginx.conf", "nginx.out"] {
+                std::os::unix::fs::chown(dir.join(f), Some(65534), Some(65534)).unwrap();
+            }
+            cmd = Command::new("/usr/bin/setpriv");
+            cmd.args(["--reuid=65534", "--regid=65534", "--clear-groups", "--"]).arg(&bin);
+        }
+        let child = cmd
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .arg("-p")
+            .arg(&dir)
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .args(["-g", "daemon off;"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(out)
+            .spawn()
+            .unwrap();
+        let mut n = Nginx { child, dir, port };
+        let t0 = Instant::now();
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if let Ok(Some(st)) = n.child.try_wait() {
+                panic!("nginx exited ({st}):\n{}", n.logs());
+            }
+            assert!(t0.elapsed() < T, "nginx does not listen:\n{}", n.logs());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(n)
+    }
+
+    fn logs(&self) -> String {
+        let read = |f: &str| std::fs::read_to_string(self.dir.join(f)).unwrap_or_default();
+        format!("{}{}", read("nginx.out"), read("error.log"))
+    }
+}
+
+impl Drop for Nginx {
+    fn drop(&mut self) {
+        // SIGTERM: a fast shutdown of the master and its workers.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let t0 = Instant::now();
+        while self.child.try_wait().ok().flatten().is_none() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A rolling restart under load through a real nginx with contrib/nginx.conf:
+/// not one request fails (fresh connections, keep-alive GETs, keep-alive
+/// POSTs), whatever net.ipv4.tcp_migrate_req says (nginx retries an
+/// idempotent request a closing worker's listener reset, over a new
+/// connection), and a WebSocket and an SSE stream held through it are ended
+/// cleanly by their old worker, through nginx, and reconnect to new ones.
+#[test]
+fn rolling_restart_through_nginx_drops_nothing() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 3", fixture("longlived.ts"));
+    let w = Warden::start("nginx", port, &long_lived_config("nginx", port, &app, ""));
+    let Some(ngx) = Nginx::start("restart", port) else { return };
+    w.wait_for("ready", T, ready(3));
+    assert!(get(ngx.port, "/health").is_some(), "the health location answers:\n{}", ngx.logs());
+
+    let post = "POST /orders HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                Content-Length: 13\r\n\r\n{\"item\":\"42\"}";
+    let ((run, ok, cut, failed), posted, post_cut, post_failed) =
+        keep_alive_requests(ngx.port, post.to_string(), || {
+            keep_alive_through(ngx.port, "/whoami", || reload_holding_via(&w, ngx.port, 3, &["/ws", "/sse"]))
+        });
+    let log = ngx.logs();
+    let retried = log.lines().filter(|l| l.contains("[error]") && l.contains("upstream")).count();
+    eprintln!(
+        "through nginx: fresh {} ok / {} failed; keep-alive GET {ok} ok, {cut} cut, {failed} failed; \
+         POST {posted} ok, {post_cut} cut, {post_failed} failed; {retried} upstream errors nginx retried",
+        run.ok, run.fail
+    );
+    assert_eq!(run.fail, 0, "requests on fresh connections failed through nginx\n{log}");
+    assert_eq!((cut, failed), (0, 0), "keep-alive GETs failed through nginx\n{log}");
+    assert_eq!((post_cut, post_failed), (0, 0), "POSTs failed through nginx\n{log}");
+    assert!(ok > 50 && posted > 50, "{ok} GETs, {posted} POSTs");
+    // The WebSocket and the SSE stream: closed 1001 / ended cleanly by an old
+    // worker (through nginx), reconnected to a new worker.
+    assert_clean_handover(&w, &run, Duration::from_secs(30));
+    assert!(!log.contains("no live upstreams"), "the port was never taken out of the upstream\n{log}");
+}
+
 // ------------------------------------------------------------ surge rollouts
 
 /// Requests on fresh connections from one client thread while `f` runs:
@@ -4866,6 +5146,12 @@ fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
 /// answered, requests cut on a connection that had served earlier ones,
 /// requests failed on a new connection).
 fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
+    keep_alive_requests(port, format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"), f)
+}
+
+/// `keep_alive_through` sending `request` (a whole HTTP/1.1 request; the
+/// answer must be a 200 with a Content-Length).
+fn keep_alive_requests<R>(port: u16, request: String, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
     let client = {
@@ -4873,7 +5159,7 @@ fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -
         std::thread::spawn(move || {
             // One response off `s`: Some(the server asked to close).
             let exchange = |s: &mut TcpStream, buf: &mut Vec<u8>| -> Option<bool> {
-                write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
+                s.write_all(request.as_bytes()).ok()?;
                 let mut tmp = [0u8; 8192];
                 let end = loop {
                     if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {

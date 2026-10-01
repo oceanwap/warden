@@ -168,7 +168,7 @@ jobs:
         run: |
           mkdir -p "dist/$NAME/contrib"
           cp "$BIN" README.md LICENSE-MIT LICENSE-APACHE notices/THIRD-PARTY-LICENSES.txt "dist/$NAME/"
-          cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf "dist/$NAME/contrib/"
+          cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf contrib/nginx.conf "dist/$NAME/contrib/"
           # No AppleDouble (._*) files from macOS tar.
           COPYFILE_DISABLE=1 tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"

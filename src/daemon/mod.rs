@@ -10,7 +10,8 @@
 //!
 //! - sends alerts (`alerts.rs`, `notify.rs`) by the rules in
 //!   `<config dir>/wardend.toml`, and keeps 24 h of resource history
-//!   (`history.rs`), both from what it already receives.
+//!   (`history.rs`), both from what it already receives; the history is
+//!   saved in the state directory and survives wardend's restarts.
 //!
 //! One thread, one `LocalSet`. Events go out through a bounded broadcast of
 //! ready-made JSON lines (`Frame`): a supervisor's line is forwarded as it
@@ -239,6 +240,8 @@ struct Core {
     /// Delivers `alerts.outbox` (none in tests of the core).
     notifier: Option<notify::Notifier>,
     history: history::Store,
+    /// Writes `history` to disk.
+    saver: history::Saver,
 }
 
 impl Core {
@@ -984,6 +987,10 @@ async fn run(resurrect: bool) -> Result<(), String> {
     // SIGHUP reads wardend.toml again (a closed terminal no longer stops wardend).
     let mut hup = signal(SignalKind::hangup()).map_err(|e| format!("installing signal handlers: {e}"))?;
 
+    // Only once no other wardend runs (checked above): one writer of the file.
+    let history_path = history::path();
+    let loaded = history::load(&history_path, events::now_ms() / 1000);
+    let saver = history::Saver::new(history_path, &loaded);
     let (tx, mut rx) = mpsc::channel(256);
     let bus = broadcast::channel(BUS_CAPACITY).0;
     let logs_bus = broadcast::channel(BUS_CAPACITY).0;
@@ -1000,7 +1007,8 @@ async fn run(resurrect: bool) -> Result<(), String> {
         last_apps: 0,
         alerts: alerts::Alerts::new(alerts::Config::default()),
         notifier: Some(notify::Notifier::start(notify::Limits::default())),
-        history: history::Store::default(),
+        history: loaded,
+        saver,
     };
     let d = Rc::new(Daemon {
         core: RefCell::new(core),
@@ -1033,6 +1041,9 @@ async fn run(resurrect: bool) -> Result<(), String> {
     // Held-back alerts, crash loops that ended, history samples.
     let mut second = tokio::time::interval(Duration::from_secs(1));
     second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let every = history::save_every();
+    let mut save = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    save.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let reason = loop {
         tokio::select! {
             Some(m) = rx.recv() => d.core.borrow_mut().on_watch(m),
@@ -1048,6 +1059,11 @@ async fn run(resurrect: bool) -> Result<(), String> {
                 core.dispatch();
                 core.history.tick(events::now_ms() / 1000);
             }
+            _ = save.tick() => {
+                let mut core = d.core.borrow_mut();
+                let Core { history, saver, .. } = &mut *core;
+                saver.periodic(history, events::now_ms() / 1000);
+            }
             _ = hup.recv() => {
                 let _ = d.load_alerts("SIGHUP");
             }
@@ -1062,7 +1078,51 @@ async fn run(resurrect: bool) -> Result<(), String> {
     // Let clients write the `bye` (each write is bounded by its own timeout).
     tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = std::fs::remove_file(&path);
+    save_history_at_exit(&d).await;
     Ok(())
+}
+
+/// The last snapshot of the history, at a clean exit: after the one in
+/// flight, bounded in time (a hung filesystem must not hold the exit up).
+async fn save_history_at_exit(d: &Daemon) {
+    let idle = d.core.borrow().saver.idle();
+    if tokio::time::timeout(Duration::from_secs(2), idle).await.is_err() {
+        let core = d.core.borrow();
+        crate::warn!(
+            "the last save of the resource history is still running; not saving it again at exit",
+            file = core.saver.path().display(),
+            hint = "the disk is very slow or hung (`dmesg`); the history on disk is up to a minute old",
+        );
+        return;
+    }
+    // Encoded here, without waiting: no borrow is held across an await.
+    let pending = {
+        let mut core = d.core.borrow_mut();
+        let Core { history, saver, .. } = &mut *core;
+        saver.start(history, events::now_ms() / 1000)
+    };
+    let r = match pending {
+        Ok(p) => {
+            let (bytes, samples, apps) = (p.bytes, p.samples, p.apps);
+            match tokio::time::timeout(Duration::from_secs(3), p.finish()).await {
+                Ok(Ok(())) => {
+                    let core = d.core.borrow();
+                    crate::info!(
+                        "resource history saved",
+                        file = core.saver.path().display(),
+                        samples = samples,
+                        apps = apps,
+                        bytes = bytes,
+                    );
+                    return;
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("fsync and rename did not finish within 3 s".to_string()),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    d.core.borrow().saver.report(r);
 }
 
 /// Host metrics: every second while someone subscribes (`host` events), and
