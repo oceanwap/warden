@@ -173,7 +173,8 @@ OOM kills were reported as such every time (status, log, alert), recycling
 was graceful with no request lost. On this 2-CPU box, shared with other
 builds at a load of 5, supervisors stalled 2–3 s while spawning workers
 (Bun took 1–2.5 s to start instead of 35 ms), which the CLI latency
-invariant flags; the 4-vCPU CI runners are the reference for that.
+invariant flags; the CI runners, not shared with other jobs, are the
+reference for that (`warden list` p99 4.7 ms there, release build).
 
 ## Last run
 
@@ -247,13 +248,30 @@ what may fail.
 ## In CI
 
 `.github/workflows/chaos.yml` runs `cargo xtask chaos --release --minutes 3
---seed 20261001` on every push and once a day: on Ubuntu as root (pid
-namespace, tmpfs, memory cgroup: everything), and on macOS. The fixed seed
-means the same faults in the same order on the same targets, so a new
-failure points at a change in Warden. The verdict, recovery per fault and
-the request counts are notice annotations, each violation an error
-annotation (job logs need a login to read; annotations don't), and the JSON
-report is an artifact. "Run workflow" takes other minutes and seeds.
+--seed 20261001` on pushes to `main` and once a day (not on every branch:
+macOS minutes count ten times against the account's spending limit): on
+Ubuntu as root (pid namespace, tmpfs, memory cgroup: everything), and on
+macOS. The fixed seed means the same faults in the same order on the same
+targets, so a new failure points at a change in Warden. The verdict,
+recovery per fault and the request counts are notice annotations, each
+violation an error annotation (job logs need a login to read; annotations
+don't), and the JSON report is an artifact. "Run workflow" takes other
+minutes and seeds.
+
+The first CI runs, 2026-10-01, on 2-vCPU runners, release build:
+
+- **Linux**: PASS, every invariant. 24 faults, every kind (`oom-kill` and
+  `memory-recycle` included: the memory cgroup could be made under the
+  cgroup v2 root), all recovered; 134,679 requests answered, 76 lost within
+  the allowances, none outside them; 26 WebSocket/SSE sessions, none
+  broken; `warden list` p50 2.8 ms, p99 4.7 ms; alerts: `oom` 1,
+  `recycled` 1, and the rest as expected.
+- **macOS**: 25 faults of the 17 kinds macOS runs, all recovered; 17,581
+  requests answered, 16 lost within the allowances, none outside them;
+  `warden list` p99 18.7 ms. It found the shim bug (#6 above), and on the
+  way two harness artifacts: the run directory in macOS's long `$TMPDIR`
+  (socket paths over the limit) and `/tmp` vs `/private/tmp` in the
+  release-pinning check (the harness now uses real paths).
 
 ## Not covered
 

@@ -1,6 +1,6 @@
-# A short `cargo xtask chaos` (docs/chaos.md) on every push and once a day,
-# with a fixed seed: the same faults in the same order on the same targets,
-# so a new failure is a change in Warden, not in the dice.
+# A short `cargo xtask chaos` (docs/chaos.md) on pushes to main and once a
+# day, with a fixed seed: the same faults in the same order on the same
+# targets, so a new failure is a change in Warden, not in the dice.
 #
 # - Linux, as root: its own pid namespace, the tmpfs for disk-full, and a
 #   memory cgroup for oom-kill (the runner allows all three), against a
@@ -13,7 +13,10 @@
 name: Chaos
 
 on:
+  # Not every branch: macOS minutes count ten times (the account's spending
+  # limit stopped jobs once). main, the scratch branch, daily, and by hand.
   push:
+    branches: [main, ci-portability]
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:

@@ -420,6 +420,9 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     let tmp = if cfg!(target_os = "linux") { std::env::temp_dir() } else { PathBuf::from("/tmp") };
     let home = tmp.join(format!("wc-{}-{}", std::process::id(), seed % 100_000));
     let tmpfs = prepare(root, &home, in_ns)?;
+    // Its real path: macOS's /tmp is a symlink to /private/tmp, and Warden
+    // pins releases (and lsof reports working directories) by real path.
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
     let mut notes = Vec::new();
     if !tmpfs {
         notes.push("no tmpfs for the log directory (needs Linux, root and the namespace): disk-full is skipped".into());
