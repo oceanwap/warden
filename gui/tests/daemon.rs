@@ -191,6 +191,17 @@ async fn apps_events_actions_logs_and_reconnect() {
     assert!(a.rollout.is_none() && a.last_outcome.as_ref().is_some_and(|o| o.ok));
     assert!(a.feed.iter().any(|l| l.contains("sleeper reload done")), "{:?}", a.feed);
 
+    // The History tab's request: the app's and the host's series on one grid.
+    let since = warden_protocol::events::now_ms() - 3_600_000;
+    let h = client::history(&socket, "sleeper", since, 10).await.expect("wardend keeps a history");
+    assert_eq!((h.step_s, h.apps.len()), (10, 1), "{h:?}");
+    assert!((360..=362).contains(&h.points), "{}", h.points);
+    assert_eq!(h.apps[0].app, "sleeper");
+    assert_eq!(h.apps[0].cpu_percent.len(), h.points as usize);
+    assert_eq!(h.host.cpu_percent.len(), h.points as usize);
+    let h = client::history(&socket, "", since, 60).await.unwrap();
+    assert!(h.apps.is_empty() && h.step_s == 60, "\"\": the host only");
+
     // Errors come back as errors, with words.
     let err = client::app_request(&socket, "nope", Request::Status).await.unwrap_err();
     assert!(err.contains("nope"), "{err}");

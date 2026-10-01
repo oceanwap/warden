@@ -22,13 +22,15 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
 use warden_protocol::control::{Request, Response};
-use warden_protocol::events::{DaemonReply, DaemonRequest, Event};
+use warden_protocol::events::{DaemonReply, DaemonRequest, Event, ResourceHistory};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// wardend answers `subscribe` with `hello` at once.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// wardend waits up to 30 s for a supervisor to answer a forwarded request.
 pub const APP_TIMEOUT: Duration = Duration::from_secs(35);
+/// wardend answers `history` from memory, at once.
+pub const HISTORY_TIMEOUT: Duration = Duration::from_secs(10);
 /// At most one batch per frame-ish: a flood costs the UI 20 updates a second.
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
 /// Longest line accepted from wardend (an `apps` event with many apps).
@@ -300,6 +302,23 @@ pub async fn start_app(socket: &Path, app: &str) -> Result<String, String> {
     let reply = daemon_request(socket, &DaemonRequest::Start { app: app.to_string() }, APP_TIMEOUT).await?;
     let msg = reply.message.unwrap_or_default();
     if reply.ok { Ok(msg) } else { Err(msg) }
+}
+
+/// wardend's resource history from `since_ms`, `step_s` per point. `app`:
+/// that app and the host (`""`: the host only).
+pub async fn history(socket: &Path, app: &str, since_ms: u64, step_s: u32) -> Result<ResourceHistory, String> {
+    let req = DaemonRequest::History { app: Some(app.to_string()), since_ms: Some(since_ms), step_s: Some(step_s) };
+    let reply = daemon_request(socket, &req, HISTORY_TIMEOUT).await?;
+    match (reply.ok, reply.history, reply.message) {
+        (true, Some(h), _) => Ok(h),
+        (_, _, Some(m)) if m.contains("unknown variant") => {
+            Err("this wardend keeps no history: it is older than this GUI. Update warden on that host, then restart \
+             wardend (`warden daemon stop`, `warden daemon --background`)"
+                .into())
+        }
+        (_, _, Some(m)) => Err(m),
+        _ => Err("wardend answered without the history".into()),
+    }
 }
 
 /// The last `lines` log lines of `app` (`logs` without `follow`).

@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use warden_gui::app::{Act, Gui, Message, Tab, Target};
 use warden_gui::client::{Batch, FeedMsg};
-use warden_gui::protocol::events::Event;
+use warden_gui::history::Range;
+use warden_gui::protocol::events::{AppHistory, Event, HostHistory, ResourceHistory};
 
 const SIZE: (f32, f32) = (1280.0, 820.0);
 
@@ -96,7 +97,83 @@ fn connected() -> Gui {
     let mut g = Gui::with_target(Target::local(Some("/run/warden/wardend.sock".into())));
     let _ = g.update(Message::Feed(FeedMsg::Connected { socket: "/run/warden/wardend.sock".into() }));
     let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: fake_stream(), ..Batch::default() })));
+    let _ = g.update(Message::HostHistoryLoaded(Ok(fake_history("", Range::Hour))));
     g
+}
+
+/// A deterministic wobble in [0, 1).
+fn noise(i: usize, salt: u64) -> f32 {
+    let mut x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(salt.wrapping_mul(1442695040888963407));
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    (x % 10_000) as f32 / 10_000.0
+}
+
+/// What wardend's `history` would answer for a busy day of `app` (and the
+/// host), ending now: CPU with a deploy spike, memory that creeps up and is
+/// recycled, a few restarts, dips in workers ready, and a gap where
+/// wardend itself was restarted.
+fn fake_history(app: &str, range: Range) -> ResourceHistory {
+    let step = range.step_s();
+    let n = 360usize;
+    let end = warden_protocol::events::now_ms() / 1000 / step * step + step;
+    let day = range == Range::Day;
+    let gap = if day { 135..143 } else { 60..66 };
+    let mb = |m: f32| Some((m * 1048576.0) as u64);
+    let mut a = AppHistory { app: app.into(), ..AppHistory::default() };
+    let mut host = HostHistory { mem_total_bytes: Some(8_220_000_000), ..HostHistory::default() };
+    let mut mem = 150.0f32;
+    for i in 0..n {
+        if gap.contains(&i) {
+            for v in [&mut a.cpu_percent, &mut host.cpu_percent, &mut host.load1] {
+                v.push(None);
+            }
+            for v in [&mut a.workers_ready, &mut a.workers_configured, &mut a.restarts] {
+                v.push(None);
+            }
+            a.rss_bytes.push(None);
+            host.mem_used_bytes.push(None);
+            continue;
+        }
+        let x = i as f32;
+        let (cpu, restarts, ready) = if day {
+            // Traffic: quiet at night, busy in the afternoon; recycles every ~6 h, a crash cluster.
+            let traffic = (((x / n as f32) * std::f32::consts::TAU) - 1.9).sin().max(0.0);
+            let recycle = i % 90 == 89;
+            let crash = (250..253).contains(&i);
+            mem = if recycle { 152.0 } else { mem + 1.15 + noise(i, 7) * 0.6 };
+            let restarts = if crash { 2 } else { u32::from(recycle) };
+            (3.0 + 22.0 * traffic + noise(i, 3) * 4.0, restarts, if crash || recycle { 3 } else { 4 })
+        } else {
+            let deploy = (210..226).contains(&i);
+            let crash = i == 132 || i == 290 || i == 291;
+            mem = if i == 132 {
+                142.0
+            } else if i == 211 {
+                150.0
+            } else {
+                mem + 0.09 + noise(i, 11) * 0.12
+            };
+            let cpu = if deploy { 26.0 + noise(i, 5) * 14.0 } else { 2.2 + 1.4 * (x / 9.0).sin() + noise(i, 3) * 1.6 };
+            (cpu, u32::from(crash), if crash || (212..224).contains(&i) { 3 } else { 4 })
+        };
+        a.cpu_percent.push(Some((cpu * 10.0).round() / 10.0));
+        a.rss_bytes.push(mb(mem + noise(i, 13) * 2.0));
+        a.restarts.push(Some(restarts));
+        a.workers_ready.push(Some(ready));
+        a.workers_configured.push(Some(4));
+        host.cpu_percent.push(Some(((18.0 + 8.0 * (x / 23.0).sin() + noise(i, 17) * 6.0) * 10.0).round() / 10.0));
+        host.mem_used_bytes.push(Some(3_150_000_000 + (noise(i, 19) * 180_000_000.0) as u64 + i as u64 * 200_000));
+        host.load1.push(Some(0.5));
+    }
+    ResourceHistory {
+        start_ms: (end - n as u64 * step) * 1000,
+        step_s: step as u32,
+        points: n as u32,
+        host,
+        apps: if app.is_empty() { vec![] } else { vec![a] },
+    }
 }
 
 fn snapshot_dir() -> PathBuf {
@@ -107,11 +184,15 @@ fn snapshot_dir() -> PathBuf {
 
 /// Render, save as `<name>-tiny-skia.png`, and check it is not blank.
 fn save(ui: &mut Simulator<'_, Message>, name: &str) {
+    save_with(ui, name, &Theme::Dark);
+}
+
+fn save_with(ui: &mut Simulator<'_, Message>, name: &str, theme: &Theme) {
     let dir = snapshot_dir();
     let base = dir.join(name);
     let png = dir.join(format!("{name}-tiny-skia.png"));
     let _ = std::fs::remove_file(&png);
-    let snap = ui.snapshot(&Theme::Dark).expect("renders");
+    let snap = ui.snapshot(theme).expect("renders");
     assert!(snap.matches_image(&base).expect("writes the PNG"));
     let bytes = std::fs::metadata(&png).map(|m| m.len()).unwrap_or(0);
     // A blank 2560x1640 PNG compresses to a few KB; a screen with text is far larger.
@@ -130,7 +211,9 @@ fn main_screen_with_fake_data() {
     let mut ui = sim(&g);
     for t in [
         "wardend 0.1.0 · pid 4211",
-        "CPU 23.4% · Mem 3.10 GB / 7.66 GB · Load 0.52 0.40 0.31",
+        "CPU 23.4%",
+        "· Mem 3.10 GB / 7.66 GB",
+        "· Load 0.52 0.40 0.31",
         "api",
         "jobs",
         "gave up",
@@ -215,6 +298,69 @@ fn logs_tab() {
     save(&mut ui, "logs-tab");
     let _ = ui.click("Pause").expect("Pause");
     assert!(matches!(ui.into_messages().last(), Some(Message::LogsPause(true))));
+}
+
+#[test]
+fn history_tab_last_hour_with_a_crosshair() {
+    let mut g = connected();
+    let _ = g.update(Message::Tab(Tab::History));
+    assert!(g.chart.as_ref().is_some_and(|c| c.app == "api" && c.range == Range::Hour));
+    let _ = g.update(Message::HistoryLoaded {
+        app: "api".into(),
+        range: Range::Hour,
+        result: Ok(fake_history("api", Range::Hour)),
+    });
+    let mut ui = sim(&g);
+    for t in [
+        "CPU",
+        "% of one core",
+        "Memory",
+        "Restarts",
+        "3 in 1 h",
+        "Workers ready",
+        "fewest 3 of 4",
+        "1 h",
+        "6 h",
+        "24 h",
+        "10 s per point · from wardend, then live",
+    ] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not on the History tab");
+    }
+    // The pointer over the memory chart: a crosshair and the value there.
+    let title = ui.find("Memory").expect("the memory chart").bounds();
+    ui.point_at(iced::Point::new(title.x + 330.0, title.y + 90.0));
+    save(&mut ui, "history-1h");
+    let _ = ui.click("24 h").expect("the 24 h button");
+    assert!(matches!(ui.into_messages().last(), Some(Message::HistoryRange(Range::Day))));
+}
+
+#[test]
+fn history_tab_last_day_light() {
+    let mut g = connected();
+    let _ = g.update(Message::Tab(Tab::History));
+    let _ = g.update(Message::HistoryRange(Range::Day));
+    let _ = g.update(Message::HistoryLoaded {
+        app: "api".into(),
+        range: Range::Day,
+        result: Ok(fake_history("api", Range::Day)),
+    });
+    let mut ui = sim(&g);
+    assert!(ui.find("4 min per point · from wardend, then live").is_ok());
+    assert!(ui.find("10 in 24 h").is_ok());
+    save_with(&mut ui, "history-24h-light", &Theme::Light);
+}
+
+#[test]
+fn history_tab_says_why_it_has_nothing() {
+    let mut g = connected();
+    let _ = g.update(Message::Tab(Tab::History));
+    let _ = g.update(Message::HistoryLoaded {
+        app: "api".into(),
+        range: Range::Hour,
+        result: Err("this wardend keeps no history: it is older than this GUI".into()),
+    });
+    let mut ui = sim(&g);
+    assert!(ui.find("this wardend keeps no history: it is older than this GUI").is_ok());
 }
 
 #[test]
