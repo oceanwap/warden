@@ -20,6 +20,7 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `failed to start worker` | The command could not be executed | The error names the path: fix `command`/`args`/`working_directory`; `warden check -c <file>` validates the config first |
 | `worker failed: too many restarts` | It crashed `max_restarts` times within `restart_window` | Fix the crash (the last exits are in `warden describe`); it is retried after `failed_cooldown`, or now with `warden reset <app>` |
 | `EADDRINUSE` in the app's output | Workers can't share the port | Bun: the shim adds `reusePort` (don't set `shim = false`). Node: needs 22.12 or newer; older Node: `port_strategy = "offset"`. Another program on the port: `ss -ltnp 'sport = :3000'` |
+| `Node cannot share a port on this OS: only one worker can listen on it` (macOS) | Node's `reusePort` exists only where the kernel spreads connections (Linux, FreeBSD); on macOS a second worker, or a reload's replacement next to the old worker, gets `EADDRINUSE` | `[workers] count = 1` and `warden restart --hard` to restart it, or `workers.port_strategy = "offset"`; Bun apps share the port on macOS too |
 | The app is `stopped` after a clean exit | Its exit code is in `restart.stop_exit_codes` | Intended for one-shot jobs; `warden restart <app>` starts it again |
 | An app without a port shows `starting` for a second | Port-less apps count as ready after `workers.min_uptime` (1000 ms) | Intended (PM2's `min_uptime`); lower it if you like |
 

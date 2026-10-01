@@ -238,6 +238,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         );
     }
     warn_if_no_migrate_req(&sup.cfg);
+    warn_if_node_cannot_share_the_port(&sup.cfg);
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
@@ -330,6 +331,29 @@ fn warn_if_no_migrate_req(cfg: &Config) {
             );
         }
     }
+}
+
+/// Node's `reusePort` exists only where the kernel spreads connections
+/// (Linux, some BSDs): on macOS a second Node worker on the port fails with
+/// EADDRINUSE, and so does a rollout's replacement next to the old worker.
+fn warn_if_node_cannot_share_the_port(cfg: &Config) {
+    let node_shares =
+        cfg!(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "solaris"));
+    if node_shares
+        || !crate::config::is_node(&cfg.app.command)
+        || cfg.workers.port_strategy != PortStrategy::Shared
+        || cfg.app.port.is_none()
+    {
+        return;
+    }
+    warn!(
+        "Node cannot share a port on this OS: only one worker can listen on it",
+        workers = cfg.workers.count,
+        hint = "Node's reusePort (libuv) exists only where the kernel spreads connections, such as Linux. Here run \
+                [workers] count = 1, and replace it with `warden restart --hard` (a reload starts the new worker \
+                next to the old one, which fails with EADDRINUSE); or set workers.port_strategy = \"offset\" \
+                (one port per worker)",
+    );
 }
 
 fn mode_name(m: Mode) -> &'static str {

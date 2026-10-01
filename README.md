@@ -490,7 +490,10 @@ What each suite does, what each number means and the fairness rules are in
 [`bench/README.md`](bench/README.md); findings, caveats and the before/after
 log of every optimisation are in [`docs/benchmarks.md`](docs/benchmarks.md).
 The machine is small (2 CPUs shared with the load generator), so compare
-columns, not absolute numbers.
+columns, not absolute numbers. The same suites also run on GitHub's 4-vCPU
+x86_64 and ARM64 runners (`.github/workflows/bench.yml`: push to the
+`bench` branch or run it by hand), each suite's table an annotation on the
+run.
 
 In short (this run, against PM2 6.0.14):
 
@@ -717,6 +720,11 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
   - `SO_REUSEPORT` does not load-balance on macOS: several workers can
     share the port, but connections are not spread across them. Use
     `[workers] count = 1` locally.
+  - Node has no `reusePort` on macOS at all (libuv offers it only where the
+    kernel balances), so only one Node worker can listen on the port, and a
+    reload, which starts the new worker next to the old one, fails: use
+    `warden restart --hard`, or `port_strategy = "offset"`. Warden says so
+    at start. Bun apps share the port as on Linux.
   - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
   - `warden serve` checks static paths with realpath instead of `openat2`
     (same confinement, slower).
