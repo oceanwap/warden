@@ -28,7 +28,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.95.0"
+  RUST_TOOLCHAIN: "1.98.1"
   # Linux binaries link glibc 2.28 symbols at most (RHEL 8, Debian 10+), so
   # they keep glibc's malloc and the preadv2 fast path (glibc 2.26+) that CI
   # tests and the benchmarks measure; musl would lose both.

@@ -7,7 +7,7 @@ repository = "https://github.com/oceanwap/warden"
 # Released as binaries on GitHub, not on crates.io.
 publish = false
 description = "A small, boring supervisor for Bun/Node HTTP workers: SO_REUSEPORT, graceful drain, rolling reload."
-rust-version = "1.85"
+rust-version = "1.98"
 
 [workspace]
 # protocol: the wire types (docs/protocol.md), shared by warden and the GUI.

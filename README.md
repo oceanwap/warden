@@ -39,8 +39,26 @@ are in [`docs/architecture.md`](docs/architecture.md) (findings F1–F14) and
 
 ## Install
 
-Every release on [GitHub Releases](https://github.com/oceanwap/warden/releases)
-has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
+**No GitHub Release is published yet.** Until the first tagged release,
+there are no prebuilt archives or `SHA256SUMS` to download. Build from
+source (see [Quick start](#quick-start) and [Development](#development)):
+
+```sh
+git clone https://github.com/oceanwap/warden.git
+cd warden
+cargo build --release                       # → target/release/warden
+```
+
+`install.sh` is kept for the day Releases exist: it will pick the archive
+for your OS and CPU, check it against the release's `SHA256SUMS`, and put
+`warden` in `/usr/local/bin` (as root) or `~/.local/bin`. Today it fails
+with a clear message if those assets are missing. Do not invent download
+URLs; use the script only after a Release is published (or point
+`WARDEN_DOWNLOAD_URL` at a directory that already holds the release files,
+e.g. CI testing).
+
+When Releases are published, each one will ship two products for Linux
+(x86_64, arm64) and macOS (arm64, x86_64):
 
 - **CLI only**: `warden-<version>-<os>-<arch>.tar.gz` with the `warden`
   binary, this README and `contrib/` (systemd units, sysctl file). The Linux
@@ -59,9 +77,7 @@ has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
   `xattr -dr com.apple.quarantine /Applications/Warden.app`. The CLI
   installed by `install.sh` is not affected.
 
-`install.sh` installs the CLI: it picks the archive for your OS and CPU,
-checks it against the release's `SHA256SUMS`, and puts `warden` in
-`/usr/local/bin` (as root) or `~/.local/bin`:
+After a Release exists:
 
 ```sh
 curl -fsSLO https://github.com/oceanwap/warden/releases/latest/download/install.sh
@@ -728,7 +744,13 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
 
 ## Development
 
+**Toolchain.** CI and every crate's `rust-version` pin **Rust 1.98** (stable
+`1.98.1` in workflows). Use that toolchain (or newer stable) to build the
+full workspace, including the GUI (`gui/` needs ≥1.88 for iced 0.14; the
+shared pin is the latest stable so CLI, protocol, GUI and xtask stay aligned).
+
 ```sh
+rustup toolchain install 1.98.1
 cargo test                  # unit + integration tests (integration tests need `bun` and `node` on PATH)
 cargo clippy --all-targets
 cargo test --workspace --bins --tests          # also protocol/ and gui/ (the GUI's own tests)
