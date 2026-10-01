@@ -35,7 +35,26 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | A reload takes about 2 s more per worker | Workers with WebSocket or SSE clients wait `long_lived_timeout` for them to end by themselves before closing them | Lower `[shutdown] long_lived_timeout` (fractions work: `0.5`); `0` leaves them open until `grace_period` |
 | `shutdown.long_lived_timeout = X must be below shutdown.grace_period` (at start or `warden check`) | The worker needs time after closing them to finish and exit, or it is SIGKILLed and its clients see resets | Lower `long_lived_timeout` or raise `grace_period` |
 | An SSE stream still holds a draining worker until `grace_period` | The shim didn't see it as SSE: a Bun response returned straight from `fetch()` (a proxied stream), a content type other than `text/event-stream`, an HTTPS `node:http` server | Bun: rebuild it, `const r = await fetch(url); return new Response(r.body, r)`. Other long streams (downloads, NDJSON) are left to finish on purpose: ending them would make a cut-off body look complete |
+| `reload failed at worker 2 … Rolled back: the 2 new workers started together were stopped` | With `[reload] surge`, one worker of a batch failed a gate | Nothing to undo: the batch's new workers were stopped and the old ones keep serving. The message names the worker and the gate |
+| `reload.surge = N starts new workers next to the ones they replace, but …` (at start or `warden check`) | Surge needs a worker and its replacement to run at once; with `port_strategy = "offset"` each worker owns its port, and apps without the shim can't share one | Remove `surge` (one worker at a time), or let the workers share the port (`port_strategy = "shared"`) |
+| Workers still run the old release after a deploy, or a restarted worker did | `[app] pin_release` (default): workers start in the release `current` pointed to at the last start / reload / safe-reload / restart. A crash restart stays on it on purpose, so versions don't mix | Reload after swapping the symlink: `warden safe-reload` (or `reload`). `warden status` shows the pinned release |
+| `the pinned release directory is gone; starting the worker in the current release instead` | The pinned release was deleted (old releases cleaned up) before a reload moved the workers off it | Delete old releases only after the reload; then run `warden reload` so every worker runs the same release again |
 | `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
+
+## Why a worker died
+
+`warden status` shows each worker's `last_exit`, and the log line of the death
+carries the same reason with a `hint=`.
+
+| You see | Why | Fix |
+|---|---|---|
+| `killed by the kernel OOM killer (out of memory)` | The cgroup Warden runs in (`MemoryMax=` of the unit, a container limit) ran out of memory and the kernel killed the worker; Warden saw the cgroup's `oom_kill` count go up | Raise `memory.max` / `MemoryMax=`, or set `[limits] max_memory` below it so Warden replaces a growing worker gracefully before the kernel kills it |
+| `killed by another process (SIGKILL)` | A SIGKILL Warden didn't send: `kill -9` by a person or script, a container runtime. With the cgroup counter readable, the OOM killer is ruled out | Find who sends it (`journalctl`, the audit log). Without a readable counter the hint says so: check `journalctl -k \| grep -i oom` |
+| `killed by another process (SIGTERM)` | Something else asked the worker to stop, often systemd stopping the unit with `KillMode=control-group` | Use `KillMode=mixed` (what `warden startup` writes), so only Warden gets the stop signal and drains its workers |
+| `crashed: SIGSEGV (segmentation fault)`, `SIGBUS`, `SIGILL` | A native crash in the runtime or a native module | The worker's last output (`warden logs <app>`) and core dumps (`coredumpctl list`) say where; try another Bun/Node version |
+| `crashed: SIGABRT (aborted)` | The program aborted itself: `process.abort()`, a failed native assertion, a fatal runtime error | Its last output lines say why |
+| `killed by Warden (SIGKILL)` | Warden killed it: it didn't exit within `shutdown.grace_period`, was hung (watchdog), or not ready in time | The line before it says which; see those entries |
+| `exit code 0 after Warden's SIGTERM` | A normal stop: the worker exited after Warden's stop signal | Nothing to do |
 
 ## Health
 

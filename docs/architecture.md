@@ -152,6 +152,19 @@ worker pid owning a `LISTEN` socket on the configured port (`/proc/<pid>/fd` ×
 ready within `ready_timeout` is killed and counted as a crash. FAILED workers
 are retried after `failed_cooldown` (default 300 s).
 
+Every death gets a reason (`last_exit`, the `crashed` event's detail, and the
+log line, with a `hint=`), not just the wait status. The task that owns each
+worker records the signals it delivered, so a SIGKILL is either *Warden's*
+(grace period over, hung, not ready in time) or *another process's*; an exit
+after Warden's stop signal is a normal stop. A SIGKILL is the kernel's *OOM
+killer* when the `oom_kill` counter of Warden's cgroup (cgroup v2
+`memory.events`, or v1 `memory.oom_control`, found through
+`/proc/self/cgroup` and `/proc/self/mountinfo`) rose since the last death it
+accounted for: workers share the cgroup, so each SIGKILL death takes at most
+one count. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
+Without a readable counter (macOS, no memory controller) an OOM kill reads as
+another process's SIGKILL, and the hint says it may be either.
+
 ### 4.5 Restart protection
 
 Per worker: every unexpected exit is a crash. The first crash after a healthy
@@ -216,6 +229,36 @@ The CLI blocks until the rollout finishes, prints its phases, and exits 1 on
 failure — usable as systemd `ExecReload=` or in a deploy script. With
 `port_strategy = "offset"` workers can't overlap, so each is stopped and then
 started. In worker mode the unit is the whole host process.
+
+**Surge** (`[reload] surge = N | "all"`, like Kubernetes' `maxSurge`; default
+1): reload, safe-reload and restart replace workers in batches of N. Each worker
+of a batch starts next to the one it replaces and goes through the gates on
+its own; when all have passed, the batch's old workers drain together, and the
+next batch starts once they have exited. A failure in any of them stops every
+new worker of the batch (a free rollback: the old ones still serve), so a
+batch is all-or-nothing. safe-reload's canary is still a batch of one with its
+soak, then the rest go N at a time. A slot that isn't serving (starting,
+stopping, down) is a batch of its own, since it has no old worker to fall back
+on. Memory: surge N runs up to N extra workers while a batch overlaps (`"all"`:
+twice the fleet for a few seconds). It requires workers that can overlap, so
+config validation refuses it with `port_strategy = "offset"`. Status shows the
+batch as `workers 1, 2: health checks 1/3`, from its slowest worker; `done`
+counts workers whose old process has exited.
+
+**Release pinning** (`[app] pin_release`, default on;
+`src/supervisor/release.rs`): deploys swap a `current` symlink, then reload.
+Warden resolves `working_directory` to its real path when it starts (also
+`start` after `stop`, `restart --hard`) and when a reload, safe-reload or
+rolling restart of every worker begins, and starts workers there; `command`,
+`args`, `entry` and `static.root` that go through the same symlink (the
+deepest one on the `working_directory` path) are rewritten to match. Crash
+restarts, recycling (health, memory, lifetime) and `restart N` of one worker
+reuse the pin, so a crash between the swap and the reload doesn't bring up the
+new release next to the old one. A failed rollout restores the previous pin
+with the previous config. If the pinned directory has been deleted, the next
+start re-resolves `current` and logs a warning (the worker may then run another
+release than the rest until a reload). `status` (`release`), `describe` and
+each rollout's start line show the pin.
 
 With a health path configured, gates are mandatory: a worker that reports no
 private socket fails them instead of skipping them (and a config whose socket
@@ -309,9 +352,9 @@ but costs fault isolation and (for NestJS) p99 latency.
 
 - NestJS inside Bun Workers works for a minimal app (F10); the real app's
   dependencies (Prisma/pg drivers, native modules) must be tested in Workers.
-- **Blue/green rollout** (`surge = N`: start all N new workers next to the old
-  ones, verify, then drain all old) would make a mid-rollout failure fully
-  reversible at the cost of 2× memory for a few seconds.
+- `surge = "all"` is blue/green for one batch, but a deploy is still not
+  reversible once a batch has been promoted: keeping the old workers stopped
+  but restartable (or SIGSTOPped) until the whole rollout passed would be.
 - Error-rate gates need request metrics Warden doesn't see (it isn't a proxy);
   `verify_command` is the hook for app-specific smoke tests today.
 - The native GUI ([`gui/`](../gui/README.md), iced) runs as a separate process

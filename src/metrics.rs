@@ -242,6 +242,7 @@ mod tests {
                 last_exit: None,
                 healthy: Some(false),
             }],
+            release: None,
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));

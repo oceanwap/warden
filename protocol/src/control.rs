@@ -164,6 +164,11 @@ pub struct Status {
     #[serde(default)]
     pub last_rollout: Option<RolloutOutcome>,
     pub workers: Vec<WorkerStatus>,
+    /// `[app] pin_release`: the real path workers start in (the target of a
+    /// `current` symlink when the pin was taken). Crash restarts reuse it;
+    /// reload, safe-reload and restart move it. None when not pinned.
+    #[serde(default)]
+    pub release: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -246,5 +251,17 @@ mod tests {
         );
         let r: Response = serde_json::from_str(r#"{"ok":false,"message":"no such worker"}"#).unwrap();
         assert!(!r.ok && r.message.as_deref() == Some("no such worker") && r.status.is_none());
+    }
+
+    #[test]
+    fn status_from_an_older_supervisor_has_no_release() {
+        let old = r#"{"app":"api","mode":"process","pid":1,"uptime_secs":0,"workers_configured":1,
+            "workers_ready":1,"healthy":null,"supervisor_rss_bytes":null,"host":null,"reloading":false,
+            "shutting_down":false,"workers":[]}"#;
+        let s: Status = serde_json::from_str(old).unwrap();
+        assert_eq!(s.release, None);
+        let with = old.replace(r#""workers":[]"#, r#""workers":[],"release":"/srv/api/releases/v2""#);
+        let s: Status = serde_json::from_str(&with).unwrap();
+        assert_eq!(s.release.as_deref(), Some("/srv/api/releases/v2"));
     }
 }

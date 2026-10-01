@@ -730,6 +730,9 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += &format!("Ready:       {}\n", s.workers_ready);
         o += &format!("PID:         {}\n", s.pid);
         o += &format!("Uptime:      {}\n", duration(s.uptime_secs));
+        if let Some(r) = &s.release {
+            o += &format!("Release:     {r}\n");
+        }
         if let Some(r) = s.supervisor_rss_bytes {
             o += &format!("Memory:      {} (supervisor)\n", bytes(r));
         }
@@ -909,6 +912,14 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     row("command", format!("{} {}", text(c("/app/command")), args.join(" ")).trim().to_string());
     row("cwd", text(c("/app/working_directory")));
     row(
+        "release",
+        match (&s.release, c("/app/pin_release").as_bool()) {
+            (Some(r), _) => format!("{r} (pinned: crash restarts stay on it; reload and restart move it)"),
+            (None, Some(false)) => "not pinned ([app] pin_release = false)".into(),
+            (None, _) => "-".into(),
+        },
+    );
+    row(
         "port",
         match c("/app/port").as_u64() {
             Some(p) => format!("{p} ({})", text(c("/workers/port_strategy"))),
@@ -941,6 +952,14 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         _ => "no health path: new workers are gated on listening only".into(),
     };
     row("health", health);
+    row(
+        "rollouts",
+        match c("/reload/surge") {
+            serde_json::Value::Number(n) if n.as_u64() == Some(1) => "one worker at a time".into(),
+            serde_json::Value::Null => "one worker at a time".into(),
+            v => format!("surge {}: that many new workers at a time, next to the old ones", text(v)),
+        },
+    );
     row("shutdown", format!("grace {} s, drain {} ms", num("/shutdown/grace_period"), num("/shutdown/drain_ms")));
     let mem = num("/limits/max_memory");
     let life = num("/limits/max_lifetime");

@@ -17,6 +17,14 @@
 //! changes. `safe-reload` adds preflight checks, requires a healthy fleet,
 //! soaks the first worker as a canary and pauses between workers; any failure
 //! halts the rollout.
+//!
+//! Workers are replaced in batches (`[reload] surge`, like Kubernetes'
+//! `maxSurge`): each worker of a batch is a lane going through the gates on
+//! its own, next to the worker it replaces; once every lane has passed, the
+//! batch's old workers drain together. A failure in any lane stops the new
+//! workers of every lane, so the whole batch rolls back. With `surge = 1`
+//! (the default) a batch is one worker. A slot that isn't serving (starting,
+//! stopping, down), or that can't overlap, is always a batch of its own.
 
 use super::*;
 use crate::control::{RolloutOutcome, RolloutStatus};
@@ -72,8 +80,13 @@ pub(super) struct Roll {
     kill_old: bool,
     /// The next replacement is the safe-reload canary.
     canary: bool,
-    /// Config in effect before this rollout's preflight applied a new one;
-    /// restored if the rollout fails, so restarts don't roll forward to it.
+    /// Workers replaced together (`[reload] surge`); 1 = one at a time.
+    surge: usize,
+    /// Batches started so far.
+    batches: usize,
+    /// Config (and release pin) in effect before this rollout's preflight
+    /// applied a new one; restored if the rollout fails, so restarts don't
+    /// roll forward to it.
     prev: Option<Snapshot>,
     /// Dropping this stops the gate ticker.
     _ticker: oneshot::Sender<()>,
@@ -83,19 +96,65 @@ struct Snapshot {
     cfg: Config,
     shim_path: Option<PathBuf>,
     host_path: Option<PathBuf>,
+    release: Option<release::Pin>,
 }
 
 enum Step {
     Idle,
     Preflight,
-    Starting { slot: usize, new: u64, old: Option<u64>, deadline: Instant },
-    Verifying(Verify),
-    Draining { slot: usize, old: u64, then_spawn: bool },
+    /// One or more workers being replaced together.
+    Batch(Vec<Lane>),
     Pausing,
 }
 
-struct Verify {
+/// One slot of a batch.
+struct Lane {
     slot: usize,
+    at: At,
+}
+
+enum At {
+    /// The new process was started; waiting for it to listen.
+    Starting {
+        new: u64,
+        old: Option<u64>,
+        deadline: Instant,
+    },
+    Verifying(Verify),
+    /// Passed every gate; waits for the rest of its batch before taking over.
+    Passed {
+        new: u64,
+        old: Option<u64>,
+    },
+    /// The old process drains (`then_spawn`: stop first, then start the new one).
+    Draining {
+        old: u64,
+        then_spawn: bool,
+    },
+    Done,
+}
+
+impl At {
+    /// The new process, until it has taken over.
+    fn new_inst(&self) -> Option<u64> {
+        match self {
+            At::Starting { new, .. } | At::Passed { new, .. } => Some(*new),
+            At::Verifying(v) => Some(v.new),
+            At::Draining { .. } | At::Done => None,
+        }
+    }
+
+    fn involves(&self, inst: u64) -> bool {
+        match self {
+            At::Starting { new, old, .. } | At::Passed { new, old } => *new == inst || *old == Some(inst),
+            At::Verifying(v) => v.new == inst || v.old == Some(inst),
+            At::Draining { old, .. } => *old == inst,
+            At::Done => false,
+        }
+    }
+}
+
+struct Verify {
     new: u64,
     old: Option<u64>,
     deadline: Instant,
@@ -108,16 +167,30 @@ struct Verify {
     canary: bool,
 }
 
+impl Verify {
+    /// How far along the gates: health checks, verify_command, soak.
+    fn stage(&self) -> u64 {
+        if self.soak_until.is_some() {
+            2
+        } else if matches!(self.cmd, Cmd::Running | Cmd::Passed) {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 /// A rollout's phase for change detection (see `rollout_phase`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PhaseKey {
     seq: u64,
     done: usize,
     step: u8,
-    /// The instance the step works on.
+    /// The instance the step works on (the batch's first).
     inst: u64,
-    /// Verifying: health passes, or verify_command running, or soaking.
-    detail: u32,
+    /// Verifying: health passes, or verify_command running, or soaking;
+    /// for a batch, how many of its workers got how far.
+    detail: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +199,13 @@ enum Cmd {
     Pending,
     Running,
     Passed,
+}
+
+/// What `rollout_on_exit` does once it has let go of the batch.
+enum OnExit {
+    Fail(usize, String),
+    Drained(usize),
+    Spawn(usize),
 }
 
 impl Supervisor {
@@ -161,13 +241,24 @@ impl Supervisor {
             }
         }
 
-        let prev = if kind.is_deploy() {
+        // Deploys, and restarts of every worker, move to the release
+        // `current` points to now (`[app] pin_release`); restoring the
+        // snapshot puts the previous pin back.
+        let all_slots = slots.len() >= self.slots.values().filter(|s| !s.removing).count();
+        let repin = kind.is_deploy() || (kind == Kind::Restart && all_slots);
+        let prev = if repin {
             let snap = Snapshot {
                 cfg: self.cfg.clone(),
                 shim_path: self.shim_path.clone(),
                 host_path: self.host_path.clone(),
+                release: self.release.clone(),
             };
-            if let Err(e) = self.preflight_sync() {
+            let checked = if kind.is_deploy() {
+                self.preflight_sync()
+            } else {
+                self.pin_release().map_err(|e| format!("{e}; nothing was restarted"))
+            };
+            if let Err(e) = checked {
                 self.restore(snap);
                 return Err(e);
             }
@@ -192,19 +283,30 @@ impl Supervisor {
         });
 
         let total = slots.len();
-        match kind {
-            Kind::Replace | Kind::Recovery => {
-                info!(
-                    "replacing worker",
-                    worker = slots.first().map(|s| self.label(*s)).unwrap_or_default(),
-                    reason = reason
-                );
+        let surge = match kind {
+            Kind::Reload | Kind::SafeReload | Kind::Restart => self.cfg.reload.surge.batch(total),
+            Kind::Replace | Kind::Recovery => 1,
+        };
+        // The log line of each rollout: what, how many at a time, which release.
+        let release = self.release_text();
+        if matches!(kind, Kind::Replace | Kind::Recovery) {
+            let worker = slots.first().map(|s| self.label(*s)).unwrap_or_default();
+            let mut fields: Vec<(&str, &dyn std::fmt::Display)> = vec![("worker", &worker), ("reason", &reason)];
+            if let Some(r) = &release {
+                fields.push(("release", r));
             }
-            _ => {
-                info!(format!("{} started", kind.name()), workers = total, seq = seq);
-                if kind.is_deploy() {
-                    systemd::reloading();
-                }
+            crate::logging::event(crate::config::Level::Info, "replacing worker", &fields);
+        } else {
+            let mut fields: Vec<(&str, &dyn std::fmt::Display)> = vec![("workers", &total), ("seq", &seq)];
+            if surge > 1 {
+                fields.push(("surge", &surge));
+            }
+            if let Some(r) = &release {
+                fields.push(("release", r));
+            }
+            crate::logging::event(crate::config::Level::Info, &format!("{} started", kind.name()), &fields);
+            if kind.is_deploy() {
+                systemd::reloading();
             }
         }
         let preflight = if kind.is_deploy() { self.cfg.reload.preflight.clone() } else { None };
@@ -219,6 +321,8 @@ impl Supervisor {
             started: Instant::now(),
             kill_old,
             canary: kind == Kind::SafeReload,
+            surge,
+            batches: 0,
             prev,
             _ticker: cancel_tx,
         });
@@ -233,12 +337,7 @@ impl Supervisor {
             Some(cmd) => {
                 info!("running preflight", command = cmd);
                 let env = vec![("WARDEN_APP".to_string(), self.cfg.app.name.clone())];
-                let fut = run_shell(
-                    cmd,
-                    self.cfg.app.working_directory.clone(),
-                    env,
-                    Duration::from_secs(self.cfg.reload.timeout),
-                );
+                let fut = run_shell(cmd, self.worker_dir(), env, Duration::from_secs(self.cfg.reload.timeout));
                 let tx = self.tx.clone();
                 tokio::task::spawn_local(async move {
                     let result =
@@ -258,8 +357,13 @@ impl Supervisor {
             let new = Config::load(&path).map_err(|e| format!("preflight: config error, nothing was changed: {e}"))?;
             self.apply_config(new)?;
         }
-        let base =
-            self.cfg.app.working_directory.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some(wd) = &self.cfg.app.working_directory {
+            if !wd.is_dir() {
+                return Err(format!("preflight: working_directory {} does not exist", wd.display()));
+            }
+        }
+        self.pin_release().map_err(|e| format!("preflight: {e}"))?;
+        let base = self.worker_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         if !base.is_dir() {
             return Err(format!("preflight: working_directory {} does not exist", base.display()));
         }
@@ -272,6 +376,7 @@ impl Supervisor {
             }
             Mode::Process if self.cfg.static_files.is_some() => {
                 let root = self.cfg.static_files.as_ref().map(|s| s.root.clone()).unwrap_or_default();
+                let root = self.pinned_path(root);
                 if !root.is_dir() {
                     return Err(format!("preflight: static.root {} is not a directory", root.display()));
                 }
@@ -279,7 +384,8 @@ impl Supervisor {
             Mode::Process => {
                 let env: std::collections::BTreeMap<String, String> =
                     self.cfg.app.environment().map(|(k, v)| (k.clone(), v.clone())).collect();
-                if !command_exists(&self.cfg.app.command, &env) {
+                let command = self.pinned_arg(&self.cfg.app.command);
+                if !command_exists(&command, &env) {
                     return Err(format!("preflight: command `{}` not found", self.cfg.app.command));
                 }
                 let script = self.cfg.app.args.iter().find(|a| {
@@ -287,7 +393,7 @@ impl Supervisor {
                         && [".js", ".mjs", ".cjs", ".ts", ".mts", ".tsx", ".jsx"].iter().any(|x| a.ends_with(x))
                 });
                 if let Some(s) = script {
-                    let p = base.join(s);
+                    let p = base.join(self.pinned_arg(s));
                     if !p.is_file() {
                         return Err(format!("preflight: {} not found", p.display()));
                     }
@@ -305,6 +411,7 @@ impl Supervisor {
         self.policy = Policy::from(&self.cfg.restart);
         self.shim_path = snap.shim_path;
         self.host_path = snap.host_path;
+        self.release = snap.release;
     }
 
     /// Apply what can change without restarting Warden; report the rest.
@@ -386,80 +493,125 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Start the next batch: up to `surge` workers (1 for the canary), each
+    /// next to the one it replaces. Done when the queue is empty.
     pub(super) fn advance_rollout(&mut self) {
-        loop {
+        let overlap = self.cfg.overlap();
+        let mut ids = Vec::new();
+        {
             let Some(roll) = &mut self.roll else { return };
             if !matches!(roll.step, Step::Idle) || self.shutting_down || self.stopped {
                 return;
             }
-            let Some(slot_id) = roll.queue.pop_front() else {
+            let size = if roll.canary { 1 } else { roll.surge };
+            while ids.len() < size {
+                let Some(id) = roll.queue.pop_front() else { break };
+                let Some(slot) = self.slots.get(&id).filter(|s| !s.removing) else { continue };
+                let serving = slot.current.is_some() && matches!(slot.state, State::Running | State::Restarting);
+                // Stop-then-start, or nothing serving: replaced on its own, as
+                // there is no old worker to fall back on if another lane fails.
+                let alone = !(serving && overlap);
+                if alone && !ids.is_empty() {
+                    roll.queue.push_front(id);
+                    break;
+                }
+                ids.push(id);
+                if alone {
+                    break;
+                }
+            }
+            if ids.is_empty() {
                 self.finish_rollout(true, None);
                 return;
-            };
-            let Some(slot) = self.slots.get_mut(&slot_id).filter(|s| !s.removing) else { continue };
+            }
+            // The batch exists before its first worker starts: a failure
+            // while starting the others stops the ones already started.
+            roll.step = Step::Batch(Vec::with_capacity(ids.len()));
+            roll.batches += 1;
+            if ids.len() > 1 {
+                info!(
+                    "starting new workers next to the old ones",
+                    workers = id_list(&ids),
+                    batch = roll.batches,
+                    surge = roll.surge,
+                );
+            }
+        }
+        let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
+        for slot_id in ids {
+            let Some(slot) = self.slots.get_mut(&slot_id) else { continue };
             slot.token += 1; // cancel a pending restart timer; this rollout takes over
             let current = slot.current;
             let serving = current.filter(|_| matches!(slot.state, State::Running | State::Restarting));
-            let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
-            let overlap = self.cfg.overlap();
-            let step = match (serving, current) {
+            let at = match (serving, current) {
                 // Each worker owns its port, or the app can't share it: stop,
                 // then start (a gap for this worker only).
                 (Some(old), _) if !overlap => {
                     self.stop_instance(old);
-                    Step::Draining { slot: slot_id, old, then_spawn: true }
+                    At::Draining { old, then_spawn: true }
                 }
                 (Some(old), _) => match self.spawn_instance(slot_id, Role::Replacement) {
-                    Ok(new) => Step::Starting { slot: slot_id, new, old: Some(old), deadline },
+                    Ok(new) => At::Starting { new, old: Some(old), deadline },
                     Err(e) => {
-                        self.fail_rollout(format!("could not start a new worker: {e}"));
+                        self.fail_at(Some(slot_id), format!("could not start a new worker: {e}"));
                         return;
                     }
                 },
                 // Starting / stopping: let it finish exiting, then start fresh.
                 (None, Some(old)) => {
                     self.stop_instance(old);
-                    Step::Draining { slot: slot_id, old, then_spawn: true }
+                    At::Draining { old, then_spawn: true }
                 }
                 (None, None) => match self.spawn_current(slot_id) {
-                    Some(new) => Step::Starting { slot: slot_id, new, old: None, deadline },
+                    Some(new) => At::Starting { new, old: None, deadline },
                     None => {
-                        self.fail_rollout("could not start a new worker".into());
+                        self.fail_at(Some(slot_id), "could not start a new worker".into());
                         return;
                     }
                 },
             };
-            if let Some(r) = &mut self.roll {
-                r.step = step;
+            if let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll {
+                lanes.push(Lane { slot: slot_id, at });
             }
-            return;
         }
     }
 
     /// Called from `mark_ready`: the instance is listening.
     pub(super) fn rollout_on_ready(&mut self, inst: u64) {
         let can_check = self.can_check(inst);
-        let rl = self.cfg.reload.clone();
+        let rl = &self.cfg.reload;
+        let (health_passes, verify, canary_soak, min_ready) =
+            (rl.health_passes, rl.verify_command.is_some(), rl.canary_soak, rl.min_ready);
         let worker_mode = self.is_worker_mode();
         let label_of = |s: usize| if worker_mode { "host".to_string() } else { s.to_string() };
         let Some(roll) = &mut self.roll else { return };
-        let Step::Starting { slot, new, old, deadline } = roll.step else { return };
-        if new != inst {
-            return;
-        }
         let canary = roll.canary && roll.kind == Kind::SafeReload;
-        let soak = Duration::from_secs(if canary { rl.canary_soak } else { rl.min_ready });
-        let cmd = if rl.verify_command.is_some() { Cmd::Pending } else { Cmd::Skip };
+        let Step::Batch(lanes) = &mut roll.step else { return };
+        let several = lanes.len() > 1;
+        let Some(lane) = lanes.iter_mut().find(|l| matches!(l.at, At::Starting { new, .. } if new == inst)) else {
+            return;
+        };
+        let At::Starting { new, old, deadline } = lane.at else { return };
+        let soak = Duration::from_secs(if canary { canary_soak } else { min_ready });
+        let cmd = if verify { Cmd::Pending } else { Cmd::Skip };
         if canary {
             info!(
                 "canary listening next to the old worker",
-                worker = label_of(slot),
+                worker = label_of(lane.slot),
                 soak_s = soak.as_secs(),
-                health_passes = if can_check { rl.health_passes } else { 0 },
+                health_passes = if can_check { health_passes } else { 0 },
             );
         }
-        roll.step = Step::Verifying(Verify {
-            slot,
+        // Nothing to wait for: it passed.
+        if (health_passes == 0 || !can_check) && cmd == Cmd::Skip && soak.is_zero() {
+            lane.at = At::Passed { new, old };
+            if several {
+                debug!("new worker passed its gates; waiting for the rest of its batch", worker = lane.slot);
+            }
+            self.promote_if_ready();
+            return;
+        }
+        lane.at = At::Verifying(Verify {
             new,
             old,
             deadline,
@@ -471,10 +623,6 @@ impl Supervisor {
             soak_until: None,
             canary,
         });
-        // Nothing to wait for: promote right away.
-        if (rl.health_passes == 0 || !can_check) && cmd == Cmd::Skip && soak.is_zero() {
-            self.promote();
-        }
     }
 
     /// With a health path configured, health gates are mandatory: a worker
@@ -489,16 +637,13 @@ impl Supervisor {
             GateEvent::Tick { seq } if Some(seq) == seq_now => self.gate_tick(),
             GateEvent::Check { seq, inst, result } if Some(seq) == seq_now => self.gate_check(inst, result),
             GateEvent::Command { seq, inst, result } if Some(seq) == seq_now => {
-                let Some(Roll { step: Step::Verifying(v), .. }) = &mut self.roll else { return };
-                if v.new != inst {
-                    return;
-                }
+                let Some((slot, v)) = self.verifying(inst) else { return };
                 match result {
                     Ok(()) => {
                         v.cmd = Cmd::Passed;
-                        info!("verify_command passed", worker = v.slot);
+                        info!("verify_command passed", worker = slot);
                     }
-                    Err(e) => self.fail_rollout(format!("verify_command failed: {e}")),
+                    Err(e) => self.fail_at(Some(slot), format!("verify_command failed: {e}")),
                 }
             }
             GateEvent::Preflight { seq, result } if Some(seq) == seq_now => match result {
@@ -523,61 +668,94 @@ impl Supervisor {
         }
     }
 
+    /// The lane verifying `inst`: its slot and gates.
+    fn verifying(&mut self, inst: u64) -> Option<(usize, &mut Verify)> {
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll else { return None };
+        lanes.iter_mut().find_map(|l| match &mut l.at {
+            At::Verifying(v) if v.new == inst => Some((l.slot, v)),
+            _ => None,
+        })
+    }
+
     fn gate_tick(&mut self) {
         let now = Instant::now();
         let timeout = self.cfg.reload.timeout;
         let required = self.cfg.reload.health_passes;
+        let checks = required > 0 && self.can_check(0);
         let Some(roll) = &mut self.roll else { return };
         let seq = roll.seq;
-        match &mut roll.step {
-            Step::Starting { deadline, .. } if now > *deadline => {
-                self.fail_rollout(format!("new worker not listening within {timeout}s"));
-            }
-            Step::Verifying(v) => {
-                if now > v.deadline {
-                    let msg = format!("gates not passed within {timeout}s (health {}/{required})", v.passes);
-                    self.fail_rollout(msg);
-                    return;
+        let Step::Batch(lanes) = &mut roll.step else { return };
+        let several = lanes.len() > 1;
+        // Decide for every lane first, then act (acting needs `self`).
+        let mut fail = None;
+        let mut checks_due = Vec::new();
+        let mut commands_due = Vec::new();
+        for lane in lanes.iter_mut() {
+            let mut passed = None;
+            match &mut lane.at {
+                At::Starting { deadline, .. } if now > *deadline => {
+                    fail = Some((lane.slot, format!("new worker not listening within {timeout}s")));
+                    break;
                 }
-                if v.checking || v.cmd == Cmd::Running {
-                    return;
-                }
-                let (new, slot) = (v.new, v.slot);
-                let checks = required > 0 && self.can_check(new);
-                let Some(Roll { step: Step::Verifying(v), .. }) = &mut self.roll else { return };
-                if checks && v.passes < required {
-                    v.checking = true;
-                    self.launch_check(seq, new);
-                    return;
-                }
-                if v.cmd == Cmd::Pending {
-                    v.cmd = Cmd::Running;
-                    self.launch_command(seq, new, slot);
-                    return;
-                }
-                if !v.soak.is_zero() {
-                    let until = *v.soak_until.get_or_insert(crate::restart::later(now, v.soak));
-                    if now < until {
-                        if checks {
-                            v.checking = true;
-                            self.launch_check(seq, new);
-                        }
-                        return;
+                At::Verifying(v) => {
+                    if now > v.deadline {
+                        fail = Some((
+                            lane.slot,
+                            format!("gates not passed within {timeout}s (health {}/{required})", v.passes),
+                        ));
+                        break;
                     }
+                    if v.checking || v.cmd == Cmd::Running {
+                        continue;
+                    }
+                    if checks && v.passes < required {
+                        v.checking = true;
+                        checks_due.push(v.new);
+                        continue;
+                    }
+                    if v.cmd == Cmd::Pending {
+                        v.cmd = Cmd::Running;
+                        commands_due.push((v.new, lane.slot));
+                        continue;
+                    }
+                    if !v.soak.is_zero() {
+                        let until = *v.soak_until.get_or_insert(crate::restart::later(now, v.soak));
+                        if now < until {
+                            if checks {
+                                v.checking = true;
+                                checks_due.push(v.new);
+                            }
+                            continue;
+                        }
+                    }
+                    passed = Some((v.new, v.old));
                 }
-                self.promote();
+                _ => {}
             }
-            _ => {}
+            if let Some((new, old)) = passed {
+                lane.at = At::Passed { new, old };
+                if several {
+                    debug!("new worker passed its gates; waiting for the rest of its batch", worker = lane.slot);
+                }
+            }
         }
+        if let Some((slot, msg)) = fail {
+            self.fail_at(Some(slot), msg);
+            return;
+        }
+        for inst in checks_due {
+            self.launch_check(seq, inst);
+        }
+        for (inst, slot) in commands_due {
+            self.launch_command(seq, inst, slot);
+        }
+        self.promote_if_ready();
     }
 
     fn gate_check(&mut self, inst: u64, result: Result<(), String>) {
         let required = self.cfg.reload.health_passes;
         let threshold = self.cfg.health.failure_threshold;
-        let Some(Roll { step: Step::Verifying(v), .. }) = &mut self.roll else { return };
-        if v.new != inst {
-            return;
-        }
+        let Some((slot, v)) = self.verifying(inst) else { return };
         v.checking = false;
         let soaking = v.soak_until.is_some();
         match result {
@@ -585,9 +763,9 @@ impl Supervisor {
                 v.fails = 0;
                 if !soaking && v.passes < required {
                     v.passes += 1;
-                    debug!("gate health check passed", worker = v.slot, passes = v.passes, required = required);
+                    debug!("gate health check passed", worker = slot, passes = v.passes, required = required);
                     if v.passes == required {
-                        info!("new worker passed health checks", worker = v.slot, passes = required);
+                        info!("new worker passed health checks", worker = slot, passes = required);
                     }
                 }
             }
@@ -596,12 +774,12 @@ impl Supervisor {
                 if !soaking {
                     v.passes = 0;
                 }
-                debug!("gate health check failed", worker = v.slot, error = e, consecutive = v.fails);
+                debug!("gate health check failed", worker = slot, error = e, consecutive = v.fails);
                 if soaking && v.fails >= threshold {
                     let what = if v.canary { "canary" } else { "new worker" };
-                    self.fail_rollout(format!("{what} failed {threshold} health checks during soak: {e}"));
+                    self.fail_at(Some(slot), format!("{what} failed {threshold} health checks during soak: {e}"));
                 } else if !soaking && v.fails >= threshold * 3 {
-                    self.fail_rollout(format!("new worker keeps failing health checks: {e}"));
+                    self.fail_at(Some(slot), format!("new worker keeps failing health checks: {e}"));
                 }
             }
         }
@@ -655,8 +833,7 @@ impl Supervisor {
             env.push(("PORT".into(), networking::worker_port(p, self.cfg.workers.port_strategy, slot).to_string()));
         }
         info!("running verify_command", worker = self.label(slot), command = cmd);
-        let fut =
-            run_shell(cmd, self.cfg.app.working_directory.clone(), env, Duration::from_secs(self.cfg.reload.timeout));
+        let fut = run_shell(cmd, self.worker_dir(), env, Duration::from_secs(self.cfg.reload.timeout));
         let tx = self.tx.clone();
         tokio::task::spawn_local(async move {
             let result = crate::guard::catch_unwind(fut).await.unwrap_or_else(|p| Err(format!("internal error: {p}")));
@@ -664,76 +841,100 @@ impl Supervisor {
         });
     }
 
-    /// The new worker passed every gate: it takes over, the old one drains.
-    fn promote(&mut self) {
-        if let Some(Roll { step: Step::Verifying(v), .. }) = &self.roll {
-            if let Some(t) = self.insts.get(&v.new).and_then(|i| i.threads.iter().find(|(_, t)| t.crashed)) {
+    /// Every new worker of the batch passed every gate: they take over, and
+    /// the old ones drain together.
+    fn promote_if_ready(&mut self) {
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &self.roll else { return };
+        if lanes.is_empty() || !lanes.iter().all(|l| matches!(l.at, At::Passed { .. })) {
+            return;
+        }
+        let passed: Vec<(usize, u64, Option<u64>)> = lanes
+            .iter()
+            .filter_map(|l| match l.at {
+                At::Passed { new, old } => Some((l.slot, new, old)),
+                _ => None,
+            })
+            .collect();
+        // Worker mode: a Worker of a new host died after its checks.
+        for (slot, new, _) in &passed {
+            if let Some(t) = self.insts.get(new).and_then(|i| i.threads.iter().find(|(_, t)| t.crashed)) {
                 let msg = format!("Worker {} of the new host crashed", t.0);
-                self.fail_rollout(msg);
+                self.fail_at(Some(*slot), msg);
                 return;
             }
         }
         let Some(roll) = &mut self.roll else { return };
-        let Step::Verifying(v) = &roll.step else { return };
-        let (slot_id, new, old, canary) = (v.slot, v.new, v.old.filter(|o| self.insts.contains_key(o)), v.canary);
-        let kill_old = roll.kill_old;
+        let (kill_old, canary) = (roll.kill_old, roll.canary);
         roll.canary = false;
-        if let Some(i) = self.insts.get_mut(&new) {
-            i.role = Role::Current;
-        }
-        let new_pid = self.insts.get(&new).map(|i| i.handle.pid).unwrap_or(0);
-        if let Some(s) = self.slots.get_mut(&slot_id) {
-            s.current = Some(new);
-            s.state = State::Running;
-            s.token += 1;
-            s.failed_at = None;
-            if old.is_some() {
-                s.restarts += 1;
+        let mut lanes = Vec::with_capacity(passed.len());
+        let mut finished = 0;
+        for (slot_id, new, old) in passed {
+            let old = old.filter(|o| self.insts.contains_key(o));
+            if let Some(i) = self.insts.get_mut(&new) {
+                i.role = Role::Current;
+            }
+            let new_pid = self.insts.get(&new).map(|i| i.handle.pid).unwrap_or(0);
+            if let Some(s) = self.slots.get_mut(&slot_id) {
+                s.current = Some(new);
+                s.state = State::Running;
+                s.token += 1;
+                s.failed_at = None;
+                if old.is_some() {
+                    s.restarts += 1;
+                }
+            }
+            let label = self.label(slot_id);
+            match old {
+                Some(old) => {
+                    let old_pid = self.insts.get(&old).map(|i| i.handle.pid).unwrap_or(0);
+                    if canary {
+                        info!(
+                            "canary passed; draining the worker it replaced",
+                            worker = label,
+                            new_pid = new_pid,
+                            old_pid = old_pid
+                        );
+                    } else {
+                        info!(
+                            "worker replaced; draining old process",
+                            worker = label,
+                            new_pid = new_pid,
+                            old_pid = old_pid
+                        );
+                    }
+                    if let Some(o) = self.insts.get_mut(&old) {
+                        o.role = Role::Retiring;
+                    }
+                    if kill_old {
+                        self.kill_instance(old)
+                    } else {
+                        self.stop_instance(old)
+                    }
+                    lanes.push(Lane { slot: slot_id, at: At::Draining { old, then_spawn: false } });
+                }
+                None => {
+                    info!("worker passed its gates", worker = label, pid = new_pid);
+                    lanes.push(Lane { slot: slot_id, at: At::Done });
+                    finished += 1;
+                }
             }
         }
-        let label = self.label(slot_id);
-        match old {
-            Some(old) => {
-                let old_pid = self.insts.get(&old).map(|i| i.handle.pid).unwrap_or(0);
-                if canary {
-                    info!(
-                        "canary passed; draining the worker it replaced",
-                        worker = label,
-                        new_pid = new_pid,
-                        old_pid = old_pid
-                    );
-                } else {
-                    info!(
-                        "worker replaced; draining old process",
-                        worker = label,
-                        new_pid = new_pid,
-                        old_pid = old_pid
-                    );
-                }
-                if let Some(o) = self.insts.get_mut(&old) {
-                    o.role = Role::Retiring;
-                }
-                if kill_old {
-                    self.kill_instance(old)
-                } else {
-                    self.stop_instance(old)
-                }
-                if let Some(r) = &mut self.roll {
-                    r.step = Step::Draining { slot: slot_id, old, then_spawn: false };
-                }
-            }
-            None => {
-                info!("worker passed its gates", worker = label, pid = new_pid);
-                self.slot_done();
-            }
+        if let Some(r) = &mut self.roll {
+            r.done += finished;
+            r.step = Step::Batch(lanes);
         }
         self.check_all_ready();
+        self.batch_progress();
     }
 
-    fn slot_done(&mut self) {
+    /// Every lane of the batch is done: pause (safe-reload), or the next batch.
+    fn batch_progress(&mut self) {
         let pause = self.cfg.reload.pause;
         let Some(roll) = &mut self.roll else { return };
-        roll.done += 1;
+        let Step::Batch(lanes) = &roll.step else { return };
+        if !lanes.iter().all(|l| matches!(l.at, At::Done)) {
+            return;
+        }
         roll.step = Step::Idle;
         if roll.kind == Kind::SafeReload && pause > 0 && !roll.queue.is_empty() {
             roll.step = Step::Pausing;
@@ -747,68 +948,106 @@ impl Supervisor {
     /// Called from `on_exit` for every exited instance.
     pub(super) fn rollout_on_exit(&mut self, inst: u64, reason: &str) {
         let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
-        let Some(roll) = &mut self.roll else { return };
-        match &mut roll.step {
-            Step::Starting { new, .. } if *new == inst => {
-                self.fail_rollout(format!("new worker exited before listening: {reason}"));
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll else { return };
+        let Some(lane) = lanes.iter_mut().find(|l| l.at.involves(inst)) else { return };
+        let slot = lane.slot;
+        let act = match &mut lane.at {
+            At::Starting { new, .. } if *new == inst => {
+                OnExit::Fail(slot, format!("new worker exited before listening: {reason}"))
             }
-            Step::Verifying(v) if v.new == inst => {
+            At::Verifying(v) if v.new == inst => {
                 let what = if v.canary { "canary" } else { "new worker" };
-                self.fail_rollout(format!("{what} exited during its checks: {reason}"));
+                OnExit::Fail(slot, format!("{what} exited during its checks: {reason}"))
             }
-            Step::Starting { old, .. } if *old == Some(inst) => *old = None,
-            Step::Verifying(v) if v.old == Some(inst) => v.old = None,
-            Step::Draining { slot, old, then_spawn } if *old == inst => {
-                let (slot, then_spawn) = (*slot, *then_spawn);
-                if !then_spawn {
-                    self.slot_done();
-                    return;
+            At::Passed { new, .. } if *new == inst => {
+                OnExit::Fail(slot, format!("new worker exited while the rest of its batch was checked: {reason}"))
+            }
+            // The old worker died first: the new one owns the slot now (see `on_slot_crash`).
+            At::Starting { old, .. } | At::Passed { old, .. } => {
+                *old = None;
+                return;
+            }
+            At::Verifying(v) => {
+                v.old = None;
+                return;
+            }
+            At::Draining { then_spawn: true, .. } => OnExit::Spawn(slot),
+            At::Draining { then_spawn: false, .. } => OnExit::Drained(slot),
+            At::Done => return,
+        };
+        match act {
+            OnExit::Fail(slot, msg) => self.fail_at(Some(slot), msg),
+            OnExit::Drained(slot) => {
+                if let Some(Roll { step: Step::Batch(lanes), done, .. }) = &mut self.roll {
+                    if let Some(l) = lanes.iter_mut().find(|l| l.slot == slot) {
+                        l.at = At::Done;
+                        *done += 1;
+                    }
                 }
-                match self.spawn_current(slot) {
-                    Some(new) => {
-                        if let Some(r) = &mut self.roll {
-                            r.step = Step::Starting { slot, new, old: None, deadline };
+                self.batch_progress();
+            }
+            OnExit::Spawn(slot) => {
+                let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline });
+                match at {
+                    Some(at) => {
+                        if let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll {
+                            if let Some(l) = lanes.iter_mut().find(|l| l.slot == slot) {
+                                l.at = at;
+                            }
                         }
                     }
-                    None => self.fail_rollout("could not start a new worker".into()),
+                    None => self.fail_at(Some(slot), "could not start a new worker".into()),
                 }
             }
-            _ => {}
         }
     }
 
     /// The replacement (not yet promoted) this rollout is starting or verifying for `slot_id`.
     pub(super) fn rollout_new_instance(&self, slot_id: usize) -> Option<u64> {
-        let roll = self.roll.as_ref()?;
-        let new = match &roll.step {
-            Step::Starting { slot, new, .. } if *slot == slot_id => *new,
-            Step::Verifying(v) if v.slot == slot_id => v.new,
-            _ => return None,
-        };
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &self.roll else { return None };
+        let new = lanes.iter().find(|l| l.slot == slot_id)?.at.new_inst()?;
         self.insts.get(&new).filter(|i| i.role == Role::Replacement).map(|_| new)
     }
 
     /// A rollout is currently working on this slot.
     pub(super) fn rollout_replacing(&self, slot_id: usize) -> bool {
-        match self.roll.as_ref().map(|r| &r.step) {
-            Some(Step::Starting { slot, .. } | Step::Draining { slot, .. }) => *slot == slot_id,
-            Some(Step::Verifying(v)) => v.slot == slot_id,
+        match &self.roll {
+            Some(Roll { step: Step::Batch(lanes), .. }) => {
+                lanes.iter().any(|l| l.slot == slot_id && !matches!(l.at, At::Done))
+            }
             _ => false,
         }
     }
 
-    /// Stop the rollout. While the old worker still exists this is a free
-    /// rollback: the new process is stopped and nothing else changes. If the
-    /// new process already owns the slot (the old one died, the slot was empty,
-    /// or offset ports), it is stopped and the slot restarted through crash
-    /// handling. The config that was in effect before the rollout is restored.
+    /// Stop the rollout (see `fail_at`), at the batch's first worker.
     pub(super) fn fail_rollout(&mut self, reason: String) {
+        let at = match &self.roll {
+            Some(Roll { step: Step::Batch(lanes), .. }) => lanes.iter().find(|l| l.at.new_inst().is_some()),
+            _ => None,
+        }
+        .map(|l| l.slot);
+        self.fail_at(at, reason);
+    }
+
+    /// Stop the rollout because of worker `at`. Every new worker of the batch
+    /// that has not taken over is stopped. While the old worker it replaces
+    /// still exists this is a free rollback: nothing else changes. If the new
+    /// process already owns its slot (the old one died, the slot was empty,
+    /// or offset ports), it is stopped and the slot restarted. The config and
+    /// release pin in effect before the rollout are restored.
+    fn fail_at(&mut self, at: Option<usize>, reason: String) {
         let Some(roll) = &mut self.roll else { return };
-        let (slot, new, old) = match &roll.step {
-            Step::Starting { slot, new, old, .. } => (Some(*slot), Some(*new), *old),
-            Step::Verifying(v) => (Some(v.slot), Some(v.new), v.old),
-            Step::Draining { slot, .. } => (Some(*slot), None, None),
-            _ => (None, None, None),
+        // (slot, new, old) of every worker of the batch that has not taken over.
+        let pending: Vec<(usize, u64, Option<u64>)> = match &roll.step {
+            Step::Batch(lanes) => lanes
+                .iter()
+                .filter_map(|l| match &l.at {
+                    At::Starting { new, old, .. } | At::Passed { new, old } => Some((l.slot, *new, *old)),
+                    At::Verifying(v) => Some((l.slot, v.new, v.old)),
+                    At::Draining { .. } | At::Done => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         };
         let (kind, done, total, kill_old) = (roll.kind, roll.done, roll.total, roll.kill_old);
         let prev = roll.prev.take();
@@ -816,30 +1055,44 @@ impl Supervisor {
         if let Some(p) = prev {
             self.restore(p);
         }
-        let old = old.filter(|o| self.insts.contains_key(o));
-        let new = new.filter(|n| self.insts.contains_key(n));
-        let mut rolled_back = false;
-        let mut restarting = false;
-        if let Some(n) = new {
-            if old.is_some() {
-                rolled_back = true;
-            } else if let Some(i) = self.insts.get_mut(&n) {
-                // It owns the slot: stop it (draining) and restart the slot afterwards.
-                i.restart_on_exit = true;
-                restarting = true;
+        let (mut rolled_back, mut restarting) = (0usize, 0usize);
+        let mut kept = Vec::new();
+        for &(slot, new, old) in &pending {
+            let old = old.filter(|o| self.insts.contains_key(o));
+            if self.insts.contains_key(&new) {
+                if old.is_some() {
+                    rolled_back += 1;
+                } else if let Some(i) = self.insts.get_mut(&new) {
+                    // It owns the slot: stop it (draining) and restart the slot afterwards.
+                    i.restart_on_exit = true;
+                    restarting += 1;
+                }
+                self.stop_instance(new);
+            } else if old.is_some() {
+                rolled_back += 1;
             }
-            self.stop_instance(n);
-        } else if old.is_some() {
-            rolled_back = true;
+            if let Some(o) = old {
+                kept.push((slot, o));
+            }
         }
-        let who = slot.map(|s| format!("worker {}", self.label(s))).unwrap_or_else(|| "preflight".into());
-        let cfg_note = if restored { " The previous config is back in effect." } else { "" };
+        let at = at.or(pending.first().map(|p| p.0));
+        let who = at.map(|s| format!("worker {}", self.label(s))).unwrap_or_else(|| "preflight".into());
+        let cfg_note = if restored && kind.is_deploy() { " The previous config is back in effect." } else { "" };
+        let batch = pending.len();
         let message = match kind {
-            Kind::SafeReload | Kind::Reload if done == 0 && rolled_back => format!(
+            Kind::SafeReload | Kind::Reload if done == 0 && rolled_back > 0 && restarting == 0 && batch > 1 => format!(
+                "{} failed at {who}: {reason}. Rolled back: the {batch} new workers started together were stopped; every worker still runs the previous version.{cfg_note}",
+                kind.name()
+            ),
+            Kind::SafeReload | Kind::Reload if done == 0 && rolled_back > 0 && restarting == 0 => format!(
                 "{} failed at {who}: {reason}. Rolled back: every worker still runs the previous version.{cfg_note}",
                 kind.name()
             ),
-            Kind::SafeReload | Kind::Reload if done == 0 && restarting => format!(
+            Kind::SafeReload | Kind::Reload if done == 0 && restarting > 0 && batch > 1 => format!(
+                "{} failed at {who}: {reason}. The new workers started together were stopped; {restarting} of them could not be rolled back (the old process was already gone) and are being restarted, the others still run the previous version.{cfg_note}",
+                kind.name()
+            ),
+            Kind::SafeReload | Kind::Reload if done == 0 && restarting > 0 => format!(
                 "{} failed at {who}: {reason}. That worker could not be rolled back (its old process was already gone) and is being restarted; no other worker was touched.{cfg_note}",
                 kind.name()
             ),
@@ -853,13 +1106,16 @@ impl Supervisor {
             _ => format!(
                 "{} of {who} failed: {reason}{}",
                 kind.name(),
-                if rolled_back { "; the old worker keeps serving" } else { "" }
+                match rolled_back {
+                    0 => "",
+                    1 => "; the old worker keeps serving",
+                    _ => "; the old workers keep serving",
+                }
             ),
         };
         self.finish_rollout(false, Some(message));
 
-        let Some(slot) = slot else { return };
-        if let Some(o) = old {
+        for (slot, o) in kept {
             if kill_old {
                 // It was being replaced because it is hung: kill it anyway;
                 // crash handling restarts it.
@@ -888,11 +1144,16 @@ impl Supervisor {
         }
         let Some(roll) = self.roll.take() else { return };
         let secs = roll.started.elapsed().as_secs_f64();
+        let batches = match roll.batches {
+            _ if roll.surge <= 1 => String::new(),
+            1 => format!(" (1 batch of up to {})", roll.surge),
+            n => format!(" ({n} batches of up to {})", roll.surge),
+        };
         let message = message.unwrap_or_else(|| match roll.kind {
             Kind::Reload | Kind::SafeReload => {
-                format!("{} complete: {} worker(s) replaced in {secs:.1}s", roll.kind.name(), roll.done)
+                format!("{} complete: {} worker(s) replaced in {secs:.1}s{batches}", roll.kind.name(), roll.done)
             }
-            Kind::Restart => format!("restart complete in {secs:.1}s"),
+            Kind::Restart => format!("restart complete in {secs:.1}s{batches}"),
             Kind::Replace | Kind::Recovery => format!("worker replaced ({}) in {secs:.1}s", roll.reason),
         });
         if ok {
@@ -931,52 +1192,21 @@ impl Supervisor {
             Step::Idle => (0, 0, 0),
             Step::Preflight => (1, 0, 0),
             Step::Pausing => (2, 0, 0),
-            Step::Starting { new, .. } => (3, *new, 0),
-            Step::Draining { old, .. } => (4, *old, 0),
-            Step::Verifying(v) => {
-                let detail = if v.soak_until.is_some() {
-                    u32::MAX
-                } else if v.cmd == Cmd::Running {
-                    u32::MAX - 1
-                } else {
-                    v.passes
-                };
-                (5, v.new, detail)
-            }
+            Step::Batch(lanes) => batch_key(lanes),
         };
         Some(PhaseKey { seq: r.seq, done: r.done, step, inst, detail })
     }
 
     pub(super) fn rollout_status(&self) -> Option<RolloutStatus> {
         let r = self.roll.as_ref()?;
-        let pid = |i: &u64| self.insts.get(i).map(|x| x.handle.pid).unwrap_or(0);
-        let now = Instant::now();
         let phase = match &r.step {
             // Only seen at the start (the `rollout` event announcing it).
             Step::Idle if r.done == 0 => "starting".to_string(),
             Step::Idle => "next worker".to_string(),
             Step::Preflight => "running preflight".to_string(),
             Step::Pausing => format!("pausing {}s between workers", self.cfg.reload.pause),
-            Step::Starting { slot, new, .. } => {
-                format!("worker {}: starting new process (pid {})", self.label(*slot), pid(new))
-            }
-            Step::Draining { slot, old, .. } => {
-                format!("worker {}: draining old process (pid {})", self.label(*slot), pid(old))
-            }
-            Step::Verifying(v) => {
-                let who = if v.canary {
-                    format!("worker {} (canary)", self.label(v.slot))
-                } else {
-                    format!("worker {}", self.label(v.slot))
-                };
-                if let Some(until) = v.soak_until {
-                    format!("{who}: soaking, {}s left", until.saturating_duration_since(now).as_secs())
-                } else if v.cmd == Cmd::Running {
-                    format!("{who}: running verify_command")
-                } else {
-                    format!("{who}: health checks {}/{}", v.passes, self.cfg.reload.health_passes)
-                }
-            }
+            Step::Batch(lanes) if lanes.len() == 1 => self.lane_phase(&lanes[0]),
+            Step::Batch(lanes) => self.batch_phase(lanes),
         };
         Some(RolloutStatus {
             seq: r.seq,
@@ -987,6 +1217,125 @@ impl Supervisor {
             elapsed_secs: r.started.elapsed().as_secs(),
         })
     }
+
+    fn pid_of(&self, inst: u64) -> u32 {
+        self.insts.get(&inst).map(|x| x.handle.pid).unwrap_or(0)
+    }
+
+    /// One worker: `worker 2: health checks 1/3`.
+    fn lane_phase(&self, l: &Lane) -> String {
+        let label = self.label(l.slot);
+        match &l.at {
+            At::Starting { new, .. } => format!("worker {label}: starting new process (pid {})", self.pid_of(*new)),
+            At::Draining { old, .. } => format!("worker {label}: draining old process (pid {})", self.pid_of(*old)),
+            At::Passed { .. } => format!("worker {label}: passed its gates"),
+            At::Done => format!("worker {label}: done"),
+            At::Verifying(v) => {
+                let who = if v.canary { format!("worker {label} (canary)") } else { format!("worker {label}") };
+                format!("{who}: {}", self.verify_phase(v))
+            }
+        }
+    }
+
+    fn verify_phase(&self, v: &Verify) -> String {
+        if let Some(until) = v.soak_until {
+            format!("soaking, {}s left", until.saturating_duration_since(Instant::now()).as_secs())
+        } else if v.cmd == Cmd::Running {
+            "running verify_command".into()
+        } else {
+            format!("health checks {}/{}", v.passes, self.cfg.reload.health_passes)
+        }
+    }
+
+    /// Several workers: where the batch stands, from its slowest worker.
+    /// `workers 1, 2: health checks 1/3, 1/2 passed`.
+    fn batch_phase(&self, lanes: &[Lane]) -> String {
+        let n = lanes.len();
+        let ids: Vec<usize> = lanes.iter().map(|l| l.slot).collect();
+        let who = format!("workers {}", id_list(&ids));
+        let starting = lanes.iter().filter(|l| matches!(l.at, At::Starting { .. })).count();
+        let passed = lanes.iter().filter(|l| matches!(l.at, At::Passed { .. })).count();
+        let slowest = lanes
+            .iter()
+            .filter_map(|l| if let At::Verifying(v) = &l.at { Some(v) } else { None })
+            .min_by_key(|v| (v.stage(), u64::from(v.passes), std::cmp::Reverse(v.soak_until)));
+        let draining: Vec<String> = lanes
+            .iter()
+            .filter_map(|l| if let At::Draining { old, .. } = l.at { Some(self.pid_of(old).to_string()) } else { None })
+            .collect();
+        let passed_note = if passed > 0 { format!(", {passed}/{n} passed") } else { String::new() };
+        if starting > 0 {
+            format!("{who}: starting {n} new processes ({}/{n} listening)", n - starting)
+        } else if let Some(v) = slowest {
+            format!("{who}: {}{passed_note}", self.verify_phase(v))
+        } else if !draining.is_empty() {
+            format!("{who}: draining {} old process(es) (pid {})", draining.len(), draining.join(", "))
+        } else if passed == n {
+            format!("{who}: all {n} passed their gates")
+        } else {
+            format!("{who}: done")
+        }
+    }
+}
+
+/// Phase key of a batch (see `PhaseKey`): which stage its slowest worker is
+/// in, and how many workers got how far.
+fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
+    let first = lanes.iter().find_map(|l| l.at.new_inst()).unwrap_or(0);
+    let count = |f: fn(&At) -> bool| lanes.iter().filter(|l| f(&l.at)).count() as u64;
+    let starting = count(|a| matches!(a, At::Starting { .. }));
+    let passed = count(|a| matches!(a, At::Passed { .. }));
+    let draining = count(|a| matches!(a, At::Draining { .. }));
+    let slowest = lanes
+        .iter()
+        .filter_map(|l| if let At::Verifying(v) = &l.at { Some(v) } else { None })
+        .min_by_key(|v| (v.stage(), u64::from(v.passes)));
+    if lanes.len() == 1 {
+        return match &lanes[0].at {
+            At::Starting { new, .. } => (3, *new, 0),
+            At::Draining { old, .. } => (4, *old, 0),
+            At::Verifying(v) => {
+                let detail = match v.stage() {
+                    2 => u64::from(u32::MAX),
+                    1 if v.cmd == Cmd::Running => u64::from(u32::MAX - 1),
+                    _ => u64::from(v.passes),
+                };
+                (5, v.new, detail)
+            }
+            At::Passed { new, .. } => (6, *new, 0),
+            At::Done => (7, 0, 0),
+        };
+    }
+    if starting > 0 {
+        (3, first, starting)
+    } else if let Some(v) = slowest {
+        (5, first, (v.stage() << 48) | (u64::from(v.passes) << 24) | passed)
+    } else if draining > 0 {
+        (4, first, draining)
+    } else {
+        (6, first, passed)
+    }
+}
+
+/// `1, 2` or `1-4, 7`.
+fn id_list(ids: &[usize]) -> String {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    let mut parts = Vec::new();
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i;
+        while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+            j += 1;
+        }
+        if j - i >= 2 {
+            parts.push(format!("{}-{}", ids[i], ids[j]));
+        } else {
+            parts.extend(ids[i..=j].iter().map(|x| x.to_string()));
+        }
+        i = j + 1;
+    }
+    parts.join(", ")
 }
 
 async fn check_sockets(sockets: &[PathBuf], path: &str, timeout: Duration) -> Result<(), String> {
