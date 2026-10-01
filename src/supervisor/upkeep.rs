@@ -18,9 +18,20 @@ impl Supervisor {
     pub(super) fn on_tick(&mut self) {
         crate::guard::fault("tick");
         self.ticks += 1;
-        self.systemd_watchdog();
+        let gap = self.systemd_watchdog();
         if self.shutting_down || self.stopped {
             return;
+        }
+        if gap > STALL {
+            // Warden did not run (SIGSTOP, a paused VM, an overloaded host):
+            // the heartbeats sent meanwhile wait unread in the workers'
+            // pipes. That time is nobody's silence; without this, a freeze
+            // longer than watchdog.timeout killed every healthy worker as hung.
+            let stall = gap.saturating_sub(TICK);
+            let now = Instant::now();
+            for i in self.insts.values_mut() {
+                forgive_stall(&mut i.heartbeats, stall, now);
+            }
         }
         self.watchdog();
         if self.cfg.limits.max_memory > 0 && self.ticks % 5 == 0 {
@@ -37,8 +48,9 @@ impl Supervisor {
 
     /// CP2: tell systemd we're alive (`WatchdogSec=`), but only while the event
     /// loop keeps up: ticks arriving more than 2 s late mean something blocks
-    /// it (a stalled stdout, a bug), and systemd should restart us.
-    fn systemd_watchdog(&mut self) {
+    /// it (a stalled stdout, a bug), and systemd should restart us. Returns
+    /// the time since the previous tick.
+    fn systemd_watchdog(&mut self) -> Duration {
         let now = Instant::now();
         let gap = now.duration_since(self.last_tick);
         self.last_tick = now;
@@ -47,8 +59,16 @@ impl Supervisor {
                 systemd::notify("WATCHDOG=1");
             }
         } else {
-            warn!("event loop was blocked", for_ms = gap.as_millis().saturating_sub(1000));
+            warn!(
+                "event loop was blocked",
+                for_ms = gap.saturating_sub(TICK).as_millis(),
+                hint = "Warden itself did not run for that long: it was stopped (SIGSTOP, a debugger), the host or VM \
+                        was paused or overloaded, or its stdout blocked. Workers kept serving, and the watchdog does \
+                        not count that time against them. If it repeats, check the host's load and what reads \
+                        Warden's output",
+            );
         }
+        gap
     }
 
     /// Queue a graceful (new first, then drain old) replacement of one worker.
@@ -110,7 +130,10 @@ impl Supervisor {
                 "worker hung: no heartbeat from its event loop",
                 worker = worker,
                 pid = pid,
-                silent_s = silent.as_secs()
+                silent_s = silent.as_secs(),
+                hint = "its event loop is blocked (an endless loop, a synchronous call that never returns) or the \
+                        process is stopped; Warden kills it and starts a new one. Its last output is in `warden \
+                        logs <app> --worker N`; raise [watchdog] timeout if it blocks this long on purpose",
             );
             // Worker mode: the silent Worker (0: the host's own thread).
             let wid = if worker_mode { worker } else { slot };
@@ -236,6 +259,19 @@ impl Supervisor {
     }
 }
 
+/// The maintenance tick's period, and the tick gap above which Warden
+/// counts as having stalled (it did not run, so it read no heartbeat).
+const TICK: Duration = Duration::from_secs(1);
+const STALL: Duration = Duration::from_millis(1500);
+
+/// Move each heartbeat forward by `stall` (time Warden did not run), at most
+/// to `now`, so the watchdog only counts silence Warden was there to hear.
+pub(super) fn forgive_stall(beats: &mut BTreeMap<usize, Instant>, stall: Duration, now: Instant) {
+    for t in beats.values_mut() {
+        *t = t.checked_add(stall).map_or(now, |later| later.min(now));
+    }
+}
+
 /// `d` ± 10%, so workers started together don't all recycle together.
 pub(super) fn jittered(d: Duration, seed: u64) -> Duration {
     let span = d.as_millis() as u64 / 10;
@@ -253,6 +289,25 @@ pub(super) fn jittered(d: Duration, seed: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stall is not the workers' silence: a heartbeat received just before
+    /// Warden stopped for 7 s is 0.5 s old afterwards, not 7.5 s.
+    #[test]
+    fn a_stall_does_not_count_as_heartbeat_silence() {
+        let now = Instant::now();
+        let (Some(before), Some(older)) =
+            (now.checked_sub(Duration::from_millis(7500)), now.checked_sub(Duration::from_secs(20)))
+        else {
+            return; // a clock too close to its origin to go back 20 s
+        };
+        let mut beats = BTreeMap::from([(1, before), (2, older), (3, now)]);
+        forgive_stall(&mut beats, Duration::from_secs(7), now);
+        assert_eq!(now.duration_since(beats[&1]), Duration::from_millis(500));
+        // Silent long before the stall: still silent for 13 s, still hung.
+        assert_eq!(now.duration_since(beats[&2]), Duration::from_secs(13));
+        // Never in the future.
+        assert_eq!(beats[&3], now);
+    }
 
     #[test]
     fn jitter_stays_within_ten_percent() {

@@ -634,6 +634,39 @@ fn watchdog_kills_a_hung_worker() {
     assert!(!alive(before));
 }
 
+/// Found by `cargo xtask chaos` (stop-supervisor): Warden frozen (SIGSTOP)
+/// for longer than watchdog.timeout killed every healthy worker as hung when
+/// it resumed, because their heartbeats were still waiting unread. The
+/// workers served all along; they must be left alone.
+#[test]
+fn a_frozen_supervisor_does_not_kill_its_workers_as_hung() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("frozen", port, 2, "").replace("[restart]", "[watchdog]\ntimeout = 2\n[restart]");
+    let w = Warden::start("frozen", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    std::thread::sleep(Duration::from_millis(1500)); // let heartbeats arm the watchdog
+    w.signal(libc::SIGSTOP);
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(get(port, "/whoami").is_some(), "the workers serve while Warden is frozen");
+    w.signal(libc::SIGCONT);
+    std::thread::sleep(Duration::from_secs(3)); // ticks that would have judged them
+    let s = w.wait_for("ready", T, ready(2));
+    assert_eq!(pid_set(&s), before, "no worker was replaced:\n{}", w.log());
+    let log = w.log();
+    assert!(!log.contains("worker hung"), "{log}");
+    assert!(log.lines().any(|l| l.contains("event loop was blocked") && l.contains(" hint=")), "{log}");
+    // The watchdog still works after the stall.
+    let victim = *before.iter().next().unwrap();
+    let _ = std::process::Command::new("kill").args(["-STOP", &victim.to_string()]).status();
+    let s = w.wait_for("the stopped worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    assert!(
+        s["workers"].as_array().unwrap().iter().any(|w| w["last_exit"].as_str().is_some_and(|e| e.contains("hung")))
+    );
+}
+
 #[test]
 fn memory_and_lifetime_recycling() {
     if !have_bun() {
