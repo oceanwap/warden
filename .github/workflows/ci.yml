@@ -83,7 +83,13 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends openssh-server nginx
       - run: cargo fmt --all --check
-      - run: shellcheck install.sh
+      - run: shellcheck install.sh scripts/*.sh .github/code-changed.sh
+      # The macOS release script, with stubs for the Mac-only tools; and the
+      # release tooling (xtask).
+      - name: scripts/dist-macos.sh (stubbed) and xtask tests
+        run: |
+          bash scripts/test-dist-macos.sh
+          cargo test -p xtask
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --bin warden
         run: |

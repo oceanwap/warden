@@ -6,7 +6,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] — 0.1.0-unreleased
 
 Current `main`. There is no GitHub Release or tag yet; the first one is cut
-with `cargo release 0.1.0` (see [`docs/releasing.md`](docs/releasing.md)).
+with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md)).
 
 ### Added
 
@@ -35,9 +35,11 @@ with `cargo release 0.1.0` (see [`docs/releasing.md`](docs/releasing.md)).
 - CI: Linux (x86_64, arm64) and macOS builds and tests; a workflow that checks
   `warden startup` against real systemd and launchd; benchmarks on x86_64 and
   ARM64 runners; a short chaos run.
-- `install.sh` for the release assets, and a Release workflow that can also
-  be started by hand from GitHub (Actions → Release → Run workflow), which
-  creates the tag itself once everything is built and tested.
+- `install.sh` for the release assets, and a Release workflow that builds and
+  tests the Linux archives and can also be started by hand from GitHub
+  (Actions → Release → Run workflow), which creates the tag itself once
+  everything is built and tested. The macOS archives are built on a Mac
+  (`cargo dist-macos`, run by `cargo release`) and published with the rest.
 - [`contrib/nginx.conf`](contrib/nginx.conf) and
   [`docs/proxies.md`](docs/proxies.md) for running behind nginx or a cloud load
   balancer.

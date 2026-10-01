@@ -97,8 +97,11 @@ TASKS:
                goes (perf record, top symbols); Warden built with symbols
     chaos      A chaos soak: a fleet under load, random faults, invariants checked
                (docs/chaos.md)
-    release    Release a version: checks, version bump, tag, push, then follow the
-               Release workflow to the GitHub Release (also: cargo release)
+    release    Release a version: checks, version bump, tag, push, build the macOS
+               archives (on a Mac), then follow the Release workflow to the GitHub
+               Release (also: cargo release)
+    dist-macos Build the macOS release archives on this Mac and upload them to the
+               draft release the Release workflow takes them from (also: cargo dist-macos)
 
 `cargo xtask TASK --help` lists a task's options.
 ";
@@ -172,6 +175,13 @@ fn main() -> ExitCode {
             }
         },
         Some("release") => match release::main(&args[1..], &root()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("xtask: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("dist-macos") => match release::dist_macos(&args[1..], &root()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("xtask: {e}");

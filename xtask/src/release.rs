@@ -21,8 +21,12 @@ cargo xtask release VERSION [OPTIONS]      (also: cargo release VERSION [OPTIONS
 
 Releases Warden: checks everything, sets VERSION in Cargo.toml, protocol/ and
 gui/ (and Cargo.lock), commits \"Release vVERSION\", tags vVERSION and pushes
-both. GitHub Actions (.github/workflows/release.yml) then builds, tests and
-publishes the GitHub Release, which this follows to the end.
+both. GitHub Actions (.github/workflows/release.yml) then builds and tests the
+Linux archives and publishes the GitHub Release, which this follows to the end.
+The macOS archives are built here, on a Mac (scripts/dist-macos.sh, after the
+push) and wait in a draft release; the workflow takes them from there. On any
+other machine, run `cargo xtask dist-macos` on a Mac while the workflow waits
+(it waits an hour).
 
 VERSION:
     X.Y.Z, X.Y.Z-PRE   e.g. 0.2.0 or 0.2.0-rc.1 (a leading v is fine)
@@ -37,14 +41,19 @@ OPTIONS:
     --no-ci-check      Don't require a green CI run for the commit
     --wait-ci          If CI is still running for the commit, wait for it
     --no-wait          Don't follow the Release workflow after pushing
+    --no-macos         Don't build the macOS archives here (build them on a Mac:
+                       cargo xtask dist-macos)
     --trailer TEXT     Add a trailer (\"Key: value\") to the release commit; repeatable
     -y, --yes          Don't ask for confirmation
     -h, --help         This help
 
 GITHUB_TOKEN or GH_TOKEN, if set, authenticates the GitHub API calls (CI status,
 following the workflow): a higher rate limit, and private repositories work.
-NEEDS: git; curl (unless --no-ci-check --no-wait); the right to push tags to origin.
+NEEDS: git; curl (unless --no-ci-check --no-wait); the right to push tags to origin;
+on a Mac, for the macOS archives: rustup, cargo-about and the GitHub CLI (gh auth login).
 ";
+
+const MACOS_SCRIPT: &str = "scripts/dist-macos.sh";
 
 /// Released together, always with the same version: release.yml checks both
 /// `warden --version` and `warden-gui --version` against the tag. xtask/ is
@@ -53,7 +62,7 @@ const MANIFESTS: &[&str] = &["Cargo.toml", "protocol/Cargo.toml", "gui/Cargo.tom
 /// The `name:` of .github/workflows/ci.yml and release.yml.
 const CI_WORKFLOW: &str = "CI";
 const RELEASE_WORKFLOW: &str = "Release";
-const STEPS: usize = 8;
+const STEPS: usize = 9;
 
 #[derive(Debug)]
 pub(crate) struct Options {
@@ -65,6 +74,7 @@ pub(crate) struct Options {
     ci_check: bool,
     wait_ci: bool,
     follow: bool,
+    macos: bool,
     yes: bool,
     trailers: Vec<String>,
 }
@@ -80,6 +90,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Option<Options>, String> {
         ci_check: true,
         wait_ci: false,
         follow: true,
+        macos: true,
         yes: false,
         trailers: Vec::new(),
     };
@@ -97,6 +108,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Option<Options>, String> {
             "--no-ci-check" => o.ci_check = false,
             "--wait-ci" => o.wait_ci = true,
             "--no-wait" => o.follow = false,
+            "--no-macos" => o.macos = false,
             "-y" | "--yes" => o.yes = true,
             "--branch" => o.branch = it.next().ok_or("--branch needs a branch name")?.clone(),
             "--trailer" => {
@@ -137,6 +149,8 @@ pub(crate) struct Env {
     token: Option<String>,
     /// The cargo that runs the checks and `cargo update` (`$CARGO`).
     cargo: String,
+    /// This is a Mac: it builds the macOS archives itself.
+    mac: bool,
 }
 
 pub(crate) fn main(args: &[String], root: &Path) -> Result<(), String> {
@@ -146,7 +160,27 @@ pub(crate) fn main(args: &[String], root: &Path) -> Result<(), String> {
         .filter_map(|k| std::env::var(k).ok())
         .map(|t| t.trim().to_string())
         .find(|t| !t.is_empty());
-    release(&o, root, &Env { interactive: std::io::stdin().is_terminal(), token, cargo: cargo_bin() })
+    release(
+        &o,
+        root,
+        &Env { interactive: std::io::stdin().is_terminal(), token, cargo: cargo_bin(), mac: cfg!(target_os = "macos") },
+    )
+}
+
+/// `cargo xtask dist-macos`: the macOS archives, built here and uploaded to a
+/// draft release (scripts/dist-macos.sh, which has the options).
+pub(crate) fn dist_macos(args: &[String], root: &Path) -> Result<(), String> {
+    let script = root.join(MACOS_SCRIPT);
+    if !script.is_file() {
+        return Err(format!("{} not found", script.display()));
+    }
+    let status = Command::new("bash")
+        .arg(&script)
+        .args(args)
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("running bash {MACOS_SCRIPT}: {e}"))?;
+    if status.success() { Ok(()) } else { Err(format!("{MACOS_SCRIPT} failed ({status})")) }
 }
 
 // ------------------------------------------------------------------ semver
@@ -1330,6 +1364,42 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     }
 
     // ---------------------------------------------------------------- 8
+    // After the push: the workflow's Linux builds are already running, and its
+    // `macos` job waits (an hour) for the archives this uploads to the draft.
+    r.step("macOS archives");
+    let by_hand = format!("on a Mac with {tag} checked out (git pull): cargo xtask dist-macos");
+    if !o.macos {
+        r.note(&format!(
+            "skipped (--no-macos). The Release workflow waits up to an hour for the macOS archives: {by_hand}"
+        ));
+    } else if !env.mac {
+        r.note(&format!(
+            "this is not a Mac. The Release workflow waits up to an hour for the macOS archives: {by_hand}"
+        ));
+    } else if !root.join(MACOS_SCRIPT).is_file() {
+        r.note(&format!("{MACOS_SCRIPT} not found: the macOS archives are not built here ({by_hand})"));
+    } else {
+        let cmd = format!("{MACOS_SCRIPT} --branch {}", o.branch);
+        r.cmd(&cmd);
+        if !o.dry_run {
+            let built = dist_macos(&["--branch".to_string(), o.branch.clone()], root);
+            if let Err(e) = built {
+                r.fail(
+                    &format!("the macOS archives were not built or uploaded ({e})"),
+                    &format!(
+                        "{tag} is pushed, and the Release workflow waits up to an hour for them.\n\
+                         Fix the cause shown above, then run here: cargo xtask dist-macos\n\
+                         (it needs rustup, cargo-about and gh logged in). If the hour passed, re-run the\n\
+                         workflow afterwards (Actions > Release > Re-run all jobs)."
+                    ),
+                )?;
+            } else {
+                r.ok(&format!("the macOS archives are in the draft release {tag}"));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- 9
     r.step("Release workflow");
     let workflow_url = github.as_ref().map(|g| format!("https://github.com/{g}/actions/workflows/release.yml"));
     match (o.follow, api.as_mut()) {
@@ -1633,7 +1703,7 @@ fn undo_edit(git: &Git, files: &[&str], dry_run: bool) {
     }
 }
 
-/// Step 8: the Release run for the pushed tag, job by job, to the release.
+/// Step 9: the Release run for the pushed tag, job by job, to the release.
 fn follow(r: &mut Report, api: &mut GitHub, tag: &str, sha: &str) -> Result<(), String> {
     api.patient = true;
     let t0 = Instant::now();
@@ -2040,9 +2110,10 @@ version = \"0.2.0\"
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
         let o = parse(&a("0.2.0 --dry-run --yes --branch release --no-wait")).unwrap().unwrap();
         assert_eq!(
-            (o.version.as_str(), o.branch.as_str(), o.dry_run, o.yes, o.follow),
-            ("0.2.0", "release", true, true, false)
+            (o.version.as_str(), o.branch.as_str(), o.dry_run, o.yes, o.follow, o.macos),
+            ("0.2.0", "release", true, true, false, true)
         );
+        assert!(!parse(&a("0.2.0 --no-macos")).unwrap().unwrap().macos);
         assert!(parse(&a("")).unwrap_err().contains("which version"));
         assert!(parse(&a("0.2.0 0.3.0")).unwrap_err().contains("one version"));
         assert!(parse(&a("0.2.0 --nope")).unwrap_err().contains("unknown option"));
@@ -2124,10 +2195,29 @@ version = \"0.2.0\"
         }
 
         fn release(&self, args: &[&str]) -> Result<(), String> {
+            self.release_on(args, false)
+        }
+
+        /// `mac`: this is a Mac, so the macOS archives are built here.
+        fn release_on(&self, args: &[&str], mac: bool) -> Result<(), String> {
             let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             args.extend(["--no-ci-check", "--skip-checks", "--no-wait"].map(String::from));
             let o = parse(&args).unwrap().unwrap();
-            release(&o, &self.work, &Env { interactive: false, token: None, cargo: cargo_bin() })
+            release(&o, &self.work, &Env { interactive: false, token: None, cargo: cargo_bin(), mac })
+        }
+
+        /// A scripts/dist-macos.sh that records when it ran and what origin had
+        /// by then, then exits with `code`; committed and pushed.
+        fn fake_dist_script(&self, code: i32) {
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" > ../dist-ran.txt\n\
+                 git ls-remote --tags origin >> ../dist-ran.txt\nexit {code}\n"
+            );
+            std::fs::create_dir_all(self.work.join("scripts")).unwrap();
+            std::fs::write(self.work.join(MACOS_SCRIPT), script).unwrap();
+            sh(&self.work, "git", &["add", "-A"]);
+            sh(&self.work, "git", &["commit", "--quiet", "-m", "fake dist script"]);
+            sh(&self.work, "git", &["push", "--quiet", "origin", "main"]);
         }
 
         /// Every ref here and on origin, the status, and the version files.
@@ -2249,6 +2339,45 @@ version = \"0.2.0\"
     }
 
     #[test]
+    fn the_macos_archives_are_built_after_the_push_on_a_mac() {
+        let t = TempRepo::new("macos");
+        t.fake_dist_script(0);
+        t.release_on(&["0.2.0", "--yes"], true).unwrap();
+        // The script ran with the branch, and origin already had the tag.
+        let ran = std::fs::read_to_string(t.base.join("dist-ran.txt")).unwrap();
+        assert!(ran.starts_with("--branch main\n"), "{ran}");
+        assert!(ran.contains("refs/tags/v0.2.0"), "the tag was not on origin yet: {ran}");
+    }
+
+    #[test]
+    fn the_macos_archives_are_not_built_elsewhere_or_when_declined_or_in_a_dry_run() {
+        for (args, mac) in [(vec!["0.2.0", "--yes"], false), (vec!["0.2.0", "--yes", "--no-macos"], true)] {
+            let t = TempRepo::new("macos-skip");
+            t.fake_dist_script(0);
+            t.release_on(&args, mac).unwrap();
+            assert!(!t.base.join("dist-ran.txt").exists(), "{args:?} on a Mac: {mac}");
+            assert_eq!(t.git(&["tag", "--list"]), "v0.2.0");
+        }
+        let t = TempRepo::new("macos-dry");
+        t.fake_dist_script(0);
+        t.release_on(&["0.2.0", "--dry-run"], true).unwrap();
+        assert!(!t.base.join("dist-ran.txt").exists());
+        assert_eq!(t.git(&["tag", "--list"]), "");
+    }
+
+    #[test]
+    fn a_failed_macos_build_leaves_the_pushed_release_and_says_what_to_do() {
+        let t = TempRepo::new("macos-fail");
+        t.fake_dist_script(1);
+        let e = t.release_on(&["0.2.0", "--yes"], true).unwrap_err();
+        assert!(e.contains("stopped at step 8/9"), "{e}");
+        assert!(e.contains("macOS archives were not built or uploaded"), "{e}");
+        // Nothing is undone: the tag is on origin, where the workflow waits.
+        assert_eq!(sh(&t.origin, "git", &["tag", "--list"]), "v0.2.0");
+        assert_eq!(t.git(&["status", "--porcelain"]), "");
+    }
+
+    #[test]
     fn a_failed_check_undoes_the_version_edit() {
         let t = TempRepo::new("undo");
         let before = t.snapshot();
@@ -2260,7 +2389,8 @@ version = \"0.2.0\"
         let before_fmt = t.snapshot();
         assert_ne!(before, before_fmt);
         let o = parse(&["minor", "--yes", "--no-ci-check", "--no-wait"].map(String::from)).unwrap().unwrap();
-        let e = release(&o, &t.work, &Env { interactive: false, token: None, cargo: cargo_bin() }).unwrap_err();
+        let e =
+            release(&o, &t.work, &Env { interactive: false, token: None, cargo: cargo_bin(), mac: false }).unwrap_err();
         assert!(e.contains("cargo fmt --all --check failed"), "{e}");
         assert_eq!(t.snapshot(), before_fmt);
     }
@@ -2282,7 +2412,7 @@ version = \"0.2.0\"
 
     fn release_with(t: &TempRepo, cargo: String) -> Result<(), String> {
         let o = parse(&["minor", "--yes", "--no-ci-check", "--no-wait"].map(String::from)).unwrap().unwrap();
-        release(&o, &t.work, &Env { interactive: false, token: None, cargo })
+        release(&o, &t.work, &Env { interactive: false, token: None, cargo, mac: false })
     }
 
     #[test]

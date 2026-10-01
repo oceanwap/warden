@@ -856,6 +856,7 @@ cargo run -p warden-gui     # the GUI
 cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
 cargo xtask chaos           # chaos soak: a fleet under load, random faults, invariants checked (docs/chaos.md)
 cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
+cargo dist-macos            # the macOS release archives, built on this Mac (see Releasing below)
 ```
 
 The workspace: `warden` (this directory), `protocol/` (the wire types, serde
@@ -928,12 +929,15 @@ sync with origin, that the tag is new and CI passed for the commit, sets the
 version in `Cargo.toml`, `protocol/` and `gui/` (and `Cargo.lock`), runs fmt,
 clippy and the tests, then commits `Release v<version>`, tags
 `v<version>` and pushes both. The tag starts the Release workflow, which
-builds the CLI and the GUI for Linux and macOS, checksums them, tests
-`install.sh` and publishes the
-[GitHub Release](https://github.com/oceanwap/warden/releases); the command
-follows it to the end and prints the release's files. Pushing the tag needs
-the right to push tags to the repository. macOS notarization is still a
-TODO. Every step, the options and what to do when one fails:
+builds the CLI and the GUI for Linux, checksums them with the macOS archives,
+tests `install.sh` and publishes the
+[GitHub Release](https://github.com/oceanwap/warden/releases). The macOS
+archives are built on the Mac that runs `cargo release` (macOS runners cost
+ten times a Linux minute): it builds, checks and uploads them to a draft
+release after the push, and the workflow takes them from there. The command
+follows the workflow to the end and prints the release's files. Pushing the
+tag needs the right to push tags to the repository. macOS notarization is
+still a TODO. Every step, the options and what to do when one fails:
 [`docs/releasing.md`](docs/releasing.md).
 
 ## License

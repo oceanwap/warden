@@ -3,7 +3,14 @@
 #   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI: warden-gui, warden,
 #                                            README.md, README-GUI.md, contrib/ (.tar.gz on
 #                                            Linux, a zipped Warden.app on macOS)
-# plus install.sh and SHA256SUMS covering every file. Every archive carries
+# plus install.sh and SHA256SUMS covering every file, and macos-build-info.txt.
+#
+# Linux is built, tested and packaged here. macOS is NOT: a macOS runner minute
+# costs ten Linux ones on a private repository, so the macOS archives are
+# built on the maintainer's Mac (scripts/dist-macos.sh, which `cargo release`
+# runs after pushing the tag) and uploaded to a DRAFT release for the tag.
+# The `macos` job waits for them (up to an hour), refuses any that were built
+# from another commit, and the release is published only with all of them. Every archive carries
 # LICENSE-MIT, LICENSE-APACHE and the third-party notices (cargo-about,
 # about.toml): THIRD-PARTY-LICENSES.txt, and THIRD-PARTY-LICENSES-GUI.txt in
 # the GUI bundles.
@@ -15,10 +22,9 @@
 #     "Publish the release" ticked. The tag v<version> is created at that
 #     commit once everything is built and tested, so a failed build leaves no
 #     tag behind. Needs a green CI run on the commit (see docs/releasing.md).
-# Manual runs without the box ticked are dry runs: everything is built,
-# packaged, checksummed and install-tested, and uploaded as workflow
-# artifacts only. (Not on a branch push: the macOS jobs here are the most
-# expensive minutes of the repository, ten times a Linux minute.)
+# Manual runs without the box ticked are dry runs: the Linux archives are
+# built, packaged, checksummed and install-tested, and uploaded as workflow
+# artifacts only (no macOS archives, no release).
 name: Release
 
 on:
@@ -160,10 +166,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: true }
-          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, zig: true }
-          - { os: macos, arch: arm64, runner: macos-latest, target: aarch64-apple-darwin, zig: false }
-          - { os: macos, arch: x86_64, runner: macos-latest, target: x86_64-apple-darwin, zig: false }
+          - { os: linux, arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       NAME: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
@@ -176,40 +180,26 @@ jobs:
           target: ${{ matrix.target }}
           cache: false
           rustflags: ""
-      - if: matrix.zig
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - if: matrix.zig
-        name: Install zig and cargo-zigbuild
+      - name: Install zig and cargo-zigbuild
         run: python -m pip install --disable-pip-version-check "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
       - name: Build (release profile, stripped)
         run: |
-          if [ "${{ matrix.zig }}" = true ]; then
-            cargo zigbuild --release --locked --bin warden --target "${{ matrix.target }}.$GLIBC"
-          else
-            cargo build --release --locked --bin warden --target "${{ matrix.target }}"
-          fi
+          cargo zigbuild --release --locked --bin warden --target "${{ matrix.target }}.$GLIBC"
           file "$BIN"
           ls -l "$BIN"
       - name: Check the binary
         run: |
-          if [ "${{ matrix.os }}" = linux ]; then
-            file "$BIN" | grep -q ', stripped' || { echo "::error::$BIN is not stripped"; exit 1; }
-            newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
-            echo "newest glibc symbol version: $newest"
-            if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC" | sort -V | tail -1)" != "$GLIBC" ]; then
-              echo "::error::$BIN needs glibc $newest, newer than the $GLIBC baseline"; exit 1
-            fi
-            objdump -T "$BIN" | grep -qw preadv2 || { echo "::error::$BIN lost the preadv2 (RWF_NOWAIT) static-file fast path"; exit 1; }
+          file "$BIN" | grep -q ', stripped' || { echo "::error::$BIN is not stripped"; exit 1; }
+          newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "newest glibc symbol version: $newest"
+          if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC" | sort -V | tail -1)" != "$GLIBC" ]; then
+            echo "::error::$BIN needs glibc $newest, newer than the $GLIBC baseline"; exit 1
           fi
-          run="$BIN"
-          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
-            if arch -x86_64 /usr/bin/true 2>/dev/null; then run="arch -x86_64 $BIN"; else
-              echo "::notice::no Rosetta on this runner: the x86_64 macOS binary was built but not run"; exit 0
-            fi
-          fi
-          got=$($run --version)
+          objdump -T "$BIN" | grep -qw preadv2 || { echo "::error::$BIN lost the preadv2 (RWF_NOWAIT) static-file fast path"; exit 1; }
+          got=$("$BIN" --version)
           echo "$got"
           [ "$got" = "warden $VERSION" ] || { echo "::error::$BIN --version says '$got', expected 'warden $VERSION'"; exit 1; }
       - uses: actions/download-artifact@v4
@@ -221,8 +211,7 @@ jobs:
           mkdir -p "dist/$NAME/contrib"
           cp "$BIN" README.md LICENSE-MIT LICENSE-APACHE notices/THIRD-PARTY-LICENSES.txt "dist/$NAME/"
           cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf contrib/nginx.conf "dist/$NAME/contrib/"
-          # No AppleDouble (._*) files from macOS tar.
-          COPYFILE_DISABLE=1 tar -C dist -czf "$NAME.tar.gz" "$NAME"
+          tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
@@ -247,8 +236,6 @@ jobs:
           # distro keeps the glibc baseline low (2.35).
           - { os: linux, arch: x86_64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: linux, arch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos, arch: arm64, runner: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos, arch: x86_64, runner: macos-latest, target: x86_64-apple-darwin }
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       NAME: warden-gui-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
@@ -286,28 +273,17 @@ jobs:
         run: |
           gui="target/${{ matrix.target }}/release/${{ steps.build.outputs.bin }}"
           file "$gui"
-          if [ "${{ matrix.os }}" = linux ]; then
-            echo "linked libraries:"; ldd "$gui"
-            newest=$(objdump -T "$gui" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
-            echo "newest glibc symbol version: $newest"
-            if ldd "$gui" | grep -qiE 'libvulkan|libGL|libEGL|libX11|libwayland|libxkbcommon'; then
-              echo "::error::$gui links a display library at build time; the release must start without it (they are loaded at run time)"; exit 1
-            fi
-          else
-            otool -L "$gui"
-          fi
-          run="$gui"
-          if [ "${{ matrix.target }}" = x86_64-apple-darwin ]; then
-            if arch -x86_64 /usr/bin/true 2>/dev/null; then run="arch -x86_64 $gui"; else
-              echo "::notice::no Rosetta on this runner: the x86_64 macOS GUI was built but not run"; exit 0
-            fi
+          echo "linked libraries:"; ldd "$gui"
+          newest=$(objdump -T "$gui" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "newest glibc symbol version: $newest"
+          if ldd "$gui" | grep -qiE 'libvulkan|libGL|libEGL|libX11|libwayland|libxkbcommon'; then
+            echo "::error::$gui links a display library at build time; the release must start without it (they are loaded at run time)"; exit 1
           fi
           # --version answers without a display.
-          got=$($run --version)
+          got=$("$gui" --version)
           echo "$got"
           [ "$got" = "warden-gui $VERSION" ] || { echo "::error::$gui --version says '$got', expected 'warden-gui $VERSION'"; exit 1; }
-      - name: Package (Linux, .tar.gz)
-        if: matrix.os == 'linux'
+      - name: Package (.tar.gz)
         run: |
           bin=${{ steps.build.outputs.bin }}
           mkdir -p "dist/$NAME"
@@ -317,67 +293,130 @@ jobs:
           cp -R "$CLI/contrib" "dist/$NAME/"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
-          echo "FILE=$NAME.tar.gz" >> "$GITHUB_ENV"
-      - name: Package (macOS, Warden.app zipped)
-        if: matrix.os == 'macos'
-        run: |
-          bin=${{ steps.build.outputs.bin }}
-          app=dist/Warden.app
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-          cp "target/${{ matrix.target }}/release/$bin" "$app/Contents/MacOS/"
-          cp "$CLI/warden" "$app/Contents/MacOS/warden"
-          cp -R "$CLI/contrib" "$CLI/README.md" "$app/Contents/Resources/"
-          cp gui/README.md "$app/Contents/Resources/README-GUI.md"
-          cp LICENSE-MIT LICENSE-APACHE "$CLI/THIRD-PARTY-LICENSES.txt" notices/THIRD-PARTY-LICENSES-GUI.txt "$app/Contents/Resources/"
-          cat > "$app/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>Warden</string>
-            <key>CFBundleDisplayName</key><string>Warden</string>
-            <key>CFBundleIdentifier</key><string>io.github.oceanwap.warden</string>
-            <key>CFBundleExecutable</key><string>$bin</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>$VERSION</string>
-            <key>CFBundleVersion</key><string>$VERSION</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          EOF
-          plutil -lint "$app/Contents/Info.plist"
-          # Ad-hoc signature: a consistent bundle (Apple silicon runs only
-          # signed code; the linker signs the binaries, not the bundle).
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict --verbose=2 "$app"
-          # TODO(signing): not notarized yet, so Gatekeeper refuses the first open.
-          # Needs the owner's Apple Developer ID (repository secrets): import
-          # the certificate into a temporary keychain, then
-          #   codesign --force --deep --options runtime --timestamp --sign "Developer ID Application: <name> (<team>)" "$app"
-          #   xcrun notarytool submit <zip> --apple-id … --team-id … --password … --wait
-          #   xcrun stapler staple "$app"   (and zip again after stapling)
-          ditto -c -k --keepParent "$app" "$NAME.zip"
-          unzip -l "$NAME.zip"
-          echo "FILE=$NAME.zip" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: gui-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ env.FILE }}
+          path: ${{ env.NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # The macOS archives, built on the maintainer's Mac and waiting in a draft
+  # release for this tag (scripts/dist-macos.sh uploads them). Only a real
+  # release needs them; a dry run has none. The files must have been built from
+  # this very commit (macos-build-info.txt), and each is checked to be what its
+  # name says. A Linux runner, so this costs a Linux minute while it waits.
+  macos:
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    name: macOS archives (from the draft release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    permissions:
+      contents: write # a draft release is visible only with write access
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Wait for the archives built on a Mac
+        run: |
+          set -euo pipefail
+          archives=(
+            "warden-$VERSION-macos-arm64.tar.gz" "warden-$VERSION-macos-x86_64.tar.gz"
+            "warden-gui-$VERSION-macos-arm64.zip" "warden-gui-$VERSION-macos-x86_64.zip"
+          )
+          mkdir -p macos
+          deadline=$((SECONDS + 60 * 60))
+          last_said=-1000
+          while :; do
+            rel=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+              jq -c --arg tag "$TAG" '[.[] | select(.draft and .tag_name == $tag)][0] // empty')
+            why=""
+            if [ -z "$rel" ]; then
+              why="there is no draft release $TAG yet"
+            else
+              missing=""
+              for f in "${archives[@]}" macos-build-info.txt; do
+                id=$(jq -r --arg f "$f" '[.assets[] | select(.name == $f and .state == "uploaded")][0].id // empty' <<<"$rel")
+                [ -n "$id" ] || missing="$missing $f"
+              done
+              if [ -n "$missing" ]; then
+                why="the draft release $TAG lacks:$missing"
+              else
+                id=$(jq -r '[.assets[] | select(.name == "macos-build-info.txt")][0].id' <<<"$rel")
+                gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > macos/macos-build-info.txt
+                built=$(sed -n 's/^commit: //p' macos/macos-build-info.txt | head -1)
+                if [ "$built" != "$GITHUB_SHA" ]; then
+                  why="the archives were built from ${built:-an unknown commit}, but this release is $GITHUB_SHA"
+                elif grep -qx 'dirty: yes' macos/macos-build-info.txt; then
+                  why="the archives were built from a tree with uncommitted changes"
+                else
+                  break
+                fi
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error title=No macOS archives::gave up after an hour: $why. On a Mac with this commit checked out ($GITHUB_SHA), run: scripts/dist-macos.sh (needs gh logged in), then re-run this workflow (Re-run all jobs). Nothing was published."
+              exit 1
+            fi
+            if [ $((SECONDS - last_said)) -ge 300 ]; then
+              last_said=$SECONDS
+              echo "::notice title=Waiting for the macOS archives::$why. Build them on a Mac at commit $GITHUB_SHA: git pull && scripts/dist-macos.sh (or cargo xtask dist-macos). This job waits up to an hour."
+              echo "waiting: $why"
+            fi
+            sleep 30
+          done
+          cat macos/macos-build-info.txt
+          for f in "${archives[@]}"; do
+            id=$(jq -r --arg f "$f" '[.assets[] | select(.name == $f)][0].id' <<<"$rel")
+            gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > "macos/$f"
+          done
+          ls -l macos
+      # Each archive must hold a Mach-O binary of the architecture in its name:
+      # the wrong target, or a Linux build, must not go out as a macOS one.
+      - name: Check what the archives hold
+        run: |
+          set -euo pipefail
+          cd macos
+          # Captured first: `grep -q` in a pipe can end it early (SIGPIPE under pipefail).
+          macho() { # file arch
+            local what
+            what=$(file "$1")
+            echo "$what"
+            grep -q "Mach-O 64-bit.* $2" <<<"$what"
+          }
+          for arch in arm64 x86_64; do
+            cli="warden-$VERSION-macos-$arch"
+            tar -tzf "$cli.tar.gz" > "$cli.list"
+            grep -qx "$cli/LICENSE-MIT" "$cli.list" || { echo "::error::$cli.tar.gz has no LICENSE-MIT"; exit 1; }
+            tar -xzf "$cli.tar.gz" "$cli/warden"
+            macho "$cli/warden" "$arch" || { echo "::error::$cli.tar.gz does not hold a macOS $arch warden"; exit 1; }
+            gui="warden-gui-$VERSION-macos-$arch"
+            unzip -q -o "$gui.zip" "Warden.app/Contents/MacOS/warden-gui" "Warden.app/Contents/MacOS/warden" "Warden.app/Contents/Info.plist"
+            for bin in warden-gui warden; do
+              macho "Warden.app/Contents/MacOS/$bin" "$arch" || { echo "::error::$gui.zip: $bin is not a macOS $arch binary"; exit 1; }
+            done
+            grep -q "<string>$VERSION</string>" Warden.app/Contents/Info.plist ||
+              { echo "::error::$gui.zip: Info.plist does not say version $VERSION"; exit 1; }
+            rm -rf "$cli" "$cli.list" Warden.app
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: macos/*
           if-no-files-found: error
           retention-days: 14
 
   checksums:
-    needs: [meta, cli, gui]
-    # The gui job is skipped until gui/ exists.
-    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') }}
+    needs: [meta, cli, gui, macos]
+    # The gui job is skipped until gui/ exists, the macos job in a dry run.
+    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
-          pattern: "{cli,gui}-*"
+          pattern: "{cli,gui,macos}-*"
           path: dist
           merge-multiple: true
       - name: SHA256SUMS
@@ -405,7 +444,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       URL: http://127.0.0.1:8765
@@ -441,6 +480,10 @@ jobs:
           fi
           test ! -e "$RUNNER_TEMP/tampered/warden"
 
+  # The draft release already holds the macOS archives (the macos job read
+  # them there): add the Linux archives, SHA256SUMS and install.sh, write the
+  # notes and publish it. A tag pushed by hand is what was built; started by
+  # hand, publishing creates the tag at the commit built.
   publish:
     needs: [meta, checksums, install-test]
     if: needs.meta.outputs.publish == 'true'
@@ -458,14 +501,32 @@ jobs:
           path: dist
       - name: GitHub Release
         run: |
-          flags=()
-          [[ "$VERSION" == *-* ]] && flags+=(--prerelease)
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            # The tag was pushed: it is what was built.
-            flags+=(--verify-tag)
-          else
-            # Started by hand: this creates the tag, at the commit built.
+          set -euo pipefail
+          ls -l dist
+          # What the draft doesn't hold yet (the macOS files are in it).
+          rest=()
+          for f in dist/*; do
+            case "$(basename "$f")" in
+              *-macos-*|macos-build-info.txt) ;;
+              *) rest+=("$f") ;;
+            esac
+          done
+          gh release upload "$TAG" "${rest[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+          notes_args=(-f tag_name="$TAG")
+          flags=(--draft=false --title "Warden $VERSION")
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            # Started by hand: publishing creates the tag, at the commit built.
+            notes_args+=(-f target_commitish="$GITHUB_SHA")
             flags+=(--target "$GITHUB_SHA")
           fi
-          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-            --title "Warden $VERSION" --generate-notes "${flags[@]}"
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${notes_args[@]}" --jq .body > notes.md
+          flags+=(--notes-file notes.md)
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease=true); else flags+=(--prerelease=false); fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+      - name: What was published
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,url,assets \
+            --jq '"draft: \(.isDraft)\n\(.url)\n" + ([.assets[] | "  \(.name) \(.size)"] | join("\n"))'
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          [ "$draft" = false ] || { echo "::error::$TAG is still a draft"; exit 1; }
