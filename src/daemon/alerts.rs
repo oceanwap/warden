@@ -25,9 +25,6 @@ pub(crate) const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(300);
 pub(crate) const RECOVERED_AFTER: Duration = Duration::from_secs(60);
 /// Default `min_interval`.
 pub(crate) const DEFAULT_MIN_INTERVAL: Duration = Duration::from_secs(300);
-/// A crash whose detail holds this word was an OOM kill
-/// (docs/protocol.md: `oom-killed …` at the start of the exit reason).
-pub(crate) const OOM_MARKER: &str = "oom-killed";
 /// Bounds on what the file may ask for.
 const MAX_RULES: usize = 64;
 const MAX_FILE: u64 = 256 * 1024;
@@ -747,8 +744,10 @@ impl Alerts {
     }
 }
 
+/// A crash whose detail holds the supervisor's OOM exit reason was an OOM
+/// kill (docs/protocol.md, "The OOM marker").
 fn is_oom(detail: &str) -> bool {
-    detail.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).any(|w| w.eq_ignore_ascii_case(OOM_MARKER))
+    detail.contains(warden_protocol::events::OOM_KILLED)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -998,9 +997,11 @@ on = ["all"]
         let mut a = Alerts::new(config(text));
         let (api, web): (Arc<str>, Arc<str>) = ("api".into(), "web".into());
         let t = Instant::now();
-        a.worker(&api, 1, WorkerEvent::Crashed, Some("oom-killed (memory.max 512M): signal 9 (SIGKILL)"), t);
-        a.worker(&api, 1, WorkerEvent::Crashed, Some("signal 9 (SIGKILL), oom-killed"), t);
-        a.worker(&api, 1, WorkerEvent::Crashed, Some("exit code 1 (not oom-killedx)"), t + secs(400));
+        // The supervisor's own wording, as the crash detail or followed by more.
+        let oom = crate::process::exit::Reason::Oom.short();
+        a.worker(&api, 1, WorkerEvent::Crashed, Some(&oom), t);
+        a.worker(&api, 1, WorkerEvent::Crashed, Some(&format!("{oom} (standby)")), t);
+        a.worker(&api, 1, WorkerEvent::Crashed, Some("killed by another process (SIGKILL)"), t + secs(400));
         a.worker(&api, 1, WorkerEvent::Hung, Some("no heartbeat for 10s"), t);
         a.worker(&api, 1, WorkerEvent::Ready, None, t);
         a.supervisor(&api, SupervisorEvent::GaveUp, "10 deaths in 600 s", t);
@@ -1020,6 +1021,23 @@ on = ["all"]
         let got: Vec<&str> = a.outbox.iter().map(|d| d.payload.kind).collect();
         assert_eq!(got, ["oom", "oom", "unhealthy", "gave_up", "unresponsive", "rollout_failed", "recycled"]);
         assert!(a.outbox[5].payload.detail.starts_with("reload #4: reload failed"), "{:?}", a.outbox[5].payload);
+    }
+
+    /// The `oom` alert matches what the supervisor writes: if its wording
+    /// changes, `OOM_KILLED` (protocol/) must change with it.
+    #[test]
+    fn the_oom_marker_is_the_supervisors_exit_reason() {
+        let reason = crate::process::exit::Reason::Oom.short();
+        assert!(reason.starts_with(warden_protocol::events::OOM_KILLED), "{reason:?}");
+        assert!(is_oom(&reason));
+        for other in [
+            crate::process::exit::Reason::Killed(libc::SIGKILL),
+            crate::process::exit::Reason::KilledByWarden,
+            crate::process::exit::Reason::Crashed(libc::SIGSEGV),
+            crate::process::exit::Reason::Code(137),
+        ] {
+            assert!(!is_oom(&other.short()), "{other:?}");
+        }
     }
 
     #[test]

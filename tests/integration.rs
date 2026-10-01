@@ -2963,6 +2963,62 @@ fn wardend_alert_rules_are_checked_and_reloaded() {
     assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
 }
 
+/// `on = ["oom"]` fires on the supervisor's own OOM exit reason, once per OOM
+/// kill, and never for a plain kill -9. A fake `memory.events` (debug builds
+/// only) stands in for the kernel's OOM kill counter.
+#[test]
+fn wardend_alerts_an_oom_kill_once() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-oom");
+    let out = f.home.join("alerts.jsonl");
+    let events = f.home.join("memory.events");
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    std::fs::write(
+        f.home.join("wardend.toml"),
+        format!(
+            "[[alert]]\nname = \"oom\"\non = [\"oom\"]\ncommand = [\"/bin/sh\", \"-c\", \"cat >> '{out}'; echo >> \
+             '{out}'\"]\nmin_interval = \"0s\"\n",
+            out = out.display()
+        ),
+    )
+    .unwrap();
+    let port = free_port().to_string();
+    let (code, text) = f.cli_env(
+        &["start", &fixture("app.ts"), "--name", "api", "--port", &port],
+        &[("WARDEN_TEST_MEMORY_EVENTS", events.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "{text}");
+    let d = Wardend::start(&f, &[]);
+    wait_log(&d, "alert rules read rules=1");
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+    ev.wait("api status", |v| v["type"] == "status" && v["app"] == "api");
+    let crashed = |v: &Value| v["type"] == "worker" && v["app"] == "api" && v["event"] == "crashed";
+
+    // The OOM killer's kill: the counter rose, the worker died of SIGKILL.
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    let pid = f.pids("api")[0];
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let c = ev.wait("the OOM crash", crashed);
+    assert_eq!(c["detail"], "killed by the kernel OOM killer (out of memory)", "{c}");
+    let got = wait_for_alerts(&out, "the oom alert", |a| !a.is_empty());
+    assert_eq!(got.len(), 1, "{got:#?}");
+    assert_eq!((got[0]["kind"].as_str(), got[0]["app"].as_str()), (Some("oom"), Some("api")), "{got:#?}");
+    assert!(got[0]["detail"].as_str().unwrap().contains("killed for lack of memory"), "{got:#?}");
+
+    // A kill -9 that is not the OOM killer (the counter didn't move): no alert.
+    f.wait("api restarted", |f| f.pids("api").first().is_some_and(|p| *p != pid));
+    d.wait_app("api ready", "api", |a| a["status"]["workers_ready"] == 1);
+    let pid = f.pids("api")[0];
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let c = ev.wait("the kill -9 crash", crashed);
+    assert_eq!(c["detail"], "killed by another process (SIGKILL)", "{c}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let got = alerts_in(&out);
+    assert_eq!(got.len(), 1, "one OOM kill, one alert: {got:#?}");
+}
+
 // ---- subscribe (event stream)
 
 use std::io::BufRead;
