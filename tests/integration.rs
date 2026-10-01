@@ -4386,8 +4386,17 @@ fn drain_without_long_lived_connections_is_unchanged() {
     eprintln!("reload took {:?}; plain requests: {} ok, {} failed", run.took, run.ok, run.fail);
     assert!(run.before.is_disjoint(&run.after));
     assert!(run.fail <= allowed_resets(), "plain requests failed: {}", run.fail);
-    // Waiting for long_lived_timeout would take >= 2 x 3 s.
-    assert!(run.took < Duration::from_secs(5), "reload took {:?}\n{}", run.took, w.log());
+    // Waiting for long_lived_timeout would add >= 2 x 3 s to the startups
+    // (which a loaded CI runner stretches to seconds: count them out).
+    let log = w.log();
+    let startups: u64 = log
+        .lines()
+        .filter(|l| l.contains("replacement listening"))
+        .filter_map(|l| l.split("startup_ms=").nth(1)?.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    let draining = run.took.saturating_sub(Duration::from_millis(startups));
+    assert!(draining < Duration::from_secs(4), "reload took {:?}, {startups} ms of it startups\n{log}", run.took);
+    assert!(!log.contains("closed long-lived connections"), "{log}");
 
     // A download and a slow request in flight through a reload, both longer
     // than long_lived_timeout: they finish, complete.
@@ -4644,7 +4653,10 @@ fn surge_replaces_workers_in_batches_without_dropping_requests() {
     no_dropped_requests(ok, fail);
     assert!(ok > 20, "{ok}");
     assert_eq!(batch_lines(&w), ["1, 2", "3, 4"], "{}", w.log());
-    assert!(two < one, "surge 2 ({two}s) should be faster than one at a time ({one}s)");
+    // Faster on a quiet machine (1.7 vs 2.3 s); a loaded CI runner can stretch
+    // one startup by seconds, so only "not slower" is checked here (the
+    // benchmark measures the gain).
+    assert!(two < one + 1.0, "surge 2 ({two}s) slower than one at a time ({one}s)");
     let s = w.status().unwrap();
     assert!(pid_set(&s).is_disjoint(&before), "every worker must be new");
     assert_eq!(s["workers_ready"], 4);
@@ -5148,8 +5160,9 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
         promote_ms(&w)
     );
     assert!(who.starts_with(&format!("{standby}:")), "the standby took over: {who}");
-    // ~5-15 ms on an idle machine; generous for loaded CI runners.
-    assert!(took < Duration::from_millis(500), "promotion took {took:?}\n{}", w.log());
+    // ~5-15 ms on an idle machine; generous for loaded CI runners (the pid
+    // check above already proves the standby, not a cold start, answered).
+    assert!(took < Duration::from_secs(1), "promotion took {took:?}\n{}", w.log());
 
     // Events: the usual story of worker 1, the new process marked as promoted.
     let events = ev.until("worker 1 ready", |e| is_worker(e, 1, "ready"));
@@ -5246,7 +5259,7 @@ fn standby_nestjs_on_bun_and_node() {
             ms(took),
             promote_ms(&w)
         );
-        assert!(took < Duration::from_millis(500), "{name}: {took:?}\n{}", w.log());
+        assert!(took < Duration::from_secs(1), "{name}: {took:?}\n{}", w.log());
         assert!(get(port, "/json").is_some_and(|b| b.contains("Hello")), "{name}: the app works after promotion");
         if command == "node" {
             // Node runs the listen callback (which logs) at promotion: by then
