@@ -106,11 +106,21 @@ expect_eq() {
 }
 
 # Run CMD, show it and its output in the log, keep the output in $OUT and
-# the exit code in $CODE.
+# the exit code in $CODE. Where `timeout` exists (Linux), CMD gets
+# RUN_TIMEOUT seconds (exit 124 after that): a `systemctl start` of a
+# Type=notify unit that never gets ready would otherwise block for its
+# TimeoutStartSec. CMD may be a function the script exported (`export -f`).
+RUN_TIMEOUT=${RUN_TIMEOUT:-180}
 run() {
   echo "\$ $*"
-  OUT=$("$@" 2>&1)
+  if command -v timeout >/dev/null; then
+    OUT=$(timeout -k 10 "$RUN_TIMEOUT" bash -c '"$@"' run "$@" 2>&1)
+  else
+    OUT=$("$@" 2>&1)
+  fi
   CODE=$?
+  [ "$CODE" -eq 124 ] && OUT="$OUT
+(killed: still running after $RUN_TIMEOUT s)"
   printf '%s\n' "$OUT" | sed 's/^/  | /'
   echo "  (exit $CODE)"
 }

@@ -7,12 +7,14 @@
 #   linux.sh user     warden startup as the runner user: user units, lingering
 #
 # Both modes: two saved apps (a Bun app scaled to 3 workers, a static site)
-# must come back from a cold start through the units' boot wiring, a
-# SIGKILLed supervisor and a SIGKILLed wardend must be restarted by systemd,
-# `systemctl reload` must run a safe-reload, and `warden unstartup` must
-# remove what startup installed (the apps keep running until `warden kill`).
-# User mode also restarts the user manager (user@UID.service): its units
-# stop and start as at a reboot.
+# must come back from a cold start through the units' boot wiring, as the
+# user that saved them and with the saved worker count, visible to `warden
+# list` and wardend; a SIGKILLed supervisor and a SIGKILLed wardend must be
+# restarted by systemd; `systemctl reload` must run a safe-reload; `warden
+# unstartup` must stop anything from starting at boot while the apps keep
+# running (and stay stoppable: `warden kill`), and remove the rest once
+# nothing runs under it. User mode also restarts the user manager
+# (user@UID.service): its units stop and start as at a reboot.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=lib.sh
@@ -46,6 +48,9 @@ fi
 w() { $SUDO "$W" "$@"; }
 # shellcheck disable=SC2086
 sc() { $SCTL "$@"; }
+# For `run`, which runs commands under `timeout` in a child bash.
+export W SUDO SCTL
+export -f w sc
 mainpid() { sc show -p MainPID --value "$1"; }
 # UNIT has a main process other than OLD, and is active.
 new_main_pid() {
@@ -80,6 +85,8 @@ diag() {
   for u in "warden@$API" "warden@$SITE" wardend; do
     sc status --no-pager -n 0 "$u.service" 2>&1 | sed -n '1,4p' | cut -c1-160
   done
+  sc show "warden@$API.service" -p LoadState,ActiveState,SubState,Result,NRestarts,User 2>&1 | tr '\n' ' '
+  echo
   echo "--- warden list"
   w list 2>&1 | head -6 | cut -c1-160
   echo "--- processes"
@@ -256,20 +263,32 @@ fi
 
 # ----------------------------------------------------------------- unstartup
 
-note "warden unstartup"
+note "warden unstartup, with the apps still running under their units"
+API_PID=$(mainpid "warden@$API.service")
 run_ok "warden unstartup" w unstartup
-for f in warden@.service wardend.service; do
-  check_not "$UNIT_DIR/$f removed" test -e "$UNIT_DIR/$f"
-done
-check_not "nothing of ours left in $WANTS" bash -c "ls '$UNIT_DIR/$WANTS' 2>/dev/null | grep -E '^(warden@|wardend)'"
+check_not "$UNIT_DIR/wardend.service removed" test -e "$UNIT_DIR/wardend.service"
 check_not "wardend.service stopped" sc is-active --quiet wardend.service
+check_not "nothing of ours left in $WANTS (nothing starts at boot)" \
+  bash -c "ls '$UNIT_DIR/$WANTS' 2>/dev/null | grep -E '^(warden@|wardend)'"
+# The template stays while instances run: a running unit whose file is
+# reloaded away is left half configured (systemd killed it as hung every
+# WatchdogSec).
+check "$UNIT_DIR/warden@.service kept while the apps run under it" test -f "$UNIT_DIR/warden@.service"
+contains "unstartup says how to finish" "$OUT" "kept, because"
 if [ "$MODE" = system ]; then
   check_not "/etc/sysctl.d/99-warden.conf removed" test -e /etc/sysctl.d/99-warden.conf
 else
   expect_eq "lingering left on (unstartup says how to turn it off)" yes "$(loginctl show-user "$ME" -p Linger --value 2>&1)"
 fi
+sleep 12
+expect_eq "$API's supervisor still the same process 12 s later (WatchdogSec=10)" "$API_PID" "$(mainpid "warden@$API.service")"
 check "$API keeps running after unstartup" http_ok "$PORT_API"
+check "$SITE keeps running after unstartup" http_ok "$PORT_SITE"
 run_ok "warden kill --yes (after unstartup)" w kill --yes
 wait_for "nothing left after warden kill" 40 none_left
+run_ok "warden unstartup again" w unstartup
+check_not "$UNIT_DIR/warden@.service removed once nothing runs under it" test -e "$UNIT_DIR/warden@.service"
+check_not "no warden@ unit left running or failed" \
+  bash -c "$SCTL list-units --plain --no-legend --state=active,activating,deactivating,failed 'warden@*' | grep ."
 
 finish
