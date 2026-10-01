@@ -1652,6 +1652,9 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
     std::fs::write(site.join("mid.bin"), &mid).unwrap();
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
     std::fs::write(site.join("big.bin"), &big).unwrap();
+    // Let the files go quiet (2 s) so the response cache takes them: each
+    // mode is then checked through the cache as well as the open path.
+    std::thread::sleep(Duration::from_millis(2200));
 
     for mode in ["cached", "beneath", "legacy"] {
         let port = free_port();
@@ -1667,18 +1670,23 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
             _ => "(files opened with realpath check)",
         };
         w.wait_log(how, T);
+        // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+        static_io_used(&w, &std::env::var("WARDEN_STATIC_IO").unwrap_or_default());
         let get = |p: &str| get_close(port, p, "");
-        assert_eq!(get("/").2, b"home", "{mode}");
-        assert_eq!(get("/sub/").2, b"sub home", "{mode}");
-        assert_eq!(get("/alias.css").2, b"a{}", "{mode}: relative symlink inside");
-        assert_eq!(get("/abs.css").2, b"a{}", "{mode}: absolute symlink inside");
-        assert_eq!(get("/subabs/").2, b"sub home", "{mode}: absolute directory symlink inside");
-        for bad in ["/escape.txt", "/up.txt", "/outdir/outside.txt", "/pipe.txt", "/missing.txt"] {
-            assert_eq!(get(bad).0, 404, "{mode}: {bad}");
+        // The first round fills the cache, the second is answered from it.
+        for _ in 0..2 {
+            assert_eq!(get("/").2, b"home", "{mode}");
+            assert_eq!(get("/sub/").2, b"sub home", "{mode}");
+            assert_eq!(get("/alias.css").2, b"a{}", "{mode}: relative symlink inside");
+            assert_eq!(get("/abs.css").2, b"a{}", "{mode}: absolute symlink inside");
+            assert_eq!(get("/subabs/").2, b"sub home", "{mode}: absolute directory symlink inside");
+            for bad in ["/escape.txt", "/up.txt", "/outdir/outside.txt", "/pipe.txt", "/missing.txt"] {
+                assert_eq!(get(bad).0, 404, "{mode}: {bad}");
+            }
+            assert_eq!(get("/%2e%2e/outside.txt").0, 403, "{mode}");
+            assert!(get("/mid.bin").2 == mid, "{mode}: small body");
+            assert!(get("/big.bin").2 == big, "{mode}: sendfile body");
         }
-        assert_eq!(get("/%2e%2e/outside.txt").0, 403, "{mode}");
-        assert!(get("/mid.bin").2 == mid, "{mode}: small body");
-        assert!(get("/big.bin").2 == big, "{mode}: sendfile body");
         // Keep-alive after a refused path: the connection still works.
         let (st, _, body) = http_raw(
             port,
@@ -1688,6 +1696,215 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
         assert!(String::from_utf8_lossy(&body).ends_with("a{}"), "{mode}: {}", String::from_utf8_lossy(&body));
         drop(w);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Everything the server sends back for `req` (pipelined requests too),
+/// until it closes the connection.
+fn raw_exchange(port: u16, req: &str) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    buf
+}
+
+/// How the static worker says it serves: "via epoll", or "via io_uring"
+/// unless io_uring is unavailable here (then it must have said why).
+fn static_io_used(w: &Warden, io: &str) -> &'static str {
+    let log = w.wait_log("serving ", T);
+    if io != "uring" || log.contains("via io_uring") {
+        assert!(log.contains(if io == "uring" { "via io_uring" } else { "via epoll" }), "{log}");
+        return if io == "uring" { "io_uring" } else { "epoll" };
+    }
+    assert!(log.contains("io_uring is unavailable") && log.contains("via epoll"), "no fallback warning:\n{log}");
+    eprintln!("note: io_uring is unavailable here; tested the epoll fallback");
+    "epoll"
+}
+
+/// The static cache (default on): cached responses are byte-identical to
+/// an uncached server's (`cache_size = 0` behaves as before), in both I/O
+/// modes; an edited or deleted file shows within cache_valid_ms; a cached
+/// path swapped for a symlink out of the root is refused, not served.
+#[test]
+fn static_cache_hits_match_and_stay_fresh() {
+    for io in ["epoll", "uring"] {
+        static_cache_case(io);
+    }
+}
+
+fn static_cache_case(io: &str) {
+    let dir = std::env::temp_dir().join(format!("warden-it-cache-{io}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let site = dir.join("site");
+    std::fs::create_dir_all(site.join("docs")).unwrap();
+    std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
+    std::fs::write(site.join("docs/index.html"), "docs home").unwrap();
+    std::fs::write(site.join("a.css"), "a{}").unwrap();
+    std::fs::write(site.join("app.3f9a2c1b.js"), "console.log(1)").unwrap();
+    std::fs::write(site.join("style.css"), "body{color:red}").unwrap();
+    std::fs::write(site.join("style.css.gz"), "gzipped bytes").unwrap();
+    std::fs::write(site.join("style.css.br"), "brotli bytes").unwrap();
+    std::fs::write(site.join("edit.txt"), "version 1").unwrap();
+    std::fs::write(site.join("inplace.txt"), "rsync v1").unwrap();
+    std::fs::write(site.join("gone.txt"), "here").unwrap();
+    std::fs::write(site.join("swap.txt"), "inside").unwrap();
+    std::fs::write(dir.join("outside.txt"), "secret").unwrap();
+    // Between the single-write limit (16 KB) and cache_max_file (64 KB),
+    // and one above it (never cached).
+    let mid: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("mid.bin"), &mid).unwrap();
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(site.join("big.bin"), &big).unwrap();
+    let written = Instant::now();
+
+    let (on, off) = (free_port(), free_port());
+    let toml = |name: &str, port: u16, extra: &str| {
+        format!(
+            "[app]\nname = \"{name}\"\nport = {port}\n[workers]\ncount = 1\n[static]\nroot = \"{}\"\naccess_log = true\n{extra}",
+            site.display()
+        )
+    };
+    let env = [("WARDEN_STATIC_IO", io)];
+    let mut w_on =
+        Warden::start_env(&format!("cache-on-{io}"), on, &toml("cache-on", on, "cache_valid_ms = 300\n"), &env);
+    let w_off = Warden::start_env(&format!("cache-off-{io}"), off, &toml("cache-off", off, "cache_size = 0\n"), &env);
+    w_on.wait_for("cached static worker ready", T, ready(1));
+    w_off.wait_for("uncached static worker ready", T, ready(1));
+    let used = static_io_used(&w_on, io);
+    assert_eq!(static_io_used(&w_off, io), used);
+    w_on.wait_log(&format!("via {used}, cache 16384 KB per worker"), T);
+    w_off.wait_log(&format!("via {used}, no cache"), T);
+    // Files changed in the last 2 s are served but not cached (a write in
+    // the same timestamp tick could go unnoticed): wait that out.
+    std::thread::sleep(Duration::from_millis(2200).saturating_sub(written.elapsed()));
+
+    let close = "GET /a.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let (_, h, _) = get_close(on, "/a.css", "");
+    let (etag, lm) = (h["etag"].clone(), h["last-modified"].clone());
+    let requests = [
+        "GET /a.css HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "HEAD /a.css HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        format!("GET /a.css HTTP/1.1\r\nIf-None-Match: {etag}\r\n\r\n"),
+        format!("HEAD /a.css HTTP/1.1\r\nIf-None-Match: \"other\", {etag}\r\n\r\n"),
+        format!("GET /a.css HTTP/1.1\r\nIf-Modified-Since: {lm}\r\n\r\n"),
+        "GET /a.css HTTP/1.1\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.1\r\nIf-None-Match: \"nope\"\r\n\r\n".to_string(),
+        "GET /a.css?v=2 HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.0\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.0\r\nConnection: keep-alive\r\n\r\n".to_string(),
+        "GET /app.3f9a2c1b.js HTTP/1.1\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nAccept-Encoding: gzip, deflate, br\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n".to_string(),
+        "HEAD /style.css HTTP/1.1\r\nAccept-Encoding: br\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nRange: bytes=2-5\r\n\r\n".to_string(),
+        "GET / HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs/ HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs/index.html/ HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=-10\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".to_string(),
+        "GET /big.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /missing.css HTTP/1.1\r\n\r\n".to_string(),
+        "GET /../a.css HTTP/1.1\r\n\r\n".to_string(),
+        "POST /a.css HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_string(),
+        // Pipelined: many requests in one write, answered in order.
+        "GET /a.css HTTP/1.1\r\n\r\nHEAD /a.css HTTP/1.1\r\n\r\n".repeat(25),
+    ];
+    for r in &requests {
+        let full = format!("{r}{close}");
+        let reference = raw_exchange(off, &full);
+        assert!(reference.starts_with(b"HTTP/1."), "{io}: {r:?}");
+        let miss = raw_exchange(on, &full);
+        let hit = raw_exchange(on, &full);
+        let show = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(600)]).to_string();
+        assert!(
+            miss == reference,
+            "{io}: first answer differs for {r:?}:\n{}\nvs uncached:\n{}",
+            show(&miss),
+            show(&reference)
+        );
+        assert!(
+            hit == reference,
+            "{io}: cached answer differs for {r:?}:\n{}\nvs uncached:\n{}",
+            show(&hit),
+            show(&reference)
+        );
+    }
+    // Ranges are still right (and not from the cache).
+    let (st, _, body) = get_close(on, "/mid.bin", "Range: bytes=100-199\r\n");
+    assert!(st == 206 && body == mid[100..200], "{io}");
+    assert!(get_close(on, "/mid.bin", "").2 == mid && get_close(on, "/big.bin", "").2 == big, "{io}");
+    // The hits really came from the cache; the uncached server never says so.
+    let log = w_on.log();
+    let hits = log.lines().filter(|l| l.contains("cache=hit")).count();
+    assert!(hits >= requests.len(), "{io}: only {hits} hits:\n{log}");
+    assert!(log.lines().any(|l| l.contains("GET /mid.bin 200 40000B") && l.contains("cache=hit")), "{io}");
+    assert!(log.lines().filter(|l| l.contains("GET /big.bin 200")).all(|l| l.contains("cache=miss")), "{io}: big.bin");
+    assert!(!w_off.log().contains("cache="), "cache_size = 0: no cache at all");
+
+    let valid = Duration::from_millis(300);
+    // Polls `path` until `done`; every answer before that must pass `ok`.
+    let until = |path: &str, what: &str, done: &dyn Fn(u16, &[u8]) -> bool, ok: &dyn Fn(u16, &[u8]) -> bool| {
+        let t0 = Instant::now();
+        loop {
+            let (st, _, body) = get_close(on, path, "");
+            if done(st, &body) {
+                return t0.elapsed();
+            }
+            assert!(ok(st, &body), "{io}: {path} answered {st} {:?} before {what}", String::from_utf8_lossy(&body));
+            assert!(t0.elapsed() < valid + Duration::from_millis(700), "{io}: {path} never {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Edited in place (same inode, same size): fresh within cache_valid_ms.
+    for _ in 0..2 {
+        assert_eq!(get_close(on, "/edit.txt", "").2, b"version 1");
+    }
+    std::fs::OpenOptions::new().write(true).open(site.join("edit.txt")).unwrap().write_all(b"version 2").unwrap();
+    let took = until("/edit.txt", "showed the edit", &|_, b| b == b"version 2", &|_, b| b == b"version 1");
+    eprintln!("{io}: edit served after {took:?}");
+    // Rewritten with the old mtime put back (rsync --inplace): ctime tells.
+    assert_eq!(get_close(on, "/inplace.txt", "").2, b"rsync v1");
+    let old = std::fs::metadata(site.join("inplace.txt")).unwrap().modified().unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(site.join("inplace.txt")).unwrap();
+    (&f).write_all(b"rsync v2").unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+    until("/inplace.txt", "showed the rewrite", &|_, b| b == b"rsync v2", &|_, b| b == b"rsync v1");
+    // Deleted: 404 within cache_valid_ms.
+    assert_eq!(get_close(on, "/gone.txt", "").2, b"here");
+    std::fs::remove_file(site.join("gone.txt")).unwrap();
+    until("/gone.txt", "went 404", &|st, _| st == 404, &|st, b| st == 200 && b == b"here");
+    // Cached, then swapped for a symlink leaving the root: the old content
+    // for at most cache_valid_ms, then refused; never the target.
+    for _ in 0..2 {
+        assert_eq!(get_close(on, "/swap.txt", "").2, b"inside");
+    }
+    std::os::unix::fs::symlink(dir.join("outside.txt"), site.join("swap.tmp")).unwrap();
+    std::fs::rename(site.join("swap.tmp"), site.join("swap.txt")).unwrap();
+    until("/swap.txt", "was refused", &|st, _| st == 404, &|st, b| st == 200 && b == b"inside");
+    for _ in 0..3 {
+        assert_eq!(get_close(on, "/swap.txt", "").0, 404, "{io}");
+    }
+    // A directory's index swapped the same way.
+    assert_eq!(get_close(on, "/docs/", "").2, b"docs home");
+    std::fs::remove_file(site.join("docs/index.html")).unwrap();
+    std::os::unix::fs::symlink("../../outside.txt", site.join("docs/index.html")).unwrap();
+    until("/docs/", "was refused", &|st, _| st == 404, &|st, b| st == 200 && b == b"docs home");
+
+    // On the way out the worker reports what the cache did.
+    w_on.terminate(T);
+    let log = w_on.wait_log("static cache: ", T);
+    let line = log.lines().find(|l| l.contains("static cache: ")).unwrap();
+    let n: u64 = line.split("static cache: ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!(n >= hits as u64, "{line}");
+    assert!(line.contains("dropped as changed on disk"), "{line}");
+    drop((w_on, w_off));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1869,6 +2086,18 @@ fn serve_static_files() {
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
     assert!(out.contains("site: online (2/2"), "{out}");
+    // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+    if std::env::var("WARDEN_STATIC_IO").as_deref() == Ok("uring") {
+        let t0 = Instant::now();
+        let logs = loop {
+            let logs = f.cli(&["logs", "site", "-n", "100"]).1;
+            if logs.contains("serving ") || t0.elapsed() > T {
+                break logs;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(logs.contains("via io_uring") || logs.contains("io_uring is unavailable"), "{logs}");
+    }
 
     let (st, h, body) = get_close(port, "/", "");
     assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));

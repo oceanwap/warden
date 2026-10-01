@@ -132,3 +132,7 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # basic_auth = "user:password"               # example; keep the config file private (0600)
 # headers = { "X-Frame-Options" = "DENY" }   # example; extra response headers
 # access_log = false                         # one stdout line per request
+# cache_size = "16MB"                        # per worker: prebuilt responses of small files in memory (0 = off)
+# cache_max_file = "64KB"                    # larger files are not cached (sent with sendfile)
+# cache_valid_ms = 1000                      # a cached file is re-checked on disk at most this often
+# io = "epoll"                               # or "uring" (io_uring, Linux; experimental, falls back to epoll)

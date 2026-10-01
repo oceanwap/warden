@@ -94,12 +94,54 @@ Numbers from the README run (2 CPUs, 4 workers).
 | Private health socket only when a health path or `verify_command` uses it | a second server per worker | always | only when used |
 | Output readers share one read buffer per thread | supervisor with 16 workers | 7.4 MB RSS | 5.5 MB RSS |
 
+Static server, response cache and io_uring (kept; throughput to be measured
+on a quiet machine with `bun bench/static.ts --scenarios warden,warden-uring,nginx`):
+
+| Change | Measured on | Before | After |
+|---|---|---|---|
+| Response cache (`[static] cache_size`, default 16 MB per worker): a small-file hit is one `send(2)` of a prebuilt response | worker syscalls per keep-alive request, 1.5 KB page (strace -c, oha 20k requests, 16 connections, 1 worker) | ~9.1 (3 openat2: the file and its `.br` / `.gz` siblings, as oha sends `Accept-Encoding: gzip, br`; statx, preadv2, fcntl, close, send, recv) | ~2.1 (send, recv; an `epoll_wait` per ~14 requests) |
+| same | req/s, 1.5 KB / 48 KB | 85.0k / 68.4k | (to measure) |
+| `[static] io = "uring"` (off by default): io_uring RECV/SEND/ACCEPT, one `io_uring_enter` per driver turn for all connections | worker syscalls per keep-alive request, same setup | ~2.1 | ~0.17 (2,588 `io_uring_enter` + 716 `epoll_wait` for 20k requests) |
+| same | req/s, 1.5 KB / 48 KB / new connection per request | (epoll numbers) | (to measure: flip the default only if it wins) |
+
+Notes for that run:
+
+- The cache now serves 16–64 KB files from memory with one copying
+  `send(2)`, where they used to go out as headers + `sendfile(2)` (the
+  48 KB row above). If the 48 KB row loses against the old numbers, lower
+  the default `cache_max_file` to 16 KB (the old single-write limit).
+- Under strace the io_uring path did 29.5k req/s against epoll's 12.9k, but
+  strace inflates every syscall, so that ratio says nothing about the real
+  one.
+- Worker CPU per request (`/proc/<pid>/schedstat`, 40k keep-alive
+  requests, 1 worker, release build, CPUs shared with other jobs, so only
+  indicative): the 1.5 KB page cost about the same with both paths (epoll
+  4.4–4.7 µs, io_uring 4.3 µs). The 48 KB file first cost more with
+  io_uring (8.6–11 µs vs 7.0–7.4 µs): its sends came back short and went
+  round the driver again. With `MSG_WAITALL` the kernel finishes the
+  send itself, and the two paths measured the same (9.3–10.5 µs vs
+  9.4–12.7 µs, on a busier machine). Most of that time is the kernel's
+  loopback TCP work, which neither path changes.
+- A browser (`Accept-Encoding: gzip, br`) and curl (none) get separate
+  cache entries for the same file (the variant can differ); both are
+  counted against `cache_size`.
+- Not tried yet: multishot accept/recv with provided buffer rings (no
+  per-request re-arm), `IORING_SETUP_COOP_TASKRUN | SINGLE_ISSUER` (fewer
+  interrupts), registered files. The driver works without them; each is a
+  small change if the plain version wins.
+
 Tried and dropped (no measurable win, so no code):
 
 - Bigger worker pipe buffers (`F_SETPIPE_SZ`, 256 KB and 1 MB): the same
   flood throughput as the default 64 KB.
 - A worker-thread mode for Node (like Watt's): 4 threads in one process use
   more memory (104 MB PSS) than 4 processes (96 MB), and lose isolation.
+- inotify instead of a TTL for the static cache (design, not measured):
+  watches are per directory and limited per user, atomic replaces and
+  renames need directory watches, a queue overflow means flushing
+  everything, and NFS / overlay filesystems don't report changes made
+  elsewhere. One re-check per hot file per `cache_valid_ms` costs a few
+  syscalls a second and bounds staleness everywhere.
 
 Fixed in the harness (the numbers were wrong, not the software):
 

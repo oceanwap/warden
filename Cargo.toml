@@ -26,6 +26,10 @@ tokio = { version = "1.53.1", features = ["rt", "macros", "process", "signal", "
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde"] }
 warden-protocol = { path = "protocol" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `[static] io = "uring"` (experimental, off by default); used only in src/sys/uring.rs.
+io-uring = "0.7.15"
+
 [dev-dependencies]
 libc = "0.2.189"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
