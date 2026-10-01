@@ -737,6 +737,7 @@ impl Supervisor {
                                 worker = label.unwrap_or_default(),
                                 pid = i.handle.pid,
                                 ready_timeout_s = timeout,
+                                hint = "the app must listen on process.env.PORT (or call process.send('ready') with wait_ready) within workers.ready_timeout; `warden logs <app> --worker N` shows why it didn't; raise ready_timeout for slow boots",
                             );
                         }
                         i.timed_out = true;
@@ -750,7 +751,8 @@ impl Supervisor {
                     warn!(
                         "worker did not exit within grace period; sending SIGKILL",
                         worker = self.inst_label(i),
-                        pid = i.handle.pid
+                        pid = i.handle.pid,
+                        hint = "the app ignored the stop signal or kept running work: close servers and DB pools on SIGTERM (apps written for PM2 listen for SIGINT: set shutdown.signal = \"SIGINT\"), or raise shutdown.grace_period",
                     );
                     i.handle.signal(libc::SIGKILL);
                 }

@@ -73,7 +73,7 @@ impl Reason {
             Reason::Code(c) => format!("exit code {c}"),
             Reason::AfterStop { stop, code: Some(c) } => format!("exit code {c} after Warden's {}", name(stop)),
             Reason::AfterStop { stop, code: None } => format!("stopped by Warden's {}", name(stop)),
-            Reason::Oom => "killed by the kernel OOM killer (out of memory)".into(),
+            Reason::Oom => warden_protocol::events::OOM_KILLED.into(),
             Reason::KilledByWarden => "killed by Warden (SIGKILL)".into(),
             Reason::SignalFromWarden(s) => format!("ended by {} from Warden", name(s)),
             Reason::Killed(s) => format!("killed by another process ({})", name(s)),

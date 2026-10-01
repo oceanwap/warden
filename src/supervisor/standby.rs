@@ -599,7 +599,7 @@ impl Supervisor {
                     None => format!("it had taken no traffic; {logs}"),
                 },
             );
-            // The reason leads the detail: alerts match e.g. `oom-killed`.
+            // The reason leads the detail: alerts match `events::OOM_KILLED`.
             self.emit_worker(STANDBY_SLOT, WorkerEvent::Crashed, Some(pid), || Some(format!("{reason} (standby)")));
             self.pool.crashes += 1;
             self.pool.last_exit = Some(reason);
