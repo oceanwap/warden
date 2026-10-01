@@ -163,6 +163,8 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # basic_auth = "user:password"               # example; keep the config file private (0600)
 # headers = { "X-Frame-Options" = "DENY" }   # example; extra response headers
 # access_log = false                         # one stdout line per request
-# cache_size = "16MB"                        # per worker: prebuilt responses of small files in memory (0 = off)
+# cache_size = "16MB"                        # per worker: prebuilt responses of small files in memory (0 = off);
+#                                            # bodies of 8 KB and up are kept in memfds and sent with sendfile
+#                                            # (one descriptor each, at most 1/8 of the open-files limit)
 # cache_max_file = "64KB"                    # larger files are not cached (sent with sendfile)
 # cache_valid_ms = 1000                      # a cached file is re-checked on disk at most this often

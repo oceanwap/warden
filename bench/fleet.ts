@@ -15,7 +15,7 @@
 import { spawnSync } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { BIN, TMP, WARDEN, baseEnv, childrenOf, cpuSeconds, machine, mb, parseArgs, pkgVersion, pss, rss, saveResults, sleep, table, version, waitFor } from "./lib.ts";
+import { BIN, TMP, WARDEN, baseEnv, childrenOf, cpuSeconds, machine, mb, onAppCpus, parseArgs, pkgVersion, pss, rss, saveResults, sleep, table, version, waitFor } from "./lib.ts";
 
 const args = parseArgs();
 const APPS = Number(args.apps ?? 10);
@@ -52,7 +52,7 @@ async function startWarden(): Promise<Fleet> {
   for (let i = 0; i < APPS; i++) {
     // --no-wait: like `pm2 start`, return without waiting for the app to be
     // up (by default `warden start` waits and reports whether it came up).
-    const r = spawnSync([WARDEN, "start", IDLE, "--name", `app${i}`, ...(WAIT ? [] : ["--no-wait"])], {
+    const r = spawnSync(onAppCpus([WARDEN, "start", IDLE, "--name", `app${i}`, ...(WAIT ? [] : ["--no-wait"])]), {
       env,
       stdout: "ignore",
       stderr: "pipe",
@@ -112,7 +112,7 @@ async function startPm2(): Promise<Fleet> {
   mkdirSync(home, { recursive: true });
   const env = { ...baseEnv, PM2_HOME: home };
   for (let i = 0; i < APPS; i++) {
-    const r = spawnSync([pm2, "start", IDLE, "--name", `app${i}`], { env, stdout: "ignore", stderr: "pipe" });
+    const r = spawnSync(onAppCpus([pm2, "start", IDLE, "--name", `app${i}`]), { env, stdout: "ignore", stderr: "pipe" });
     if (r.exitCode !== 0) throw new Error("pm2 start failed: " + r.stderr.toString());
   }
   const daemon = () => {

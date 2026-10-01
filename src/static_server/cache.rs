@@ -1,6 +1,8 @@
 //! In-memory cache of small hot files for `warden serve`: one complete,
 //! prebuilt response per file and variant (status line, headers, body), so
-//! a keep-alive GET hit is a single send(2) with no open, fstat or read.
+//! a keep-alive GET hit is a single send(2) with no open, fstat or read; a
+//! body of MEMFD_MIN or more lives in a sealed memfd instead, and the hit is
+//! a single sendfile(2), which hands the kernel the pages without copying.
 //!
 //! Bounded per worker by `[static] cache_size` (LRU eviction; every byte an
 //! entry holds is counted: response, 304 head, key, validators and the
@@ -21,7 +23,7 @@
 //! per hot file per second.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -90,12 +92,37 @@ pub struct Dep {
     pub seen: Seen,
 }
 
+/// Responses with a body at least this big are kept in a sealed memfd and
+/// sent with sendfile(2): the kernel takes the pages by reference instead of
+/// copying them into the socket, which is what a send(2) from memory costs
+/// (measured: docs/benchmarks.md, "memfd"). Smaller ones stay in memory,
+/// where one send(2) is cheaper than sendfile's page handling.
+pub const MEMFD_MIN: u64 = 8 * 1024;
+
+/// A cached response (head and body) in a sealed memfd, counted against
+/// the cache's limit on open memfds while it lives.
+#[derive(Debug)]
+pub struct MemFile {
+    pub file: std::fs::File,
+    open: Arc<AtomicUsize>,
+}
+
+impl Drop for MemFile {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A complete response for one file and variant, as the server sends it
 /// with `Connection: keep-alive`; the other forms are derived from it.
 #[derive(Debug)]
 pub struct Entry {
-    /// Head then body: a keep-alive GET is exactly these bytes.
+    /// Head then body: a keep-alive GET is exactly these bytes. With
+    /// `file`, only the head (the whole response is in the file).
     pub resp: Arc<[u8]>,
+    /// The whole response (head then body) in a memfd, for bodies of at
+    /// least MEMFD_MIN: a keep-alive GET is one sendfile(2) of it.
+    pub file: Option<MemFile>,
     pub head_len: usize,
     /// Where the Connection header's value ("keep-alive") starts in `resp`.
     pub conn_at: usize,
@@ -117,7 +144,10 @@ impl Entry {
     fn cost(&self, key: &str) -> usize {
         const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
         let deps: usize = self.deps.iter().map(|d| d.path.len() + std::mem::size_of::<Dep>()).sum();
+        // A memfd's pages are memory like the heap's.
+        let in_file = if self.file.is_some() { self.head_len + self.body_len as usize } else { 0 };
         self.resp.len()
+            + in_file
             + self.not_modified.len()
             + 3 * ARC_HEADER
             + self.etag.len()
@@ -295,13 +325,20 @@ pub struct Cache {
     /// Entries dropped because the file changed (or went away).
     pub stale: AtomicU64,
     pub evicted: AtomicU64,
+    /// Memfds alive (cached or still being sent), and how many may be:
+    /// each is a descriptor, and connections need theirs.
+    memfds: Arc<AtomicUsize>,
+    max_memfds: usize,
 }
 
 impl Cache {
-    pub fn new(size: u64, max_file: u64, valid_ms: u64) -> Option<Cache> {
+    /// `nofile`: the soft limit on open descriptors (memfds take at most an
+    /// eighth of it).
+    pub fn new(size: u64, max_file: u64, valid_ms: u64, nofile: u64) -> Option<Cache> {
         if size == 0 {
             return None;
         }
+        let max_memfds = (size / MEMFD_MIN).min(nofile / 8).min(4096) as usize;
         Some(Cache {
             lru: Mutex::new(Lru::new(usize::try_from(size).unwrap_or(usize::MAX))),
             // A file the whole budget can't hold is never read in to try.
@@ -311,7 +348,36 @@ impl Cache {
             misses: AtomicU64::new(0),
             stale: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
+            memfds: Arc::new(AtomicUsize::new(0)),
+            max_memfds,
         })
+    }
+
+    /// `resp` (a whole response) in a sealed memfd, if its body is big
+    /// enough to be worth it and fewer than the limit are open. None: keep
+    /// it in memory (also where there is no memfd, or creating one fails:
+    /// out of descriptors or memory, which the next accept reports).
+    pub fn memfd(&self, resp: &[u8], body_len: u64) -> Option<MemFile> {
+        if body_len < MEMFD_MIN {
+            return None;
+        }
+        // Take a slot; give it back if over the limit or creation fails.
+        if self.memfds.fetch_add(1, Ordering::Relaxed) >= self.max_memfds {
+            self.memfds.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        match crate::sys::sealed_memfd(c"warden-static", resp) {
+            Ok(file) => Some(MemFile { file, open: self.memfds.clone() }),
+            Err(_) => {
+                self.memfds.fetch_sub(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Memfds open now.
+    pub fn memfds(&self) -> usize {
+        self.memfds.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Lru<String, Slot>> {
@@ -444,6 +510,7 @@ mod tests {
     fn entry(body: usize) -> Arc<Entry> {
         Arc::new(Entry {
             resp: vec![b'x'; 100 + body].into(),
+            file: None,
             head_len: 100,
             conn_at: 50,
             not_modified: vec![b'y'; 80].into(),
@@ -462,7 +529,7 @@ mod tests {
         // At least the buffers, the strings and the key twice.
         assert!(cost >= 1100 + 80 + 7 + 5 + 2 * 6, "{cost}");
         assert!(cost < 1100 + 80 + 1024, "overhead stays modest: {cost}");
-        let c = Cache::new((cost * 3) as u64, 1 << 20, 1000).unwrap();
+        let c = Cache::new((cost * 3) as u64, 1 << 20, 1000, 1024).unwrap();
         let now = Instant::now();
         for i in 0..10 {
             c.insert(format!("f{i}.css"), entry(1000), now);
@@ -472,12 +539,51 @@ mod tests {
         assert!(c.evicted.load(Ordering::Relaxed) >= 7);
         assert!(matches!(c.lookup("f9.css", now), Lookup::Fresh(_)));
         assert!(matches!(c.lookup("f0.css", now), Lookup::Miss));
-        assert!(Cache::new(0, 1, 1).is_none(), "cache_size = 0 turns it off");
+        assert!(Cache::new(0, 1, 1, 1024).is_none(), "cache_size = 0 turns it off");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn big_bodies_go_into_memfds_up_to_the_limit() {
+        use std::os::unix::fs::FileExt;
+        // A budget for 4 memfd bodies; a descriptor limit allowing 2.
+        let c = Cache::new(4 * MEMFD_MIN, 1 << 20, 1000, 16).unwrap();
+        let resp: Vec<u8> = (0..(MEMFD_MIN + 300) as u32).map(|i| (i % 251) as u8).collect();
+        let body = MEMFD_MIN;
+        assert!(c.memfd(&resp, body - 1).is_none(), "smaller bodies stay in memory");
+        let a = c.memfd(&resp, body).expect("a memfd");
+        let mut back = vec![0u8; resp.len()];
+        a.file.read_exact_at(&mut back, 0).unwrap();
+        assert!(back == resp, "the exact response");
+        let b = c.memfd(&resp, body).expect("a second");
+        assert_eq!(c.memfds(), 2);
+        assert!(c.memfd(&resp, body).is_none(), "the third is over nofile / 8");
+        assert_eq!(c.memfds(), 2, "a refused one takes no slot");
+        drop(a);
+        assert_eq!(c.memfds(), 1, "dropping one gives its slot back");
+        let d = c.memfd(&resp, body).expect("room again");
+        // The cost counts the memfd's bytes like memory.
+        let head = 300;
+        let e = Entry {
+            resp: resp[..head].into(),
+            file: Some(d),
+            head_len: head,
+            conn_at: 10,
+            not_modified: vec![b'y'; 80].into(),
+            nm_conn_at: 40,
+            etag: "W/\"1-2\"".into(),
+            mtime: 2,
+            body_len: body,
+            deps: Vec::new(),
+        };
+        assert!(e.cost("k") >= head + resp.len() + 80, "{}", e.cost("k"));
+        drop((b, e));
+        assert_eq!(c.memfds(), 0);
     }
 
     #[test]
     fn entries_go_stale_after_the_validity_window() {
-        let c = Cache::new(1 << 20, 1 << 20, 1000).unwrap();
+        let c = Cache::new(1 << 20, 1 << 20, 1000, 1024).unwrap();
         let t0 = Instant::now();
         let e = entry(10);
         c.insert("k".into(), e.clone(), t0);
@@ -499,7 +605,7 @@ mod tests {
         assert!(matches!(c.lookup("k", t0), Lookup::Miss));
         assert_eq!(c.stale.load(Ordering::Relaxed), 1);
         // cache_valid_ms = 0: every use is checked.
-        let c = Cache::new(1 << 20, 1 << 20, 0).unwrap();
+        let c = Cache::new(1 << 20, 1 << 20, 0, 1024).unwrap();
         c.insert("k".into(), entry(1), t0);
         assert!(matches!(c.lookup("k", t0), Lookup::Stale(_)));
     }

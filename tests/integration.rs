@@ -1910,8 +1910,8 @@ fn static_cache_hits_match_and_stay_fresh() {
     std::fs::write(site.join("gone.txt"), "here").unwrap();
     std::fs::write(site.join("swap.txt"), "inside").unwrap();
     std::fs::write(dir.join("outside.txt"), "secret").unwrap();
-    // Between the single-write limit (16 KB) and cache_max_file (64 KB),
-    // and one above it (never cached).
+    // Between the single-write limit (16 KB) and cache_max_file (64 KB):
+    // cached in a memfd (MEMFD_MIN, 8 KB); and one above it (never cached).
     let mid: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(site.join("mid.bin"), &mid).unwrap();
     let big: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
@@ -1963,6 +1963,10 @@ fn static_cache_hits_match_and_stay_fresh() {
         "GET /docs HTTP/1.1\r\n\r\n".to_string(),
         "GET /docs/index.html/ HTTP/1.1\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        // A memfd entry's other forms: HEAD, Connection: close, 304.
+        "HEAD /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.0\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nIf-Modified-Since: Fri, 01 Jan 2100 00:00:00 GMT\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=-10\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".to_string(),
@@ -5280,6 +5284,134 @@ fn node_drain_answers_keep_alive_requests_instead_of_cutting_them() {
     assert!(ok > 50, "{ok} answered");
     assert_eq!(cut, 0, "keep-alive requests cut by a draining worker\n{}", w.log());
     assert!(fresh <= 2 * allowed_resets(), "{fresh} failed on a new connection");
+}
+
+/// Bun.serve apps: outside a drain the shim adds nothing to a request (the
+/// app's own fetch handler runs); a drain swaps in, with server.reload(), one
+/// that adds `Connection: close`, so a keep-alive client moves to the new
+/// workers instead of being cut when the old one exits.
+#[test]
+fn bun_drain_answers_keep_alive_requests_instead_of_cutting_them() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg =
+        format!("[app]\nname = \"bdrain\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n", fixture("app.ts"));
+    let w = Warden::start("bdrain", port, &cfg);
+    w.wait_for("ready", T, ready(2));
+    let ((), ok, cut, fresh) = keep_alive_through(port, "/whoami", || {
+        for _ in 0..3 {
+            let (code, out) = w.cli(&["reload"]);
+            assert_eq!(code, 0, "{out}");
+        }
+    });
+    eprintln!("bun: {ok} answered, {cut} cut, {fresh} failed on a new connection");
+    assert!(ok > 50, "{ok} answered");
+    assert_eq!(cut, 0, "keep-alive requests cut by a draining worker\n{}", w.log());
+    assert!(fresh <= 2 * allowed_resets(), "{fresh} failed on a new connection");
+}
+
+/// An app that swaps its own handler (server.reload) keeps it through a
+/// drain: the drain's `Connection: close` handler wraps the handler the app
+/// has now, never the one it started with.
+#[test]
+fn bun_drain_keeps_the_handler_the_app_reloaded() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"breload\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 1\n\
+         [shutdown]\ndrain_ms = 4000\ngrace_period = 15\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("breload", port, &cfg);
+    w.wait_for("ready", T, ready(1));
+    // One keep-alive connection to the (only) worker, which swaps its handler.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = Vec::new();
+    let mut exchange = |s: &mut TcpStream, path: &str| -> (String, String) {
+        write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut tmp = [0u8; 4096];
+        let end = loop {
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            let n = s.read(&mut tmp).unwrap();
+            assert!(n > 0, "connection closed before a response to {path}");
+            buf.extend_from_slice(&tmp[..n]);
+        };
+        let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+        let len: usize =
+            head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok()).unwrap();
+        while buf.len() < end + len {
+            let n = s.read(&mut tmp).unwrap();
+            assert!(n > 0, "connection closed in the body of {path}");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let body = String::from_utf8_lossy(&buf[end..end + len]).to_string();
+        buf.drain(..end + len);
+        (head, body)
+    };
+    let (_, who) = exchange(&mut s, "/reload-v2");
+    let (_, body) = exchange(&mut s, "/whoami");
+    assert_eq!(body, format!("v2 {who}"), "the app's own reload took effect");
+    // A reload: the new worker starts, then the old one drains (4 s), with
+    // our connection still open to it.
+    let reload = {
+        let cfg = w.cfg.clone();
+        std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
+    };
+    // The new worker listens, Warden signals the old one, and the old one
+    // closes its listener when its drain starts (it then drains for 4 s).
+    w.wait_log("draining old process", T);
+    let t0 = Instant::now();
+    while listeners(port) != 1 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let (head, body) = exchange(&mut s, "/whoami");
+    assert_eq!(body, format!("v2 {who}"), "the drain brought back the handler the app replaced");
+    assert!(head.contains("connection: close"), "no Connection: close in the drain: {head}");
+    let out = reload.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Node: a request in flight holds the drain until it is answered (the shim
+/// reads the requests in flight off the open connections; it adds nothing
+/// per request).
+#[test]
+fn node_drain_waits_for_requests_in_flight() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"nslow\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 1\n\
+         [shutdown]\ndrain_ms = 100\ngrace_period = 15\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("nslow", port, &cfg);
+    w.wait_for("ready", T, ready(1));
+    let slow = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "GET /slow?ms=2500 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let r = s.read_to_string(&mut out);
+        (r.map_err(|e| e.to_string()), out)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let (r, body) = slow.join().unwrap();
+    assert!(
+        r.is_ok() && body.starts_with("HTTP/1.1 200"),
+        "slow request cut by the drain: {r:?} {body:?}\n{}",
+        w.log()
+    );
 }
 
 /// None of the requests sent during a rolling replacement failed. Without

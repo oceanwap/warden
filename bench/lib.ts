@@ -1,7 +1,7 @@
 // Shared helpers for the benchmark scripts (run.ts, static.ts, logs.ts,
 // fleet.ts): /proc sampling, the load generator, run metadata and output.
 import { spawnSync } from "bun";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export const ROOT = resolve(import.meta.dir, "..");
@@ -83,6 +83,45 @@ export function cpuSeconds(pid: number): number {
   }
 }
 
+/** CPU time of every thread of `pid` in nanoseconds (/proc/<pid>/task/<tid>/schedstat:
+ *  exact, where /proc/<pid>/stat counts 10 ms ticks). Falls back to ticks. */
+export function cpuNs(pid: number): number {
+  try {
+    let ns = 0;
+    for (const tid of readdirSync(`/proc/${pid}/task`)) {
+      try {
+        ns += Number(readFileSync(`/proc/${pid}/task/${tid}/schedstat`, "utf8").split(" ")[0]);
+      } catch {} // the thread just exited
+    }
+    return ns;
+  } catch {
+    return cpuSeconds(pid) * 1e9;
+  }
+}
+
+export const median = (xs: number[]) => {
+  const s = xs.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (!s.length) return NaN;
+  return s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+};
+
+/** Several runs of the same measurement as one: the median of every
+ *  number (field by field, nested objects too), the first run's value for
+ *  anything else. For `--rounds N` (interleaved A/B runs). */
+export function medianOf<T>(runs: T[]): T {
+  const first = runs[0] as any;
+  if (runs.every((r) => typeof r === "number")) {
+    const m = median(runs as number[]);
+    return (runs.every((r) => Number.isInteger(r)) ? Math.round(m) : +m.toFixed(2)) as T;
+  }
+  if (first && typeof first === "object" && !Array.isArray(first)) {
+    const out: any = {};
+    for (const k of Object.keys(first)) out[k] = medianOf(runs.map((r: any) => r?.[k]));
+    return out;
+  }
+  return first;
+}
+
 /** Direct children of `pid`. */
 export function childrenOf(pid: number): number[] {
   const out: number[] = [];
@@ -136,13 +175,22 @@ function cpuCount(list: string | undefined): number {
   }, 0);
 }
 
+export interface LoadOptions {
+  keepalive?: boolean;
+  headers?: string[];
+  /** A fixed number of requests instead of `seconds` (oha only; wrk runs for `seconds`):
+   *  per-request costs then divide by an exact count. */
+  requests?: number;
+}
+
 /** A load test against `url` for `seconds` with the configured generator. */
-export function oha(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] } = {}): LoadResult {
+export function oha(url: string, seconds: number, connections: number, opts: LoadOptions = {}): LoadResult {
   return LOADGEN === "wrk" ? wrk(url, seconds, connections, opts) : ohaRun(url, seconds, connections, opts);
 }
 
-function ohaRun(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] }): LoadResult {
-  const cmd = ["oha", "-z", `${seconds}s`, "-c", String(connections), "--no-tui", "--output-format", "json"];
+function ohaRun(url: string, seconds: number, connections: number, opts: LoadOptions): LoadResult {
+  const amount = opts.requests ? ["-n", String(opts.requests)] : ["-z", `${seconds}s`];
+  const cmd = ["oha", ...amount, "-c", String(connections), "--no-tui", "--output-format", "json"];
   if (opts.keepalive === false) cmd.push("--disable-keepalive");
   for (const h of opts.headers ?? []) cmd.push("-H", h);
   cmd.push(url);
@@ -174,7 +222,7 @@ const WRK_REPORT = `done = function(s, lat, req)
 end
 `;
 
-function wrk(url: string, seconds: number, connections: number, opts: { keepalive?: boolean; headers?: string[] }): LoadResult {
+function wrk(url: string, seconds: number, connections: number, opts: LoadOptions): LoadResult {
   const script = join(TMP, "wrk-report.lua");
   mkdirSync(TMP, { recursive: true });
   writeFileSync(script, WRK_REPORT);

@@ -72,7 +72,11 @@ Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
   nginx** on small files (1.5 KB page 107.6k vs 100.8k req/s; without the
   cache 99.4k), on a new connection per request (35.3k vs 31.6k) and on a
   1 MB file (5.1–6.7 vs 4.9 GB/s), and behind on the 48 KB script (74.7k vs
-  82.6k; the cache neither helps nor hurts there). It uses 40 % less memory
+  82.6k; the cache neither helped nor hurt there: its send(2) copied the
+  body). Since then, cached bodies of 8 KB and more go out with sendfile
+  from a memfd: 28 % less CPU per request on that script, ahead of nginx in
+  an A/B on the same machine (optimisation log below; the README table is
+  from before). It uses 40 % less memory
   (PSS 8.0 vs 13.0 MB), and delivers 4–37× what `pm2 serve` and `serve` do.
 - **Logs.** Warden reads a flooding worker at ~890 MB/s (PM2 163 MB/s) for
   a twelfth of PM2's CPU per GB. Keeping every line costs more when lines
@@ -132,7 +136,75 @@ worker rather than on an old one that drains next. The cost is memory for
 the drain: up to `max_draining` old workers (here all 4) alive until their
 long-lived connections close.
 
+2026-10-01, second round: the same 2-CPU machine shared with other build
+and test jobs, so req/s moved 2× between runs; these use the numbers that
+don't (`bench/shim-cost.ts`, `bench/profile.ts`: CPU time per request from
+schedstat, syscalls per request; medians of interleaved rounds). No hardware
+counters in this VM, so no instructions per request.
+
+| Change | Measured on | Before | After |
+|---|---|---|---|
+| Shim, Node: no `request` listener and no `res.once('close')` per request; requests in flight read off the open connections in a drain | node:http `request` + `close` in-process (shim-cost.ts, 3 rounds; bare 180–228 ns) | 384–483 ns | 203–216 ns: the same as bare within noise |
+| same | end to end, 1 Node process pinned to CPU 0, oha on CPU 1, 200k requests × 5 rounds, server CPU per request (bare 20.5 µs) | 22.4 µs | 21.3 µs (±2 µs between rounds) |
+| Shim, Bun: no fetch wrapper; a drain swaps in the `Connection: close` handler with `server.reload()` | the handler Bun calls, called from native code (shim-cost.ts) | wrapped | the app's own; no measurable difference either way (JSC inlines the wrapper; ±10 ns) |
+| same | end to end as above (bare 8.11 µs) | 8.21 µs | 8.12 µs: within noise |
+| Static cache, **memfd**: a cached body of 8 KB or more lives (with its head) in a sealed memfd, and a hit is one `sendfile(2)` instead of a `send(2)` that copied it (the copy was 30 % of the worker's CPU on the 48 KB script: `_copy_from_iter`) | 48 KB script, 1 worker on CPU 0, oha on CPU 1, 200k requests, 3 rounds: server CPU per request | 11.77 µs (nginx 10.67) | 8.53 µs; 2.04 syscalls per request (nginx 8.03) |
+| same | same, req/s | 59.8k | 73.4k (nginx 72.6k) |
+| same | 48 KB script, 4 workers unpinned (the README setup), 300k requests, 3 rounds | 70.0k req/s, 12.39 µs | 77.9k req/s, 11.13 µs (nginx 76.0k, 12.63 µs) |
+| same | 1.5 KB page (stays in memory) | 6.80 µs | 7.01 µs: noise, same code path |
+| same: where the memfd starts paying (`MEMFD_MIN`) | body size, memfd vs in memory, µs per request (3 and 5 rounds) | 1.5 KB 7.01, 2 KB 6.93, 4 KB 7.24–7.28, 6 KB 7.64, 8 KB 7.70–7.92, 16 KB 8.58, 32 KB 10.14 (in memory) | 8.13, 7.19, 7.16–7.57, 7.30, 7.40–7.77, 7.67, 8.37 (memfd): crossover between 4 and 6 KB, so 8 KB |
+
+The 48 KB numbers on the README machine (74.7k vs nginx 82.6k req/s,
+"What the data says") are from before the memfd change; the 4-worker A/B
+above, on the same machine, puts Warden ahead (77.9k vs 76.0k).
+
 Tried and dropped (no measurable win, so no code):
+
+- **`TCP_CORK`** around the head and the sendfile body (what nginx's
+  `tcp_nopush` does), instead of `MSG_MORE` on the head: uncached 48 KB
+  script 11.6 vs 12.3 µs per request (noise), uncached 1 MB file **302 vs
+  195 µs** (nginx, corking: 293 µs). Two more syscalls per request, and big
+  files get much slower; `MSG_MORE` already puts the head in the body's
+  first segment.
+- **A bigger `cache_max_file`** now that a cached big body costs one
+  sendfile: a 256 KB file cached in a memfd (`cache_max_file = 512KB`) vs
+  sent uncached: 2 vs 8 syscalls per request, but 27.5 vs 27.4 µs per
+  request (nginx 43.8 µs). The open, fstat and sibling lookups the cache
+  saves are small next to the body; 64 KB stays (the budget is better
+  spent on more small files).
+- **A shorter response head**: Warden's is 280 bytes for the 48 KB script
+  (with Cache-Control and Vary), nginx's 256 (with Server and Date); not a
+  factor at 48 KB, and both headers Warden adds are wanted.
+- New connection per request (1.5 KB page, 1 worker, 3 rounds): Warden and
+  nginx are level (17.6k vs 18.4k req/s, 19.2 vs 19.2 µs per request, 8.1
+  vs 11.0 syscalls); nothing to change there.
+- **Per-worker CPU affinity** (`sched_setaffinity`, worker i on CPU i-1,
+  emulated with `bench/profile.ts --pin-servers`) and, for `warden serve`,
+  **`SO_ATTACH_REUSEPORT_CBPF` steering** (`return cpu % workers`: a new
+  connection goes to the worker on the CPU it came in on). 2 workers on the
+  2 CPUs, oha unpinned (as a front proxy would be), 1.5 KB page, 9–10
+  interleaved rounds (`research/static-cpu-steering/run.sh`):
+  - pinned alone: no gain. New connection per request 34.1k vs 34.4k req/s
+    unpinned, 19.74 vs 19.39 µs per request; keep-alive 114.2k vs 113.9k,
+    7.55 µs both.
+  - pinned + CBPF, new connection per request: 37.0k req/s and 18.37 µs per
+    request (medians; unpinned 34.4k, 19.39 µs), but better in only 7 of
+    10 rounds, the ranges overlap (CPU per request 17.5–19.5 vs 18.2–21.3
+    µs), and context switches double (0.45 vs 0.23 per request: client and
+    server now take turns on one CPU).
+  - pinned + CBPF, keep-alive: 110k to 159k req/s from round to round, by
+    which worker got the client's connections: steering by the connecting
+    CPU puts every connection made from one CPU on one worker.
+
+  Not shipped: no win this machine can show apart from its noise, and
+  steering has a failure mode a win would have to outweigh (a front proxy
+  that connects from fewer CPUs than there are workers, such as a single
+  nginx worker or a tunnel daemon, funnels into fewer workers; restarts and
+  surges reorder the reuseport group's sockets, which loses the CPU match).
+  **Re-measure on many-core hardware** (the 4-vCPU ARM64 and x86 CI
+  benchmark runners): `research/static-cpu-steering/run.sh` builds the
+  experiment (`cbpf.patch`) and prints the same rows; the steering program
+  assumes one worker per CPU.
 
 - **io_uring for the static server** (accept/recv/send through one ring per
   worker, about 1,500 lines with its `unsafe` driver): fewer syscalls per

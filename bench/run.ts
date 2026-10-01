@@ -4,16 +4,21 @@
 // and errors. Results go to bench/results/<date>-<app>.json plus a Markdown
 // table on stdout. See bench/README.md.
 //
-//   bun bench/run.ts --app bun-http   (Bun.serve app)     scenarios: bare,pm2,warden-process,warden-surge,warden-worker
-//   bun bench/run.ts --app node-http  (node:http app)     scenarios: bare,pm2,watt,warden-process,warden-surge
+//   bun bench/run.ts --app bun-http   (Bun.serve app)     scenarios: bare,shim,pm2,warden-process,warden-surge,warden-worker
+//   bun bench/run.ts --app node-http  (node:http app)     scenarios: bare,shim,pm2,watt,warden-process,warden-surge
 //   bun bench/run.ts --app nest-bun   (NestJS on Bun)     scenarios: bare,pm2,warden-process,warden-surge,warden-worker
 //   bun bench/run.ts --app nest-node  (NestJS on Node)    scenarios: bare,pm2,watt,warden-process,warden-surge
 //
 // Options: --duration 10  --connections 64  --workers 4  --scenarios a,b,...
+// Each load also reports the CPU time per request of every process of the
+// scenario (exact, from /proc/<pid>/task/*/schedstat): steadier than req/s on
+// a busy machine. For a closer look at one server: bench/profile.ts.
 //
 // Scenarios:
 //   bare            N copies started directly (what N systemd units would do)
-//   shim            the same, with Warden's shim loaded as under Warden: its cost alone
+//   shim            the same, with Warden's shim preloaded as Warden does it (drain hooks on,
+//                   heartbeat, reusePort): what the shim costs per request, against `bare`.
+//                   The NestJS apps' `bare` already needs the shim (with its drain off).
 //   pm2             PM2 the usual way: cluster mode for Node, fork mode for Bun
 //   watt            Platformatic Watt (wattpm), N worker threads (Node only)
 //   warden-process  Warden, N worker processes
@@ -30,7 +35,7 @@ import { spawn, spawnSync, type Subprocess } from "bun";
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  BIN, ROOT, SHIM, TMP, WARDEN, baseEnv, cpuSeconds, listenersOnPort, machine, mb, oha as ohaRaw,
+  BIN, ROOT, SHIM, TMP, WARDEN, baseEnv, cpuNs, cpuSeconds, listenersOnPort, machine, mb, oha as ohaRaw,
   parseArgs, pkgVersion, pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor,
   onAppCpus,
 } from "./lib.ts";
@@ -58,14 +63,14 @@ const apps: Record<string, AppDef> = {
     entry: join(ROOT, "bench/app/server.ts"),
     cwd: join(ROOT, "bench/app"),
     needsShim: false,
-    scenarios: ["bare", "pm2", "warden-process", "warden-surge", "warden-worker"],
+    scenarios: ["bare", "shim", "pm2", "warden-process", "warden-surge", "warden-worker"],
   },
   "node-http": {
     runtime: "node",
     entry: join(ROOT, "bench/node/server.mjs"),
     cwd: join(ROOT, "bench/node"),
     needsShim: false,
-    scenarios: ["bare", "pm2", "watt", "warden-process", "warden-surge"],
+    scenarios: ["bare", "shim", "pm2", "watt", "warden-process", "warden-surge"],
   },
   "nest-bun": {
     runtime: "bun",
@@ -403,9 +408,10 @@ async function runScenario(name: string) {
   const endpoints: Record<string, any> = {};
   for (const path of rollingOnly ? [] : PATHS) {
     oha(path, 2); // warm-up
-    const a0 = sum(all, cpuSeconds);
+    const a0 = sum(all, cpuNs);
     const r = oha(path, DURATION);
-    endpoints[path] = { ...r, cpu_s: +(sum(all, cpuSeconds) - a0).toFixed(2) };
+    const ns = sum(all, cpuNs) - a0;
+    endpoints[path] = { ...r, cpu_s: +(ns / 1e9).toFixed(2), cpu_us: r.ok ? +(ns / 1000 / r.ok).toFixed(2) : 0 };
   }
   const loaded = rollingOnly
     ? null
@@ -544,6 +550,7 @@ const lines = [
     ...PATHS.flatMap((p): [string, (r: any) => string | number][] => [
       [`${p} req/s`, (r) => r.endpoints[p]?.rps ?? "-"],
       [`${p} p50 / p99 (ms)`, (r) => (r.endpoints[p] ? `${r.endpoints[p].p50_ms} / ${r.endpoints[p].p99_ms}` : "-")],
+      [`${p} CPU per request (µs)`, (r) => r.endpoints[p]?.cpu_us ?? "-"],
       [`${p} errors`, (r) => r.endpoints[p]?.errors ?? "-"],
     ]),
   ]),

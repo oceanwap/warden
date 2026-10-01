@@ -378,7 +378,11 @@ with `openat2(RESOLVE_BENEATH)` on Linux.
 Small files are served from memory. Each worker keeps complete responses
 (headers and body) of recently used files up to `cache_max_file` (64 KB), in
 at most `cache_size` (16 MB, least recently used out first; `0` turns it
-off), so a hit is one `send(2)`. HEAD and 304s come from the same entry;
+off), so a hit is one system call: a `send(2)` from memory, or, for a body
+of 8 KB or more, a `sendfile(2)` from a sealed in-memory file (memfd), where
+the kernel takes the pages by reference instead of copying them (48 KB
+script: 28 % less CPU per request, ahead of nginx; see
+[docs/benchmarks.md](docs/benchmarks.md)). HEAD and 304s come from the same entry;
 ranges and anything unusual take the normal path. A cached file is checked
 against the disk at most every `cache_valid_ms` (1 s): an edit, a deletion
 or a symlink swapped in shows within that time (on NFS, within the
@@ -812,8 +816,16 @@ Limitations:
 - Worker mode needs Bun and the shim.
 - Node apps share the port through Warden's shim (`--import`, Node ≥ 22.12
   for `reusePort`); older Node needs `port_strategy = "offset"`.
+- Outside a drain the shim adds no work to a request: a `Bun.serve` app's
+  own fetch handler answers it, and on Node it keeps one entry per open
+  connection, nothing per request. When a drain starts, each `Bun.serve`
+  server gets a handler that adds `Connection: close` through
+  `server.reload()`; the shim intercepts `reload()` on Bun's server
+  prototype, so an app's own `server.reload()` still works (and a drain
+  never brings back a handler the app replaced).
 - On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
-  bodies in a drain (about 20 ns per `new Response`). The wrappers pass for
+  bodies in a drain (one call frame per `new Response`, which JSC inlines:
+  no measurable difference, `bench/shim-cost.ts`). The wrappers pass for
   Bun's own: `instanceof` (also for `fetch()` responses), `constructor`,
   `name`, `length`, the statics, subclassing, the error without `new`, and
   the source text (`Function.prototype.toString` is wrapped for that: one

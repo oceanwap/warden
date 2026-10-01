@@ -21,6 +21,13 @@ Setup: `cd research/bun && npm i autocannon` (the scripts use `bun`, `node`,
 | F10 preload shim | `./t_pre.sh`, and `research/nest/t.sh` for NestJS |
 | F11 signals and Workers | `bun sigh.ts`, then `kill -TERM <pid>` |
 
+`static-cpu-steering/run.sh` (from the repository root) re-runs the
+per-worker CPU pinning and `SO_ATTACH_REUSEPORT_CBPF` experiment for
+`warden serve` (docs/benchmarks.md, "Tried and dropped"): it builds Warden
+with and without `cbpf.patch` and measures unpinned / pinned / pinned with
+steering, interleaved. Dropped on 2 CPUs for lack of a clear win; meant for
+many-core runners.
+
 `listeners.sh <pid> <port>` counts the LISTEN sockets a pid owns (the same
 check Warden uses for readiness and leak detection).
 
