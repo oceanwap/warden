@@ -1,0 +1,97 @@
+# A short `cargo xtask chaos` (docs/chaos.md) on every push and once a day,
+# with a fixed seed: the same faults in the same order on the same targets,
+# so a new failure is a change in Warden, not in the dice.
+#
+# - Linux, as root: its own pid namespace, the tmpfs for disk-full, and a
+#   memory cgroup for oom-kill (the runner allows all three), against a
+#   release build.
+# - macOS: what macOS supports (no namespace, tmpfs, cgroup or /proc: the
+#   run lists what it leaves out), release build too.
+#
+# Job logs need a login to read, so the verdict, recovery per fault and the
+# request counts are notice annotations, and each violation an error one.
+name: Chaos
+
+on:
+  push:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes of faults"
+        default: "3"
+      seed:
+        description: "Seed"
+        default: "20261001"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chaos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+  BUN_VERSION: "1.3.13"
+  NODE_VERSION: "22"
+  MINUTES: ${{ inputs.minutes || '3' }}
+  SEED: ${{ inputs.seed || '20261001' }}
+
+jobs:
+  chaos:
+    name: chaos (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            # Root: the pid namespace, the tmpfs, the memory cgroup.
+            as: sudo env "PATH=$PATH"
+          - os: macos
+            runner: macos-latest
+            as: ""
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: bench/nest/package-lock.json
+      # The NestJS app of the fleet (as the runner user, so root writes nothing here).
+      - name: npm ci (bench/nest)
+        working-directory: bench/nest
+        run: npm ci --no-audit --no-fund
+      - name: Build Warden (release) and xtask
+        run: |
+          cargo build --release --package warden
+          cargo build --package xtask
+      - name: cargo xtask chaos --release --minutes ${{ env.MINUTES }} --seed ${{ env.SEED }}
+        run: |
+          set -o pipefail
+          ${{ matrix.as }} target/debug/xtask chaos --release --warden "$PWD/target/release/warden" \
+            --minutes "$MINUTES" --seed "$SEED" --out "$PWD/chaos.json" 2>&1 | tee chaos.log
+      - name: Annotations
+        if: ${{ !cancelled() }}
+        run: python3 .github/chaos-annotations.py "chaos ${{ matrix.os }}" chaos.json
+      - name: Upload the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-${{ matrix.os }}
+          path: |
+            chaos.json
+            chaos.log
+          if-no-files-found: warn
+          retention-days: 14
