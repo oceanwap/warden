@@ -163,12 +163,16 @@ Every death gets a reason (`last_exit`, the `crashed` event's detail, and the
 log line, with a `hint=`), not just the wait status. The task that owns each
 worker records the signals it delivered, so a SIGKILL is either *Warden's*
 (grace period over, hung, not ready in time) or *another process's*; an exit
-after Warden's stop signal is a normal stop. A SIGKILL is the kernel's *OOM
-killer* when the `oom_kill` counter of Warden's cgroup (cgroup v2
-`memory.events`, or v1 `memory.oom_control`, found through
-`/proc/self/cgroup` and `/proc/self/mountinfo`) rose since the last death it
-accounted for: workers share the cgroup, so each SIGKILL death takes at most
-one count. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
+after Warden's stop signal is a normal stop. A SIGKILL Warden did not send
+is the kernel's *OOM killer* when the `oom_kill` counter of Warden's cgroup
+(cgroup v2 `memory.events`, or v1 `memory.oom_control`, found through
+`/proc/self/cgroup` and `/proc/self/mountinfo`) rose in the 2 s before the
+death: Warden reads it every second (the tick) and at each death, stamping
+each rise with when it was seen. Everything in the cgroup shares the
+counter, so each SIGKILL death takes at most one recent rise; an older one
+was something else's (a helper process, a `verify_command`) and is
+forgotten. A SIGKILL Warden sent stays Warden's even if the counter moved
+meanwhile. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
 Without a readable counter (macOS, no memory controller) an OOM kill reads as
 another process's SIGKILL, and the hint says it may be either.
 

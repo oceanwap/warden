@@ -4812,7 +4812,14 @@ fn oom_kill_is_told_apart_from_a_kill_9() {
     kill_worker(&w, 0);
     let s = w.status().unwrap();
     assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
-    w.wait_log("OOM killer was ruled out", T);
+    w.wait_log("Probably not the kernel's OOM killer", T);
+    // It moved, but 3 s before the kill -9 (a helper process the app ran,
+    // OOM-killed long ago): not this worker's death.
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 4\noom_kill 5\noom_group_kill 0\n").unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)", "{}", w.log());
     let _ = std::fs::remove_file(&events);
 }
 

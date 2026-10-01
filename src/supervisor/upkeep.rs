@@ -18,6 +18,9 @@ impl Supervisor {
     pub(super) fn on_tick(&mut self) {
         crate::guard::fault("tick");
         self.ticks += 1;
+        // OOM kills are charged only to deaths right after them: stamp new
+        // ones now (also while stopped: a kill seen late must not look fresh).
+        self.oom.sample(Instant::now());
         let gap = self.systemd_watchdog();
         if self.shutting_down || self.stopped {
             return;

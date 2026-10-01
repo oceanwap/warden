@@ -967,8 +967,8 @@ impl Supervisor {
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
-        // Who ended it: the OOM killer, Warden, someone else, a crash.
-        let oom = signal == Some(libc::SIGKILL) && self.oom.took_one();
+        // Who ended it: Warden, the OOM killer (just before), someone else, a crash.
+        let oom = self.oom.oom_killed(signal, sent, Instant::now());
         let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), oom);
         // A `note` (Warden lost track of it) is the whole story.
         let hint = if note.is_some() { None } else { cause.hint(self.oom.available()) };
