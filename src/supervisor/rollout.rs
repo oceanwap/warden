@@ -1119,12 +1119,6 @@ impl Supervisor {
                 return;
             }
         }
-        // Between batches, any exit may have made room (a drain this rollout
-        // does not track, e.g. one it found at its start).
-        if matches!(self.roll, Some(Roll { step: Step::Idle, .. })) {
-            self.advance_rollout();
-            return;
-        }
         let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll else { return };
         let Some(lane) = lanes.iter_mut().find(|l| l.at.involves(inst)) else { return };
         let slot = lane.slot;
@@ -1340,7 +1334,9 @@ impl Supervisor {
     fn end_rollout(&mut self, ok: bool, message: Option<String>, logged: bool) {
         // The phase it failed in, if not published yet (it cannot be after
         // `rollout_done`). Idle: all done, or failed before a step began.
-        if self.roll.as_ref().is_some_and(|r| !matches!(r.step, Step::Idle)) {
+        // Ending: published as it began and as its drains ended; its last
+        // drain gone, `rollout_done` says the rest.
+        if self.roll.as_ref().is_some_and(|r| !matches!(r.step, Step::Idle | Step::Ending { .. })) {
             self.publish_rollout();
         }
         let Some(roll) = self.roll.take() else { return };
@@ -1437,6 +1433,7 @@ impl Supervisor {
     fn drains_text(&self, r: &Roll) -> String {
         let pids: Vec<String> = r.draining.iter().map(|d| self.pid_of(d.old).to_string()).collect();
         match pids.len() {
+            0 => "no old worker left draining".to_string(),
             1 => format!("1 old worker draining (pid {})", pids[0]),
             n => format!("{n} old workers draining (pid {})", pids.join(", ")),
         }
@@ -1730,6 +1727,7 @@ wait $!
             assert!(phases.iter().any(|p| p.contains("waits for room to drain") && p.contains("max_draining = 2")));
             assert!(phases.iter().any(|p| p.contains("; 1 old worker draining (pid ")), "{phases:#?}");
             assert!(phases.iter().any(|p| p.starts_with("every worker replaced; ")), "{phases:#?}");
+            assert!(!phases.iter().any(|p| p.contains("no old worker") || p.contains("(pid )")), "{phases:#?}");
             r.shutdown().await;
         })
         .await;

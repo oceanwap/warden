@@ -3265,7 +3265,12 @@ fn subscribe_streams_worker_rollout_log_and_bye_events() {
     assert_eq!(got[0]["rollout"]["phase"], "starting");
     assert_eq!((&got[0]["rollout"]["done"], &got[0]["rollout"]["total"]), (&0.into(), &2.into()));
     let phases: HashSet<&str> = rollouts.iter().map(|r| r["rollout"]["phase"].as_str().unwrap()).collect();
-    assert!(phases.iter().any(|p| p.contains("draining old process")), "{phases:?}");
+    // Old workers drain in the background, as the next ones are replaced.
+    assert!(
+        phases.iter().any(|p| p.contains("old worker draining (pid ") || p.contains("old workers draining (pid ")),
+        "{phases:?}"
+    );
+    assert!(!phases.iter().any(|p| p.contains("0 old workers") || p.contains("(pid )")), "{phases:?}");
     for old in &before {
         let of_old: Vec<&str> = got.iter().filter(|e| e["pid"] == *old).map(|e| e["event"].as_str().unwrap()).collect();
         assert_eq!(of_old, ["stopping", "stopped"], "old worker {old}: {got:#?}");
