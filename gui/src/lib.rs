@@ -11,15 +11,19 @@
 //!   and backoff, short requests), all off the UI thread;
 //! - `ssh`: the tunnel to a remote wardend, and shell quoting for remote commands;
 //! - `commands`: the `warden` CLI as a subprocess (local, or over SSH);
-//! - `model`, `logs`, `format`, `ring`: state and text, no I/O (unit-tested);
-//! - `app`, `view`: the iced program (update, subscriptions, widgets).
+//! - `model`, `logs`, `history`, `format`, `ring`: state and text, no I/O
+//!   (unit-tested);
+//! - `app`, `view`, `charts`: the iced program (update, subscriptions,
+//!   widgets, the canvas charts).
 
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod charts;
 pub mod client;
 pub mod commands;
 pub mod format;
+pub mod history;
 pub mod logs;
 pub mod model;
 pub mod ring;

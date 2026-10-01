@@ -1,6 +1,7 @@
-//! Host metrics for `host` events: CPU from /proc/stat, memory from
-//! /proc/meminfo (MemTotal - MemAvailable), load from /proc/loadavg.
-//! Sampled only while someone subscribes.
+//! Host metrics for `host` events and the history: CPU from /proc/stat,
+//! memory from /proc/meminfo (MemTotal - MemAvailable), load from
+//! /proc/loadavg. Sampled every second while someone subscribes, else once
+//! per history sample (10 s). No /proc (macOS): no host metrics.
 
 use crate::events::Event;
 use std::io::Read;
@@ -72,11 +73,6 @@ pub(crate) struct Sampler {
 }
 
 impl Sampler {
-    /// Forget the previous sample (nobody listened for a while).
-    pub fn reset(&mut self) {
-        self.prev = None;
-    }
-
     fn read(&mut self, path: &str) -> Option<&str> {
         self.buf.clear();
         std::fs::File::open(path).ok()?.read_to_string(&mut self.buf).ok()?;

@@ -119,6 +119,8 @@ pub fn discover() -> Vec<App> {
         let mut paths: Vec<PathBuf> = rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "toml") && p.is_file())
+            // wardend's own file (alert rules), not an app.
+            .filter(|p| p.file_name().is_none_or(|n| n != crate::daemon::alerts::FILE_NAME))
             .collect();
         paths.sort();
         for p in paths {

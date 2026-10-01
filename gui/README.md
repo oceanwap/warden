@@ -10,7 +10,8 @@ one ~8 MB binary, no web view, no GPU driver.
 ## What it does
 
 - **Connection bar**: wardend's version and pid, the host's CPU, memory and
-  load (from `host` events). When wardend is not running it says so, why it
+  load (from `host` events), with sparklines of the last hour of CPU and of
+  memory (out of the total). When wardend is not running it says so, why it
   matters, and offers **Start wardend** (`warden daemon --background`, with
   the `warden` next to the GUI, else the one on PATH). It reconnects by
   itself, with backoff (0.25 s up to 5 s), and says `reconnecting…` meanwhile.
@@ -34,6 +35,19 @@ one ~8 MB binary, no web view, no GPU driver.
   window: lines are handed over in batches at most 20 times a second, a batch
   keeps the newest 2,000 lines, and every gap shows as "… N lines skipped",
   as `warden logs -f` does.
+- **History** (a tab next to Events and Logs): the app's last 1 h, 6 h or
+  24 h in four charts: CPU (% of one core, mean per point), memory (resident,
+  with the supervisor, max per point), restarts (per point) and workers ready
+  (the fewest per point), each with its average, peak or total. A point is
+  10 s, 1 min or 4 min (360 per chart). The series come from wardend's
+  `history` request when the tab opens (or the app or range changes, or the
+  connection comes back), then grow live from the statuses already
+  streaming, counted the way wardend counts them. Gaps (wardend was not
+  running, the app was not watched) stay gaps. Hovering a chart shows a
+  crosshair with the value and the time. An older wardend without history
+  is named as the reason.
+
+  ![The History tab, rendered headless by the tests](../docs/gui-history.png)
 - **Add app**: script, program or command line, name, instances, port, and
   an optional env file. It runs `warden start <what> --name <name> -i <n>
   --port <port>` (the exact command is shown) and shows what it printed. The
@@ -123,6 +137,12 @@ warden-gui --ssh deploy@web-1 --remote-warden '~/.local/bin/warden'   # for Add 
   `warden` itself uses: the two cannot drift. The GUI does not depend on the
   `warden` crate.
 - Long lists (events, logs) draw only the rows in view.
+- Charts are drawn on iced's `canvas` (tiny-skia paths, real text for the
+  labels). Each keeps its drawing in a `canvas::Cache` and draws again only
+  when a point moves by half a pixel or more (a fingerprint of the
+  positions); the crosshair is a layer of its own. They hold one app's 5
+  series and the host's 2, of 360 points each: a few tens of KB whatever
+  the range.
 
 ## Memory and CPU
 
@@ -134,6 +154,22 @@ shown, after 15 s, then 60 s idle:
 |---|---|---|---|---|---|
 | default (tiny-skia, CPU) | 20.7 MB | 16.3 MB | 13.8 MB | 4 | 0.14% |
 | `--features wgpu` (GPU renderer; here Mesa's llvmpipe through OpenGL, no GPU) | 143.6 MB | 120.6 MB | 99.6 MB | 9 | 1.9% |
+
+With the History tab and the header's sparklines (measured the same way, on
+a busier machine, wardend holding a full 24 h for each of the 10 apps,
+`WARDEN_HISTORY_PREFILL=1` in a debug wardend):
+
+| View | RSS | PSS | Idle CPU |
+|---|---|---|---|
+| Events tab | 21.1 MB | 16.6 MB | 0.2% |
+| History tab, 24 h | 21.5 MB | 17.0 MB | 0.2% |
+| History tab, 6 h | | | 0.45% |
+| History tab, 1 h | 21.5 MB | 17.0 MB | 1% |
+
+A chart's drawing is cached and redrawn only when a point moves on screen:
+with 1 h shown a new point comes every 10 s and the four charts are drawn
+again, with 24 h every 4 minutes. The charts hold 360 points per series
+whatever the range.
 
 The target was under 60 MB. The default build is the CPU renderer: loading
 a GPU driver costs more memory than drawing this window on the CPU (a real
@@ -159,8 +195,10 @@ cargo build --bin warden && cargo test -p warden-gui
   quoted command lines are run through `sh` and must come back unchanged).
 - `tests/render.rs`: headless rendering with `iced_test` (tiny-skia): the
   main screen with fake wardend data, an app that gave up, the logs tab, a
-  confirmation, the Add app, Edit config and Connection dialogs, and the
-  "wardend is not running" screen. Each is searched for
+  confirmation, the Add app, Edit config and Connection dialogs, the
+  "wardend is not running" screen, and the History tab (`history-1h` with
+  the crosshair over the memory chart, `history-24h-light`, and the error
+  of a wardend without history). Each is searched for
   what it must show, clicked, and saved as a PNG in
   `$WARDEN_GUI_SNAPSHOT_DIR` (default `target/tmp/snapshots`; CI uploads
   them as the `gui-snapshots` artifact).

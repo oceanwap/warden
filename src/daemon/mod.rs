@@ -8,13 +8,20 @@
 //! - is never on the request path: apps never depend on it, stopping or
 //!   killing it stops no app, and it sets no parent-death signal on anything.
 //!
+//! - sends alerts (`alerts.rs`, `notify.rs`) by the rules in
+//!   `<config dir>/wardend.toml`, and keeps 24 h of resource history
+//!   (`history.rs`), both from what it already receives.
+//!
 //! One thread, one `LocalSet`. Events go out through a bounded broadcast of
 //! ready-made JSON lines (`Frame`): a supervisor's line is forwarded as it
 //! was sent, wardend's own events are serialized once, and every client
 //! writes the same bytes. A slow client lags or is dropped, never waited for.
 
+pub(crate) mod alerts;
 pub mod client;
+mod history;
 mod host;
+mod notify;
 mod policy;
 mod watcher;
 
@@ -228,9 +235,22 @@ struct Core {
     /// Hash of every app's (name, state, pid, restarts): an `apps` event
     /// goes out when it changes.
     last_apps: u64,
+    alerts: alerts::Alerts,
+    /// Delivers `alerts.outbox` (none in tests of the core).
+    notifier: Option<notify::Notifier>,
+    history: history::Store,
 }
 
 impl Core {
+    /// Hand the alerts the last step raised to the notifier.
+    fn dispatch(&mut self) {
+        for d in self.alerts.outbox.drain(..) {
+            if let Some(n) = &self.notifier {
+                n.send(d);
+            }
+        }
+    }
+
     fn epoch(&mut self) -> u64 {
         self.next_epoch += 1;
         self.next_epoch
@@ -268,13 +288,16 @@ impl Core {
             r.problem = app.problem;
             r.seen = true;
         }
-        // Gone from both directories and not running: forget it.
-        self.apps.retain(|_, r| {
+        // Gone from both directories and not running: forget it (its
+        // resource history stays until it is a day old).
+        let alerts = &mut self.alerts;
+        self.apps.retain(|name, r| {
             let keep = r.seen || r.running() || r.phase == Phase::Backoff || r.watcher.is_some();
             if !keep {
                 if let Some(w) = r.watcher.take() {
                     w.abort();
                 }
+                alerts.forget(name);
             }
             keep
         });
@@ -335,8 +358,14 @@ impl Core {
     }
 
     fn on_watch(&mut self, m: WatchMsg) {
+        self.on_watch_msg(m);
+        self.dispatch();
+    }
+
+    fn on_watch_msg(&mut self, m: WatchMsg) {
         let (app, epoch) = m.key();
         let app = app.clone();
+        let now = Instant::now();
         let bus = &self.bus;
         let Some(r) = self.apps.get_mut(&app) else { return };
         let current = match m {
@@ -365,6 +394,9 @@ impl Core {
                     // Started by someone else (`warden start`, systemd): a fresh history.
                     r.backoff.clear();
                 }
+                self.history.observe_app(&app, &status, r.restarts);
+                self.alerts.attached(&app, &status, now);
+                self.alerts.status(&app, &status, now);
                 r.status = Some(status);
                 r.unresponsive = false;
                 r.note = None;
@@ -390,6 +422,8 @@ impl Core {
                 if !status.launched.is_empty() && r.launched.as_deref() != Some(status.launched.as_str()) {
                     r.launched = Some(status.launched.clone());
                 }
+                self.history.observe_app(&app, &status, r.restarts);
+                self.alerts.status(&app, &status, now);
                 r.status = Some(status);
                 if r.state() == before {
                     return; // the common case: nothing for `apps`
@@ -417,7 +451,19 @@ impl Core {
                         ),
                     );
                 }
+                let said = format!("pid {shown} answers neither events nor `status` ({detail})");
+                self.alerts.supervisor(&app, SupervisorEvent::Unresponsive, &said, now);
                 sup_event(bus, &app, SupervisorEvent::Unresponsive, pid, Some(detail));
+            }
+            WatchMsg::Event { event, .. } => {
+                match *event {
+                    Event::Worker { worker, event, detail, .. } => {
+                        self.alerts.worker(&app, worker, event, detail.as_deref(), now)
+                    }
+                    Event::RolloutDone { outcome, .. } => self.alerts.rollout_done(&app, &outcome, now),
+                    _ => {}
+                }
+                return; // nothing for `apps`
             }
             WatchMsg::Responsive { .. } => {
                 r.unresponsive = false;
@@ -463,6 +509,7 @@ impl Core {
             return;
         }
         let uptime = r.up_since.map(|t| now.saturating_duration_since(t));
+        self.alerts.supervisor(app, SupervisorEvent::Died, &format!("pid {pid} exited {detail}"), now);
         sup_event(bus, app, SupervisorEvent::Died, Some(pid), Some(detail.clone()));
         let launched = r.launched.clone().unwrap_or_default();
         match launched.as_str() {
@@ -511,6 +558,8 @@ impl Core {
                         last_lines = last,
                         hint = format!("fix the error shown in its last log lines, then run `warden start {app}`"),
                     );
+                    let said = format!("its supervisor died {deaths} times in {window} s (last: {detail})");
+                    self.alerts.supervisor(app, SupervisorEvent::GaveUp, &said, now);
                     let detail = format!("{deaths} deaths in {window} s");
                     sup_event(bus, app, SupervisorEvent::GaveUp, Some(pid), Some(detail));
                 }
@@ -692,6 +741,50 @@ impl Drop for WantsLogs {
 }
 
 impl Daemon {
+    /// Read `wardend.toml` (at start, SIGHUP, the `reload` request). On an
+    /// error the rules in force stay. Ok/Err: what to tell who asked.
+    fn load_alerts(&self, why: &str) -> Result<String, String> {
+        let path = alerts::path();
+        let loaded = alerts::load(&path);
+        let mut core = self.core.borrow_mut();
+        match loaded {
+            Ok(cfg) => {
+                let found = cfg.is_some();
+                let cfg = cfg.unwrap_or_default();
+                for note in &cfg.notes {
+                    crate::warn!("alert rules: a warning", file = path.display(), warning = note);
+                }
+                let n = cfg.rules.len();
+                let msg = if found {
+                    format!("{n} alert rule{} loaded from {}", if n == 1 { "" } else { "s" }, path.display())
+                } else {
+                    format!("no alert rules: {} does not exist", path.display())
+                };
+                crate::info!("alert rules read", rules = n, file = path.display(), on = why);
+                core.alerts.set_config(cfg);
+                Ok(msg)
+            }
+            Err(problems) => {
+                let kept = core.alerts.config().rules.len();
+                crate::error!(
+                    "wardend.toml has errors; keeping the alert rules in force",
+                    file = path.display(),
+                    errors = problems.join("; "),
+                    kept_rules = kept,
+                    on = why,
+                    hint =
+                        "`warden daemon check` lists every problem; fix them, then `warden daemon reload` (or SIGHUP)",
+                );
+                Err(format!(
+                    "{} has errors; wardend keeps the {kept} rule{} in force:\n  {}",
+                    path.display(),
+                    if kept == 1 { "" } else { "s" },
+                    problems.join("\n  ")
+                ))
+            }
+        }
+    }
+
     fn discover(&self) {
         let found = fleet::discover();
         let mut core = self.core.borrow_mut();
@@ -885,6 +978,8 @@ async fn run(resurrect: bool) -> Result<(), String> {
     let listener = control::bind(&path).await?;
     let mut term = signal(SignalKind::terminate()).map_err(|e| format!("installing signal handlers: {e}"))?;
     let mut int = signal(SignalKind::interrupt()).map_err(|e| format!("installing signal handlers: {e}"))?;
+    // SIGHUP reads wardend.toml again (a closed terminal no longer stops wardend).
+    let mut hup = signal(SignalKind::hangup()).map_err(|e| format!("installing signal handlers: {e}"))?;
 
     let (tx, mut rx) = mpsc::channel(256);
     let bus = broadcast::channel(BUS_CAPACITY).0;
@@ -900,6 +995,9 @@ async fn run(resurrect: bool) -> Result<(), String> {
         logs,
         children: Vec::new(),
         last_apps: 0,
+        alerts: alerts::Alerts::new(alerts::Config::default()),
+        notifier: Some(notify::Notifier::start(notify::Limits::default())),
+        history: history::Store::default(),
     };
     let d = Rc::new(Daemon {
         core: RefCell::new(core),
@@ -916,6 +1014,8 @@ async fn run(resurrect: bool) -> Result<(), String> {
         configs = fleet::config_dir().display(),
         hint = "`warden events` shows live events; stopping wardend stops no app",
     );
+    // A bad file is logged, and wardend runs without alerts until it is fixed.
+    let _ = d.load_alerts("start");
     crate::systemd::notify("READY=1\nSTATUS=watching apps");
     let watchdog = crate::systemd::watchdog_requested();
     crate::guard::spawn_essential("wardend socket", serve(d.clone(), listener));
@@ -927,6 +1027,9 @@ async fn run(resurrect: bool) -> Result<(), String> {
 
     let mut discover = tokio::time::interval(DISCOVER_EVERY);
     discover.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Held-back alerts, crash loops that ended, history samples.
+    let mut second = tokio::time::interval(Duration::from_secs(1));
+    second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let reason = loop {
         tokio::select! {
             Some(m) = rx.recv() => d.core.borrow_mut().on_watch(m),
@@ -935,6 +1038,15 @@ async fn run(resurrect: bool) -> Result<(), String> {
                 if watchdog {
                     crate::systemd::notify("WATCHDOG=1");
                 }
+            }
+            _ = second.tick() => {
+                let mut core = d.core.borrow_mut();
+                core.alerts.tick(Instant::now());
+                core.dispatch();
+                core.history.tick(events::now_ms() / 1000);
+            }
+            _ = hup.recv() => {
+                let _ = d.load_alerts("SIGHUP");
             }
             _ = term.recv() => break "SIGTERM",
             _ = int.recv() => break "SIGINT",
@@ -950,17 +1062,26 @@ async fn run(resurrect: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Host metrics: every second while someone subscribes (`host` events), and
+/// at least once per history sample (10 s) for the history.
 async fn host_loop(d: Rc<Daemon>) {
     let mut sampler = host::Sampler::default();
     let mut tick = tokio::time::interval(WATCH_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampled_slot = None;
     loop {
         tick.tick().await;
-        if d.bus.receiver_count() == 0 {
-            sampler.reset();
+        let listening = d.bus.receiver_count() > 0;
+        let slot = events::now_ms() / 1000 / history::STEP_S;
+        if !listening && sampled_slot == Some(slot) {
             continue;
         }
-        if let Some(ev) = sampler.sample() {
+        let Some(ev) = sampler.sample() else { continue };
+        sampled_slot = Some(slot);
+        if let Event::Host { cpu_percent, mem_used_bytes, mem_total_bytes, load, .. } = &ev {
+            d.core.borrow_mut().history.observe_host(*cpu_percent, *mem_used_bytes, *mem_total_bytes, load[0]);
+        }
+        if listening {
             emit(&d.bus, None, Kind::Host, &ev);
         }
     }
@@ -1080,6 +1201,17 @@ async fn handle(d: Rc<Daemon>, stream: UnixStream, mut slot: control::Slot) -> s
             let r = reply(&mut w, &reply_ok("wardend is exiting; every app keeps running".into())).await;
             d.shutdown.notify_one();
             r
+        }
+        DaemonRequest::History { app, since_ms, step_s } => {
+            let h = d.core.borrow().history.query(app.as_deref(), since_ms, step_s, events::now_ms());
+            reply(&mut w, &DaemonReply { ok: true, history: Some(h), ..Default::default() }).await
+        }
+        DaemonRequest::Reload => {
+            let r = match d.load_alerts("reload request") {
+                Ok(msg) => reply_ok(msg),
+                Err(msg) => reply_err(msg),
+            };
+            reply(&mut w, &r).await
         }
     }
 }

@@ -107,6 +107,8 @@ fn main() {
         }
         Command::Daemon(cli::DaemonCmd::Status) => rt.block_on(daemon::client::status(args.json)),
         Command::Daemon(cli::DaemonCmd::Stop) => rt.block_on(daemon::client::stop()),
+        Command::Daemon(cli::DaemonCmd::Check) => daemon::client::check(args.config.clone()),
+        Command::Daemon(cli::DaemonCmd::Reload) => rt.block_on(daemon::client::reload()),
         Command::Events { logs, interval_ms } => {
             daemon::client::events(&rt, args.target.clone(), args.json, logs, interval_ms)
         }

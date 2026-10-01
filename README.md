@@ -334,11 +334,44 @@ yours); a hung one is reported, never killed, because its workers are still
 serving. The protocol, for scripts and other clients:
 [`docs/protocol.md`](docs/protocol.md).
 
+**Alerts.** Put rules in `<config dir>/wardend.toml` (`/etc/warden` for
+root, `~/.config/warden` for a user) and wardend tells a command or a
+webhook when something goes wrong:
+
+```toml
+[[alert]]
+on = ["crash_loop", "gave_up", "rollout_failed", "unresponsive", "worker_failed", "oom"]   # or ["all"]
+apps = ["api"]                                    # optional; default every app
+webhook = "https://hooks.slack.com/services/…"    # POSTed as JSON, through curl
+min_interval = "5m"                               # repeats within it are counted and sent as one
+
+[[alert]]
+on = ["all"]
+command = ["/usr/local/bin/notify", "--channel", "ops"]   # the alert as JSON on stdin
+```
+
+The kinds also include `died`, `unhealthy`, `recycled` and `recovered`
+(healthy again after an alert). `warden daemon check` validates the file
+with every problem and its line; `warden daemon reload` (or SIGHUP) applies
+it, and a broken file keeps the rules in force. Deliveries never hold
+wardend up: a bounded queue, 10 s per try, one retry. Webhooks go through
+`curl` (Warden has no TLS stack of its own), with the URL on curl's stdin,
+never in a process list or a log line. Details:
+[Alerts](docs/protocol.md#alerts).
+
+**History.** wardend keeps the last 24 hours of every app's CPU, memory,
+workers ready and restarts, and the host's CPU, memory and load, from the
+statuses it already receives (a sample per 10 s; at most 135 KiB per app).
+The GUI charts them; scripts ask `{"cmd":"history"}`
+([Resource history](docs/protocol.md#resource-history)).
+
 ## GUI
 
 `warden-gui` is a native window (Rust, [iced](https://iced.rs)) on wardend:
 every app with its state, workers, CPU and memory, pushed live; each app's
-workers, rollout progress, events and logs; and the CLI's actions (reload,
+workers, rollout progress, events, logs and charts of its last 1, 6 or 24
+hours (CPU, memory, restarts, workers ready), with the host's CPU and memory
+as sparklines in the header; and the CLI's actions (reload,
 safe reload, rolling or hard restart, restart one worker, scale, stop,
 start, reset), adding an app (`warden start …`) and editing its config
 (checked with `warden check` before it is saved). It is a separate process:
@@ -349,7 +382,8 @@ warden-gui                                   # this machine's wardend (`Start wa
 warden-gui --ssh deploy@web-1                # a remote host, through an SSH tunnel (your agent and keys)
 ```
 
-It idles at about 21 MB resident and 0.1% CPU with 10 apps. Details, the SSH
+It idles at about 21 MB resident and 0.1–0.2% CPU with 10 apps (21.5 MB with
+the History tab showing a full day). Details, the SSH
 setup and the measurements: [`gui/README.md`](gui/README.md).
 
 ## Benchmarks

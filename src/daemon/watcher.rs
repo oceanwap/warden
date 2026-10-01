@@ -90,6 +90,13 @@ pub(crate) enum WatchMsg {
         app: Arc<str>,
         epoch: u64,
     },
+    /// A worker or rollout event alerts are made of (`crashed`, `failed`,
+    /// `unhealthy`, `hung`, `rollout_done`); it went to the bus as well.
+    Event {
+        app: Arc<str>,
+        epoch: u64,
+        event: Box<Event>,
+    },
     /// wardend's own timer: restart after the backoff.
     RestartDue {
         app: Arc<str>,
@@ -112,6 +119,7 @@ impl WatchMsg {
             | WatchMsg::Lost { app, epoch, .. }
             | WatchMsg::Unresponsive { app, epoch, .. }
             | WatchMsg::Responsive { app, epoch }
+            | WatchMsg::Event { app, epoch, .. }
             | WatchMsg::RestartDue { app, epoch }
             | WatchMsg::Ended { app, epoch, .. } => (app, *epoch),
         }
@@ -232,6 +240,9 @@ enum LineKind {
     Bye,
     Log,
     Lagged,
+    /// `worker` and `rollout_done`: forwarded, and looked at for alerts.
+    Worker,
+    RolloutDone,
     Other,
     Junk,
 }
@@ -250,9 +261,21 @@ fn classify(line: &[u8]) -> LineKind {
             "bye" => LineKind::Bye,
             "log" => LineKind::Log,
             "lagged" => LineKind::Lagged,
+            "worker" => LineKind::Worker,
+            "rollout_done" => LineKind::RolloutDone,
             _ => LineKind::Other,
         },
         Err(_) => LineKind::Junk,
+    }
+}
+
+/// A worker or rollout event that alerts are made of, parsed.
+fn alertable(line: &[u8]) -> Option<Box<Event>> {
+    use crate::events::WorkerEvent as W;
+    match serde_json::from_slice::<Event>(line).ok()? {
+        ev @ Event::Worker { event: W::Crashed | W::Failed | W::Unhealthy | W::Hung, .. } => Some(Box::new(ev)),
+        ev @ Event::RolloutDone { .. } => Some(Box::new(ev)),
+        _ => None,
     }
 }
 
@@ -454,6 +477,13 @@ impl Watcher {
                 _ => self.forward(Kind::Other),
             },
             LineKind::Other => self.forward(Kind::Other),
+            LineKind::Worker | LineKind::RolloutDone => {
+                self.forward(Kind::Other);
+                if let Some(event) = alertable(&self.buf) {
+                    let m = WatchMsg::Event { app: self.app(), epoch: self.spec.epoch, event };
+                    self.send(m).await;
+                }
+            }
         }
     }
 
@@ -804,6 +834,13 @@ mod tests {
             assert_eq!(kinds[0].0, Kind::Status);
             assert!(kinds[1].1.starts_with(r#"{"type":"worker","app":"api","worker":2"#), "{kinds:?}");
             assert!(kinds[1].1.ends_with('\n'));
+            // The crash also reaches wardend's core, for alerts.
+            match s.next().await {
+                WatchMsg::Event { event, epoch: 7, .. } => {
+                    assert!(matches!(*event, Event::Worker { worker: 2, .. }), "{event:?}")
+                }
+                other => panic!("expected the crash, got {other:?}"),
+            }
             let (on_purpose, detail) = s.kill_and_wait_gone().await;
             assert!(on_purpose, "bye seen: {detail}");
             assert!(detail.contains("shutdown"), "{detail}");
@@ -921,10 +958,26 @@ mod tests {
     }
 
     #[test]
+    fn only_alertable_events_go_to_the_core() {
+        let line = |e: &str| format!(r#"{{"type":"worker","app":"a","worker":1,"event":"{e}","at_ms":1}}"#);
+        for e in ["crashed", "failed", "unhealthy", "hung"] {
+            assert!(alertable(line(e).as_bytes()).is_some(), "{e}");
+        }
+        for e in ["ready", "starting", "stopping", "restarting"] {
+            assert!(alertable(line(e).as_bytes()).is_none(), "{e}");
+        }
+        let done = r#"{"type":"rollout_done","app":"a","outcome":{"seq":1,"kind":"reload","ok":false,"message":"x","duration_secs":1.0}}"#;
+        assert!(alertable(done.as_bytes()).is_some());
+        assert!(alertable(br#"{"type":"worker""#).is_none(), "junk");
+    }
+
+    #[test]
     fn classifies_lines() {
         assert_eq!(classify(br#"{"type":"status","app":"a"}"#), LineKind::Status);
         assert_eq!(classify(br#"{"app":"a","type":"bye","reason":"x"}"#), LineKind::Bye);
-        assert_eq!(classify(br#"{"type":"rollout_done"}"#), LineKind::Other);
+        assert_eq!(classify(br#"{"type":"rollout_done"}"#), LineKind::RolloutDone);
+        assert_eq!(classify(br#"{"type":"rollout"}"#), LineKind::Other);
+        assert_eq!(classify(br#"{"type":"worker","app":"a"}"#), LineKind::Worker);
         assert_eq!(classify(br#"{"type":"log"}"#), LineKind::Log, "escapes are fine");
         assert_eq!(classify(b"not json"), LineKind::Junk);
         assert_eq!(classify(br#"{"ok":false}"#), LineKind::Junk);
