@@ -3661,6 +3661,82 @@ fn direct_output_flush_and_logs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `warden flush` empties every current log file in both output modes,
+/// like `pm2 flush`: Warden's log, each worker's out and err file (also one
+/// no running worker writes), keeps the rotated ones, and writing goes on
+/// from the start of each file with whole lines (no hole, no cut line).
+#[test]
+fn flush_empties_the_log_files_in_both_modes() {
+    for mode in ["capture", "direct"] {
+        let dir = direct_dir(&format!("flush-{mode}"));
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // A worker of an earlier run (count was 3), with a rotated file.
+        std::fs::write(logs.join("out-3.log"), "from an earlier run\n").unwrap();
+        std::fs::write(logs.join("out-3.log.1"), "older still\n").unwrap();
+        // A burst that rotates (4 KB files), then slow ticks that don't.
+        let script = "i=0; while [ $i -lt 150 ]; do i=$((i+1)); echo burst $i padding padding padding padding; \
+                      done; echo boom >&2; i=0; while :; do i=$((i+1)); echo tick $i; sleep 0.05; done";
+        let toml = format!(
+            "[app]\nname = \"flush-{mode}\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+             [workers]\ncount = 2\nmin_uptime = 100\n\
+             [logging]\nworker_output = \"{mode}\"\nper_worker_files = true\nfile = \"{}\"\n\
+             out_file = \"{}\"\nerr_file = \"{}\"\n[logging.rotate]\nmax_size = \"4K\"\nkeep = 10\n",
+            logs.join("warden.log").display(),
+            logs.join("out.log").display(),
+            logs.join("err.log").display()
+        );
+        let w = Warden::start(&format!("flush-{mode}"), 0, &toml);
+        w.wait_for("2 workers", T, ready(2));
+        let ticks = |n: u32| -> Vec<u64> {
+            let text = std::fs::read_to_string(logs.join(format!("out-{n}.log"))).unwrap_or_default();
+            assert!(!text.contains('\0'), "{mode}: a hole in out-{n}.log: {text:?}");
+            text.lines().filter_map(|l| l.strip_prefix("tick ")?.parse().ok()).collect()
+        };
+        eventually(&w, "ticks from both workers", || ticks(1).len() >= 3 && ticks(2).len() >= 3);
+        assert!(logs.join("out-1.log.1").exists(), "{mode}: the burst rotated");
+        let before = [*ticks(1).last().unwrap(), *ticks(2).last().unwrap()];
+
+        let (code, text) = w.cli(&["flush"]);
+        assert_eq!(code, 0, "{mode}: {text}");
+        assert!(text.contains("rotated files are kept"), "{mode}: {text}");
+        for f in ["warden.log", "out-1.log", "out-2.log", "out-3.log", "err-1.log", "err-2.log"] {
+            assert!(text.contains(&logs.join(f).display().to_string()), "{mode}: {f} not listed:\n{text}");
+        }
+        assert!(!text.contains("out-1.log.1"), "{mode}: a rotated file listed:\n{text}");
+        // Emptied: only what came after the flush is there.
+        assert_eq!(std::fs::read_to_string(logs.join("out-3.log")).unwrap(), "", "{mode}");
+        assert_eq!(std::fs::read_to_string(logs.join("err-1.log")).unwrap(), "", "{mode}");
+        for (i, n) in [1, 2].into_iter().enumerate() {
+            let after = ticks(n);
+            assert!(after.first().is_none_or(|t| *t > before[i]), "{mode}: worker {n} kept old lines: {after:?}");
+        }
+        // Rotated files are kept, the burst with them.
+        assert_eq!(std::fs::read_to_string(logs.join("out-3.log.1")).unwrap(), "older still\n", "{mode}");
+        let rotated: String = (1..=10)
+            .map(|i| std::fs::read_to_string(logs.join(format!("out-1.log.{i}"))).unwrap_or_default())
+            .collect();
+        assert!(rotated.contains("burst 1 padding"), "{mode}: rotated files lost: {rotated:?}");
+
+        // Writing goes on from the start of each file, whole lines only.
+        eventually(&w, "new ticks after the flush", || ticks(1).len() >= 3 && ticks(2).len() >= 3);
+        for n in [1, 2] {
+            let text = std::fs::read_to_string(logs.join(format!("out-{n}.log"))).unwrap();
+            assert!(text.lines().all(|l| l.starts_with("tick ")), "{mode}: out-{n}.log: {text:?}");
+            let t = ticks(n);
+            assert!(t.windows(2).all(|p| p[1] == p[0] + 1), "{mode}: out-{n}.log: {t:?}");
+        }
+        let log = std::fs::read_to_string(logs.join("warden.log")).unwrap();
+        assert!(!log.contains('\0') && !log.contains("burst 1 ") && !log.contains("worker ready"), "{mode}: {log}");
+        assert!(log.contains("logs flushed on request files=6 failed=0"), "{mode}: {log}");
+        // The in-memory buffer was emptied too.
+        let (_, recent) = w.cli(&["logs", "--nostream", "-n", "500"]);
+        assert!(!recent.contains("burst 1 ") && !recent.contains("worker ready"), "{mode}: {recent}");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to

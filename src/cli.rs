@@ -38,7 +38,8 @@ APPS (familiar from PM2):
                      --grep TEXT --exclude TEXT --ignore-case --since 2h --until
                      2026-09-30T12:00 --level warn --json (one object per line)
     search <text> [target]   Search all of an app's logs (= logs --history --grep)
-    flush [target]   Empty the log buffer and truncate log files
+    flush [target]   Empty the log buffer and the current log files ([logging] file, out
+                     and err files, every worker's); rotated files (.1, .gz) are kept
     env <app>        The app's environment (values hidden unless --show-secrets)
     reset <target>   Zero restart counters and retry FAILED workers now
     signal <SIG> <target>   Send a signal to the workers (SIGUSR2, USR2, 12)

@@ -1031,6 +1031,10 @@ impl Config {
             per_worker: l.per_worker_files,
             timestamps: l.file_timestamps,
             rotate: crate::logging::RotatePolicy::from(&l.rotate),
+            direct: match crate::process::Output::from_config(l) {
+                crate::process::Output::Direct(d) => Some(d),
+                _ => None,
+            },
         }
     }
 

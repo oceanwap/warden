@@ -48,7 +48,9 @@ pub enum Request {
         #[serde(default)]
         show_secrets: bool,
     },
-    /// Empty the in-memory log buffers and truncate the log file.
+    /// Empty the in-memory log buffers and the current log files (Warden's,
+    /// every worker's out and err file); rotated files are kept. The
+    /// message lists the files; not ok if one could not be emptied.
     Flush,
     Logs {
         lines: usize,

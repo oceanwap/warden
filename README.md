@@ -256,7 +256,8 @@ has everything; the differences are in the right column.
 | `pm2 describe api` | `warden describe api` | Also the last exits and the last rollout |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
-| `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files, pipe-friendly |
+| `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files (every worker's with `per_worker_files`), pipe-friendly |
+| `pm2 flush api` | `warden flush api` | The same: empties the in-memory buffer and the current log files (Warden's, each worker's out and err file), lists them, keeps rotated ones; safe while workers write |
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server as fast as nginx, faster on small files (see Benchmarks) |
 | `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](#surviving-reboots-and-crashes) |
 | `pm2 monit` | `warden top`, `warden events` | `events`: every worker, rollout and supervisor event as it happens (`--json` for scripts, `--logs` for output) |

@@ -46,6 +46,11 @@ Requests are `control::Request`, tagged by `cmd`: `status`, `stop`,
 `control::Response` line (`{"ok":true,"message":…,"status":…}`), except
 `logs` (log lines) and `subscribe` (events).
 
+`flush` empties the in-memory log buffer and the app's current log files
+(rotated ones are kept); its `message` lists the files, one per line after
+the first. `ok` is false when a file could not be emptied (the message
+names it and the error); the others are emptied all the same.
+
 ### `subscribe`
 
 ```json

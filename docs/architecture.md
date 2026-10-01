@@ -396,6 +396,15 @@ app-level check; their rollout gates fall back to it too.
   "direct"` the bytes go from the worker's pipe into its log file with
   `splice(2)`: no copy through Warden, no parsing, rotation at a line
   boundary (supervisor CPU per 200 MB: 0.72 s captured, 0.14 s direct).
+  `warden flush` (like `pm2 flush`) empties the in-memory rings and every
+  current log file, each on the thread that writes it, between two writes:
+  the writer thread's files are `O_APPEND` and hold whole lines only, so a
+  message in its queue truncates them through its own descriptors and the
+  next line lands at offset 0 (lines queued before the flush go too); the
+  output thread resets each direct file's write offset, keeping the start of
+  a line a worker is in the middle of, so both kinds of file begin with a
+  whole line. Files no running worker writes (a scaled-down worker's, an
+  earlier run's `out-3.log`) are emptied by name; rotated ones are kept.
 - Live events: every worker state change, rollout phase and (on request) log
   line is pushed to `subscribe` clients as it happens, with a full status
   every interval; with no subscriber an event costs one atomic load.

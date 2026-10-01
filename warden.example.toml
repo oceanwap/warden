@@ -102,6 +102,9 @@ max_lines_per_sec = 10000                    # worker output kept per worker and
 per_worker_files = false                     # api-out-1.log, api-out-2.log… (PM2 without merge_logs)
 file_timestamps = false                      # prefix out/err lines with a timestamp (PM2's `time`; capture only)
 #
+# `warden flush` empties all of these files that exist now (every worker's too), never the rotated ones;
+# `warden logs --history` reads them back, rotated and .gz ones included, oldest first.
+#
 # worker_output = "direct" is for apps that log heavily and only need the files:
 #   + the kernel moves the bytes from each worker's pipe into its file (splice): no parsing, no copy
 #     through Warden, no line budget, no line lost; the file is byte for byte what the app wrote
