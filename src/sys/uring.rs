@@ -273,6 +273,13 @@ impl Ring {
         self.start(Held::Poll { _sock: sock }, |_| opcode::PollAdd::new(fd, libc::POLLOUT as u32).build())
     }
 
+    /// Completes once `sock` is readable (for a listener: a connection is
+    /// waiting), or has an error.
+    pub fn poll_readable(&mut self, sock: Sock) -> io::Result<OpId> {
+        let fd = types::Fd(sock.raw());
+        self.start(Held::Poll { _sock: sock }, |_| opcode::PollAdd::new(fd, libc::POLLIN as u32).build())
+    }
+
     /// Ask the kernel to cancel `id` if it is still pending. Its completion
     /// still arrives (with ECANCELED, or its result if it finished first).
     pub fn cancel(&mut self, id: OpId) {
@@ -540,6 +547,19 @@ mod tests {
         r.poll_writable(Sock::Stream(s)).unwrap();
         let Done::Poll(Ok(mask)) = collect(&mut r, 1).remove(0).1 else { panic!("poll failed") };
         assert!(mask & libc::POLLOUT as u32 != 0, "{mask:#x}");
+    }
+
+    #[test]
+    fn a_listener_polls_readable_when_a_connection_waits() {
+        let Some(mut r) = ring() else { return };
+        let l = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
+        r.poll_readable(Sock::Listener(l.clone())).unwrap();
+        r.submit().unwrap();
+        r.wait(Duration::from_millis(30)).unwrap();
+        assert_eq!(r.complete(|_, _| panic!("readable with no connection")), 0);
+        let _c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let Done::Poll(Ok(mask)) = collect(&mut r, 1).remove(0).1 else { panic!("poll failed") };
+        assert!(mask & libc::POLLIN as u32 != 0, "{mask:#x}");
     }
 
     #[test]

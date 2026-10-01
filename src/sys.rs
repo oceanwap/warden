@@ -221,6 +221,8 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 
 /// A listening TCP socket, non-blocking and close-on-exec, with
 /// SO_REUSEADDR and optionally SO_REUSEPORT set before bind (std can't).
+/// Non-blocking is for epoll; the io_uring server makes it blocking again
+/// (`static_server/uring_io.rs`, `Listener::new`).
 pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Result<std::net::TcpListener> {
     let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: socket(2) with constant arguments.

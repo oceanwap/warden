@@ -230,14 +230,40 @@ fn unexpected() -> io::Error {
 pub struct Listener {
     d: Arc<Driver>,
     sock: Arc<TcpListener>,
-    /// The pending accept, kept across `accept()` calls (the server's
-    /// select! drops the future when another branch wins).
+    /// The pending accept (or readiness poll), kept across `accept()` calls
+    /// (the server's select! drops the future when another branch wins).
     op: Option<Op>,
+    /// The next operation is a readiness poll, then the accept: an accept
+    /// completed with EAGAIN.
+    poll_first: bool,
+}
+
+/// What the listener does after a completion.
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// Hand it to the server: a connection, or an error it handles.
+    Done,
+    /// Queue another accept: EINTR, or the poll said a connection waits.
+    Accept,
+    /// Wait for a connection with a poll first, then accept: the accept
+    /// completed with EAGAIN (some kernels do that for a non-blocking
+    /// listener instead of waiting); accepting again at once would spin.
+    PollThenAccept,
+}
+
+fn next(done: &Done) -> Next {
+    match done {
+        Done::Accept(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => Next::PollThenAccept,
+        Done::Accept(Err(e)) if e.kind() == io::ErrorKind::Interrupted => Next::Accept,
+        Done::Poll(Ok(_)) => Next::Accept,
+        _ => Next::Done,
+    }
 }
 
 impl Listener {
     /// Set up the ring and its driver task (needs the tokio runtime). On
-    /// failure the listener comes back, so the caller can use epoll.
+    /// failure the listener comes back as it was (non-blocking), so the
+    /// caller can use epoll.
     pub fn new(l: TcpListener) -> Result<Listener, (io::Error, TcpListener)> {
         let ring = match Ring::new(ENTRIES) {
             Ok(r) => r,
@@ -247,13 +273,22 @@ impl Listener {
             Ok(a) => a,
             Err(e) => return Err((e, l)),
         };
+        // A blocking listener, so an ACCEPT waits in the kernel for a
+        // connection. Since "io_uring: check file O_NONBLOCK state for
+        // accept" (5.10), some kernels complete it at once with EAGAIN on a
+        // non-blocking one, which would spin a CPU per idle worker. Changed
+        // last: every failure above leaves it non-blocking for epoll, and
+        // nothing else uses this socket from here on.
+        if let Err(e) = l.set_nonblocking(false) {
+            return Err((e, l));
+        }
         let d = Arc::new(Driver {
             afd,
             state: Mutex::new(State { ring, waiters: HashMap::new() }),
             queued: tokio::sync::Notify::new(),
         });
         tokio::spawn(drive(d.clone()));
-        Ok(Listener { d, sock: Arc::new(l), op: None })
+        Ok(Listener { d, sock: Arc::new(l), op: None, poll_first: false })
     }
 
     pub async fn accept(&mut self) -> io::Result<Stream> {
@@ -261,27 +296,42 @@ impl Listener {
     }
 
     fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Stream>> {
-        if self.op.is_none() {
-            let sock = self.sock.clone();
-            match self.d.start(true, |r| r.accept(sock)) {
-                Ok(op) => self.op = Some(op),
-                Err(e) => return Poll::Ready(Err(e)),
+        loop {
+            if self.op.is_none() {
+                let sock = self.sock.clone();
+                let started = if self.poll_first {
+                    self.d.start(true, |r| r.poll_readable(Sock::Listener(sock)))
+                } else {
+                    self.d.start(true, |r| r.accept(sock))
+                };
+                match started {
+                    Ok(op) => self.op = Some(op),
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+            let Some(op) = self.op.as_mut() else { return Poll::Pending };
+            // A new operation is still pending here: completions only come
+            // from the driver task, so this loop never spins.
+            let done = match Pin::new(op).poll(cx) {
+                Poll::Ready(d) => d,
+                Poll::Pending => return Poll::Pending,
+            };
+            self.op = None;
+            match next(&done) {
+                Next::Accept => self.poll_first = false,
+                Next::PollThenAccept => self.poll_first = true,
+                Next::Done => {
+                    return Poll::Ready(match done {
+                        Done::Accept(Ok(s)) => {
+                            let _ = s.set_nodelay(true);
+                            Ok(Stream { d: self.d.clone(), sock: Arc::new(s) })
+                        }
+                        Done::Accept(Err(e)) | Done::Poll(Err(e)) => Err(e),
+                        _ => Err(unexpected()),
+                    });
+                }
             }
         }
-        let Some(op) = self.op.as_mut() else { return Poll::Pending };
-        let done = match Pin::new(op).poll(cx) {
-            Poll::Ready(d) => d,
-            Poll::Pending => return Poll::Pending,
-        };
-        self.op = None;
-        Poll::Ready(match done {
-            Done::Accept(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                Ok(Stream { d: self.d.clone(), sock: Arc::new(s) })
-            }
-            Done::Accept(Err(e)) => Err(e),
-            _ => Err(unexpected()),
-        })
     }
 }
 
@@ -435,5 +485,72 @@ impl Writer {
             }
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    /// O_NONBLOCK on `fd`, from /proc (no unsafe outside src/sys*).
+    fn nonblocking(fd: RawFd) -> bool {
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let flags = info.lines().find_map(|l| l.strip_prefix("flags:")).unwrap().trim();
+        i64::from_str_radix(flags, 8).unwrap() & libc::O_NONBLOCK as i64 != 0
+    }
+
+    #[test]
+    fn an_eagain_accept_waits_for_a_connection_before_accepting_again() {
+        let failed = |n| Done::Accept(Err(io::Error::from_raw_os_error(n)));
+        assert_eq!(next(&failed(libc::EAGAIN)), Next::PollThenAccept, "never re-armed at once: that would spin");
+        assert_eq!(next(&failed(libc::EINTR)), Next::Accept);
+        assert_eq!(next(&Done::Poll(Ok(libc::POLLIN as u32))), Next::Accept);
+        // The server's to handle (and back off from).
+        assert_eq!(next(&failed(libc::EMFILE)), Next::Done);
+        assert_eq!(next(&failed(libc::ECONNABORTED)), Next::Done);
+        assert_eq!(next(&Done::Poll(Err(io::Error::from_raw_os_error(libc::ECANCELED)))), Next::Done);
+    }
+
+    #[test]
+    fn the_ring_gets_a_blocking_listener_and_serves_through_it() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            // As the server makes it: non-blocking, for epoll.
+            let l = crate::sys::listen_tcp("127.0.0.1:0".parse().unwrap(), false, 16).unwrap();
+            let addr = l.local_addr().unwrap();
+            assert!(nonblocking(l.as_raw_fd()));
+            let mut ul = match Listener::new(l) {
+                Ok(u) => u,
+                Err((e, back)) => {
+                    assert!(nonblocking(back.as_raw_fd()), "given back as it was, for epoll");
+                    eprintln!("skipping: io_uring is unavailable here ({e})");
+                    return;
+                }
+            };
+            assert!(!nonblocking(ul.sock.as_raw_fd()), "an ACCEPT on it waits in the kernel");
+            // Idle: the pending accept neither completes nor fails.
+            assert!(tokio::time::timeout(Duration::from_millis(100), ul.accept()).await.is_err());
+            // Straight to the accept, and (as after an EAGAIN) through a poll first.
+            for poll_first in [false, true] {
+                ul.poll_first = poll_first;
+                let client = std::thread::spawn(move || {
+                    let mut c = TcpStream::connect(addr).unwrap();
+                    c.write_all(b"ping").unwrap();
+                    let mut b = [0u8; 4];
+                    c.read_exact(&mut b).unwrap();
+                    b
+                });
+                let s = tokio::time::timeout(Duration::from_secs(5), ul.accept()).await.unwrap().unwrap();
+                let (mut r, mut w) = s.split();
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b).await.unwrap();
+                assert_eq!(&b, b"ping");
+                w.send_all(OutBuf::Vec(b"pong".to_vec()), false).await.unwrap();
+                assert_eq!(&client.join().unwrap(), b"pong", "poll_first={poll_first}");
+            }
+        });
     }
 }

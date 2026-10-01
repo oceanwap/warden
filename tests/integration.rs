@@ -1797,6 +1797,97 @@ fn static_io_used(w: &Warden, io: &str) -> &'static str {
 /// an uncached server's (`cache_size = 0` behaves as before), in both I/O
 /// modes; an edited or deleted file shows within cache_valid_ms; a cached
 /// path swapped for a symlink out of the root is refused, not served.
+/// CPU time (user + system, in clock ticks) `pid` has used.
+fn cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // After "(comm)": the state is field 3, utime 14, stime 15.
+    let f: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    f[11].parse::<u64>().unwrap() + f[12].parse::<u64>().unwrap()
+}
+
+/// A static worker out of file descriptors (EMFILE) neither spins nor goes
+/// quiet: it backs off, says why and how to fix it, and serves again once
+/// descriptors are free. Both I/O modes.
+#[test]
+fn static_accept_errors_back_off_and_say_why() {
+    for io in ["epoll", "uring"] {
+        static_emfile_case(io);
+    }
+}
+
+fn static_emfile_case(io: &str) {
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("warden-it-emfile-{io}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "hi").unwrap();
+    let out = dir.join("out.log");
+    let file = std::fs::File::create(&out).unwrap();
+    let port = free_port();
+    // The worker itself, with few descriptors: a few dozen idle connections use them up.
+    let child = Command::new("sh")
+        .args(["-c", "ulimit -n 48 && exec \"$0\" serve-static", BIN])
+        .env("WARDEN_STATIC", serde_json::json!({ "root": dir.join("site") }).to_string())
+        .env("PORT", port.to_string())
+        .env("WARDEN_STATIC_IO", io)
+        .stdout(Stdio::from(file.try_clone().unwrap()))
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let w = Kill(child);
+    let log = || std::fs::read_to_string(&out).unwrap_or_default();
+    let t0 = Instant::now();
+    while get(port, "/index.html").is_none() {
+        assert!(t0.elapsed() < T, "the static worker does not serve:\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let via = if log().contains("via io_uring") { "io_uring" } else { "epoll" };
+    assert!(io == "uring" || via == "epoll", "{}", log());
+
+    // Half a request head each: every connection holds a descriptor of the
+    // worker until the head timeout (10 s).
+    let held: Vec<std::net::TcpStream> = (0..80)
+        .map(|_| {
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.write_all(b"GET /index.html HTTP/1.1\r\n").unwrap();
+            c
+        })
+        .collect();
+    let t0 = Instant::now();
+    while !log().contains("cannot accept connections") {
+        assert!(t0.elapsed() < Duration::from_secs(5), "no accept error logged ({via}):\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Backing off, not spinning on the error.
+    let pid = w.0.id();
+    let before = cpu_ticks(pid);
+    std::thread::sleep(Duration::from_secs(1));
+    let used = cpu_ticks(pid) - before;
+    let text = log();
+    assert!(used < 20, "{used} ticks of CPU within 1 s with {via}: spinning on EMFILE\n{text}");
+    let line = text.lines().find(|l| l.contains("cannot accept connections")).unwrap();
+    assert!(line.contains("Too many open files") && line.contains(&format!("via={via}")), "{line}");
+    assert!(line.contains("retry_in_ms=") && line.contains("LimitNOFILE=65536"), "{line}");
+    assert_eq!(text.matches("cannot accept connections").count(), 1, "logged at most every 10 s:\n{text}");
+
+    // Descriptors free again: it accepts and serves.
+    drop(held);
+    let t0 = Instant::now();
+    while get(port, "/index.html").is_none() {
+        assert!(t0.elapsed() < T, "it does not serve again ({via}):\n{}", log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(log().contains("accepting connections again"), "{}", log());
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn static_cache_hits_match_and_stay_fresh() {
     for io in ["epoll", "uring"] {
