@@ -241,17 +241,21 @@ fn main_screen_with_fake_data() {
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
 }
 
-/// Hot standbys (`status.standbys`) are listed after the workers, as standbys.
+/// Hot standbys (`status.standbys`) are listed after the workers, as `s1`
+/// (the name `warden status`, the logs and the events give them); old
+/// processes still draining after a rollout (`status.draining`) come
+/// between, as `N (old)`.
 #[test]
-fn standbys_are_listed_after_the_workers() {
+fn standbys_and_draining_processes_are_listed_after_the_workers() {
     let mut g = connected();
     let mut web = status("web", vec![worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None)], 1, json!(null));
     web["standbys"] = json!([worker(1, "STANDBY", Some(5150), 61, 0.0, 0, None)]);
+    web["draining"] = json!([worker(1, "DRAINING", Some(5090), 66, 0.5, 0, None)]);
     let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": web})).unwrap();
     let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
     let _ = g.update(Message::Select("web".into()));
     let mut ui = sim(&g);
-    for t in ["standby 1", "STANDBY", "5150", "5101"] {
+    for t in ["s1 (standby)", "STANDBY", "5150", "5101", "1 (old)", "DRAINING", "5090"] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the web app's screen");
     }
 }

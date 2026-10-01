@@ -4250,6 +4250,11 @@ struct LongLivedRun {
 /// One client per path (`/ws` or an SSE path) plus a plain-request loop,
 /// held through `warden reload`.
 fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
+    rollout_holding(w, workers, paths, &["reload"])
+}
+
+/// Like `reload_holding`, through the rollout `command` runs (`reload`, `restart`).
+fn rollout_holding(w: &Warden, workers: u64, paths: &[&'static str], command: &[&str]) -> LongLivedRun {
     let port = w.port;
     let before = pid_set(&w.wait_for("ready", T, ready(workers)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -4275,7 +4280,7 @@ fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLived
     };
     std::thread::sleep(Duration::from_millis(200));
     let t0 = Instant::now();
-    let (code, out) = w.cli(&["reload"]);
+    let (code, out) = w.cli(command);
     let took = t0.elapsed();
     assert_eq!(code, 0, "{out}\n{}", w.log());
     let after = pid_set(&w.status().unwrap());
@@ -4354,6 +4359,55 @@ fn long_lived_connections_hand_over_in_a_node_reload() {
     let w = Warden::start("ll-node", port, &long_lived_config("ll-node", port, &app, ""));
     let run = reload_holding(&w, 2, &["/ws", "/sse"]);
     assert_clean_handover(&w, &run, Duration::from_secs(20));
+}
+
+/// The drains of a rolling restart overlap (`[reload] max_draining`, 4 by
+/// default): once a new worker took over, the next one is replaced while
+/// the old one closes its WebSockets and SSE streams. 4 workers holding
+/// long-lived clients restart in about one long_lived_timeout plus the
+/// startups, not one long_lived_timeout per worker; every client still
+/// gets a clean close and lands on a new worker, and `warden restart`
+/// returns only once every old worker has exited.
+#[test]
+fn a_rolling_restart_overlaps_the_long_lived_drains() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 4", fixture("longlived.ts"));
+    let cfg =
+        long_lived_config("ll-overlap", port, &app, "").replace("long_lived_timeout = 1", "long_lived_timeout = 2");
+    let w = Warden::start("ll-overlap", port, &cfg);
+    // Enough clients that every old worker holds some (SO_REUSEPORT spreads them).
+    let paths: Vec<&'static str> = [["/ws"; 8], ["/sse"; 8]].concat();
+    let run = rollout_holding(&w, 4, &paths, &["restart"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(30));
+    let log = w.log();
+    // Old workers drained side by side: some replacement took over while
+    // other old workers were still draining (`draining=` counts them).
+    let most = log
+        .lines()
+        .filter(|l| l.contains("worker replaced; draining old process"))
+        .filter_map(|l| l.split("draining=").nth(1)?.split_whitespace().next()?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    assert!(most >= 2, "no drains overlapped\n{log}");
+    // One drain after another took at least 4 x long_lived_timeout (8 s) on
+    // top of the startups; overlapping, about one (2 s) and the closing
+    // handshakes. The startups are counted out (a loaded runner stretches
+    // them to seconds).
+    let startups: u64 = log
+        .lines()
+        .filter(|l| l.contains("replacement listening"))
+        .filter_map(|l| l.split("startup_ms=").nth(1)?.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    let draining = run.took.saturating_sub(Duration::from_millis(startups));
+    eprintln!("restart took {:?}, {startups} ms of it startups; at most {most} old workers drained at once", run.took);
+    assert!(draining < Duration::from_secs(5), "restart took {:?}, {startups} ms of it startups\n{log}", run.took);
+    // The CLI returned after the last old worker exited, not before.
+    let s = w.status().unwrap();
+    assert!(s["draining"].as_array().is_none_or(|d| d.is_empty()), "{s}");
+    assert!(log.contains("every worker replaced; waiting for the old ones to finish draining"), "{log}");
 }
 
 #[test]

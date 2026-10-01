@@ -148,7 +148,15 @@ clients that don't know them show a worker 0.
 (`done` 0, `phase` `starting` or `running preflight`), and whenever its
 `phase` changes, except the soak countdown; `rollout_done` follows when it
 ends (`status.last_rollout` from then on). A supervisor's `lagged` names its
-app.
+app. `done` counts workers whose new process took over. Their old processes
+drain in the background while the rollout goes on (`[reload]
+max_draining`), and the rollout ends, `rollout_done` included, once every
+one of them has exited: until then `phase` reads `every worker replaced; 2
+old workers draining (pid 101, 102)` (`failed; …` after a failure, whose
+log line came at once), and they are listed in `status.draining`: one
+`WorkerStatus` per old process, `id` the worker it served (0: worker mode's
+host), `state` `DRAINING` (`control::DRAINING`), the slot's `restarts` and
+`crashes`. The field is absent when nothing drains; older clients ignore it.
 
 `supervisor.event` (from `wardend` only):
 

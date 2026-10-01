@@ -79,6 +79,11 @@ surge = 1                                    # new workers started at once, each
                                              # 1, N or "all". The old ones drain once the whole batch passed the
                                              # gates; a failure stops the batch's new workers. Briefly runs up to
                                              # N extra workers (memory). Not with port_strategy = "offset"
+max_draining = 4                             # old workers that may still be draining (closing WebSockets/SSE,
+                                             # finishing requests) while the next ones are replaced; past that,
+                                             # the next replacement waits for one to exit. Each holds its memory
+                                             # until it exits: a rollout runs at most max(surge, max_draining)
+                                             # extra processes. 1 = each old worker exits before the next starts
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)

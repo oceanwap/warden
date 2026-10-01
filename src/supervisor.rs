@@ -11,6 +11,8 @@
 //! - `release.rs`: release pinning (`[app] pin_release`).
 
 mod release;
+#[cfg(test)]
+mod rig;
 mod rollout;
 mod standby;
 mod upkeep;
@@ -1898,6 +1900,32 @@ impl Supervisor {
             // Hot standbys: their own list (`Status.standbys`).
             self.standby_rows(&mut standbys, &sample);
         }
+        // Old processes a rollout replaced, still draining (`Status.draining`).
+        let mut draining = Vec::new();
+        let worker_mode = self.is_worker_mode();
+        let mut retiring: Vec<u64> =
+            self.insts.iter().filter(|(_, i)| i.role == Role::Retiring).map(|(id, _)| *id).collect();
+        retiring.sort_unstable();
+        for id in retiring {
+            let Some(i) = self.insts.get_mut(&id) else { continue };
+            let (pid, started, slot) = (i.handle.pid, i.started, i.slot);
+            let stats = sample(pid, &mut i.cpu_prev, started);
+            let (restarts, crashes) = self.slots.get(&slot).map(|s| (s.restarts, s.crashes)).unwrap_or((0, 0));
+            draining.push(WorkerStatus {
+                id: if worker_mode { 0 } else { slot },
+                state: control::DRAINING.into(),
+                pid: Some(pid),
+                uptime_secs: Some(started.elapsed().as_secs()),
+                restarts,
+                crashes,
+                rss_bytes: stats.map(|x| x.0.rss_bytes),
+                cpu_seconds: stats.map(|x| x.0.cpu_seconds),
+                cpu_percent: stats.map(|x| x.1),
+                last_exit: None,
+                healthy: None,
+            });
+        }
+        draining.sort_by_key(|w| w.id);
         let me = std::process::id();
         let started = self.started;
         let sup = sample(me, &mut self.supervisor_cpu_prev, started);
@@ -1935,6 +1963,7 @@ impl Supervisor {
             workers,
             release: self.release_text(),
             standbys,
+            draining,
         }
     }
 }

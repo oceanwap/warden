@@ -764,6 +764,7 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rig::{Rig, local};
     use super::*;
 
     /// A fake app speaking the shim's fd-3 protocol. Workers report
@@ -788,55 +789,10 @@ echo '{"ev":"listening","port":1}' >&3
 exec sleep 60
 "#;
 
-    struct Rig {
-        sup: Supervisor,
-        rx: mpsc::UnboundedReceiver<Event>,
-        proc_rx: mpsc::UnboundedReceiver<ProcEvent>,
-        dir: PathBuf,
-    }
-
-    impl Rig {
-        /// One worker and one standby running FAKE; `extra` adds config sections.
-        fn new(name: &str, extra: &str) -> Rig {
-            let dir = std::env::temp_dir().join(format!("warden-pool-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            // The control socket is never bound here; a short path keeps the
-            // socket-length checks happy where temp_dir is long (macOS).
-            let toml = format!(
-                "[app]\nname = \"{name}\"\nargs = [\"x.js\"]\nport = 1\n[workers]\ncount = 1\nstandby = 1\n{extra}\n\
-                 [control]\nsocket = \"/tmp/wp.sock\"\n"
-            );
-            let mut cfg = Config::parse(&toml).unwrap();
-            cfg.app.command = "sh".into();
-            cfg.app.args = vec!["-c".into(), FAKE.into()];
-            let (tx, rx) = mpsc::unbounded_channel();
-            let (proc_tx, proc_rx) = mpsc::unbounded_channel();
-            let sup = Supervisor::new(cfg, None, dir.clone(), (None, None), tx, proc_tx);
-            Rig { sup, rx, proc_rx, dir }
-        }
-
-        /// The supervisor's event loop, until `f` holds.
-        async fn until(&mut self, what: &str, f: impl Fn(&Supervisor) -> bool) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while !f(&self.sup) {
-                tokio::select! {
-                    Some(ev) = self.rx.recv() => self.sup.on_event(ev),
-                    Some(pe) = self.proc_rx.recv() => self.sup.on_proc(pe),
-                    _ = tokio::time::sleep_until(deadline) => panic!("timed out waiting for {what}"),
-                }
-            }
-        }
-
-        fn kill(&self, inst: u64) {
-            self.sup.insts[&inst].handle.signal(libc::SIGKILL);
-        }
-
-        async fn shutdown(mut self) {
-            self.sup.begin_shutdown("test");
-            self.until("every process gone", |s| s.insts.is_empty()).await;
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+    /// One worker and one standby running FAKE; `extra` adds config
+    /// (`[workers]` keys first, then sections).
+    fn rig(name: &str, extra: &str) -> Rig {
+        Rig::new(&format!("pool-{name}"), &format!("[workers]\ncount = 1\nstandby = 1\n{extra}"), FAKE)
     }
 
     fn available(s: &Supervisor) -> Vec<u64> {
@@ -852,14 +808,10 @@ exec sleep 60
         s.status().standbys
     }
 
-    async fn local(f: impl std::future::Future<Output = ()>) {
-        tokio::task::LocalSet::new().run_until(f).await
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn a_crashed_worker_gets_the_standby_and_the_pool_refills() {
         local(async {
-            let mut r = Rig::new("promote", "");
+            let mut r = rig("promote", "");
             r.sup.start_all();
             // Standbys start once the worker is up, not alongside it.
             assert!(r.sup.live_standbys().is_empty());
@@ -890,7 +842,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn standbys_are_numbered_and_a_successor_takes_the_free_number() {
         local(async {
-            let mut r = Rig::new("numbers", "");
+            let mut r = rig("numbers", "");
             r.sup.cfg.workers.standby = 2;
             r.sup.start_all();
             r.until("worker and two standbys ready", |s| running(s) && available(s).len() == 2).await;
@@ -936,7 +888,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn standby_instance_numbers_stay_unique_when_scaling_up() {
         local(async {
-            let mut r = Rig::new("scaleup", "");
+            let mut r = rig("scaleup", "");
             r.sup.cfg.workers.standby = 2;
             r.sup.start_all();
             r.until("worker and two standbys ready", |s| running(s) && available(s).len() == 2).await;
@@ -967,7 +919,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn crashing_standbys_back_off_then_fail_and_workers_restart_cold() {
         local(async {
-            let mut r = Rig::new(
+            let mut r = rig(
                 "crashloop",
                 "[restart]\nbackoff_initial = 20\nbackoff_max = 1000\nmax_restarts = 3\nfailed_cooldown = 0\n",
             );
@@ -1003,7 +955,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn deploys_pause_the_pool_and_replace_it_only_when_they_succeed() {
         local(async {
-            let mut r = Rig::new("deploy", "");
+            let mut r = rig("deploy", "");
             r.sup.start_all();
             r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
             let old = available(&r.sup)[0];
@@ -1034,7 +986,7 @@ exec sleep 60
     async fn recycling_uses_the_standby_as_the_replacement() {
         local(async {
             // (A real standby config has the shim, so workers overlap; `sh` doesn't.)
-            let mut r = Rig::new("recycle", "overlap = true\n");
+            let mut r = rig("recycle", "overlap = true\n");
             r.sup.start_all();
             r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
             let (worker, standby) = (r.sup.slots[&1].current.unwrap(), available(&r.sup)[0]);
@@ -1052,7 +1004,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn a_standby_that_listens_early_turns_standbys_off() {
         local(async {
-            let mut r = Rig::new("early", "");
+            let mut r = rig("early", "");
             r.sup.cfg.app.env.insert("FAKE_STANDBY_LISTENS".into(), "1".into());
             r.sup.start_all();
             r.until("standbys disabled", |s| s.pool.disabled.is_some()).await;
@@ -1074,7 +1026,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn a_stopped_standby_is_not_held_by_its_pending_read() {
         local(async {
-            let mut r = Rig::new("deaf", "[shutdown]\ngrace_period = 30\n");
+            let mut r = rig("deaf", "[shutdown]\ngrace_period = 30\n");
             r.sup.cfg.app.env.insert("FAKE_STANDBY_DEAF".into(), "1".into());
             r.sup.start_all();
             r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
@@ -1094,7 +1046,7 @@ exec sleep 60
     #[tokio::test(flavor = "current_thread")]
     async fn only_a_standby_in_the_pinned_release_is_promoted() {
         local(async {
-            let mut r = Rig::new("pin", "");
+            let mut r = rig("pin", "");
             r.sup.start_all();
             r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
             let old = available(&r.sup)[0];

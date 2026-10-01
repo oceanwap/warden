@@ -25,6 +25,17 @@
 //! workers of every lane, so the whole batch rolls back. With `surge = 1`
 //! (the default) a batch is one worker. A slot that isn't serving (starting,
 //! stopping, down), or that can't overlap, is always a batch of its own.
+//!
+//! Drains overlap (`[reload] max_draining`): once a batch's old workers have
+//! been told to stop (their replacements already listen and passed the
+//! gates, so capacity never drops), the next batch starts while they finish
+//! draining in the background: closing WebSockets and SSE streams after
+//! `long_lived_timeout`, finishing requests in flight. A batch starts only
+//! while its old workers fit in max(max_draining, batch size) draining at
+//! once, which bounds the extra memory. The rollout ends (and the CLI
+//! returns) once every old worker it stopped has exited, by itself or by
+//! SIGKILL at `grace_period`; a failure rolls back the batch in progress at
+//! once and then waits for those drains too.
 
 use super::*;
 use crate::control::{RolloutOutcome, RolloutStatus};
@@ -88,8 +99,19 @@ pub(super) struct Roll {
     /// applied a new one; restored if the rollout fails, so restarts don't
     /// roll forward to it.
     prev: Option<Snapshot>,
+    /// Old workers this rollout stopped once their replacements took over,
+    /// until they exit (see the module doc: drains overlap).
+    draining: Vec<Drain>,
+    /// The next batch waits for drains to make room (logged once per wait).
+    held: bool,
     /// Dropping this stops the gate ticker.
     _ticker: oneshot::Sender<()>,
+}
+
+/// An old worker draining in the background.
+struct Drain {
+    slot: usize,
+    old: u64,
 }
 
 struct Snapshot {
@@ -100,11 +122,19 @@ struct Snapshot {
 }
 
 enum Step {
+    /// Between batches; persists only while the next batch waits for drains
+    /// (`Roll::held`).
     Idle,
     Preflight,
     /// One or more workers being replaced together.
     Batch(Vec<Lane>),
     Pausing,
+    /// Nothing left to replace, or the rollout failed (its batch rolled back,
+    /// its failure logged): it ends once `Roll::draining` is empty.
+    Ending {
+        ok: bool,
+        message: Option<String>,
+    },
 }
 
 /// One slot of a batch.
@@ -126,11 +156,13 @@ enum At {
         new: u64,
         old: Option<u64>,
     },
-    /// The old process drains (`then_spawn`: stop first, then start the new one).
-    Draining {
+    /// The old process must exit before the new one starts: workers that
+    /// can't overlap, or a slot that wasn't serving (starting, stopping).
+    Vacating {
         old: u64,
-        then_spawn: bool,
     },
+    /// The new process took over (its old one, if any, drains in the
+    /// background: `Roll::draining`).
     Done,
 }
 
@@ -140,7 +172,7 @@ impl At {
         match self {
             At::Starting { new, .. } | At::Passed { new, .. } => Some(*new),
             At::Verifying(v) => Some(v.new),
-            At::Draining { .. } | At::Done => None,
+            At::Vacating { .. } | At::Done => None,
         }
     }
 
@@ -148,7 +180,7 @@ impl At {
         match self {
             At::Starting { new, old, .. } | At::Passed { new, old } => *new == inst || *old == Some(inst),
             At::Verifying(v) => v.new == inst || v.old == Some(inst),
-            At::Draining { old, .. } => *old == inst,
+            At::Vacating { old } => *old == inst,
             At::Done => false,
         }
     }
@@ -191,6 +223,8 @@ pub(super) struct PhaseKey {
     /// Verifying: health passes, or verify_command running, or soaking;
     /// for a batch, how many of its workers got how far.
     detail: u64,
+    /// Old workers draining in the background.
+    draining: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +238,6 @@ enum Cmd {
 /// What `rollout_on_exit` does once it has let go of the batch.
 enum OnExit {
     Fail(usize, String),
-    Drained(usize),
     Spawn(usize),
 }
 
@@ -324,6 +357,8 @@ impl Supervisor {
             surge,
             batches: 0,
             prev,
+            draining: Vec::new(),
+            held: false,
             _ticker: cancel_tx,
         });
         if preflight.is_some() {
@@ -494,9 +529,14 @@ impl Supervisor {
     }
 
     /// Start the next batch: up to `surge` workers (1 for the canary), each
-    /// next to the one it replaces. Done when the queue is empty.
+    /// next to the one it replaces, once the old workers still draining
+    /// leave room for this batch's (`[reload] max_draining`). Done when the
+    /// queue is empty and every drain has ended.
     pub(super) fn advance_rollout(&mut self) {
         let overlap = self.cfg.overlap();
+        let max_draining = self.cfg.reload.max_draining;
+        let draining_now = self.draining_count();
+        let worker_mode = self.is_worker_mode();
         let mut ids = Vec::new();
         {
             let Some(roll) = &mut self.roll else { return };
@@ -521,9 +561,36 @@ impl Supervisor {
                 }
             }
             if ids.is_empty() {
-                self.finish_rollout(true, None);
+                self.conclude(true, None);
                 return;
             }
+            // Each worker of the batch drains once its replacement took over:
+            // start it only while they fit next to the drains still running
+            // (a batch larger than max_draining starts once none is left).
+            if draining_now + ids.len() > max_draining.max(ids.len()) {
+                for id in ids.into_iter().rev() {
+                    roll.queue.push_front(id);
+                }
+                if !roll.held {
+                    roll.held = true;
+                    let pids: Vec<String> = roll
+                        .draining
+                        .iter()
+                        .filter_map(|d| self.insts.get(&d.old))
+                        .map(|i| i.handle.pid.to_string())
+                        .collect();
+                    let next = roll.queue.front().copied().unwrap_or(0);
+                    info!(
+                        "waiting for old workers to finish draining before replacing the next ones",
+                        next_worker = if worker_mode { "host".to_string() } else { next.to_string() },
+                        draining = draining_now,
+                        max_draining = max_draining,
+                        pids = pids.join(","),
+                    );
+                }
+                return;
+            }
+            roll.held = false;
             // The batch exists before its first worker starts: a failure
             // while starting the others stops the ones already started.
             roll.step = Step::Batch(Vec::with_capacity(ids.len()));
@@ -549,7 +616,7 @@ impl Supervisor {
                 // then start (a gap for this worker only).
                 (Some(old), _) if !overlap => {
                     self.stop_instance(old);
-                    At::Draining { old, then_spawn: true }
+                    At::Vacating { old }
                 }
                 (Some(old), _) => match self.start_replacement(slot_id, kind) {
                     Ok(new) => At::Starting { new, old: Some(old), deadline },
@@ -561,7 +628,7 @@ impl Supervisor {
                 // Starting / stopping: let it finish exiting, then start fresh.
                 (None, Some(old)) => {
                     self.stop_instance(old);
-                    At::Draining { old, then_spawn: true }
+                    At::Vacating { old }
                 }
                 (None, None) => match self.spawn_current(slot_id) {
                     Some(new) => At::Starting { new, old: None, deadline },
@@ -679,6 +746,10 @@ impl Supervisor {
     }
 
     fn gate_tick(&mut self) {
+        // Drains end with their process's exit (`rollout_on_exit`); this
+        // catches room freed by an exit seen elsewhere, so a rollout waiting
+        // for drains can't wait past them.
+        self.after_drain();
         let now = Instant::now();
         let timeout = self.cfg.reload.timeout;
         let required = self.cfg.reload.health_passes;
@@ -868,7 +939,7 @@ impl Supervisor {
         let (kill_old, canary) = (roll.kill_old, roll.canary);
         roll.canary = false;
         let mut lanes = Vec::with_capacity(passed.len());
-        let mut finished = 0;
+        let mut drains = Vec::new();
         for (slot_id, new, old) in passed {
             let old = old.filter(|o| self.insts.contains_key(o));
             if let Some(i) = self.insts.get_mut(&new) {
@@ -888,19 +959,25 @@ impl Supervisor {
             match old {
                 Some(old) => {
                     let old_pid = self.insts.get(&old).map(|i| i.handle.pid).unwrap_or(0);
+                    // Its replacement listens and passed the gates: the old
+                    // one stops taking connections and drains in the
+                    // background while the rollout goes on.
+                    let draining = self.draining_count() + 1;
                     if canary {
                         info!(
                             "canary passed; draining the worker it replaced",
                             worker = label,
                             new_pid = new_pid,
-                            old_pid = old_pid
+                            old_pid = old_pid,
+                            draining = draining,
                         );
                     } else {
                         info!(
                             "worker replaced; draining old process",
                             worker = label,
                             new_pid = new_pid,
-                            old_pid = old_pid
+                            old_pid = old_pid,
+                            draining = draining,
                         );
                     }
                     if let Some(o) = self.insts.get_mut(&old) {
@@ -911,21 +988,75 @@ impl Supervisor {
                     } else {
                         self.stop_instance(old)
                     }
-                    lanes.push(Lane { slot: slot_id, at: At::Draining { old, then_spawn: false } });
+                    drains.push(Drain { slot: slot_id, old });
                 }
-                None => {
-                    info!("worker passed its gates", worker = label, pid = new_pid);
-                    lanes.push(Lane { slot: slot_id, at: At::Done });
-                    finished += 1;
-                }
+                None => info!("worker passed its gates", worker = label, pid = new_pid),
             }
+            lanes.push(Lane { slot: slot_id, at: At::Done });
         }
         if let Some(r) = &mut self.roll {
-            r.done += finished;
+            r.done += lanes.len();
             r.step = Step::Batch(lanes);
+            r.draining.extend(drains);
         }
         self.check_all_ready();
         self.batch_progress();
+    }
+
+    /// Old workers draining now: replaced by a rollout, their stop signal sent.
+    pub(super) fn draining_count(&self) -> usize {
+        self.insts.values().filter(|i| i.role == Role::Retiring).count()
+    }
+
+    /// Nothing left to replace (`ok`), or the rollout failed (its batch rolled
+    /// back and `message` logged): it ends now, or once the old workers it
+    /// stopped have finished draining (the CLI returns then).
+    fn conclude(&mut self, ok: bool, message: Option<String>) {
+        let Some(roll) = &mut self.roll else { return };
+        roll.draining.retain(|d| self.insts.contains_key(&d.old));
+        if roll.draining.is_empty() {
+            self.end_rollout(ok, message, !ok);
+            return;
+        }
+        let pids: Vec<String> =
+            roll.draining.iter().filter_map(|d| self.insts.get(&d.old)).map(|i| i.handle.pid.to_string()).collect();
+        let workers: Vec<usize> = roll.draining.iter().map(|d| d.slot).collect();
+        // One worker's rollout: its `draining old process` line said it all.
+        if ok && roll.total > 1 {
+            info!(
+                "every worker replaced; waiting for the old ones to finish draining",
+                workers = id_list(&workers),
+                pids = pids.join(","),
+                grace_s = self.cfg.shutdown.grace_period,
+            );
+        } else {
+            debug!(
+                "rollout ends once its old workers finish draining",
+                workers = id_list(&workers),
+                pids = pids.join(","),
+                ok = ok,
+            );
+        }
+        if let Some(r) = &mut self.roll {
+            r.held = false;
+            r.step = Step::Ending { ok, message };
+        }
+    }
+
+    /// A drain ended, or the ticker found one gone: the batch waiting for
+    /// room may start, or a rollout waiting for its last drains ends.
+    fn after_drain(&mut self) {
+        let Some(roll) = &mut self.roll else { return };
+        roll.draining.retain(|d| self.insts.contains_key(&d.old));
+        match &mut roll.step {
+            Step::Idle => self.advance_rollout(),
+            Step::Ending { ok, message } if roll.draining.is_empty() => {
+                let (ok, message) = (*ok, message.take());
+                // A failure was logged when it happened.
+                self.end_rollout(ok, message, !ok);
+            }
+            _ => {}
+        }
     }
 
     /// Every lane of the batch is done: pause (safe-reload), or the next batch.
@@ -949,6 +1080,20 @@ impl Supervisor {
     /// Called from `on_exit` for every exited instance.
     pub(super) fn rollout_on_exit(&mut self, inst: u64, reason: &str) {
         let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
+        // An old worker drained (or died, or was killed at grace_period).
+        if let Some(roll) = &mut self.roll {
+            if let Some(pos) = roll.draining.iter().position(|d| d.old == inst) {
+                roll.draining.remove(pos);
+                self.after_drain();
+                return;
+            }
+        }
+        // Between batches, any exit may have made room (a drain this rollout
+        // does not track, e.g. one it found at its start).
+        if matches!(self.roll, Some(Roll { step: Step::Idle, .. })) {
+            self.advance_rollout();
+            return;
+        }
         let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll else { return };
         let Some(lane) = lanes.iter_mut().find(|l| l.at.involves(inst)) else { return };
         let slot = lane.slot;
@@ -972,21 +1117,11 @@ impl Supervisor {
                 v.old = None;
                 return;
             }
-            At::Draining { then_spawn: true, .. } => OnExit::Spawn(slot),
-            At::Draining { then_spawn: false, .. } => OnExit::Drained(slot),
+            At::Vacating { .. } => OnExit::Spawn(slot),
             At::Done => return,
         };
         match act {
             OnExit::Fail(slot, msg) => self.fail_at(Some(slot), msg),
-            OnExit::Drained(slot) => {
-                if let Some(Roll { step: Step::Batch(lanes), done, .. }) = &mut self.roll {
-                    if let Some(l) = lanes.iter_mut().find(|l| l.slot == slot) {
-                        l.at = At::Done;
-                        *done += 1;
-                    }
-                }
-                self.batch_progress();
-            }
             OnExit::Spawn(slot) => {
                 let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline });
                 match at {
@@ -1035,9 +1170,14 @@ impl Supervisor {
     /// still exists this is a free rollback: nothing else changes. If the new
     /// process already owns its slot (the old one died, the slot was empty,
     /// or offset ports), it is stopped and the slot restarted. The config and
-    /// release pin in effect before the rollout are restored.
+    /// release pin in effect before the rollout are restored. Old workers of
+    /// earlier batches, already replaced and draining, finish their drain:
+    /// the failure is logged now, and the rollout ends once they are gone.
     fn fail_at(&mut self, at: Option<usize>, reason: String) {
         let Some(roll) = &mut self.roll else { return };
+        if matches!(roll.step, Step::Ending { .. }) {
+            return; // already over: nothing left to roll back
+        }
         // (slot, new, old) of every worker of the batch that has not taken over.
         let pending: Vec<(usize, u64, Option<u64>)> = match &roll.step {
             Step::Batch(lanes) => lanes
@@ -1045,7 +1185,7 @@ impl Supervisor {
                 .filter_map(|l| match &l.at {
                     At::Starting { new, old, .. } | At::Passed { new, old } => Some((l.slot, *new, *old)),
                     At::Verifying(v) => Some((l.slot, v.new, v.old)),
-                    At::Draining { .. } | At::Done => None,
+                    At::Vacating { .. } | At::Done => None,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -1114,7 +1254,10 @@ impl Supervisor {
                 }
             ),
         };
-        self.finish_rollout(false, Some(message));
+        // The phase it failed in, if not published yet.
+        self.publish_rollout();
+        self.log_outcome(false, &message);
+        self.conclude(false, Some(message));
 
         for (slot, o) in kept {
             if kill_old {
@@ -1131,13 +1274,39 @@ impl Supervisor {
         }
     }
 
+    /// A stop, `restart --hard` or shutdown takes over: the rollout ends now
+    /// (the old workers still draining are stopped with everything else).
     pub(super) fn abort_rollout(&mut self, reason: &str) {
-        if self.roll.is_some() {
-            self.finish_rollout(false, Some(format!("aborted: {reason}")));
+        // Every worker was replaced already, or its failure was reported:
+        // that stays the outcome.
+        if let Some(Roll { step: Step::Ending { ok, message }, .. }) = &mut self.roll {
+            let (ok, message) = (*ok, message.take());
+            self.end_rollout(ok, message, !ok);
+        } else if self.roll.is_some() {
+            self.end_rollout(false, Some(format!("aborted: {reason}")), false);
         }
     }
 
-    fn finish_rollout(&mut self, ok: bool, message: Option<String>) {
+    /// The log line of a rollout's outcome: what happened, and for a
+    /// failure what Warden did about it and what the operator does next.
+    fn log_outcome(&self, ok: bool, message: &str) {
+        if ok {
+            info!(message)
+        } else {
+            let hint = if message.starts_with("aborted:") {
+                "a stop, `restart --hard` or shutdown took over during the rollout; run it again once the workers \
+                 are back, if it is still needed"
+            } else {
+                "the reason names the gate that failed; the new workers' output is in `warden logs <app>` and the \
+                 last rollout in `warden describe <app>`. Fix the release or config, then run it again"
+            };
+            error!(message, hint = hint)
+        }
+    }
+
+    /// The rollout is over: record and announce its outcome (`logged`: its
+    /// log line was written when it failed, while drains still ran).
+    fn end_rollout(&mut self, ok: bool, message: Option<String>, logged: bool) {
         // The phase it failed in, if not published yet (it cannot be after
         // `rollout_done`). Idle: all done, or failed before a step began.
         if self.roll.as_ref().is_some_and(|r| !matches!(r.step, Step::Idle)) {
@@ -1157,19 +1326,8 @@ impl Supervisor {
             Kind::Restart => format!("restart complete in {secs:.1}s{batches}"),
             Kind::Replace | Kind::Recovery => format!("worker replaced ({}) in {secs:.1}s", roll.reason),
         });
-        if ok {
-            info!(message)
-        } else {
-            // The message says what failed and what Warden did about it;
-            // the hint, what the operator does next.
-            let hint = if message.starts_with("aborted:") {
-                "a stop, `restart --hard` or shutdown took over during the rollout; run it again once the workers \
-                 are back, if it is still needed"
-            } else {
-                "the reason names the gate that failed; the new workers' output is in `warden logs <app>` and the \
-                 last rollout in `warden describe <app>`. Fix the release or config, then run it again"
-            };
-            error!(message, hint = hint)
+        if !logged {
+            self.log_outcome(ok, &message);
         }
         if roll.kind.is_deploy() || roll.kind == Kind::Restart {
             systemd::notify(if ok {
@@ -1200,24 +1358,35 @@ impl Supervisor {
     pub(super) fn rollout_phase(&self) -> Option<PhaseKey> {
         let r = self.roll.as_ref()?;
         let (step, inst, detail) = match &r.step {
-            Step::Idle => (0, 0, 0),
+            Step::Idle => (0, 0, u64::from(r.held)),
             Step::Preflight => (1, 0, 0),
             Step::Pausing => (2, 0, 0),
             Step::Batch(lanes) => batch_key(lanes),
+            Step::Ending { ok, .. } => (8, 0, u64::from(*ok)),
         };
-        Some(PhaseKey { seq: r.seq, done: r.done, step, inst, detail })
+        Some(PhaseKey { seq: r.seq, done: r.done, step, inst, detail, draining: r.draining.len() })
     }
 
     pub(super) fn rollout_status(&self) -> Option<RolloutStatus> {
         let r = self.roll.as_ref()?;
+        let drains = self.drains_text(r);
         let phase = match &r.step {
+            Step::Idle if r.held => format!(
+                "worker {} waits for room to drain: {drains} (max_draining = {})",
+                r.queue.front().map(|s| self.label(*s)).unwrap_or_default(),
+                self.cfg.reload.max_draining
+            ),
             // Only seen at the start (the `rollout` event announcing it).
             Step::Idle if r.done == 0 => "starting".to_string(),
             Step::Idle => "next worker".to_string(),
             Step::Preflight => "running preflight".to_string(),
             Step::Pausing => format!("pausing {}s between workers", self.cfg.reload.pause),
-            Step::Batch(lanes) if lanes.len() == 1 => self.lane_phase(&lanes[0]),
-            Step::Batch(lanes) => self.batch_phase(lanes),
+            Step::Batch(lanes) => {
+                let batch = if lanes.len() == 1 { self.lane_phase(&lanes[0]) } else { self.batch_phase(lanes) };
+                if r.draining.is_empty() { batch } else { format!("{batch}; {drains}") }
+            }
+            Step::Ending { ok: true, .. } => format!("every worker replaced; {drains}"),
+            Step::Ending { ok: false, .. } => format!("failed; {drains}"),
         };
         Some(RolloutStatus {
             seq: r.seq,
@@ -1233,12 +1402,26 @@ impl Supervisor {
         self.insts.get(&inst).map(|x| x.handle.pid).unwrap_or(0)
     }
 
+    /// `2 old workers draining (pid 101, 102)`.
+    fn drains_text(&self, r: &Roll) -> String {
+        let pids: Vec<String> = r.draining.iter().map(|d| self.pid_of(d.old).to_string()).collect();
+        match pids.len() {
+            1 => format!("1 old worker draining (pid {})", pids[0]),
+            n => format!("{n} old workers draining (pid {})", pids.join(", ")),
+        }
+    }
+
     /// One worker: `worker 2: health checks 1/3`.
     fn lane_phase(&self, l: &Lane) -> String {
         let label = self.label(l.slot);
         match &l.at {
             At::Starting { new, .. } => format!("worker {label}: starting new process (pid {})", self.pid_of(*new)),
-            At::Draining { old, .. } => format!("worker {label}: draining old process (pid {})", self.pid_of(*old)),
+            At::Vacating { old } => {
+                format!(
+                    "worker {label}: draining old process (pid {}) before starting its replacement",
+                    self.pid_of(*old)
+                )
+            }
             At::Passed { .. } => format!("worker {label}: passed its gates"),
             At::Done => format!("worker {label}: done"),
             At::Verifying(v) => {
@@ -1270,17 +1453,11 @@ impl Supervisor {
             .iter()
             .filter_map(|l| if let At::Verifying(v) = &l.at { Some(v) } else { None })
             .min_by_key(|v| (v.stage(), u64::from(v.passes), std::cmp::Reverse(v.soak_until)));
-        let draining: Vec<String> = lanes
-            .iter()
-            .filter_map(|l| if let At::Draining { old, .. } = l.at { Some(self.pid_of(old).to_string()) } else { None })
-            .collect();
         let passed_note = if passed > 0 { format!(", {passed}/{n} passed") } else { String::new() };
         if starting > 0 {
             format!("{who}: starting {n} new processes ({}/{n} listening)", n - starting)
         } else if let Some(v) = slowest {
             format!("{who}: {}{passed_note}", self.verify_phase(v))
-        } else if !draining.is_empty() {
-            format!("{who}: draining {} old process(es) (pid {})", draining.len(), draining.join(", "))
         } else if passed == n {
             format!("{who}: all {n} passed their gates")
         } else {
@@ -1296,7 +1473,7 @@ fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
     let count = |f: fn(&At) -> bool| lanes.iter().filter(|l| f(&l.at)).count() as u64;
     let starting = count(|a| matches!(a, At::Starting { .. }));
     let passed = count(|a| matches!(a, At::Passed { .. }));
-    let draining = count(|a| matches!(a, At::Draining { .. }));
+    let vacating = count(|a| matches!(a, At::Vacating { .. }));
     let slowest = lanes
         .iter()
         .filter_map(|l| if let At::Verifying(v) = &l.at { Some(v) } else { None })
@@ -1304,7 +1481,7 @@ fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
     if lanes.len() == 1 {
         return match &lanes[0].at {
             At::Starting { new, .. } => (3, *new, 0),
-            At::Draining { old, .. } => (4, *old, 0),
+            At::Vacating { old } => (4, *old, 0),
             At::Verifying(v) => {
                 let detail = match v.stage() {
                     2 => u64::from(u32::MAX),
@@ -1321,8 +1498,8 @@ fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
         (3, first, starting)
     } else if let Some(v) = slowest {
         (5, first, (v.stage() << 48) | (u64::from(v.passes) << 24) | passed)
-    } else if draining > 0 {
-        (4, first, draining)
+    } else if vacating > 0 {
+        (4, first, vacating)
     } else {
         (6, first, passed)
     }
@@ -1434,5 +1611,190 @@ mod tests {
         assert!(command_exists("sh", &Default::default()));
         assert!(!command_exists("definitely-not-a-command-xyz", &Default::default()));
         assert!(command_exists("/bin/sh", &Default::default()));
+    }
+
+    use super::super::rig::{Rig, local};
+    use std::cell::{Cell, RefCell};
+
+    /// A worker that listens at once (shim protocol on fd 3) and, asked to
+    /// stop, drains for FAKE_DRAIN seconds (a WebSocket's long_lived_timeout)
+    /// before exiting 0. A worker started with FAKE_FAIL_ID = its id exits 5
+    /// before listening (a bad release reaching that worker).
+    const DRAINER: &str = r#"
+trap 'sleep "${FAKE_DRAIN:-0}"; exit 0' TERM
+if [ -n "$FAKE_FAIL_ID" ] && [ "$WARDEN_WORKER_ID" = "$FAKE_FAIL_ID" ]; then exit 5; fi
+echo '{"ev":"listening","port":1}' >&3
+sleep 60 &
+wait $!
+"#;
+
+    /// `count` workers that overlap, each draining for `drain` s when stopped.
+    async fn drainers(name: &str, count: usize, drain: &str, reload: &str) -> Rig {
+        let mut r = Rig::new(
+            name,
+            &format!("[workers]\ncount = {count}\noverlap = true\n[reload]\nhealth_passes = 0\n{reload}"),
+            DRAINER,
+        );
+        r.sup.cfg.app.env.insert("FAKE_DRAIN".into(), drain.into());
+        r.sup.start_all();
+        r.until("every worker running", |s| s.slots.values().all(|x| x.state == State::Running)).await;
+        r
+    }
+
+    fn currents(s: &Supervisor) -> Vec<u64> {
+        s.slots.values().filter_map(|x| x.current).collect()
+    }
+
+    /// Runs a rolling restart of every worker to its end; returns how long
+    /// it took and the most old workers seen draining at once.
+    async fn restart_all(r: &mut Rig) -> (Duration, usize) {
+        let before = currents(&r.sup);
+        let ids: Vec<usize> = r.sup.slots.keys().copied().collect();
+        let t0 = Instant::now();
+        r.sup.begin_rollout(Kind::Restart, ids, String::new(), false).unwrap();
+        let most = Cell::new(r.sup.draining_count());
+        r.until("the restart ends", |s| {
+            most.set(most.get().max(s.draining_count()));
+            s.roll.is_none()
+        })
+        .await;
+        let took = t0.elapsed();
+        assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true), "{:?}", r.sup.last_rollout);
+        assert_eq!(r.sup.draining_count(), 0, "the rollout ends once every old worker has exited");
+        assert!(before.iter().all(|old| !r.sup.insts.contains_key(old)), "every old worker is gone");
+        assert!(r.sup.slots.values().all(|x| x.state == State::Running && x.current.is_some()));
+        (took, most.get())
+    }
+
+    /// The next worker is replaced while the old ones drain, up to
+    /// max_draining at once: 4 workers with 2 s drains take about 2 s, not 8.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drains_overlap_up_to_max_draining() {
+        local(async {
+            let mut r = drainers("overlap", 4, "2", "").await;
+            assert_eq!(r.sup.cfg.reload.max_draining, 4, "the default");
+            let (took, most) = restart_all(&mut r).await;
+            // The 4 replacements (a shell each) start within the first drain's 2 s.
+            assert_eq!(most, 4, "every drain overlapped");
+            assert!(took < Duration::from_secs(4), "4 overlapping 2 s drains took {took:?} (one after the other: 8 s)");
+            r.shutdown().await;
+
+            let mut r = drainers("overlap2", 4, "1", "max_draining = 2\n").await;
+            let phases = RefCell::new(Vec::<String>::new());
+            let ids: Vec<usize> = r.sup.slots.keys().copied().collect();
+            r.sup.begin_rollout(Kind::Restart, ids, String::new(), false).unwrap();
+            let most = Cell::new(0);
+            r.until("the restart ends", |s| {
+                most.set(most.get().max(s.draining_count()));
+                if let Some(p) = s.rollout_status().map(|x| x.phase) {
+                    if phases.borrow().last() != Some(&p) {
+                        phases.borrow_mut().push(p);
+                    }
+                }
+                s.roll.is_none()
+            })
+            .await;
+            let phases = phases.into_inner();
+            assert_eq!(most.get(), 2, "{phases:#?}");
+            assert!(phases.iter().any(|p| p.contains("waits for room to drain") && p.contains("max_draining = 2")));
+            assert!(phases.iter().any(|p| p.contains("; 1 old worker draining (pid ")), "{phases:#?}");
+            assert!(phases.iter().any(|p| p.starts_with("every worker replaced; ")), "{phases:#?}");
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// `max_draining = 1` is the behaviour before drains overlapped: each old
+    /// worker exits before the next replacement starts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_draining_1_drains_one_at_a_time() {
+        local(async {
+            let mut r = drainers("serial", 3, "0.4", "max_draining = 1\n").await;
+            let (took, most) = restart_all(&mut r).await;
+            assert_eq!(most, 1);
+            assert!(took >= Duration::from_millis(1200), "3 drains of 0.4 s one after the other: {took:?}");
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// While old workers drain, `status` lists them (`draining`), never as
+    /// workers, and the rollout phase says so.
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_shows_the_draining_old_workers() {
+        local(async {
+            let mut r = drainers("rows", 2, "1", "").await;
+            let old: Vec<u64> = currents(&r.sup);
+            let old_pids: Vec<u32> = old.iter().map(|i| r.sup.insts[i].handle.pid).collect();
+            r.sup.begin_rollout(Kind::Restart, vec![1, 2], String::new(), false).unwrap();
+            r.until("both old workers draining", |s| s.draining_count() == 2).await;
+            let st = r.sup.status();
+            assert_eq!(st.workers.len(), 2);
+            assert!(st.workers.iter().all(|w| w.state == "RUNNING" && !old_pids.contains(&w.pid.unwrap_or(0))));
+            let rows: Vec<(usize, &str)> = st.draining.iter().map(|w| (w.id, w.state.as_str())).collect();
+            assert_eq!(rows, [(1, control::DRAINING), (2, control::DRAINING)]);
+            assert_eq!(st.draining.iter().filter_map(|w| w.pid).collect::<Vec<_>>(), old_pids);
+            let phase = st.rollout.map(|x| x.phase).unwrap_or_default();
+            assert!(phase.starts_with("every worker replaced; 2 old workers draining (pid "), "{phase}");
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            assert!(r.sup.status().draining.is_empty());
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A batch that fails while earlier old workers still drain: the batch
+    /// rolls back at once (its old worker keeps serving), the drains finish,
+    /// and only then the rollout ends, reporting what was replaced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failure_rolls_back_its_batch_and_waits_for_earlier_drains() {
+        local(async {
+            let mut r = drainers("rollback", 3, "1", "").await;
+            let old: Vec<u64> = currents(&r.sup);
+            // Every new worker 2 fails; the old one was started before.
+            r.sup.cfg.app.env.insert("FAKE_FAIL_ID".into(), "2".into());
+            r.sup.begin_rollout(Kind::Reload, vec![1, 2, 3], String::new(), false).unwrap();
+            let ending = Cell::new(false);
+            r.until("the reload ends", |s| {
+                if matches!(s.roll, Some(Roll { step: Step::Ending { ok: false, .. }, .. })) {
+                    ending.set(true);
+                    // Rolled back already: worker 2's old process serves, nothing new runs for it.
+                    assert_eq!(s.slots[&2].current, Some(old[1]));
+                    assert_eq!(s.draining_count(), 1, "worker 1's old process still drains");
+                }
+                s.roll.is_none()
+            })
+            .await;
+            assert!(ending.get(), "the failed reload waited for the drain it had started");
+            let o = r.sup.last_rollout.clone().unwrap();
+            assert!(!o.ok);
+            assert!(
+                o.message.contains("halted at worker 2") && o.message.contains("1/3 workers were replaced"),
+                "{o:?}"
+            );
+            assert_eq!(r.sup.draining_count(), 0);
+            assert!(!r.sup.insts.contains_key(&old[0]), "worker 1's old process drained and exited");
+            assert_ne!(r.sup.slots[&1].current, Some(old[0]), "worker 1 runs the new version");
+            assert_eq!((r.sup.slots[&2].current, r.sup.slots[&3].current), (Some(old[1]), Some(old[2])));
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A stop while a finished rollout waits for its last drains: the
+    /// outcome stays a success (every worker was replaced).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stop_during_the_last_drains_keeps_the_outcome() {
+        local(async {
+            let mut r = drainers("stopend", 2, "2", "").await;
+            r.sup.begin_rollout(Kind::Restart, vec![1, 2], String::new(), false).unwrap();
+            r.until("every worker replaced", |s| matches!(s.roll, Some(Roll { step: Step::Ending { .. }, .. }))).await;
+            r.sup.stopped = true;
+            r.sup.stop_all();
+            assert!(r.sup.roll.is_none());
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true), "{:?}", r.sup.last_rollout);
+            r.shutdown().await;
+        })
+        .await;
     }
 }

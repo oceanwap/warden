@@ -54,6 +54,18 @@ pub fn render_prometheus(s: &Status) -> String {
         "gauge",
         vec![(String::new(), s.workers_ready as f64)],
     );
+    gauge(
+        "warden_workers_draining",
+        "Old processes a rollout replaced that are still draining (closing connections, finishing requests).",
+        "gauge",
+        vec![(String::new(), s.draining.len() as f64)],
+    );
+    gauge(
+        "warden_workers_draining_rss_bytes",
+        "Resident memory of the old processes still draining, together.",
+        "gauge",
+        vec![(String::new(), s.draining.iter().filter_map(|w| w.rss_bytes).sum::<u64>() as f64)],
+    );
     gauge("warden_uptime_seconds", "Supervisor uptime.", "gauge", vec![(String::new(), s.uptime_secs as f64)]);
     if let Some(h) = s.healthy {
         gauge(
@@ -267,6 +279,7 @@ mod tests {
             }],
             release: None,
             standbys: vec![],
+            draining: vec![],
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));
@@ -298,5 +311,15 @@ mod tests {
         assert!(t.contains("warden_standbys_ready{app=\"api\"} 1"), "{t}");
         assert!(t.contains("warden_standbys_rss_bytes{app=\"api\"} 1500"), "{t}");
         assert!(t.contains("warden_standby_restarts_total{app=\"api\"} 3"), "{t}");
+
+        // Old processes draining after a rollout: counted, never worker series.
+        assert!(t.contains("warden_workers_draining{app=\"api\"} 0"), "always present: {t}");
+        let mut old = standby(crate::control::DRAINING, 2048);
+        old.id = 1;
+        st.draining.push(old);
+        let t = render_prometheus(&st);
+        assert!(t.contains("warden_workers_draining{app=\"api\"} 1"), "{t}");
+        assert!(t.contains("warden_workers_draining_rss_bytes{app=\"api\"} 2048"), "{t}");
+        assert_eq!(t.matches("warden_worker_up{").count(), 1, "{t}");
     }
 }
