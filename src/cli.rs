@@ -34,7 +34,9 @@ APPS (familiar from PM2):
     logs [target]    Recent lines, then follow on a terminal
                      [--lines N] [--err|--out] [--events] [--nostream] [-f]
                      --worker N: one worker; s1, s2…: one hot standby; standby: all
-                     --history: from the log files (rotated and .gz too) or journald
+                     --history: from the log files (rotated and .gz too, every
+                     worker's with per_worker_files) or journald; --lines N there
+                     is the last N of each file
                      --grep TEXT --exclude TEXT --ignore-case --since 2h --until
                      2026-09-30T12:00 --level warn --json (one object per line)
     search <text> [target]   Search all of an app's logs (= logs --history --grep)

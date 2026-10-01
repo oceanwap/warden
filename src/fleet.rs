@@ -669,7 +669,7 @@ async fn logs(
 /// `warden logs --history` / `warden search`: the app's log files (rotated
 /// and gzipped ones too, oldest first) or journald.
 async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview::Query, json: bool) -> i32 {
-    use crate::logview::{file_chain, for_each_line, journal_lines};
+    use crate::logview::{Source, file_chain, for_each_line, journal_lines};
     let multi = sels.len() > 1;
     let width = sels.iter().map(|s| s.app.name.len()).max().unwrap_or(0);
     let mut out = crate::logview::PipeOut::new();
@@ -700,90 +700,92 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
         };
         let l = &cfg.logging;
         let background = Some(log_path(&app.name)).filter(|p| p.exists());
-        // (path, raw): raw = the app's own lines (out/err files), not Warden-framed.
-        let mut sources: Vec<(PathBuf, bool)> = Vec::new();
-        match q.stream.as_deref() {
-            Some("stderr") if l.err_file.is_some() => sources.push((l.err_file.clone().unwrap_or_default(), true)),
-            Some("stdout") if l.out_file.is_some() => sources.push((l.out_file.clone().unwrap_or_default(), true)),
-            _ => {
-                if let Some(f) = l.file.clone().or(running_log).or(background) {
-                    sources.push((f, false));
-                } else {
-                    for f in [l.out_file.clone(), l.err_file.clone()].into_iter().flatten() {
-                        sources.push((f, true));
-                    }
-                }
-            }
-        }
-        let emit_prefix = |line: &str| -> String {
-            if json {
-                crate::logview::to_json(&app.name, line)
-            } else if multi {
-                format!("{:<width$} | {line}", app.name)
-            } else {
-                line.to_string()
+        let setup = crate::logview::Setup {
+            logging: l,
+            framed: l.file.clone().or(running_log).or(background),
+            journal: unit.is_some(),
+            processes: if cfg.workers.mode == config::Mode::Process { cfg.workers.count } else { 0 },
+        };
+        let sources = match crate::logview::sources(&setup, &q) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warden: {}: {e}", app.name);
+                worst = worst.max(1);
+                continue;
             }
         };
-        // Keep only the last N when asked; otherwise stream everything.
-        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        let mut push = |line: String, out: &mut crate::logview::PipeOut| -> bool {
-            match lines {
-                Some(n) => {
-                    tail.push_back(line);
-                    if tail.len() > n {
-                        tail.pop_front();
+        // Lines from several files (per-worker files, Warden's log next to
+        // them) say whose they are; one file's are printed as written.
+        let label = sources.len() > 1;
+        for src in &sources {
+            let emit = |line: &str| -> String {
+                let line = match src {
+                    Source::Raw { worker, stream, .. } if json => {
+                        return crate::logview::raw_to_json(&app.name, worker.as_deref(), stream, line);
                     }
-                    true
+                    Source::Raw { worker, stream, .. } if label => {
+                        std::borrow::Cow::Owned(crate::logview::frame_raw(worker.as_deref(), stream, line))
+                    }
+                    _ if json => return crate::logview::to_json(&app.name, line),
+                    _ => std::borrow::Cow::Borrowed(line),
+                };
+                if multi { format!("{:<width$} | {line}", app.name) } else { line.into_owned() }
+            };
+            // `--lines N`: the last N of each source (as `pm2 logs --lines`
+            // shows each file's); otherwise stream everything.
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            let mut push = |line: String, out: &mut crate::logview::PipeOut| -> bool {
+                match lines {
+                    Some(n) => {
+                        tail.push_back(line);
+                        if tail.len() > n {
+                            tail.pop_front();
+                        }
+                        true
+                    }
+                    None => out.line(&line),
                 }
-                None => out.line(&line),
-            }
-        };
-        if sources.is_empty() {
-            match &unit {
-                Some((scope, u)) => {
+            };
+            let (path, raw) = match src {
+                Source::Journal => {
+                    let Some((scope, u)) = &unit else { continue };
                     let res = journal_lines(u, *scope == Scope::User, &q, &mut |line| {
-                        if q.matches(line) { push(emit_prefix(line), &mut out) } else { true }
+                        if q.matches(line) { push(emit(line), &mut out) } else { true }
                     });
                     if let Err(e) = res {
                         eprintln!("warden: {}: {e}", app.name);
                         worst = 2;
                     }
+                    (None, false)
                 }
-                None => {
-                    eprintln!(
-                        "warden: {}: no log files to read. Set [logging] file (or out_file / err_file) to keep \
-                         history; `warden logs {}` shows the recent lines in memory",
-                        app.name, app.name
-                    );
+                Source::Framed(p) => (Some(p), false),
+                Source::Raw { path, .. } => (Some(path), true),
+            };
+            if let Some(path) = path {
+                let chain = file_chain(path);
+                if chain.is_empty() {
+                    eprintln!("warden: {}: {} does not exist yet", app.name, path.display());
                     worst = worst.max(1);
-                    continue;
                 }
-            }
-        }
-        for (path, raw) in &sources {
-            let chain = file_chain(path);
-            if chain.is_empty() {
-                eprintln!("warden: {}: {} does not exist yet", app.name, path.display());
-                worst = worst.max(1);
-            }
-            for f in chain {
-                let res = for_each_line(&f, &mut |line| {
-                    let keep = if *raw { q.matches_raw(line) } else { q.matches(line) };
-                    if keep { push(emit_prefix(line), &mut out) } else { true }
-                });
-                match res {
-                    Ok(true) => {}
-                    Ok(false) => return 0, // the reader went away (| head)
-                    Err(e) => {
-                        eprintln!("warden: {}: {e}", app.name);
-                        worst = worst.max(1);
+                for f in chain {
+                    let res = for_each_line(&f, &mut |line| {
+                        let keep = if raw { q.matches_raw(line) } else { q.matches(line) };
+                        if keep { push(emit(line), &mut out) } else { true }
+                    });
+                    match res {
+                        Ok(true) => {}
+                        Ok(false) => return 0, // the reader went away (| head)
+                        Err(e) => {
+                            eprintln!("warden: {}: {e}", app.name);
+                            worst = worst.max(1);
+                        }
                     }
                 }
             }
-        }
-        for line in tail {
-            if !out.line(&line) {
-                return 0;
+            for line in tail {
+                if !out.line(&line) {
+                    return 0;
+                }
             }
         }
     }

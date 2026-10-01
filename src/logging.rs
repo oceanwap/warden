@@ -328,7 +328,7 @@ pub fn worker_labels(base: &std::path::Path) -> Vec<String> {
 }
 
 /// Workers by number, then standbys by number, then the rest.
-fn label_order(label: &str) -> (u8, u64, String) {
+pub fn label_order(label: &str) -> (u8, u64, String) {
     if let Ok(n) = label.parse::<u64>() {
         (0, n, String::new())
     } else if let Some(n) = label.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()) {

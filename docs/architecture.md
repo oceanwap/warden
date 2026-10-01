@@ -405,6 +405,17 @@ app-level check; their rollout gates fall back to it too.
   a line a worker is in the middle of, so both kinds of file begin with a
   whole line. Files no running worker writes (a scaled-down worker's, an
   earlier run's `out-3.log`) are emptied by name; rotated ones are kept.
+- History (`warden logs --history`, `warden search`, `src/logview.rs`):
+  the CLI reads the files itself, so it works while the app is stopped.
+  `logview::sources` picks them: in capture mode `[logging] file` has
+  every line tagged with its worker and stream and answers alone
+  (`--out`/`--err` read the out/err files); in direct mode Warden's file
+  (or journald) has the events and the out/err files the output, so both
+  are read. Per-worker files are found on disk by name (`out-<label>.log`
+  for a worker number, `sN` or `host`, current or rotated), so gone
+  workers' are read too; each file comes with its rotated and gzipped
+  ones, oldest first, workers in order. Lines of several files are
+  labelled `worker=N stream:`, and `--lines N` is per file (as `pm2 logs`).
 - Live events: every worker state change, rollout phase and (on request) log
   line is pushed to `subscribe` clients as it happens, with a full status
   every interval; with no subscriber an event costs one atomic load.

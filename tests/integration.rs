@@ -3737,6 +3737,91 @@ fn flush_empties_the_log_files_in_both_modes() {
     }
 }
 
+/// `warden logs --history` with a file per worker (direct mode's, or
+/// capture mode's out/err files): every worker's files, rotated and
+/// gzipped ones too, each oldest first, workers in order; `--out`, `--err`,
+/// `--worker N`, `--grep`/`search`, `--lines` and `--json` pick from them.
+#[test]
+fn log_history_reads_every_workers_files() {
+    for mode in ["direct", "capture"] {
+        let dir = direct_dir(&format!("history-{mode}"));
+        let logs = dir.join("logs");
+        let script = "i=0; while [ $i -lt 300 ]; do i=$((i+1)); echo w$WARDEN_WORKER_ID line $i padding padding; \
+                      done; echo boom $WARDEN_WORKER_ID >&2; exec sleep 300";
+        let toml = format!(
+            "[app]\nname = \"history-{mode}\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+             [workers]\ncount = 2\nmin_uptime = 100\n\
+             [logging]\nworker_output = \"{mode}\"\nper_worker_files = true\nfile = \"{}\"\n\
+             out_file = \"{}\"\nerr_file = \"{}\"\n[logging.rotate]\nmax_size = \"4K\"\nkeep = 20\ncompress = true\n",
+            logs.join("warden.log").display(),
+            logs.join("out.log").display(),
+            logs.join("err.log").display()
+        );
+        let w = Warden::start(&format!("history-{mode}"), 0, &toml);
+        w.wait_for("2 workers", T, ready(2));
+        let has = |f: &str, text: &str| std::fs::read_to_string(logs.join(f)).is_ok_and(|t| t.contains(text));
+        eventually(&w, "every line written", || has("err-1.log", "boom 1") && has("err-2.log", "boom 2"));
+        eventually(&w, "rotated files gzipped", || {
+            logs.join("out-1.log.1.gz").exists() && !logs.join("out-1.log.1").exists()
+        });
+        let history = |args: &[&str]| -> String {
+            let mut all = vec!["logs", "--history"];
+            all.extend_from_slice(args);
+            let (code, text) = w.cli(&all);
+            assert_eq!(code, 0, "{mode}: logs --history {args:?}:\n{text}");
+            text
+        };
+        let numbers = |text: &str, prefix: &str| -> Vec<u32> {
+            text.lines().filter_map(|l| l.strip_prefix(prefix)?.split(' ').next()?.parse().ok()).collect()
+        };
+
+        // --out: both workers' files, rotated and .gz included, in order, labelled.
+        let out = history(&["--out"]);
+        for n in [1, 2] {
+            let got = numbers(&out, &format!("worker={n} stdout: w{n} line "));
+            assert_eq!(got, (1..=300).collect::<Vec<_>>(), "{mode}: worker {n}:\n{out}");
+        }
+        let first_w2 = out.lines().position(|l| l.starts_with("worker=2 ")).unwrap();
+        assert!(out.lines().skip(first_w2).all(|l| !l.starts_with("worker=1 ")), "{mode}: workers in order");
+        assert!(!out.contains("boom"), "{mode}: --out has no stderr");
+        // --out --worker 2: that file alone, as written.
+        let two = history(&["--out", "--worker", "2"]);
+        assert_eq!(numbers(&two, "w2 line "), (1..=300).collect::<Vec<_>>(), "{mode}:\n{two}");
+        assert_eq!(two.lines().count(), 300, "{mode}:\n{two}");
+        // --err: both workers' stderr.
+        let err = history(&["--err"]);
+        assert_eq!(err.lines().collect::<Vec<_>>(), vec!["worker=1 stderr: boom 1", "worker=2 stderr: boom 2"]);
+        // --lines N: the last N of each file.
+        let last = history(&["--out", "--lines", "2"]);
+        assert_eq!(numbers(&last, "worker=1 stdout: w1 line "), vec![299, 300], "{mode}:\n{last}");
+        assert_eq!(numbers(&last, "worker=2 stdout: w2 line "), vec![299, 300], "{mode}:\n{last}");
+        // search / --grep: across every file.
+        let (code, found) = w.cli(&["search", "w2 line 150 "]);
+        assert_eq!(code, 0, "{found}");
+        assert_eq!(found.lines().count(), 1, "{mode}:\n{found}");
+        assert!(found.contains("w2 line 150 padding"), "{mode}:\n{found}");
+        let json = history(&["--grep", "boom 2", "--json"]);
+        let v: Value = serde_json::from_str(json.lines().next().unwrap()).unwrap();
+        assert_eq!((v["worker"].as_str(), v["stream"].as_str()), (Some("2"), Some("stderr")), "{mode}: {json}");
+        assert_eq!(v["message"], "boom 2");
+        // --worker 1: Warden's lines about it and its output, nothing of worker 2.
+        let one = history(&["--worker", "1"]);
+        assert!(one.contains("worker ready worker=1"), "{mode}:\n{one}");
+        assert!(one.contains("w1 line 300 ") && one.contains("boom 1"), "{mode}:\n{one}");
+        assert!(!one.contains("w2 line") && !one.contains("boom 2"), "{mode}:\n{one}");
+        if mode == "direct" {
+            // Everything: Warden's events first, then each worker's files.
+            let all = history(&[]);
+            let events = all.lines().position(|l| l.contains("INFO  all workers ready")).unwrap();
+            let output = all.lines().position(|l| l.starts_with("worker=1 stdout: w1 line 1 ")).unwrap();
+            assert!(events < output, "{mode}: events first:\n{all}");
+            assert_eq!(numbers(&all, "worker=2 stdout: w2 line ").len(), 300, "{mode}");
+        }
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to
