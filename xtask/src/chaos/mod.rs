@@ -17,6 +17,7 @@
 //! host or `docker run --init` provides; the log directory's tmpfs (for the
 //! full-disk fault) disappears with the namespace.
 
+mod cgroup;
 mod faults;
 mod fleet;
 mod load;
@@ -47,7 +48,8 @@ OPTIONS:
     --seed S           RNG seed (default: from the clock; printed at start)
     --only FAULTS      Comma-separated subset of the faults below
     --bound S          Seconds every app gets to be ready again after a fault (default 60)
-    --warden PATH      Use this warden binary instead of building one (debug)
+    --release          Build and run Warden in release mode (default: debug)
+    --warden PATH      Use this warden binary instead of building one
     --no-namespace     Do not run in an own pid/mount namespace (no tmpfs: no disk-full fault)
     --keep             Keep the run directory (always kept when something failed)
     --out FILE         Where to write the JSON (default bench/results/chaos-<time>-seed<S>.json)
@@ -56,9 +58,11 @@ OPTIONS:
 FAULTS: kill-worker, kill-standby, kill-supervisor, kill-wardend, stop-worker,
 stop-supervisor, stop-wardend, reload, safe-reload, restart, restart-hard,
 scale, overlap, bad-config, release-swap, throw-thread, log-flood, disk-full,
-crash-loop
+crash-loop, oom-kill, memory-recycle
 
-NEEDS: Linux, bun, node >= 22.12. Root for the namespace and the tmpfs.
+NEEDS: Linux or macOS, bun, node >= 22.12. Linux, as root: the namespace, the
+tmpfs (disk-full) and a memory cgroup (oom-kill). npm, once, for the NestJS
+app's packages (bench/nest). What a host lacks is skipped, and the run says why.
 ";
 
 // -------------------------------------------------------------------- rng
@@ -118,6 +122,11 @@ pub struct Rec {
 
 /// Failures kept for the report; past this only the counts grow.
 const MAX_FAILURES: usize = 100_000;
+
+/// The memory cgroup of the `oom` app: its supervisor and 2 Bun workers
+/// (~150 MB with a rollout's extra worker) fit with room to spare; the
+/// oom-kill fault makes one worker grow twice past it.
+const OOM_LIMIT_MB: u64 = 400;
 
 pub struct Shared {
     t0: Instant,
@@ -200,6 +209,7 @@ struct Opts {
     seed: Option<u64>,
     only: Option<Vec<&'static str>>,
     bound: u64,
+    release: bool,
     warden: Option<PathBuf>,
     no_ns: bool,
     keep: bool,
@@ -207,8 +217,17 @@ struct Opts {
 }
 
 fn parse(args: &[String]) -> Result<Opts, String> {
-    let mut o =
-        Opts { minutes: 10.0, seed: None, only: None, bound: 60, warden: None, no_ns: false, keep: false, out: None };
+    let mut o = Opts {
+        minutes: 10.0,
+        seed: None,
+        only: None,
+        bound: 60,
+        release: false,
+        warden: None,
+        no_ns: false,
+        keep: false,
+        out: None,
+    };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = |what: &str| it.next().cloned().ok_or(format!("{a} needs {what}"));
@@ -240,6 +259,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 }
                 o.only = Some(kinds);
             }
+            "--release" => o.release = true,
             "--warden" => o.warden = Some(PathBuf::from(val("a path")?)),
             "--out" => o.out = Some(PathBuf::from(val("a path")?)),
             "--no-namespace" => o.no_ns = true,
@@ -258,31 +278,58 @@ fn have(tool: &str) -> bool {
     Command::new(tool).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
-fn build(root: &Path) -> Result<PathBuf, String> {
-    eprintln!("chaos: building Warden (debug)");
+fn build(root: &Path, release: bool) -> Result<PathBuf, String> {
+    let profile = if release { "release" } else { "debug" };
+    eprintln!("chaos: building Warden ({profile})");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    crate::run(
-        Command::new(&cargo).args(["build", "--package", "warden"]).current_dir(root),
-        "cargo build --package warden",
-    )?;
+    let mut args = vec!["build", "--package", "warden"];
+    if release {
+        args.push("--release");
+    }
+    crate::run(Command::new(&cargo).args(&args).current_dir(root), &format!("cargo {}", args.join(" ")))?;
     let target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from).unwrap_or_else(|| root.join("target"));
-    let bin = target.join("debug/warden");
+    let bin = target.join(profile).join("warden");
     if bin.is_file() { Ok(bin) } else { Err(format!("{} was not built", bin.display())) }
+}
+
+/// What the binary under test is: "release", "debug", or its path.
+fn build_label(bin: &Path) -> String {
+    let parent = bin.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
+    match parent.as_deref() {
+        Some("release") => "release".into(),
+        Some("debug") => "debug".into(),
+        _ => bin.display().to_string(),
+    }
+}
+
+/// The NestJS app's packages in `bench/nest`: there, or installed now
+/// (`npm ci`, as `cargo xtask bench` does). Err: why the app is left out.
+fn nest_ready(dir: &Path) -> Result<(), String> {
+    let core = dir.join("node_modules/@nestjs/core/package.json");
+    if core.is_file() {
+        return Ok(());
+    }
+    if !have("npm") {
+        return Err(format!("{} is missing and npm is not installed (npm ci in bench/nest)", core.display()));
+    }
+    eprintln!("chaos: installing the NestJS app's packages (npm ci in bench/nest)");
+    crate::run(Command::new("npm").args(["ci", "--no-audit", "--no-fund"]).current_dir(dir), "npm ci in bench/nest")?;
+    if core.is_file() { Ok(()) } else { Err(format!("npm ci ran, but {} is still missing", core.display())) }
 }
 
 pub fn main(args: &[String], root: &Path) -> Result<(), String> {
     let o = parse(args)?;
-    if !cfg!(target_os = "linux") {
-        return Err("the chaos soak reads /proc and needs SO_REUSEPORT balancing: run it on Linux".into());
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err("the chaos soak runs on Linux (all of it) and macOS (without the Linux-only faults)".into());
     }
     if !have("bun") || !have("node") {
         return Err("the chaos soak needs bun and node (22.12 or newer) on PATH".into());
     }
     let in_ns = std::env::var_os("WARDEN_CHAOS_NS").is_some();
-    if !in_ns && !o.no_ns && procfs::is_root() && have("unshare") && have("bash") {
+    if cfg!(target_os = "linux") && !in_ns && !o.no_ns && procfs::is_root() && have("unshare") && have("bash") {
         let bin = match &o.warden {
             Some(b) => b.clone(),
-            None => build(root)?,
+            None => build(root, o.release)?,
         };
         let exe = std::env::current_exe().map_err(|e| format!("finding the xtask binary: {e}"))?;
         // bash as the namespace's init reaps orphans; `"$@"; exit $?` keeps
@@ -301,7 +348,7 @@ pub fn main(args: &[String], root: &Path) -> Result<(), String> {
     }
     let bin = match &o.warden {
         Some(b) => b.clone(),
-        None => build(root)?,
+        None => build(root, o.release)?,
     };
     run(&o, root, &bin, in_ns)
 }
@@ -369,18 +416,62 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     let mut rng = Rng::new(seed);
     let home = std::env::temp_dir().join(format!("wc-{}-{}", std::process::id(), seed % 100_000));
     let tmpfs = prepare(root, &home, in_ns)?;
+    let mut notes = Vec::new();
     if !tmpfs {
-        println!(
-            "chaos: note: no tmpfs for the log directory (needs root and the namespace): the disk-full fault is skipped"
+        notes.push("no tmpfs for the log directory (needs Linux, root and the namespace): disk-full is skipped".into());
+    }
+    // The optional apps: each needs something the host may not have.
+    let nest_dir = root.join("bench/nest");
+    let nest = match nest_ready(&nest_dir) {
+        Ok(()) => true,
+        Err(why) => {
+            notes.push(format!("no NestJS app: {why}"));
+            false
+        }
+    };
+    let cgroup = if !cfg!(target_os = "linux") {
+        notes.push("no memory cgroup on this OS: no `oom` app, oom-kill is skipped".into());
+        None
+    } else if !procfs::is_root() {
+        notes.push("no memory cgroup without root: no `oom` app, oom-kill is skipped".into());
+        None
+    } else {
+        let name = format!("warden-chaos-{}-{}", std::process::id(), seed % 100_000);
+        match cgroup::make(&name, OOM_LIMIT_MB) {
+            Ok(cg) => {
+                println!("chaos: the `oom` app runs in {} ({} MB, no swap)", cg.dir.display(), cg.limit_mb);
+                Some(cg)
+            }
+            Err(why) => {
+                notes.push(format!("no memory cgroup could be made ({why}): no `oom` app, oom-kill is skipped"));
+                None
+            }
+        }
+    };
+    let rss = cfg!(target_os = "linux");
+    if !rss {
+        notes.push("Warden reads workers' RSS from /proc (Linux): no `memhog` app, memory-recycle is skipped".into());
+    }
+    // README, Platforms: without a parent-death signal the workers of a
+    // SIGKILLed supervisor keep running (and serving) next to the new ones.
+    let pdeathsig = cfg!(target_os = "linux");
+    if !pdeathsig {
+        notes.push(
+            "no parent-death signal on this OS (a killed supervisor's workers live on): kill-supervisor is skipped"
+                .into(),
         );
     }
-    let specs: Vec<AppSpec> = fleet::specs()?;
+    for n in &notes {
+        println!("chaos: note: {n}");
+    }
+    let specs: Vec<AppSpec> = fleet::specs(&fleet::Optional { nest, oom: cgroup.is_some(), rss })?;
     let logs = home.join("logs");
     let crash_flag = home.join("crash-flag");
     let alerts_file = home.join("alerts.jsonl");
     let mut good = BTreeMap::new();
+    let paths = fleet::Paths { home: &home, logs: &logs, crash_flag: &crash_flag, nest: &nest_dir };
     for s in &specs {
-        let text = fleet::config_text(s, &home, &logs, &crash_flag);
+        let text = fleet::config_text(s, &paths);
         write(&home.join(format!("{}.toml", s.name)), &text)?;
         good.insert(s.name.to_string(), text);
     }
@@ -399,6 +490,7 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
         env,
         crash_flag,
         good_config: good,
+        cgroup,
     });
     // wardend's alerts go to a file, one JSON object per line.
     let q = alerts_file.display().to_string().replace('\'', "");
@@ -415,7 +507,12 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     }
     println!("chaos: run directory {}", home.display());
     for s in &fleet.apps {
-        let r = fleet.cli(&["start", s.name], Duration::from_secs(90));
+        let timeout = Duration::from_secs(90);
+        let r = match (&fleet.cgroup, s.oom) {
+            // Its supervisor inherits the cgroup from the CLI that starts it.
+            (Some(cg), true) => fleet.cli_in_cgroup(cg, &["start", s.name], timeout),
+            _ => fleet.cli(&["start", s.name], timeout),
+        };
         if !r.ok() {
             return Err(format!("starting {}: {}", s.name, r.brief()));
         }
@@ -463,6 +560,9 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
         .copied()
         .filter(|k| o.only.as_ref().is_none_or(|only| only.contains(k)))
         .filter(|k| *k != "disk-full" || tmpfs)
+        .filter(|k| *k != "oom-kill" || fleet.cgroup.is_some())
+        .filter(|k| *k != "memory-recycle" || rss)
+        .filter(|k| *k != "kill-supervisor" || pdeathsig)
         .collect();
     let bound = Duration::from_secs(o.bound);
     let run_for = Duration::from_secs_f64(o.minutes * 60.0);
@@ -535,6 +635,11 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
             what: format!("still running after warden kill --yes: {}", left.join("; ")),
         });
     }
+    if let Some(cg) = &fleet.cgroup
+        && let Err(e) = cgroup::remove(cg)
+    {
+        end_problems.push(report::Violation { invariant: "cleanup", t: None, app: None, what: e });
+    }
 
     let rep = report::build(report::Inputs {
         sh: &sh,
@@ -547,6 +652,8 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
         duration_s,
         end_problems,
         alerts,
+        build: build_label(bin),
+        notes,
     });
     print!("{}", rep.text);
     let out = match &o.out {
@@ -602,14 +709,18 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     Err(format!("{} invariant violation(s); seed {seed}", rep.violations.len()))
 }
 
+/// The alerts in alerts.jsonl. Not line by line: alerts delivered at the
+/// same moment (a crash_loop and an oom of the same death) run the rule's
+/// `cat >> file; echo >> file` at once, and two objects can share a line.
+pub fn alert_values(text: &str) -> Vec<serde_json::Value> {
+    serde_json::Deserializer::from_str(text).into_iter::<serde_json::Value>().map_while(Result::ok).collect()
+}
+
 /// wardend's delivered alerts, counted by kind.
 fn read_alerts(path: &Path) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
-    for l in std::fs::read_to_string(path).unwrap_or_default().lines().filter(|l| !l.trim().is_empty()) {
-        let kind = serde_json::from_str::<serde_json::Value>(l)
-            .ok()
-            .and_then(|v| v["kind"].as_str().map(String::from))
-            .unwrap_or_else(|| "unparsed".into());
+    for v in alert_values(&std::fs::read_to_string(path).unwrap_or_default()) {
+        let kind = v["kind"].as_str().map(String::from).unwrap_or_else(|| "unparsed".into());
         *out.entry(kind).or_default() += 1;
     }
     out
@@ -622,9 +733,8 @@ fn leftovers(home: &Path, within: Duration) -> Vec<String> {
     let me = std::process::id();
     let t0 = Instant::now();
     loop {
-        let left: Vec<String> = procfs::pids()
+        let left: Vec<String> = procfs::ours(&entry, me)
             .into_iter()
-            .filter(|p| *p != me && procfs::alive(*p) && procfs::environ_has(*p, &entry))
             .map(|p| format!("pid {p}: {}", procfs::cmdline(p).join(" ")))
             .collect();
         if left.is_empty() || t0.elapsed() > within {

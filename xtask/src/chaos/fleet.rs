@@ -36,6 +36,31 @@ pub struct AppSpec {
     pub crashy: bool,
     /// Its working directory is a `current` symlink into `releases/`.
     pub releases: bool,
+    /// `[limits] max_memory` in MB (0: none): the `memory-recycle` fault.
+    pub max_memory: u64,
+    /// Its supervisor (and so its workers) runs in a memory cgroup with a
+    /// limit: the `oom-kill` fault.
+    pub oom: bool,
+    /// The NestJS app of `bench/nest` (on Bun, through the shim).
+    pub nest: bool,
+}
+
+/// A memory cgroup made for the run: the `oom` app's supervisor goes in.
+#[derive(Debug, Clone)]
+pub struct Cgroup {
+    pub dir: PathBuf,
+    /// `cgroup.procs`: a pid written here moves that process in.
+    pub procs: PathBuf,
+    pub limit_mb: u64,
+}
+
+/// Paths the configs refer to outside the run directory.
+pub struct Paths<'a> {
+    pub home: &'a Path,
+    pub logs: &'a Path,
+    pub crash_flag: &'a Path,
+    /// `bench/nest`, with its node_modules.
+    pub nest: &'a Path,
 }
 
 pub struct CliOut {
@@ -71,6 +96,8 @@ pub struct Fleet {
     pub crash_flag: PathBuf,
     /// The config text each app was started with.
     pub good_config: BTreeMap<String, String>,
+    /// The memory cgroup the `oom` app runs in, when one could be made.
+    pub cgroup: Option<Cgroup>,
 }
 
 /// Run `cmd`, killing it after `timeout`. Output is stdout + stderr.
@@ -121,6 +148,18 @@ impl Fleet {
 
     pub fn cli(&self, args: &[&str], timeout: Duration) -> CliOut {
         run_cmd(self.command(args), timeout)
+    }
+
+    /// `cli`, with the CLI process moved into `cg` first: a supervisor it
+    /// starts in the background inherits the cgroup, and so do its workers.
+    pub fn cli_in_cgroup(&self, cg: &Cgroup, args: &[&str], timeout: Duration) -> CliOut {
+        let mut c = Command::new("sh");
+        c.args(["-c", "echo $$ > \"$0\" && exec \"$@\""]).arg(&cg.procs).arg(&self.bin).args(args);
+        c.env_remove("WARDEN_CONFIG").env_remove("BUN_OPTIONS").current_dir(&self.home);
+        for (k, v) in &self.env {
+            c.env(k, v);
+        }
+        run_cmd(c, timeout)
     }
 
     pub fn spec(&self, name: &str) -> Option<&AppSpec> {
@@ -267,7 +306,8 @@ pub fn free_port() -> Result<u16, String> {
 }
 
 /// Config text for one app, as sections of `key = value` lines.
-pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) -> String {
+pub fn config_text(spec: &AppSpec, p: &Paths) -> String {
+    let (home, logs, crash_flag) = (p.home, p.logs, p.crash_flag);
     let mut s: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let q = |p: &Path| format!("{:?}", p.display().to_string());
     let apps = home.join("apps");
@@ -275,6 +315,10 @@ pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) 
     let mut workers = vec![format!("count = {}", spec.count)];
     if spec.static_site {
         s.entry("static").or_default().push(format!("root = {}", q(&home.join("site"))));
+    } else if spec.nest {
+        // On Bun: node:http needs the shim to share the port (docs/architecture.md, F9/F10).
+        app.push("args = [\"main.ts\"]".into());
+        app.push(format!("working_directory = {}", q(p.nest)));
     } else if spec.worker_mode {
         app.push(format!("entry = {}", q(&apps.join("app.ts"))));
         workers.push("mode = \"worker\"".into());
@@ -302,6 +346,9 @@ pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) 
     }
     if spec.standby > 0 {
         workers.push(format!("standby = {}", spec.standby));
+    }
+    if spec.max_memory > 0 {
+        s.entry("limits").or_default().push(format!("max_memory = {}", spec.max_memory));
     }
     s.insert("app", app);
     s.insert("workers", workers);
@@ -355,8 +402,24 @@ pub fn config_text(spec: &AppSpec, home: &Path, logs: &Path, crash_flag: &Path) 
     text
 }
 
+/// `[limits] max_memory` of the `memhog` app (MB), and how much its
+/// `memory-recycle` fault makes a worker grow: well above the limit, and
+/// well above what any other fault makes a worker hold.
+pub const MEMHOG_LIMIT_MB: u64 = 200;
+pub const MEMHOG_GROW_MB: u64 = 300;
+
+/// Which optional apps the run has (they need what the host may lack).
+pub struct Optional {
+    /// NestJS's node_modules are installed in bench/nest.
+    pub nest: bool,
+    /// A memory cgroup could be made for the `oom` app.
+    pub oom: bool,
+    /// Warden reads workers' RSS here (Linux /proc): `max_memory` works.
+    pub rss: bool,
+}
+
 /// The apps of the soak; ports are picked free.
-pub fn specs() -> Result<Vec<AppSpec>, String> {
+pub fn specs(opt: &Optional) -> Result<Vec<AppSpec>, String> {
     let base = AppSpec {
         name: "",
         port: 0,
@@ -370,6 +433,9 @@ pub fn specs() -> Result<Vec<AppSpec>, String> {
         direct: false,
         crashy: false,
         releases: false,
+        max_memory: 0,
+        oom: false,
+        nest: false,
     };
     let mut v = vec![
         // Bun, process mode, a hot standby, release pinning.
@@ -385,8 +451,20 @@ pub fn specs() -> Result<Vec<AppSpec>, String> {
         // worker_output = "direct": output spliced into files.
         AppSpec { name: "direct", chaos_app: true, direct: true, ..base.clone() },
         // Crash-looped on purpose; no client load.
-        AppSpec { name: "crashy", count: 1, chaos_app: true, crashy: true, load: None, ..base },
+        AppSpec { name: "crashy", count: 1, chaos_app: true, crashy: true, load: None, ..base.clone() },
     ];
+    if opt.rss {
+        // `[limits] max_memory`: a worker made to grow is recycled gracefully.
+        v.push(AppSpec { name: "memhog", chaos_app: true, max_memory: MEMHOG_LIMIT_MB, ..base.clone() });
+    }
+    if opt.oom {
+        // In a memory cgroup: a worker made to grow is OOM-killed by the kernel.
+        v.push(AppSpec { name: "oom", chaos_app: true, oom: true, ..base.clone() });
+    }
+    if opt.nest {
+        // NestJS (Express) on Bun: node:http through the shim, Nest's own shutdown hooks.
+        v.push(AppSpec { name: "nest", nest: true, ..base });
+    }
     for a in &mut v {
         a.port = free_port()?;
     }
@@ -399,17 +477,31 @@ mod tests {
 
     #[test]
     fn configs_have_one_table_each() {
-        let specs = specs().unwrap();
-        for s in &specs {
-            let t = config_text(s, Path::new("/h"), Path::new("/h/logs"), Path::new("/h/crash"));
+        let all = specs(&Optional { nest: true, oom: true, rss: true }).unwrap();
+        let paths = Paths {
+            home: Path::new("/h"),
+            logs: Path::new("/h/logs"),
+            crash_flag: Path::new("/h/crash"),
+            nest: Path::new("/r/bench/nest"),
+        };
+        for s in &all {
+            let t = config_text(s, &paths);
             let mut seen = std::collections::HashSet::new();
             for l in t.lines().filter(|l| l.starts_with('[')) {
                 assert!(seen.insert(l.to_string()), "{} repeats {l}:\n{t}", s.name);
             }
             assert!(t.contains("[app]") && t.contains(&format!("name = \"{}\"", s.name)), "{t}");
         }
-        let node = specs.iter().find(|s| s.name == "api-node").unwrap();
-        let t = config_text(node, Path::new("/h"), Path::new("/h/logs"), Path::new("/h/crash"));
+        let text = |name: &str| config_text(all.iter().find(|s| s.name == name).unwrap(), &paths);
+        let t = text("api-node");
         assert!(t.contains("surge = 2") && t.contains("command = \"node\""), "{t}");
+        let t = text("memhog");
+        assert!(t.contains(&format!("[limits]\nmax_memory = {MEMHOG_LIMIT_MB}\n")), "{t}");
+        let t = text("nest");
+        assert!(t.contains("args = [\"main.ts\"]") && t.contains("working_directory = \"/r/bench/nest\""), "{t}");
+        assert!(t.contains("path = \"/health\""), "gated like the other apps: {t}");
+        let names = |o: Optional| specs(&o).unwrap().iter().map(|s| s.name).collect::<Vec<_>>();
+        let none = names(Optional { nest: false, oom: false, rss: false });
+        assert!(!none.contains(&"nest") && !none.contains(&"oom") && !none.contains(&"memhog"), "{none:?}");
     }
 }

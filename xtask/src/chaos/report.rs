@@ -285,6 +285,10 @@ pub struct Inputs<'a> {
     pub duration_s: f64,
     pub end_problems: Vec<Violation>,
     pub alerts: BTreeMap<String, usize>,
+    /// The Warden binary under test: "release", "debug", or its path.
+    pub build: String,
+    /// What this host could not do, and so was left out.
+    pub notes: Vec<String>,
 }
 
 pub struct Report {
@@ -409,7 +413,15 @@ pub fn build(i: Inputs) -> Report {
             e.3.push(op);
         }
         for p in &f.problems {
-            let invariant = if p.contains("did not recover") { "recovery" } else { "fault checks" };
+            let invariant = if p.contains("did not recover") {
+                "recovery"
+            } else {
+                match f.kind {
+                    "oom-kill" => "oom",
+                    "memory-recycle" => "recycle",
+                    _ => "fault checks",
+                }
+            };
             violations.push(Violation {
                 invariant,
                 t: Some(f.end),
@@ -420,7 +432,12 @@ pub fn build(i: Inputs) -> Report {
     }
 
     // CLI latency, outside the windows when a supervisor was frozen on
-    // purpose (`list` waits up to 1 s for an app that does not answer).
+    // purpose (`list` waits up to 1 s for an app that does not answer), or
+    // its cgroup was at its memory limit (oom-kill: until the kernel kills
+    // the worker, everything in the cgroup that allocates, the supervisor
+    // too, waits in memory reclaim).
+    let mut frozen = frozen;
+    frozen.extend(i.faults.iter().filter(|f| f.kind == "oom-kill" && f.skipped.is_none()).map(|f| (f.start, f.end)));
     let in_frozen = |l: &Latency| frozen.iter().any(|(a, b)| l.t <= *b + 0.2 && l.t + l.ms / 1000.0 >= *a);
     let mut lat: BTreeMap<&'static str, (Vec<f64>, usize, usize)> = BTreeMap::new();
     for l in &mon.latency {
@@ -434,6 +451,35 @@ pub fn build(i: Inputs) -> Report {
             }
         }
     }
+    // The slowest samples of `cmd`: when, during which fault, who did not answer.
+    let slowest = |cmd: &str| -> String {
+        let mut s: Vec<&Latency> = mon.latency.iter().filter(|l| l.cmd == cmd && !in_frozen(l)).collect();
+        s.sort_by(|a, b| b.ms.total_cmp(&a.ms));
+        s.iter()
+            .take(4)
+            .map(|l| {
+                let during: Vec<String> = i
+                    .faults
+                    .iter()
+                    .filter(|f| f.skipped.is_none() && l.t >= f.start - SLACK_BEFORE && l.t <= f.end + SLACK_AFTER)
+                    .map(|f| format!("#{} {} {}", f.n, f.kind, f.app.as_deref().unwrap_or("")))
+                    .collect();
+                let who = mon
+                    .latency
+                    .iter()
+                    .filter(|x| (x.t - l.t).abs() < 1.5)
+                    .find_map(|x| x.slow.clone().filter(|s| !s.is_empty()))
+                    .unwrap_or_default();
+                format!(
+                    "{:.0} ms at {:.1}s (during {}) {who}",
+                    l.ms,
+                    l.t,
+                    if during.is_empty() { "no fault".into() } else { during.join(", ") }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     for (cmd, (v, _, failed)) in &lat {
         let v = sorted(v.clone());
         if let Some(p99) = percentile(&v, 99.0).filter(|p| *p > 100.0) {
@@ -441,7 +487,11 @@ pub fn build(i: Inputs) -> Report {
                 invariant: "cli latency",
                 t: None,
                 app: None,
-                what: format!("`warden {cmd}` p99 {p99:.0} ms > 100 ms ({} samples)", v.len()),
+                what: format!(
+                    "`warden {cmd}` p99 {p99:.0} ms > 100 ms ({} samples); slowest: {}",
+                    v.len(),
+                    slowest(cmd)
+                ),
             });
         }
         if *failed > 0 {
@@ -485,13 +535,18 @@ pub fn build(i: Inputs) -> Report {
 
     // ---------------------------------------------------------- text
     let mut text = format!(
-        "\nwarden chaos soak: seed {}, {:.1} min of faults ({:.0} s in all), tcp_migrate_req = {}, {}\n",
+        "\nwarden chaos soak: seed {}, {:.1} min of faults ({:.0} s in all), {} build, tcp_migrate_req = {}, {}\n",
         i.seed,
         i.minutes,
         i.duration_s,
+        i.build,
         i.migrate_req.as_deref().unwrap_or("unknown"),
         if i.namespace { "own pid namespace" } else { "no pid namespace" }
     );
+    text += &format!("apps: {}\n", i.fleet.apps.iter().map(|a| a.name).collect::<Vec<_>>().join(", "));
+    for n in &i.notes {
+        text += &format!("left out: {n}\n");
+    }
     text += "\nFaults (recovery: from the end of the injection to every app ready again)\n";
     let mut rows = vec![
         [
@@ -564,7 +619,7 @@ pub fn build(i: Inputs) -> Report {
     }
     text += &table(&rows);
 
-    text += "\nCLI latency (excluded: while a supervisor was frozen on purpose)\n";
+    text += "\nCLI latency (excluded: while a supervisor was frozen on purpose, or its cgroup at its memory limit)\n";
     let mut rows = vec![["command", "samples", "excluded", "p50 ms", "p99 ms", "max ms"].map(String::from).to_vec()];
     let mut lat_json = serde_json::Map::new();
     for (cmd, (v, excl, failed)) in &lat {
@@ -619,6 +674,8 @@ pub fn build(i: Inputs) -> Report {
         ("panics", "No panic lines in the logs"),
         ("hints", "Every WARN/ERROR line has a hint="),
         ("cli latency", "`warden list` and `status` answer within 100 ms (p99)"),
+        ("oom", "A kernel OOM kill is reported as one (last_exit, log line + hint, alert)"),
+        ("recycle", "Over max_memory: replaced gracefully, not a crash, said why (log, alert)"),
         ("fault checks", "Fault-specific checks (exit codes, pinning, watchdog, freezes)"),
         ("cleanup", "`warden kill --yes` leaves no process behind"),
     ];
@@ -655,6 +712,9 @@ pub fn build(i: Inputs) -> Report {
         "seed": i.seed,
         "minutes": i.minutes,
         "duration_s": i.duration_s,
+        "build": i.build,
+        "apps": i.fleet.apps.iter().map(|a| a.name).collect::<Vec<_>>(),
+        "left_out": i.notes,
         "tcp_migrate_req": i.migrate_req,
         "pid_namespace": i.namespace,
         "machine": crate::machine(),
