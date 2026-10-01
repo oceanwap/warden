@@ -31,7 +31,22 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `dependency outage suspected: holding worker replacements` | More than `health.outage_threshold` of the workers fail at once: probably a database or API is down, not the workers | Fix the dependency; Warden resumes replacements by itself. Use a `live_path` that checks the process only, and a `ready_path` for dependencies |
 | `net.ipv4.tcp_migrate_req is 0` | Connections waiting in a closing worker's accept queue get reset during restarts | `sysctl -w net.ipv4.tcp_migrate_req=1` and `contrib/99-warden.conf` (what `warden startup` installs) |
 | `worker did not exit within grace period; sending SIGKILL` | The app ignored the stop signal for `shutdown.grace_period` | Apps written for PM2 often listen for SIGINT: `shutdown.signal = "SIGINT"`. Otherwise close servers and DB pools on SIGTERM |
-| `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
+| `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count; `standby` too), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
+
+## Hot standbys (`[workers] standby`)
+
+| You see | Why | Fix |
+|---|---|---|
+| `workers.standby … is for process mode` / `needs app.port` / `needs Warden's shim` / `needs workers.port_strategy = "shared"` / `does not work with … "direct"` | Config validation: a standby defers the app's listen on its port through the shim, and joins the shared port when promoted | Do what the message says, or remove `standby` |
+| `stand-in sockets would need paths of up to N bytes` | Bun standbys serve on a Unix socket in the runtime directory until promoted; socket paths are limited to ~100 bytes | Use a shorter `[control] socket` directory |
+| `standby not initialized in time; killing` | The standby never called `Bun.serve`/`listen` on `app.port` within `workers.ready_timeout`: that call is what makes it ready (it is held back, not made) | The app's errors are in `warden logs <app> --worker standby`; raise `ready_timeout` for slow boots |
+| `standby crashed` … `standby restarting` … `standbys failed: too many standby crashes` | Standbys kept exiting before promotion (backoff like a worker, then FAILED until `failed_cooldown`) | `warden logs <app> --worker standby`; code that exits when idle, or that needs the port, fails here. `warden reset <app>` retries. Crashed workers restart the normal way meanwhile |
+| `standby keeps failing its health checks before promotion` / `standby unhealthy; replacing it` / `standby failed reload.verify_command` | A standby must pass the rollout gates on its private socket before it can be promoted, and stay healthy while idle | The health path must answer once the app is initialized, before it listens. A `verify_command` that tests `$PORT` reaches the workers, not the standby: use `$WARDEN_WORKER_SOCKET` |
+| `standbys disabled: a standby took the app's port before being promoted` | The app listens in a way the shim doesn't hold back (a raw TCP server on the port, a native HTTP server), so a standby would take traffic | Set `[workers] standby = 0`; the standbys were stopped and workers restart the normal way |
+| `promoted standby did not listen in time; killing` | A promoted standby didn't report listening within 5 s (its listen failed, or it is stuck) | The slot restarts the normal way; `warden logs <app> --worker <n>`. If it repeats, set `standby = 0` and report it |
+| A crash during `reload`/`safe-reload` restarts cold | Standbys run the previous version, so they are not promoted while a deploy runs; they are replaced when it succeeds and kept when it rolls back | Intended |
+| A cron that runs on `NODE_APP_INSTANCE == 0` stops after worker 1 crashed | The standby started with a number past the workers' (so it doesn't run the job twice) and decided at startup | After promotion `process.env.NODE_APP_INSTANCE` is the slot's; start such jobs in `process.on("warden:promote", …)` as well |
+| `warden status` shows worker `0` rows (older CLI or GUI) | Standbys are listed after the workers with id 0 | Update the client; `warden status` shows them as `standby` |
 
 ## Health
 

@@ -3535,6 +3535,13 @@ fn standby_nestjs_on_bun_and_node() {
         );
         assert!(took < Duration::from_millis(500), "{name}: {took:?}\n{}", w.log());
         assert!(get(port, "/json").is_some_and(|b| b.contains("Hello")), "{name}: the app works after promotion");
+        if command == "node" {
+            // Node runs the listen callback (which logs) at promotion: by then
+            // the standby's output carries the slot it took.
+            let line = format!("worker=1 stdout: nest bench listening on :{port} ({standby}:");
+            w.wait_log(&line, T);
+            assert!(!w.log().contains("worker=standby stdout: nest bench listening"), "{}", w.log());
+        }
     }
 }
 

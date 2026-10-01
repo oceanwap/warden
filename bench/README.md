@@ -46,6 +46,11 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `logs.ts` | Capturing worker output: steady logging (CPU, completeness) and a flood (throughput, CPU per GB) |
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
 
+Every `run.ts` app also runs `warden-standby`: Warden's processes plus one
+hot standby (`[workers] standby = 1`), so its crash recovery is a promotion
+instead of a cold start. The standby counts in the RAM rows (that is its
+cost); it answers no request until promoted.
+
 Common options: `--duration S` (seconds per load test, default 10),
 `--connections N` (64), `--workers N` (4), `--scenarios a,b` (a subset).
 `logs.ts` takes `--rate`, `--seconds` and `--mb`; `fleet.ts` takes `--apps`.

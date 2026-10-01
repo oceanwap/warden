@@ -155,11 +155,56 @@ fleet check or pauses. `warden restart N` replaces one worker through the gates.
 | | What happens | Config |
 |---|---|---|
 | Crash | Restart with exponential backoff. After too many restarts in a window, the worker is FAILED and retried after a cooldown. | `[restart]` |
+| Crash, without the startup time | A hot standby (started, app initialized, not listening) takes the dead worker's slot in a few milliseconds; a new standby starts in the background | `[workers] standby` |
 | Unhealthy worker | Replaced gracefully (new worker ready first) after `failure_threshold` failed checks | `[health] on_failure = "replace"` |
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain, SIGKILL after `grace_period` | `[shutdown]` |
+
+### Hot standbys: crash recovery in milliseconds
+
+A crashed worker normally comes back after the runtime and the app have
+started again: about 47 ms for a small Bun app, 113 ms for node:http, 800 ms
+for NestJS on Node. With standbys, that work is done before the crash:
+
+```toml
+[workers]
+count = 4
+standby = 1      # one extra worker, started but not listening
+```
+
+Warden starts the standby once the workers are ready. The shim lets the app
+initialize completely but holds back its listen on `app.port` (Bun.serve,
+node:http, Express, NestJS; servers on other ports start as usual), so the
+standby takes no traffic. When a worker dies, Warden tells the standby to
+listen: it joins the shared port in about a millisecond and becomes that
+worker (its number, `NODE_APP_INSTANCE`, its log label). A new standby then
+starts in the background. Measured from `kill -9` to the port answering
+again, with one worker: 4-15 ms (debug build, idle machine), whatever the
+app's startup time.
+
+- A promotion is the slot's restart: it is counted, backed off and ends in
+  FAILED like any restart; the standby only saves the startup.
+- A standby must pass the same health gates as a rollout's new worker before
+  it can be promoted, and while idle gets the health checks and the
+  watchdog; a failing one is replaced, never promoted. Standbys that keep
+  crashing back off, then stop until `failed_cooldown` or `warden reset`.
+- Deploys: during `reload`, `safe-reload` or `restart`, crashed workers
+  restart the normal way; when the deploy succeeds the standbys (still on the
+  previous version) are replaced, and when it rolls back they stay.
+  Recycling (memory, lifetime, health) uses a standby as the replacement.
+- Memory: a standby costs about one idle worker (RSS: 42 MB for a small Bun
+  app, 57 MB on Node, 84 MB for NestJS on Bun, ~100 MB on Node), since the
+  app is fully loaded; much of that is shared with the workers (one standby
+  next to two Bun workers: +41 MB RSS, +11 MB PSS).
+- Code that runs only on instance 0 and decides at startup (a cron) sees a
+  number past the workers' in a standby; after promotion `NODE_APP_INSTANCE`
+  is the slot's, and `process.on("warden:promote", ...)` runs late setup.
+
+`warden status` lists standbys after the workers (`standby`, `WARMING`
+then `STANDBY`). Process mode only, with `app.port`, a shared port and the
+shim (bun and node commands).
 
 ## CLI
 

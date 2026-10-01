@@ -337,7 +337,13 @@ impl Supervisor {
                         // Like workers (DS2): a shared dependency is down; don't churn.
                         debug!("standby replacement held: fleet-wide health failure", pid = pid);
                     } else {
-                        error!("standby unhealthy; replacing it", pid = pid, failures = fails, error = e);
+                        error!(
+                            "standby unhealthy; replacing it",
+                            pid = pid,
+                            failures = fails,
+                            error = e,
+                            hint = "it went bad while idle (a lost connection, a timer); its output is under `warden logs <app> --worker standby`",
+                        );
                         self.standby_failed(inst_id, format!("failed {fails} health checks: {e}"));
                     }
                 }
@@ -648,10 +654,11 @@ exec sleep 60
             let dir = std::env::temp_dir().join(format!("warden-pool-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
+            // The control socket is never bound here; a short path keeps the
+            // socket-length checks happy where temp_dir is long (macOS).
             let toml = format!(
                 "[app]\nname = \"{name}\"\nargs = [\"x.js\"]\nport = 1\n[workers]\ncount = 1\nstandby = 1\n{extra}\n\
-                 [control]\nsocket = \"{}/c.sock\"\n",
-                dir.display()
+                 [control]\nsocket = \"/tmp/wp.sock\"\n"
             );
             let mut cfg = Config::parse(&toml).unwrap();
             cfg.app.command = "sh".into();

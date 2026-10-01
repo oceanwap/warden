@@ -18,6 +18,7 @@
 //   watt            Platformatic Watt (wattpm), N worker threads (Node only)
 //   warden-process  Warden, N worker processes
 //   warden-worker   Warden, N worker threads in one Bun process
+//   warden-standby  Warden, N worker processes + 1 hot standby ([workers] standby = 1)
 //
 // Needs: Linux (/proc), bun, node >= 22.12, oha (cargo install oha),
 // target/release/warden (cargo build --release), `npm install` in bench/
@@ -85,6 +86,8 @@ const apps: Record<string, AppDef> = {
     scenarios: ["bare", "pm2", "watt", "warden-process"],
   },
 };
+// Every app also runs under Warden with a hot standby (see startWardenStandby).
+for (const a of Object.values(apps)) a.scenarios.push("warden-standby");
 const app = apps[APP];
 if (!app) throw new Error(`unknown app ${APP}; one of ${Object.keys(apps).join(", ")}`);
 const SCENARIOS = (args.scenarios ?? app.scenarios.join(",")).split(",");
@@ -289,7 +292,8 @@ async function startWatt(): Promise<Running> {
   };
 }
 
-async function startWarden(mode: "process" | "worker"): Promise<Running> {
+/** `workersExtra`: more `[workers]` keys (`standby = 1`). */
+async function startWarden(mode: "process" | "worker", workersExtra = ""): Promise<Running> {
   if (!existsSync(WARDEN)) throw new Error("build first: cargo build --release");
   const sock = join(TMP, `warden-${mode}.sock`);
   const cfg = join(TMP, `warden-${mode}.toml`);
@@ -300,7 +304,7 @@ async function startWarden(mode: "process" | "worker"): Promise<Running> {
   writeFileSync(
     cfg,
     `[app]\nname = "bench-${mode}"\n${appCfg}\nworking_directory = ${JSON.stringify(app.cwd)}\nport = ${PORT}\n` +
-      `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n` +
+      `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n${workersExtra}` +
       `[shutdown]\ngrace_period = 10\ndrain_ms = 0\n[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(sock)}\n`,
   );
   const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
@@ -337,8 +341,35 @@ function start(name: string): Promise<Running> {
       return startWarden("process");
     case "warden-worker":
       return startWarden("worker");
+    case "warden-standby":
+      return startWardenStandby();
   }
   throw new Error(`unknown scenario ${name}`);
+}
+
+// ------------------------------------------------------------------ standby
+// warden-standby: Warden processes plus one hot standby, started (app
+// initialized) but not listening; when a worker dies the standby takes its
+// slot, so "crash recovery" is a promotion instead of a cold start. It
+// counts in the RAM rows (its pid is in `warden status`), which shows what
+// it costs. It answers no request until promoted, so startup and throughput
+// see the same N workers.
+async function startWardenStandby(): Promise<Running> {
+  const run = await startWarden("process", "standby = 1\n");
+  const sock = join(TMP, "warden-process.sock");
+  const standbyReady = () => {
+    const r = spawnSync([WARDEN, "status", "--json", "--socket", sock]);
+    return r.exitCode === 0 && JSON.parse(r.stdout.toString()).workers.some((w: any) => w.id === 0 && w.state === "STANDBY");
+  };
+  return {
+    ...run,
+    // The standby starts once the workers serve (after the startup timing):
+    // memory is first sampled when it is ready too.
+    appPids: async () => {
+      await waitFor(standbyReady, 120_000);
+      return run.appPids();
+    },
+  };
 }
 
 // --------------------------------------------------------------------- measure

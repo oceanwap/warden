@@ -662,12 +662,7 @@ fn keep(batch: &mut crate::logging::OutputBatch, line: &mut Vec<u8>, rate: &mut 
     line.clear();
 }
 
-async fn pump_ipc(
-    mut rx: tokio::net::UnixStream,
-    inst: u64,
-    events: mpsc::UnboundedSender<ProcEvent>,
-    label: String,
-) {
+async fn pump_ipc(mut rx: tokio::net::UnixStream, inst: u64, events: mpsc::UnboundedSender<ProcEvent>, label: String) {
     crate::guard::fault("ipc");
     let mut chunk = [0u8; 4096];
     let mut buf: Vec<u8> = Vec::new();

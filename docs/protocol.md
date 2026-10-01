@@ -124,6 +124,19 @@ processes share a number: `pid` tells them apart. In worker mode, `worker` 0
 is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
 1..=count its Worker threads (`ready` when one listens, `crashed`, `hung`).
 
+Hot standbys (process mode, `[workers] standby`): `status.workers` lists
+them after the workers, all with `id` 0 (`control::STANDBY_ID`; workers are
+numbered from 1), `state` `WARMING` (starting, or passing its health gates)
+then `STANDBY` (can take over), or `STOPPING`; a missing one shows as
+`RESTARTING` (backoff), `FAILED` or `STOPPED`. `restarts`, `crashes` and
+`last_exit` are the pool's. Their events are `worker` 0: `starting` (detail
+`role=standby`), `ready` (`startup_ms=… role=standby`), `unhealthy`,
+`hung`, `crashed` (`… (standby)`), `restarting`, `failed`, `stopping`,
+`stopped`. A promotion is a story of the slot it fills: `crashed` (the dead
+worker), `restarting`, then `starting` and `ready` with the standby's
+`pid` and detail `promoted from standby` (`promote_ms=…` on `ready`).
+These are additions: clients that don't know them show a worker 0.
+
 `rollout` is sent when a rollout starts, before any worker is touched
 (`done` 0, `phase` `starting` or `running preflight`), and whenever its
 `phase` changes, except the soak countdown; `rollout_done` follows when it
