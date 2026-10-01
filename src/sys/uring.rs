@@ -238,13 +238,15 @@ impl Ring {
     }
 
     /// Send `buf[range]` (`more`: MSG_MORE, more data follows). Never
-    /// raises SIGPIPE. A short count is possible; send the rest again.
+    /// raises SIGPIPE. MSG_WAITALL: since 5.18 the kernel itself waits for
+    /// room and sends the rest, so the whole range takes one entry; older
+    /// kernels may still return a short count (send the rest again).
     pub fn send(&mut self, sock: Sock, buf: SendBuf, range: std::ops::Range<usize>, more: bool) -> io::Result<OpId> {
         let len = buf.bytes().len();
         if range.start > range.end || range.end > len {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "send range outside the buffer"));
         }
-        let flags = libc::MSG_NOSIGNAL | if more { libc::MSG_MORE } else { 0 };
+        let flags = libc::MSG_NOSIGNAL | libc::MSG_WAITALL | if more { libc::MSG_MORE } else { 0 };
         let fd = types::Fd(sock.raw());
         self.start(Held::Send { _sock: sock, buf, start: range.start, end: range.end }, |h| match h {
             Held::Send { buf, start, end, .. } => {
@@ -449,10 +451,11 @@ mod tests {
     }
 
     #[test]
-    fn sends_deliver_exact_bytes_across_short_writes() {
+    fn sends_deliver_exact_bytes_to_a_slow_reader() {
         let Some(mut r) = ring() else { return };
         let (s, mut c) = pair();
-        // Small buffers, so a big send comes back short and is resubmitted.
+        // Small buffers: the kernel has to wait for the reader many times
+        // within one send (older kernels return short counts instead).
         let small: libc::c_int = 16 * 1024;
         for (fd, opt) in [(s.as_raw_fd(), libc::SO_SNDBUF), (c.as_raw_fd(), libc::SO_RCVBUF)] {
             // SAFETY (test): setsockopt with a live c_int and its size.
@@ -468,7 +471,6 @@ mod tests {
         let head = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
         let mut want = head.clone();
         want.extend_from_slice(&data[7..]);
-        let mut short = 0;
         let mut queue = vec![
             (SendBuf::Vec(head.clone()), 0..head.len(), true),
             (SendBuf::Shared(data.clone()), 7..data.len(), false),
@@ -480,13 +482,11 @@ mod tests {
             let Done::Send(Ok(n), buf) = got.remove(0).1 else { panic!("send failed") };
             assert!(n > 0 && n <= range.len());
             if n < range.len() {
-                short += 1;
                 queue.push((buf, range.start + n..range.end, more));
             }
         }
         drop(s);
         assert!(reader.join().unwrap() == want, "every byte, in order");
-        assert!(short > 0, "the slow reader should have caused short sends");
         // A range outside the buffer is refused before anything is queued.
         let (s, _c) = pair();
         assert!(r.send(Sock::Stream(s), SendBuf::Vec(vec![1, 2]), 1..3, false).is_err());

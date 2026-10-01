@@ -113,6 +113,15 @@ Notes for that run:
 - Under strace the io_uring path did 29.5k req/s against epoll's 12.9k, but
   strace inflates every syscall, so that ratio says nothing about the real
   one.
+- Worker CPU per request (`/proc/<pid>/schedstat`, 40k keep-alive
+  requests, 1 worker, release build, CPUs shared with other jobs, so only
+  indicative): the 1.5 KB page cost about the same with both paths (epoll
+  4.4–4.7 µs, io_uring 4.3 µs). The 48 KB file first cost more with
+  io_uring (8.6–11 µs vs 7.0–7.4 µs): its sends came back short and went
+  round the driver again. With `MSG_WAITALL` the kernel finishes the
+  send itself, and the two paths measured the same (9.3–10.5 µs vs
+  9.4–12.7 µs, on a busier machine). Most of that time is the kernel's
+  loopback TCP work, which neither path changes.
 - A browser (`Accept-Encoding: gzip, br`) and curl (none) get separate
   cache entries for the same file (the variant can differ); both are
   counted against `cache_size`.
