@@ -144,18 +144,29 @@ pub fn file_chain(path: &Path) -> Vec<PathBuf> {
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .filter(|n| n.starts_with(&prefix) && !n.ends_with(".tmp"))
                 .collect();
-            let mut rotated: Vec<(SystemTime, PathBuf)> = names
+            // (modified, rotation number if numbered, path)
+            let mut rotated: Vec<(SystemTime, Option<u64>, PathBuf)> = names
                 .iter()
                 // Being compressed right now: `x` and the finished `x.gz`
                 // both exist for a moment. Read the plain one, once.
                 .filter(|n| !n.strip_suffix(".gz").is_some_and(|plain| names.iter().any(|m| m == plain)))
                 .filter_map(|n| {
                     let p = dir.join(n);
-                    Some((std::fs::metadata(&p).ok()?.modified().ok()?, p))
+                    let rest = &n[prefix.len()..];
+                    let number = rest.strip_suffix(".gz").unwrap_or(rest).parse::<u64>().ok();
+                    Some((std::fs::metadata(&p).ok()?.modified().ok()?, number, p))
                 })
                 .collect();
-            rotated.sort();
-            chain.extend(rotated.into_iter().map(|(_, p)| p));
+            // Numbered files (`app.log.3` is older than `app.log.1`) are
+            // ordered by their number: rotations in one burst can share a
+            // modification time (coarse timestamps on many kernels). Dated
+            // ones by time, ties by number, then name.
+            if rotated.iter().all(|r| r.1.is_some()) {
+                rotated.sort_by_key(|r| std::cmp::Reverse(r.1));
+            } else {
+                rotated.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+            }
+            chain.extend(rotated.into_iter().map(|(_, _, p)| p));
         }
     }
     if path.exists() {
@@ -503,6 +514,31 @@ mod tests {
             .unwrap();
         }
         assert_eq!(seen, vec!["one", "two", "three", "four"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn numbered_files_are_ordered_by_number_even_with_equal_times() {
+        let dir = std::env::temp_dir().join(format!("warden-logview-num-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("app.log");
+        let same = std::time::SystemTime::now() - Duration::from_secs(60);
+        for (i, text) in [(12, "a\n"), (2, "c\n"), (11, "b\n")] {
+            let f = dir.join(format!("app.log.{i}"));
+            std::fs::write(&f, text).unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(same).unwrap();
+        }
+        std::fs::write(&p, "d\n").unwrap();
+        let mut seen = Vec::new();
+        for f in file_chain(&p) {
+            for_each_line(&f, &mut |l| {
+                seen.push(l.to_string());
+                true
+            })
+            .unwrap();
+        }
+        assert_eq!(seen, vec!["a", "b", "c", "d"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
