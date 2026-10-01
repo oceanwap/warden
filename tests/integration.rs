@@ -331,6 +331,7 @@ fn crash_loop_ends_in_failed() {
     assert_eq!(s["workers"][0]["crashes"], 4);
     assert_eq!(s["workers"][0]["last_exit"], "exit code 1");
     assert!(w.log().contains("too many restarts"));
+    every_warning_has_a_hint(&w.log());
     // The supervisor stays up; a manual restart is attempted, waited for, and
     // reported as failed (exit 1) because the app still crashes.
     let (code, out) = w.cli(&["restart", "1"]);
@@ -478,6 +479,19 @@ fn worker_mode_threads_and_recovery() {
     for _ in 0..60 {
         assert!(get(port, "/whoami").is_some());
     }
+    every_warning_has_a_hint(&w.log());
+}
+
+/// Every WARN and ERROR line Warden wrote says what to do about it (a
+/// `hint=`), as docs/review-process.md (C4) asks. Found missing on several
+/// lines by `cargo xtask chaos`. Worker output is the app's, not Warden's.
+fn every_warning_has_a_hint(log: &str) {
+    let bad: Vec<&str> = log
+        .lines()
+        .filter(|l| !l.contains(" OUT ") && (l.contains(" WARN ") || l.contains(" ERROR ")))
+        .filter(|l| !l.contains(" hint=") && !l.contains("panicked at"))
+        .collect();
+    assert!(bad.is_empty(), "WARN/ERROR lines without hint=:\n{}", bad.join("\n"));
 }
 
 #[test]
@@ -594,6 +608,28 @@ fn safe_reload_rolls_back_a_bad_canary() {
     let (code, out) = w.cli(&["safe-reload"]);
     assert_eq!(code, 0, "{out}");
     assert!(pid_set(&w.status().unwrap()).is_disjoint(&before));
+    every_warning_has_a_hint(&w.log());
+}
+
+/// Found by `cargo xtask chaos` (overlap): a rollout cut short by
+/// `restart --hard` logged `ERROR aborted: …` with no hint, like every
+/// failed rollout's line.
+#[test]
+fn an_aborted_rollout_says_what_to_do() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("abort", port, &gated("abort", port, 2, "").replace("canary_soak = 1", "canary_soak = 5"));
+    w.wait_for("ready", T, ready(2));
+    let (code, out) = w.cli(&["safe-reload", "--no-wait"]);
+    assert_eq!(code, 0, "{out}");
+    w.wait_for("the canary soaking", T, |s| !s["rollout"].is_null());
+    let (code, out) = w.cli(&["restart", "--hard"]);
+    assert_eq!(code, 0, "{out}");
+    let log = w.wait_log("aborted: workers are being stopped", T);
+    w.wait_for("ready again", T, |s| s["workers_ready"] == 2 && s["rollout"].is_null());
+    every_warning_has_a_hint(&log);
 }
 
 #[test]
@@ -632,6 +668,40 @@ fn watchdog_kills_a_hung_worker() {
     });
     assert!(s["workers"][0]["last_exit"].as_str().unwrap().contains("hung"), "{s:#?}");
     assert!(!alive(before));
+    every_warning_has_a_hint(&w.log());
+}
+
+/// Found by `cargo xtask chaos` (stop-supervisor): Warden frozen (SIGSTOP)
+/// for longer than watchdog.timeout killed every healthy worker as hung when
+/// it resumed, because their heartbeats were still waiting unread. The
+/// workers served all along; they must be left alone.
+#[test]
+fn a_frozen_supervisor_does_not_kill_its_workers_as_hung() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("frozen", port, 2, "").replace("[restart]", "[watchdog]\ntimeout = 2\n[restart]");
+    let w = Warden::start("frozen", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    std::thread::sleep(Duration::from_millis(1500)); // let heartbeats arm the watchdog
+    w.signal(libc::SIGSTOP);
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(get(port, "/whoami").is_some(), "the workers serve while Warden is frozen");
+    w.signal(libc::SIGCONT);
+    std::thread::sleep(Duration::from_secs(3)); // ticks that would have judged them
+    let s = w.wait_for("ready", T, ready(2));
+    assert_eq!(pid_set(&s), before, "no worker was replaced:\n{}", w.log());
+    let log = w.log();
+    assert!(!log.contains("worker hung"), "{log}");
+    assert!(log.lines().any(|l| l.contains("event loop was blocked") && l.contains(" hint=")), "{log}");
+    // The watchdog still works after the stall.
+    let victim = *before.iter().next().unwrap();
+    let _ = std::process::Command::new("kill").args(["-STOP", &victim.to_string()]).status();
+    let s = w.wait_for("the stopped worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    assert!(
+        s["workers"].as_array().unwrap().iter().any(|w| w["last_exit"].as_str().is_some_and(|e| e.contains("hung")))
+    );
 }
 
 #[test]
@@ -4243,6 +4313,140 @@ fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
     stop.store(true, Ordering::Relaxed);
     client.join().unwrap();
     (r, ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed))
+}
+
+/// A keep-alive client (a request every 10 ms on one connection, a new one
+/// after `Connection: close`) while `f` runs: (what `f` returned, requests
+/// answered, requests cut on a connection that had served earlier ones,
+/// requests failed on a new connection).
+fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let client = {
+        let (stop, counts) = (stop.clone(), counts.clone());
+        std::thread::spawn(move || {
+            // One response off `s`: Some(the server asked to close).
+            let exchange = |s: &mut TcpStream, buf: &mut Vec<u8>| -> Option<bool> {
+                write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
+                let mut tmp = [0u8; 8192];
+                let end = loop {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    let n = s.read(&mut tmp).ok().filter(|n| *n > 0)?;
+                    buf.extend_from_slice(&tmp[..n]);
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                if !head.starts_with("http/1.1 200") {
+                    return None;
+                }
+                let len: usize =
+                    head.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok())?;
+                while buf.len() < end + len {
+                    let n = s.read(&mut tmp).ok().filter(|n| *n > 0)?;
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                buf.drain(..end + len);
+                Some(head.contains("connection: close"))
+            };
+            let mut conn: Option<(TcpStream, Vec<u8>)> = None;
+            while !stop.load(Ordering::Relaxed) {
+                let fresh = conn.is_none();
+                if fresh {
+                    match TcpStream::connect(("127.0.0.1", port)) {
+                        Ok(s) => {
+                            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                            conn = Some((s, Vec::new()));
+                        }
+                        Err(_) => {
+                            counts[2].fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    }
+                }
+                let Some((s, buf)) = conn.as_mut() else { continue };
+                match exchange(s, buf) {
+                    Some(close) => {
+                        counts[0].fetch_add(1, Ordering::Relaxed);
+                        if close {
+                            conn = None;
+                        }
+                    }
+                    None => {
+                        counts[if fresh { 2 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+                        conn = None;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let r = f();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    let n = |i: usize| counts[i].load(Ordering::Relaxed);
+    (r, n(0), n(1), n(2))
+}
+
+/// Found by `cargo xtask chaos`: a draining static worker closed its idle
+/// keep-alive connections at once, so a client sending its next request at
+/// that moment lost it. Now requests during the drain get `Connection: close`.
+#[test]
+fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
+    for io in ["epoll", "uring"] {
+        let dir = std::env::temp_dir().join(format!("warden-it-static-drain-{io}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"sdrain-{io}\"\nport = {port}\n[workers]\ncount = 2\n[static]\nroot = \"{}\"\n",
+            dir.display()
+        );
+        let w = Warden::start_env(&format!("sdrain-{io}"), port, &cfg, &[("WARDEN_STATIC_IO", io)]);
+        w.wait_for("ready", T, ready(2));
+        let ((), ok, cut, fresh) = keep_alive_through(port, "/index.html", || {
+            for _ in 0..3 {
+                let (code, out) = w.cli(&["reload"]);
+                assert_eq!(code, 0, "{out}");
+            }
+        });
+        eprintln!("{io}: {ok} answered, {cut} cut, {fresh} failed on a new connection");
+        assert!(ok > 50, "{io}: {ok} answered");
+        assert_eq!(cut, 0, "{io}: keep-alive requests cut by a draining worker\n{}", w.log());
+        assert!(fresh <= 2 * allowed_resets(), "{io}: {fresh} failed on a new connection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Found by `cargo xtask chaos`: on Node, the shim's drain closed idle
+/// keep-alive connections at once (http.Server#close() does it on Node 19+,
+/// and so did its own sweep), so a request being sent on one was lost.
+#[test]
+fn node_drain_answers_keep_alive_requests_instead_of_cutting_them() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"ndrain\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("ndrain", port, &cfg);
+    w.wait_for("ready", T, ready(2));
+    let ((), ok, cut, fresh) = keep_alive_through(port, "/whoami", || {
+        for _ in 0..3 {
+            let (code, out) = w.cli(&["reload"]);
+            assert_eq!(code, 0, "{out}");
+        }
+    });
+    eprintln!("node: {ok} answered, {cut} cut, {fresh} failed on a new connection");
+    assert!(ok > 50, "{ok} answered");
+    assert_eq!(cut, 0, "keep-alive requests cut by a draining worker\n{}", w.log());
+    assert!(fresh <= 2 * allowed_resets(), "{fresh} failed on a new connection");
 }
 
 /// None of the requests sent during a rolling replacement failed. Without

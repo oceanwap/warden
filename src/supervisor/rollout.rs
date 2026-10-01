@@ -1160,7 +1160,16 @@ impl Supervisor {
         if ok {
             info!(message)
         } else {
-            error!(message)
+            // The message says what failed and what Warden did about it;
+            // the hint, what the operator does next.
+            let hint = if message.starts_with("aborted:") {
+                "a stop, `restart --hard` or shutdown took over during the rollout; run it again once the workers \
+                 are back, if it is still needed"
+            } else {
+                "the reason names the gate that failed; the new workers' output is in `warden logs <app>` and the \
+                 last rollout in `warden describe <app>`. Fix the release or config, then run it again"
+            };
+            error!(message, hint = hint)
         }
         if roll.kind.is_deploy() || roll.kind == Kind::Restart {
             systemd::notify(if ok {

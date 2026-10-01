@@ -277,7 +277,6 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
     let stop_sig = crate::signals::parse(&stop_name).unwrap_or(libc::SIGTERM);
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(stop_sig))
         .map_err(|e| format!("installing the {stop_name} handler: {e}"))?;
-    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
 
     let unix_listener = unix.as_ref().map(|(l, _)| l);
@@ -287,14 +286,14 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
             acc = listener.accept() => {
                 let Ok(accepted) = acc else { continue };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
-                let (site, drain) = (site.clone(), drain_rx.clone());
+                let site = site.clone();
                 match accepted {
                     Accepted::Tokio(stream) => {
                         let _ = stream.set_nodelay(true);
                         tokio::spawn(async move {
                             let _permit = permit;
                             let (r, w) = stream.into_split();
-                            connection(BufReader::new(r), Conn::Tcp(w), site, drain).await;
+                            connection(BufReader::new(r), Conn::Tcp(w), site).await;
                         });
                     }
                     #[cfg(target_os = "linux")]
@@ -302,27 +301,27 @@ async fn serve(site: Arc<Site>, port: u16, io: StaticIo) -> Result<(), String> {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let (r, w) = stream.split();
-                            connection(r, Conn::Uring(w), site, drain).await;
+                            connection(r, Conn::Uring(w), site).await;
                         });
                     }
                 }
             }
             acc = async { match unix_listener { Some(l) => l.accept().await.map(|(s, _)| s), None => std::future::pending().await } } => {
                 let Ok(stream) = acc else { continue };
-                let (site, drain) = (site.clone(), drain_rx.clone());
+                let site = site.clone();
                 tokio::spawn(async move {
                     let (r, w) = stream.into_split();
-                    connection(BufReader::new(r), Conn::Unix(w), site, drain).await;
+                    connection(BufReader::new(r), Conn::Unix(w), site).await;
                 });
             }
         }
     }
 
-    // Drain: stop accepting, tell idle keep-alive connections to close, let
-    // requests in flight finish (at least WARDEN_DRAIN_MS, at most ~grace).
+    // Drain: stop accepting; answer whatever arrives on open connections
+    // with `Connection: close` (see `connection`), and let requests in flight
+    // finish (at least WARDEN_DRAIN_MS, at most ~grace).
     drop(listener);
     site.draining.store(true, Ordering::SeqCst);
-    let _ = drain_tx.send(true);
     report(serde_json::json!({"ev": "draining", "worker": worker}));
     let drain_ms: u64 = std::env::var("WARDEN_DRAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
     let t0 = Instant::now();
@@ -550,25 +549,22 @@ async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> Result<Opti
 
 /// One client connection: requests in a loop while keep-alive holds. `r`
 /// is buffered (tokio's BufReader, or the io_uring reader's own buffer).
-async fn connection<R>(mut r: R, mut w: Conn, site: Arc<Site>, mut drain: tokio::sync::watch::Receiver<bool>)
+///
+/// A drain does not close idle keep-alive connections: a client may be
+/// sending its next request at that very moment, and would see it fail
+/// (found by `cargo xtask chaos`). A request that arrives while the worker
+/// drains is answered with `Connection: close`, like the shim does for
+/// Bun and Node apps; a connection still idle when the drain ends closes
+/// as the worker exits.
+async fn connection<R>(mut r: R, mut w: Conn, site: Arc<Site>)
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut first = true;
     loop {
-        // A new connection always gets its first request served (a client
-        // that connected just before the drain began must not see an empty
-        // reply); only idle keep-alive connections are closed by the drain.
-        let head = if first {
-            first = false;
-            tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut r)).await
-        } else {
-            tokio::select! {
-                biased;
-                h = tokio::time::timeout(IDLE_TIMEOUT, read_head(&mut r)) => h,
-                _ = drain.wait_for(|d| *d) => return,
-            }
-        };
+        let timeout = if first { HEAD_TIMEOUT } else { IDLE_TIMEOUT };
+        first = false;
+        let head = tokio::time::timeout(timeout, read_head(&mut r)).await;
         let req = match head {
             Ok(Ok(Some(req))) => req,
             Ok(Ok(None)) | Err(_) => return,

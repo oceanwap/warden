@@ -22,6 +22,8 @@ the system recovers on its own, or tells them exactly what to do."**
 5. **Try to break it**: interleave events (crash during a reload, stop during a
    restart, scale during a drain), inject faults (`WARDEN_FAULT=<point>:<n>`,
    debug builds only), kill and freeze Warden (`SIGKILL`, `SIGSTOP`).
+   `cargo xtask chaos` ([`chaos.md`](chaos.md)) does this to a whole fleet
+   under load for minutes, from a seed, and checks the invariants.
 6. **Report** in the format of §5. Mark each finding **CONFIRMED** (reproduced
    or traced unambiguously) or **SUSPECTED**. Do not modify the repository.
 

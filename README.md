@@ -696,6 +696,7 @@ cargo test --workspace --bins --tests          # also protocol/ and gui/ (the GU
 cargo clippy --workspace --all-targets
 cargo run -p warden-gui     # the GUI
 cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
+cargo xtask chaos           # chaos soak: a fleet under load, random faults, invariants checked (docs/chaos.md)
 cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
 ```
 

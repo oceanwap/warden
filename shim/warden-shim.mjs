@@ -1041,15 +1041,26 @@ async function markNodeResponsesClose() {
 function stopAccepting(s) {
   try {
     if (isBun) s.stop(false); // stop accepting; keep serving open connections
+    // Node >= 19: http.Server#close() also closes idle keep-alive
+    // connections at once, cutting a request a client is sending on one
+    // right then. net.Server#close() only stops accepting.
+    else if (isHttpServer(s)) netServerClose(s);
     else s.close();
   } catch {}
 }
 
+function netServerClose(s) {
+  const net = require("node:net");
+  net.Server.prototype.close.call(s);
+}
+
 // Node: close keep-alive connections that already served a request and sit
-// idle. Not Node's closeIdleConnections(): it also closes connections just
-// accepted whose first request hasn't been parsed yet, and those clients
-// would see an empty reply. New connections get their request answered
-// (with Connection: close) and close after it.
+// idle, once the drain window is over (until then a client's next request
+// is answered with Connection: close; closing them earlier races with a
+// request being sent, which then fails). Not Node's closeIdleConnections():
+// it also closes connections just accepted whose first request hasn't been
+// parsed yet, and those clients would see an empty reply. New connections
+// get their request answered (with Connection: close) and close after it.
 function closeServedIdle() {
   for (const sock of nodeConns) {
     const st = sock.__warden;
@@ -1082,7 +1093,10 @@ async function drain() {
     // deadline this closes WebSockets and ends SSE responses.
     const longLivedBusy = longLived && longLivedStep(elapsed);
     if (elapsed >= drainMs && pending() === 0 && !longLivedBusy) break;
-    if (!isBun) closeServedIdle();
+    // After the window: idle keep-alive connections (ended SSE responses'
+    // included, so EventSource reconnects to a new worker) go; requests in
+    // flight and long-lived ones may still hold the drain.
+    if (!isBun && elapsed >= drainMs) closeServedIdle();
     await sleep(20);
   }
   if (longLived) reportLongLived();
