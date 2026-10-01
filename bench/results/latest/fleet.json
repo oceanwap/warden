@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-01T07:07:57.359Z",
+    "date": "2026-10-01T08:01:26.323Z",
     "kernel": "6.18.44-fc-v50 x86_64",
     "cpus": 2,
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -17,15 +17,15 @@
     {
       "name": "warden",
       "apps": 10,
-      "manager_processes": 10,
-      "start_all_ms": 578,
-      "manager_rss_mb": 64.8,
-      "manager_pss_mb": 10,
-      "manager_idle_cpu_pct": 0,
+      "manager_processes": 11,
+      "start_all_ms": 571,
+      "manager_rss_mb": 70.7,
+      "manager_pss_mb": 11.6,
+      "manager_idle_cpu_pct": 0.1,
       "cmd_ms": {
-        "list": 2.2,
-        "list --json": 2,
-        "describe app3": 1.7,
+        "list": 2.3,
+        "list --json": 2.2,
+        "describe app3": 1.8,
         "logs app3 --nostream": 1.5
       }
     },
@@ -33,15 +33,15 @@
       "name": "pm2",
       "apps": 10,
       "manager_processes": 1,
-      "start_all_ms": 1887,
-      "manager_rss_mb": 78.9,
-      "manager_pss_mb": 38.8,
+      "start_all_ms": 2000,
+      "manager_rss_mb": 73.9,
+      "manager_pss_mb": 34.3,
       "manager_idle_cpu_pct": 0.7,
       "cmd_ms": {
-        "list": 163.2,
-        "list --json": 140.5,
-        "describe app3": 137.6,
-        "logs app3 --nostream": 140.1
+        "list": 150,
+        "list --json": 149.3,
+        "describe app3": 142.3,
+        "logs app3 --nostream": 145.5
       }
     }
   ]

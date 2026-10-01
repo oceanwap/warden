@@ -72,9 +72,24 @@ async function startWarden(): Promise<Fleet> {
           return false;
         }
       });
+  // wardend, which `warden start` starts too (like PM2's daemon): counted
+  // with the managers. Found by its WARDEN_HOME, as its command line has none.
+  const wardend = () =>
+    readdirSync("/proc")
+      .filter((d) => /^\d+$/.test(d))
+      .map(Number)
+      .filter((p) => {
+        try {
+          const cmd = readFileSync(`/proc/${p}/cmdline`, "utf8").split("\0");
+          const environ = readFileSync(`/proc/${p}/environ`, "utf8").split("\0");
+          return cmd[0] === WARDEN && cmd[1] === "daemon" && environ.includes(`WARDEN_HOME=${join(DIR, "warden")}`);
+        } catch {
+          return false;
+        }
+      });
   return {
     env,
-    managers: supervisors,
+    managers: () => [...supervisors(), ...wardend()],
     apps: () => supervisors().flatMap(childrenOf),
     commands: {
       "list": [WARDEN, "list"],
@@ -84,6 +99,8 @@ async function startWarden(): Promise<Fleet> {
     },
     stop: () => {
       spawnSync([WARDEN, "delete", "all"], { env, stdout: "ignore", stderr: "ignore" });
+      // Everything else, wardend included (`delete` leaves it running).
+      spawnSync([WARDEN, "kill", "--yes"], { env, stdout: "ignore", stderr: "ignore" });
     },
   };
 }

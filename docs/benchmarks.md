@@ -31,15 +31,15 @@ Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
   3.9 ms). PM2's cluster mode passes every connection through its daemon:
   61.1k req/s, p99 8.0 ms. Watt: 66.7k, p99 3.1 ms.
 - **Manager cost.** Warden's supervisor: ~8 MB RSS, about 1 MB PSS per app
-  (10 apps: 10 MB PSS in all), 0–0.2 % idle CPU. PM2's daemon: ~65 MB RSS
-  (39 MB PSS for 10 apps), 0.2–0.7 % idle CPU. Watt runs the app inside its
+  (10 apps: 11.6 MB PSS in all, wardend included), 0–0.2 % idle CPU. PM2's
+  daemon: ~65 MB RSS (34 MB PSS for 10 apps), 0.2–0.7 % idle CPU. Watt runs the app inside its
   own runtime: about 4× the memory of 4 processes for the Node app (PSS 477
   vs 109 MB) and 2–3 % idle CPU.
 - **Startup and CLI.** Warden starts 4 workers about as fast as starting them
   bare (node:http 215 vs 171 ms); PM2 needs 0.4–0.6 s more, Watt 3–4 s.
   `warden status` answers in ~2 ms, `pm2 jlist` in ~130 ms, `wattpm ps` in
-  ~370 ms. With 10 apps: `warden list` 2.2 ms, `pm2 list` 163 ms; starting
-  10 apps 0.58 s vs 1.9 s.
+  ~370 ms. With 10 apps: `warden list` 2.3 ms, `pm2 list` 150 ms; starting
+  10 apps 0.57 s vs 2.0 s.
 - **Recovery.** A crashed worker answers again 1.3–3× sooner under Warden
   than under PM2: node:http 129 vs 289 ms, NestJS on Node 687 vs 1,182 ms,
   Bun 54 vs 166 ms, NestJS on Bun 406 vs 529 ms; Watt 1.2–1.6 s. **With a

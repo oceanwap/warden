@@ -73,7 +73,7 @@ const SUITES: &[Suite] = &[
     Suite {
         name: "fleet",
         title: "Many apps on one host",
-        about: "10 apps (one idle Node process each): the manager's memory and CPU, and how fast everyday commands answer.",
+        about: "10 apps (one idle Node process each): the manager's memory and CPU, and how fast everyday commands answer. Warden's managers are one supervisor per app plus wardend.",
         script: "bench/fleet.ts",
         args: &[],
     },
