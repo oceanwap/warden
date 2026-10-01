@@ -1157,6 +1157,14 @@ impl App {
     }
 }
 
+/// What an env file accepts as a variable name: letters, digits and `_`, not
+/// starting with a digit (the portable shell rule).
+pub fn valid_env_name(k: &str) -> bool {
+    !k.is_empty()
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !k.starts_with(|c: char| c.is_ascii_digit())
+}
+
 /// `KEY=VALUE` lines as in systemd's EnvironmentFile and dotenv: blank lines
 /// and `#` comments skipped, an optional `export `, values optionally in
 /// double quotes (with \n, \t, \", \\ escapes) or single quotes (literal).
@@ -1172,11 +1180,12 @@ pub fn parse_env_file(text: &str) -> Result<BTreeMap<String, String>, String> {
             return Err(format!("line {}: expected KEY=VALUE", i + 1));
         };
         let k = k.trim();
-        if k.is_empty()
-            || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || k.starts_with(|c: char| c.is_ascii_digit())
-        {
-            return Err(format!("line {}: {k:?} is not a valid variable name", i + 1));
+        if !valid_env_name(k) {
+            return Err(format!(
+                "line {}: {k:?} is not a valid variable name (letters, digits and _, not starting with a digit); \
+                 rename or remove that line",
+                i + 1
+            ));
         }
         let v = v.trim();
         let value = if let Some(inner) = v.strip_prefix('"') {
@@ -1463,6 +1472,10 @@ mod tests {
         assert_eq!(e["EMPTY"], "");
         assert!(parse_env_file("NOEQUALS\n").unwrap_err().contains("line 1"));
         assert!(parse_env_file("1BAD=x\n").unwrap_err().contains("not a valid variable name"));
+        // The error says what is wrong and what to do (a hyphen is the usual culprit).
+        let e = parse_env_file("A=1\nmy-app=x\n").unwrap_err();
+        assert!(e.contains("line 2") && e.contains("\"my-app\"") && e.contains("rename or remove"), "{e}");
+        assert!(valid_env_name("_x1") && !valid_env_name("") && !valid_env_name("a-b") && !valid_env_name("1a"));
         assert!(parse_env_file("A=\"open\n").unwrap_err().contains("unterminated"));
         // Loaded relative to the config file; `env` wins over the file.
         let dir = std::env::temp_dir().join(format!("warden-envfile-{}", std::process::id()));

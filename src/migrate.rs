@@ -93,6 +93,9 @@ pub struct Pm2App {
     pub notes: Vec<(String, String)>,
     /// Env names left out as inherited from the shell that ran `pm2 start`.
     pub dropped_env: Vec<String>,
+    /// Env names an env file cannot hold (PM2 itself records one named after
+    /// the app, `my-app`): left out, and listed in the report.
+    pub bad_env: Vec<String>,
 }
 
 // ------------------------------------------------------------------ sources
@@ -365,6 +368,8 @@ pub fn from_pm2_env(e: &Value, base_env: Option<&BTreeMap<String, String>>) -> P
             let inherited = base_env.is_some_and(|b| b.get(k) == Some(&v));
             if inherited || NOT_APP_ENV.contains(&k.as_str()) || k.starts_with("PM2_") || k.starts_with("LC_") {
                 a.dropped_env.push(k.clone());
+            } else if !crate::config::valid_env_name(k) {
+                a.bad_env.push(k.clone());
             } else {
                 a.env.insert(k.clone(), v);
             }
@@ -401,6 +406,12 @@ pub fn from_ecosystem(e: &Value, dir: &Path, env_name: Option<&str>) -> Result<P
     let mut add_env = |block: Option<&Value>| {
         if let Some(Value::Object(m)) = block {
             for (k, v) in m {
+                if !crate::config::valid_env_name(k) {
+                    if !a.bad_env.contains(k) {
+                        a.bad_env.push(k.clone());
+                    }
+                    continue;
+                }
                 let v = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
                 a.env.insert(k.clone(), v);
             }
@@ -647,7 +658,9 @@ pub fn generate(a: &Pm2App, worker_mode: bool, env_file: &str) -> Result<(String
     }
     Config::parse(&out).map_err(|e| format!("app {:?}: the generated config is invalid: {e}\n{out}", a.name))?;
     let mut env = String::from("# Environment for this app (secrets live here, not in the config). Mode 0600.\n");
-    for (k, v) in &a.env {
+    // The sources keep invalid names out (`bad_env`); an env file that Warden
+    // itself refuses to read would stop the app from starting.
+    for (k, v) in a.env.iter().filter(|(k, _)| crate::config::valid_env_name(k)) {
         env += &format!("{k}={}\n", env_quote(v));
     }
     Ok((out, env))
@@ -728,6 +741,15 @@ fn report(apps: &[(Pm2App, bool)], source: &str) -> String {
                 a.dropped_env.len(),
                 a.name,
                 a.dropped_env.join(", ")
+            );
+        }
+        if !a.bad_env.is_empty() {
+            r += &format!(
+                "- Environment not carried over ({}): {} are not valid variable names (letters, digits and _, not \
+                 starting with a digit), so an env file cannot hold them. PM2 itself records one named after the \
+                 app; if your app really reads one of these, set it where it is started instead\n",
+                a.bad_env.len(),
+                a.bad_env.join(", ")
             );
         }
         for (field, how) in &a.notes {
@@ -995,6 +1017,51 @@ async fn finalize(args: &Args, o: &MigrateOpts) -> Result<i32, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// PM2 records an env entry named after the app (`my-app`): not a valid
+    /// variable name, so the env file it would land in could not be read back
+    /// and the app would never start.
+    #[test]
+    fn env_names_a_file_cannot_hold_are_left_out_and_reported() {
+        let dir = std::env::temp_dir().join(format!("warden-migrate-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let script = dir.join("a.js");
+        std::fs::write(&script, "").unwrap();
+        let sp = script.to_string_lossy().to_string();
+        let dp = dir.to_string_lossy().to_string();
+
+        let pm2 = from_pm2_env(
+            &json!({"name":"my-app","pm_exec_path":sp,"pm_cwd":dp,
+                    "env":{"NODE_ENV":"production","my-app":"{\"x\":1}","9LIVES":"1","A B":"2","OK_1":"3"}}),
+            None,
+        );
+        assert_eq!(pm2.env.keys().collect::<Vec<_>>(), vec!["NODE_ENV", "OK_1"]);
+        assert_eq!(pm2.bad_env, vec!["9LIVES", "A B", "my-app"]);
+        let (_, env) = generate(&pm2, false, "my-app.env").unwrap();
+        let parsed = crate::config::parse_env_file(&env).expect("the generated env file must parse");
+        assert_eq!(parsed.keys().collect::<Vec<_>>(), vec!["NODE_ENV", "OK_1"]);
+        let rep = report(&[(pm2.clone(), false)], "test");
+        assert!(rep.contains("not carried over (3)") && rep.contains("9LIVES, A B, my-app"), "{rep}");
+
+        // An ecosystem file: the same rule, and a name listed once.
+        let eco = from_ecosystem(
+            &json!({"name":"x","script":"a.js","env":{"a-b":"1","C":"2"},"env_production":{"a-b":"3"}}),
+            &dir,
+            Some("production"),
+        )
+        .unwrap();
+        assert_eq!(eco.env.keys().collect::<Vec<_>>(), vec!["C"]);
+        assert_eq!(eco.bad_env, vec!["a-b"]);
+
+        // Even a hand-built app can't produce a file Warden refuses.
+        let mut manual = pm2;
+        manual.env.insert("bad-name".into(), "1".into());
+        let (_, env) = generate(&manual, false, "m.env").unwrap();
+        assert!(!env.contains("bad-name"), "{env}");
+        assert!(crate::config::parse_env_file(&env).is_ok(), "{env}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn jlist_entries_group_by_name_and_drop_the_shell() {
