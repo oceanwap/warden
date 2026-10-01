@@ -330,15 +330,24 @@ Durations: `500ms`, `30s`, `5m`, `1h30m`, `1d`, or a number of seconds.
 | `recovered` | after any of the above but `rollout_failed` and `recycled`: every worker ready (and no rollout) for 1 minute |
 
 **The OOM marker.** A worker the kernel's OOM killer killed (it died of
-SIGKILL and its cgroup's `oom_kill` count rose) has the exit reason
+SIGKILL and its cgroup's `oom_kill` count rose, by a kill no other dying
+process could own) has the exit reason
 `killed by the kernel OOM killer (out of memory)`: the `crashed` event's
 `detail` and `WorkerStatus.last_exit` start with it, maybe followed by more
 (`… (standby)`, `… (replacement, before taking over)`). `wardend` matches
 exactly that text, anywhere in the detail; it is
 `warden_protocol::events::OOM_KILLED`, shared by the supervisor and
-`wardend`. A SIGKILL from anything else is `killed by another process
-(SIGKILL)`; where Warden can't read the cgroup's OOM counter, an OOM kill
-looks like that too, and no `oom` alert is sent (the log line says so).
+`wardend`. When the attribution is uncertain (other processes of Warden's
+in the same cgroup died of SIGKILL at the same moment, more than the kills
+counted) the reason is `probably killed by the kernel OOM killer (out of
+memory)` (`events::OOM_PROBABLY`), which contains the marker: it raises the
+`oom` alert too, worded `… was probably killed for lack of memory`; check
+for `OOM_PROBABLY` first to tell the two apart. A death that found no kill
+left next to such a one is `killed by another process or the kernel OOM
+killer (SIGKILL)`, with no `oom` alert. A SIGKILL from anything else is
+`killed by another process (SIGKILL)`; where Warden can't read the cgroup's
+OOM counter, an OOM kill looks like that too, and no `oom` alert is sent
+(the log line says so).
 
 ### What a rule gets
 

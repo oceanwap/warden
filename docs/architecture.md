@@ -164,17 +164,47 @@ log line, with a `hint=`), not just the wait status. The task that owns each
 worker records the signals it delivered, so a SIGKILL is either *Warden's*
 (grace period over, hung, not ready in time) or *another process's*; an exit
 after Warden's stop signal is a normal stop. A SIGKILL Warden did not send
-is the kernel's *OOM killer* when the `oom_kill` counter of Warden's cgroup
-(cgroup v2 `memory.events`, or v1 `memory.oom_control`, found through
-`/proc/self/cgroup` and `/proc/self/mountinfo`) rose in the 2 s before the
-death: Warden reads it every second (the tick) and at each death, stamping
-each rise with when it was seen. Everything in the cgroup shares the
-counter, so each SIGKILL death takes at most one recent rise; an older one
-was something else's (a helper process, a `verify_command`) and is
-forgotten. A SIGKILL Warden sent stays Warden's even if the counter moved
-meanwhile. SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
-Without a readable counter (macOS, no memory controller) an OOM kill reads as
-another process's SIGKILL, and the hint says it may be either.
+is the kernel's *OOM killer* when the `oom_kill` counter of the worker's
+cgroup rose in the 2 s before the death (`src/process/exit.rs`):
+
+- **Which counter.** The kernel counts OOM kills per cgroup, not per
+  process: cgroup v2 `memory.events.local` (kills of processes in that
+  cgroup only; `memory.events` before Linux 5.2), or v1
+  `memory.oom_control` (local too), found through `/proc/<pid>/cgroup` and
+  `/proc/self/mountinfo`. Warden creates no cgroups: under systemd or in a
+  container every worker shares Warden's. Once a worker is ready Warden
+  reads its `/proc/<pid>/cgroup`; a worker found in a cgroup of its own (a
+  `command` wrapping the app in `systemd-run --scope`, a runtime that moved
+  it) is counted there, where its kills are its own (v1 and v2's local
+  counts don't add a child's kills to Warden's).
+- **When.** Warden reads each counter every second (the tick) and at each
+  death, stamping each rise with when it was seen. The kernel counts a kill
+  once the victim's SIGKILL is sent, before it can exit, so a worker's own
+  kill is seen by its death; a rise older than 2 s was something else's (a
+  helper process, a `verify_command`) and is forgotten.
+- **Whose.** Each rise is charged to at most one SIGKILL death, and never
+  to Warden's own SIGKILL (that death stays `killed by Warden`, even if the
+  counter moved meanwhile). When the death comes, Warden counts the other
+  processes of its own in the same cgroup dying of SIGKILL at that moment:
+  reaped with their death not handled yet (the waiter records each exit on
+  the `Handle` before its event), or not reaped (their pid still theirs) and
+  a zombie of it, exiting from it (`/proc/<pid>/stat` flags and
+  `exit_code`) or with it pending (`/proc/<pid>/status`), plus Warden's own
+  SIGKILLs there while a kill was waiting. With as many kills as such
+  deaths the attribution is certain: `killed by the kernel OOM killer`
+  (`warden_protocol::events::OOM_KILLED`). With fewer it is not, and the
+  reason says so: `probably killed by the kernel OOM killer` for the death
+  that takes the kill, `killed by another process or the kernel OOM killer`
+  for one that finds none left within those 2 s. One kill and two SIGKILL
+  deaths used to read as "OOM" for whichever was handled first and
+  "probably not the OOM killer" for the other, whatever the truth.
+- **Limits.** A process the app spawned (not Warden's) OOM-killed at the
+  very moment someone kill -9s a worker still reads as that worker's OOM
+  kill. Without a readable counter (macOS, no memory controller, a worker's
+  own cgroup Warden can't read) an OOM kill reads as another process's
+  SIGKILL, and the hint says it may be either.
+
+SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT… are *crashes*, named.
 
 ### 4.5 Restart protection
 

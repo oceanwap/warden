@@ -542,7 +542,11 @@ impl Alerts {
         match event {
             WorkerEvent::Crashed => {
                 if is_oom(detail) {
-                    self.raise(app, AlertKind::Oom, format!("{who} was killed for lack of memory: {detail}"), now);
+                    // Uncertain (the cgroup's kill count is shared): it says so.
+                    let probably =
+                        if detail.contains(warden_protocol::events::OOM_PROBABLY) { "probably " } else { "" };
+                    let msg = format!("{who} was {probably}killed for lack of memory: {detail}");
+                    self.raise(app, AlertKind::Oom, msg, now);
                 }
                 let (n, window) = (self.config.crash_loop_crashes, self.config.crash_loop_window);
                 let st = self.apps.entry(app.clone()).or_default();
@@ -1061,14 +1065,26 @@ on = ["all"]
         let reason = crate::process::exit::Reason::Oom.short();
         assert!(reason.starts_with(warden_protocol::events::OOM_KILLED), "{reason:?}");
         assert!(is_oom(&reason));
+        // Uncertain: still an `oom` alert, which says so.
+        let probable = crate::process::exit::Reason::OomProbable.short();
+        assert!(probable.starts_with(warden_protocol::events::OOM_PROBABLY) && is_oom(&probable));
         for other in [
             crate::process::exit::Reason::Killed(libc::SIGKILL),
+            crate::process::exit::Reason::KilledOrOom,
             crate::process::exit::Reason::KilledByWarden,
             crate::process::exit::Reason::Crashed(libc::SIGSEGV),
             crate::process::exit::Reason::Code(137),
         ] {
             assert!(!is_oom(&other.short()), "{other:?}");
         }
+        let mut a = Alerts::new(config("[[alert]]\non = [\"oom\"]\ncommand = [\"/bin/sh\"]\nmin_interval = \"0\"\n"));
+        let api: Arc<str> = "api".into();
+        let t = Instant::now();
+        a.worker(&api, 2, WorkerEvent::Crashed, Some(&reason), t);
+        a.worker(&api, 3, WorkerEvent::Crashed, Some(&probable), t);
+        let got: Vec<&str> = a.outbox.iter().map(|d| d.payload.detail.as_str()).collect();
+        assert!(got[0].starts_with("worker 2 was killed for lack of memory: killed by"), "{got:?}");
+        assert!(got[1].starts_with("worker 3 was probably killed for lack of memory: probably"), "{got:?}");
     }
 
     #[test]

@@ -130,8 +130,9 @@ pub struct Supervisor {
     pool: standby::Pool,
     /// `[app] pin_release`: the release workers start in.
     release: Option<release::Pin>,
-    /// The cgroup's OOM kill counter, to tell OOM kills from other SIGKILLs.
-    oom: process::exit::OomCounter,
+    /// The OOM kill counters of the cgroups workers run in, to tell OOM
+    /// kills from other SIGKILLs.
+    oom: process::exit::OomTracker,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -243,7 +244,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
-    match sup.oom.path() {
+    match sup.oom.own() {
         Some(p) => debug!("OOM kills are told apart through the cgroup's counter", file = p.display()),
         None => debug!("no cgroup OOM kill counter found: a SIGKILL's sender can't be told apart from an OOM kill"),
     }
@@ -383,7 +384,7 @@ impl Supervisor {
             rollout_published: None,
             pool: standby::Pool::default(),
             release: None,
-            oom: process::exit::OomCounter::new(),
+            oom: process::exit::OomTracker::new(),
             cfg,
             cfg_path,
         }
@@ -541,6 +542,8 @@ impl Supervisor {
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
         let mut inst = Instance::new(slot_id, handle, role);
+        // It starts in Warden's cgroup; `attach_oom` looks again once it is ready.
+        inst.oom_counter = self.oom.own();
         let number = standby.map(|(n, _)| n);
         inst.standby_number = number;
         if let (Some(st), Some((_, instance))) = (inst.standby.as_mut(), standby) {
@@ -967,10 +970,39 @@ impl Supervisor {
             }
             Role::Retiring | Role::Standby => {}
         }
+        self.attach_oom(inst_id);
         self.rollout_on_ready(inst_id);
         self.check_all_ready();
         // A worker listens: start the standbys that waited for it.
         self.fill_pool();
+    }
+
+    /// Where this process's OOM kills are counted: in Warden's cgroup, or a
+    /// cgroup of its own it runs in once ready (a `command` that wraps the
+    /// app in `systemd-run --scope`, a runtime that moves it). Warden makes
+    /// no cgroups; this finds the one it is in.
+    fn attach_oom(&mut self, inst_id: u64) {
+        let Some(i) = self.insts.get(&inst_id) else { return };
+        let (pid, label) = (i.handle.pid, self.inst_label(i));
+        let counter = self.oom.attach(pid);
+        if counter != self.oom.own() {
+            match &counter {
+                Some(file) => debug!(
+                    "this process runs in a cgroup of its own: its OOM kills are counted there",
+                    worker = label,
+                    pid = pid,
+                    file = file.display(),
+                ),
+                None => debug!(
+                    "this process runs in a cgroup whose OOM kill count can't be read: its OOM kills read as SIGKILLs",
+                    worker = label,
+                    pid = pid,
+                ),
+            }
+        }
+        if let Some(i) = self.insts.get_mut(&inst_id) {
+            i.oom_counter = counter;
+        }
     }
 
     fn check_all_ready(&mut self) {
@@ -994,11 +1026,17 @@ impl Supervisor {
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
-        // Who ended it: Warden, the OOM killer (just before), someone else, a crash.
-        let oom = self.oom.oom_killed(signal, sent, Instant::now());
-        let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), oom);
+        // Who ended it: Warden, the OOM killer (just before), someone else, a
+        // crash. Its cgroup's OOM kill is its own only if no other process of
+        // Warden's there is dying of SIGKILL at this moment to share it.
+        let counter = inst.oom_counter.clone();
+        let (oom, insts) = (&mut self.oom, &self.insts);
+        let verdict = oom.verdict(counter.as_deref(), signal, sent, Instant::now(), || {
+            insts.values().filter(|o| o.oom_counter == counter && o.handle.dying_of_sigkill()).count()
+        });
+        let cause = process::exit::classify(code, signal, sent, self.cfg.stop_signal(), verdict);
         // A `note` (Warden lost track of it) is the whole story.
-        let hint = if note.is_some() { None } else { cause.hint(self.oom.available()) };
+        let hint = if note.is_some() { None } else { cause.hint(counter.is_some()) };
         // The WARN/ERROR line of a crash always says what to do, even when
         // the cause alone has nothing to add (an exit code, Warden's kill).
         let crash_hint = hint.unwrap_or(if inst.hung {

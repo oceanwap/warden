@@ -131,12 +131,20 @@ pub fn worker_name(worker: usize, standby: Option<usize>) -> String {
 }
 
 /// The exit reason of a worker the kernel's OOM killer killed (it died of
-/// SIGKILL and the cgroup's `oom_kill` count rose): the supervisor writes it
-/// at the start of the `crashed` event's `detail` and of
-/// `WorkerStatus.last_exit`, maybe followed by more (` (standby)`), and
-/// wardend's `oom` alert matches it anywhere in the detail
-/// (docs/protocol.md, "The OOM marker").
+/// SIGKILL and its cgroup's `oom_kill` count rose, by a kill no other death
+/// there could own): the supervisor writes it at the start of the `crashed`
+/// event's `detail` and of `WorkerStatus.last_exit`, maybe followed by more
+/// (` (standby)`), and wardend's `oom` alert matches it anywhere in the
+/// detail (docs/protocol.md, "The OOM marker").
 pub const OOM_KILLED: &str = "killed by the kernel OOM killer (out of memory)";
+
+/// The exit reason when the attribution is uncertain: the worker died of
+/// SIGKILL right after its cgroup counted an OOM kill, but other processes
+/// there died of SIGKILL at the same moment, more than the kills counted,
+/// so the kill may have been theirs. It contains [`OOM_KILLED`]: a client
+/// matching that anywhere (wardend's `oom` alert, older versions) sees
+/// both; check for this one first to tell them apart.
+pub const OOM_PROBABLY: &str = "probably killed by the kernel OOM killer (out of memory)";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

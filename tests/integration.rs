@@ -5041,11 +5041,54 @@ fn oom_kill_is_told_apart_from_a_kill_9() {
     let _ = std::fs::remove_file(&events);
 }
 
+/// One OOM kill counted while two workers of the same cgroup die of SIGKILL
+/// at the same moment (the OOM killer took one, someone's kill -9 the
+/// other): the shared count can't say which, so neither is called an OOM
+/// kill for sure, nor "probably not the OOM killer"; both reasons say so.
+#[test]
+fn one_oom_kill_for_two_sigkill_deaths_is_reported_as_uncertain() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let events = std::env::temp_dir().join(format!("warden-it-memory.events-two-{}", std::process::id()));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    let ev = events.display().to_string();
+    let w = Warden::start_env("oomtwo", port, &simple("oomtwo", port, 2, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
+    let s = w.wait_for("ready", T, ready(2));
+    let pids: Vec<u64> = (0..2).map(|i| s["workers"][i]["pid"].as_u64().unwrap()).collect();
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    for p in &pids {
+        unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+    }
+    let s = w.wait_for("both restarted", T, |s| {
+        (0..2).all(|i| {
+            s["workers"][i]["state"] == "RUNNING" && !pids.contains(&s["workers"][i]["pid"].as_u64().unwrap_or(0))
+        })
+    });
+    let mut reasons: Vec<String> =
+        (0..2).map(|i| s["workers"][i]["last_exit"].as_str().unwrap_or_default().to_string()).collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        [
+            "killed by another process or the kernel OOM killer (SIGKILL)".to_string(),
+            "probably killed by the kernel OOM killer (out of memory)".to_string()
+        ],
+        "{}",
+        w.log()
+    );
+    let log = w.wait_log("names the pid the kernel killed", T);
+    assert!(log.contains("the kernel may have killed one of them instead"), "{log}");
+    assert!(!log.contains("Probably not the kernel's OOM killer"), "{log}");
+    let _ = std::fs::remove_file(&events);
+}
+
 /// A child of our own memory cgroup with `limit` bytes (cgroup v1 or v2), if
 /// this machine lets us make one: (its directory, its cgroup.procs).
-fn memory_cgroup(limit: u64) -> Option<(PathBuf, PathBuf)> {
+fn memory_cgroup(test: &str, limit: u64) -> Option<(PathBuf, PathBuf)> {
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let name = format!("warden-it-{}", std::process::id());
+    let name = format!("warden-it-{test}-{}", std::process::id());
     for line in cgroup.lines() {
         let mut f = line.splitn(3, ':');
         let (Some(_), Some(ctl), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
@@ -5104,7 +5147,7 @@ fn a_real_oom_kill_is_reported_with_its_fix() {
     if !have_bun() {
         return;
     }
-    let Some((cg, procs)) = memory_cgroup(192 << 20) else {
+    let Some((cg, procs)) = memory_cgroup("oomreal", 192 << 20) else {
         eprintln!("skipping: can't create a memory cgroup with a limit here");
         return;
     };
@@ -5117,6 +5160,45 @@ fn a_real_oom_kill_is_reported_with_its_fix() {
     });
     assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
     w.wait_log("raise memory.max / MemoryMax=", T);
+    drop(w);
+    for _ in 0..50 {
+        if std::fs::remove_dir(&cg).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A worker in a memory cgroup of its own, below Warden's (its command
+/// moves it there, as `systemd-run --scope` would): its OOM kill is counted
+/// in that cgroup, not in Warden's, and still told apart. It used to read
+/// as `killed by another process (SIGKILL)`, "probably not the OOM killer".
+#[test]
+fn a_real_oom_kill_in_a_cgroup_of_its_own_is_told_apart() {
+    if !have_bun() {
+        return;
+    }
+    let Some((cg, procs)) = memory_cgroup("oomown", 192 << 20) else {
+        eprintln!("skipping: can't create a memory cgroup with a limit here");
+        return;
+    };
+    let port = free_port();
+    // Without Warden's shim (the command is sh): one worker, ready once it listens.
+    let toml = format!(
+        "[app]\nname = \"oomown\"\ncommand = \"sh\"\nargs = [\"-c\", \"echo $$ > {} && exec bun {}\"]\nport = {port}\n\
+         [restart]\nbackoff_initial = 50\n[shutdown]\ngrace_period = 5\n",
+        procs.display(),
+        fixture("app.ts")
+    );
+    let w = Warden::start("oomown", port, &toml);
+    let pid = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    assert_ne!(own, std::fs::read_to_string("/proc/self/cgroup").unwrap(), "the worker runs in a cgroup of its own");
+    let _ = get(port, "/leak"); // ~200 MB more than the worker had
+    let s = w.wait_for("OOM-killed and restarted", T, |s| {
+        s["workers"][0]["state"] == "RUNNING" && s["workers"][0]["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
     drop(w);
     for _ in 0..50 {
         if std::fs::remove_dir(&cg).is_ok() {

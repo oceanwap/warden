@@ -225,6 +225,7 @@ impl Supervisor {
             }
         }
         debug!("standby initialized", worker = label, pid = pid, startup_ms = ms);
+        self.attach_oom(inst_id);
         self.standby_gates(inst_id);
     }
 

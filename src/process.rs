@@ -128,9 +128,24 @@ pub struct Handle {
     /// only in a standby).
     ipc: Option<std::os::unix::net::UnixStream>,
     label: Label,
+    /// Set by the waiter once it reaped the process (the signal that ended
+    /// it, if any), before its `Exited` event is sent.
+    reaped: Rc<std::cell::Cell<Option<Option<i32>>>>,
 }
 
 impl Handle {
+    /// Is this process dying of SIGKILL, from anyone: reaped by its waiter
+    /// with that death not handled yet, or (not reaped, so its pid is still
+    /// its own) a zombie of it, exiting from it, or with it pending. What a
+    /// SIGKILL death next to it asks before charging it its cgroup's OOM
+    /// kill (`exit::OomCounter::verdict`).
+    pub fn dying_of_sigkill(&self) -> bool {
+        match self.reaped.get() {
+            Some(signal) => signal == Some(libc::SIGKILL),
+            None => exit::dying_of_sigkill(self.pid),
+        }
+    }
+
     /// Send one line to the worker on fd 3 without waiting: the message is
     /// tiny and the socket buffer empty, so anything short of a whole write
     /// (the worker stopped reading, the channel is gone) is an error.
@@ -307,6 +322,8 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     // Signals delivered, shared with the waiter's caller (it may panic).
     let sent = std::rc::Rc::new(std::cell::Cell::new(exit::Sent::default()));
     let sent_by_waiter = sent.clone();
+    let reaped = Rc::new(std::cell::Cell::new(None));
+    let reaped_by_waiter = reaped.clone();
     tokio::task::spawn_local(async move {
         let waited = crate::guard::catch_unwind(async move {
             crate::guard::fault("waiter");
@@ -367,10 +384,12 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                 let _ = crate::sys::kill(-p, libc::SIGKILL);
             }
         }
+        // Before the event: from here on its pid may be another process's.
+        reaped_by_waiter.set(Some(signal));
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
-    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label })
+    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped })
 }
 
 /// Warden's end of the IPC socket, non-blocking: a tokio stream for the

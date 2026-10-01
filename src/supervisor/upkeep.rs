@@ -19,8 +19,9 @@ impl Supervisor {
         crate::guard::fault("tick");
         self.ticks += 1;
         // OOM kills are charged only to deaths right after them: stamp new
-        // ones now (also while stopped: a kill seen late must not look fresh).
-        self.oom.sample(Instant::now());
+        // ones now (also while stopped: a kill seen late must not look fresh),
+        // in every cgroup a process of Warden's runs in.
+        self.oom.sample(Instant::now(), self.insts.values().filter_map(|i| i.oom_counter.as_deref()));
         let gap = self.systemd_watchdog();
         if self.shutting_down || self.stopped {
             return;
