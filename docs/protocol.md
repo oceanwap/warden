@@ -138,6 +138,12 @@ processes share a number: `pid` tells them apart. In worker mode, `worker` 0
 is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
 1..=count its Worker threads (`ready` when one listens, `crashed`, `hung`).
 
+`status.workers[].loop_delay` (`{"p50_ms","p99_ms","max_ms"}`, absent
+without one) is the worker's event-loop delay over its last heartbeat
+interval (about a second), from Warden's shim; in worker mode each
+Worker's own. It is absent without the shim and when the worker sent no
+heartbeat in the last 5 s. An addition: older clients ignore it.
+
 Hot standbys (process mode, `[workers] standby`) are listed in
 `status.standbys` (`WorkerStatus` rows; the field is absent without
 standbys, and older clients ignore it), never in `status.workers`: `id` is

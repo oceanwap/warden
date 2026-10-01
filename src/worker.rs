@@ -121,6 +121,54 @@ pub struct StandbyGates {
     pub instance: usize,
 }
 
+/// One worker's event-loop delay, from its heartbeats.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopState {
+    pub last: crate::control::LoopDelay,
+    pub at: Instant,
+    /// Heartbeats in a row with p99 at or above the warning threshold.
+    pub high: u32,
+    /// When the last "event loop delay is high" warning was logged.
+    pub warned: Option<Instant>,
+}
+
+impl LoopState {
+    pub fn new(d: crate::control::LoopDelay, now: Instant) -> Self {
+        LoopState { last: d, at: now, high: 0, warned: None }
+    }
+
+    /// The last figure, while it is recent: a worker whose heartbeats
+    /// stopped has none (the watchdog deals with it).
+    pub fn current(&self, now: Instant) -> Option<crate::control::LoopDelay> {
+        (now.saturating_duration_since(self.at) <= LOOP_DELAY_FRESH).then_some(self.last)
+    }
+
+    /// Take one heartbeat's figure. True when `[watchdog] loop_delay_warn`
+    /// (`warn_ms`, 0 = off) should warn now: p99 at or above it for
+    /// `LOOP_WARN_AFTER` heartbeats in a row, at most once per
+    /// `LOOP_WARN_EVERY` for this worker.
+    pub fn observe(&mut self, d: crate::control::LoopDelay, now: Instant, warn_ms: f64) -> bool {
+        self.last = d;
+        self.at = now;
+        if warn_ms <= 0.0 || d.p99_ms < warn_ms {
+            self.high = 0;
+            return false;
+        }
+        self.high = self.high.saturating_add(1);
+        let due = self.warned.is_none_or(|t| now.saturating_duration_since(t) >= LOOP_WARN_EVERY);
+        if self.high >= crate::config::LOOP_WARN_AFTER && due {
+            self.warned = Some(now);
+            return true;
+        }
+        false
+    }
+}
+
+/// How long a heartbeat's event-loop delay is shown: a few heartbeats.
+pub const LOOP_DELAY_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+/// One "event loop delay is high" warning per worker per this long.
+pub const LOOP_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Debug, Clone, Default)]
 pub struct ThreadInfo {
     pub listening: bool,
@@ -152,6 +200,9 @@ pub struct Instance {
     pub sockets: BTreeMap<usize, PathBuf>,
     /// Last heartbeat per worker id (watchdog); armed by the first heartbeat.
     pub heartbeats: BTreeMap<usize, Instant>,
+    /// The event-loop delay each worker id's last heartbeat carried, and how
+    /// many heartbeats in a row it has been above `[watchdog] loop_delay_warn`.
+    pub loop_delay: BTreeMap<usize, LoopState>,
     /// Killed by the watchdog.
     pub hung: bool,
     /// Per-worker health: consecutive failures, verdict, check in flight.
@@ -194,6 +245,7 @@ impl Instance {
             cpu_prev: None,
             sockets: BTreeMap::new(),
             heartbeats: BTreeMap::new(),
+            loop_delay: BTreeMap::new(),
             hung: false,
             health_fails: 0,
             healthy: None,
@@ -234,6 +286,34 @@ fn signal_name(s: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `loop_delay_warn`: one warning after LOOP_WARN_AFTER high heartbeats
+    /// in a row, then none for LOOP_WARN_EVERY; a low one starts the count
+    /// again; 0 turns it off; an old figure is not shown.
+    #[test]
+    fn loop_delay_warning_is_rate_limited() {
+        use crate::control::LoopDelay;
+        let (low, high) = (
+            LoopDelay { p50_ms: 1.0, p99_ms: 5.0, max_ms: 9.0 },
+            LoopDelay { p50_ms: 100.0, p99_ms: 600.0, max_ms: 900.0 },
+        );
+        let t0 = Instant::now();
+        let mut s = LoopState::new(low, t0);
+        let at = |i: u64| t0 + std::time::Duration::from_secs(i);
+        let after = crate::config::LOOP_WARN_AFTER as u64;
+        for i in 1..after {
+            assert!(!s.observe(high, at(i), 500.0), "heartbeat {i}");
+        }
+        assert!(!s.observe(low, at(after), 500.0), "a low one resets the count");
+        let every = LOOP_WARN_EVERY.as_secs();
+        let warned: Vec<u64> =
+            (after + 1..=2 * after + 2 * every + 1).filter(|i| s.observe(high, at(*i), 500.0)).collect();
+        assert_eq!(warned, vec![2 * after, 2 * after + every, 2 * after + 2 * every], "once per {every} s");
+        let mut off = LoopState::new(high, t0);
+        assert!((1..100).all(|i| !off.observe(high, at(i), 0.0)), "0 = off");
+        assert_eq!(off.current(at(99)), Some(high));
+        assert_eq!(off.current(at(99) + LOOP_DELAY_FRESH + std::time::Duration::from_millis(1)), None);
+    }
 
     #[test]
     fn exits() {

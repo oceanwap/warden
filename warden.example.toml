@@ -88,6 +88,9 @@ surge = 1                                    # new workers started at once, each
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
+loop_delay_warn = 0.5                        # s (fractions ok); warn when a worker's event-loop delay (p99, from the
+                                             # shim's heartbeat; `warden list` column Loop) stays at least this high
+                                             # for 10 s; at most once per 10 min per worker (0 = off)
 
 [limits]
 max_memory = 0                               # MB per worker process; recycle gracefully above it (0 = off)

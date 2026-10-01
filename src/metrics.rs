@@ -124,6 +124,26 @@ pub fn render_prometheus(s: &Status) -> String {
         "gauge",
         per(&|w| w.healthy.map(|h| h as u8 as f64)),
     );
+    // Like prom-client's nodejs_eventloop_lag_*_seconds, per worker, over the last heartbeat (~1 s).
+    let secs = |ms: f64| ms / 1000.0;
+    gauge(
+        "warden_worker_event_loop_delay_p50_seconds",
+        "Median event-loop delay of the worker over the last second (from the shim's heartbeat).",
+        "gauge",
+        per(&|w| w.loop_delay.map(|d| secs(d.p50_ms))),
+    );
+    gauge(
+        "warden_worker_event_loop_delay_p99_seconds",
+        "99th percentile event-loop delay of the worker over the last second.",
+        "gauge",
+        per(&|w| w.loop_delay.map(|d| secs(d.p99_ms))),
+    );
+    gauge(
+        "warden_worker_event_loop_delay_max_seconds",
+        "Largest event-loop delay of the worker over the last second.",
+        "gauge",
+        per(&|w| w.loop_delay.map(|d| secs(d.max_ms))),
+    );
     if let Some(r) = &s.last_rollout {
         gauge(
             "warden_last_rollout_success",
@@ -264,6 +284,7 @@ mod tests {
                 cpu_percent: None,
                 last_exit: None,
                 healthy: Some(false),
+                loop_delay: Some(crate::control::LoopDelay { p50_ms: 0.25, p99_ms: 12.5, max_ms: 40.0 }),
             }],
             release: None,
             standbys: vec![],
@@ -274,6 +295,10 @@ mod tests {
         assert!(t.contains("warden_worker_up{app=\"api\",worker=\"1\"} 1"));
         assert!(t.contains("# TYPE warden_worker_crashes_total counter"));
         assert!(t.contains("warden_worker_healthy{app=\"api\",worker=\"1\"} 0"));
+        assert!(t.contains("warden_worker_event_loop_delay_p50_seconds{app=\"api\",worker=\"1\"} 0.00025"), "{t}");
+        assert!(t.contains("warden_worker_event_loop_delay_p99_seconds{app=\"api\",worker=\"1\"} 0.0125"), "{t}");
+        assert!(t.contains("warden_worker_event_loop_delay_max_seconds{app=\"api\",worker=\"1\"} 0.04"), "{t}");
+        assert!(t.contains("# TYPE warden_worker_event_loop_delay_p99_seconds gauge"));
         assert!(!t.contains("standby"), "no standby series without standbys");
 
         // Hot standbys get gauges of their own, never worker series.
@@ -290,6 +315,7 @@ mod tests {
             cpu_percent: None,
             last_exit: None,
             healthy: None,
+            loop_delay: None,
         };
         st.standbys.push(standby(crate::control::STANDBY, 1000));
         st.standbys.push(standby(crate::control::WARMING, 500));

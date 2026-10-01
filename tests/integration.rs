@@ -3870,6 +3870,81 @@ fn env_shows_what_a_worker_starts_with() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Event-loop delay (W2): the shim measures each worker's and the heartbeat
+/// carries it to `status --json`, `list` and `/metrics`: on Bun and Node
+/// (whose histogram counts the sampling period, which must not show), per
+/// Worker in worker mode; a loop that stays slow gets one WARN.
+#[test]
+fn event_loop_delay_is_reported() {
+    if !have_bun() {
+        return;
+    }
+    let delay = |s: &Value, i: usize, q: &str| s["workers"][i]["loop_delay"][q].as_f64();
+    // Bun, process mode: worker 2 blocks its loop for 150 ms every 400 ms.
+    // The shim samples every 100 ms, so each block holds up a sample by at
+    // least 50 ms (shorter blocks are only caught when a sample falls in them).
+    let (port, metrics) = (free_port(), free_port());
+    let cfg = format!(
+        "[app]\nname = \"loopy\"\nargs = [\"{}\"]\nport = {port}\nenv = {{ FIXTURE_BLOCK_MS = \"150\", \
+         FIXTURE_BLOCK_WORKER = \"2\" }}\n[workers]\ncount = 2\n[watchdog]\nloop_delay_warn = 0.03\n\
+         [metrics]\nlisten = \"127.0.0.1:{metrics}\"\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("loopy", port, &cfg);
+    let s = w.wait_for("loop delay of both workers", T, |s| {
+        s["workers_ready"] == 2 && delay(s, 0, "p50_ms").is_some() && delay(s, 1, "max_ms").is_some_and(|m| m >= 40.0)
+    });
+    let (quiet, busy) = (delay(&s, 0, "p50_ms").unwrap(), delay(&s, 1, "max_ms").unwrap());
+    assert!(quiet < 20.0, "an idle loop runs on time: p50 {quiet} ms\n{s:#}");
+    assert!((40.0..2000.0).contains(&busy), "150 ms blocks: max {busy} ms\n{s:#}");
+    let (_, list) = w.cli(&["status"]);
+    assert!(list.contains("Loop p99"), "{list}");
+    // One WARN once it stays high for 10 heartbeats, naming the worker.
+    let log = w.wait_log("worker event loop delay is high", T);
+    let line = log.lines().find(|l| l.contains("worker event loop delay is high")).unwrap();
+    assert!(line.contains("worker=2 ") && line.contains("hint="), "{line}");
+    assert!(!log.contains("worker event loop delay is high worker=1 "), "{log}");
+    let text = get(metrics, "/metrics").expect("metrics");
+    assert!(text.contains("warden_worker_event_loop_delay_p99_seconds{app=\"loopy\",worker=\"2\"}"), "{text}");
+    drop(w);
+
+    // Node: its histogram's samples include the 100 ms period, which must
+    // not show: an idle loop is ~0, a blocked one shows the block.
+    if have_node() {
+        for block in [None, Some(150)] {
+            let port = free_port();
+            let env = block.map(|ms| format!("env = {{ FIXTURE_BLOCK_MS = \"{ms}\" }}\n")).unwrap_or_default();
+            let cfg = format!(
+                "[app]\nname = \"loopnode\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n{env}\
+                 [workers]\ncount = 1\n",
+                fixture("node_app.mjs")
+            );
+            let w = Warden::start("loopnode", port, &cfg);
+            let s = match block {
+                None => w.wait_for("Node's loop delay", T, |s| delay(s, 0, "p50_ms").is_some()),
+                Some(_) => w.wait_for("Node's blocked loop", T, |s| delay(s, 0, "max_ms").is_some_and(|m| m >= 40.0)),
+            };
+            if block.is_none() {
+                assert!(delay(&s, 0, "p50_ms").unwrap() < 20.0, "{s:#}");
+            }
+            drop(w);
+        }
+    }
+
+    // Worker mode: each Worker's own loop.
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"loopthreads\"\nentry = \"{}\"\nport = {port}\nenv = {{ FIXTURE_BLOCK_MS = \"150\", \
+         FIXTURE_BLOCK_WORKER = \"2\" }}\n[workers]\ncount = 2\nmode = \"worker\"\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("loopthreads", port, &cfg);
+    let s = w.wait_for("each Worker's loop delay", T, |s| {
+        delay(s, 0, "p50_ms").is_some() && delay(s, 1, "max_ms").is_some_and(|m| m >= 40.0)
+    });
+    assert!(delay(&s, 0, "p50_ms").unwrap() < 20.0, "Worker 1 is not blocked by Worker 2:\n{s:#}");
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to

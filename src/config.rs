@@ -371,7 +371,15 @@ fn surge_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Surge, D::Error
 pub struct Watchdog {
     /// Seconds. 0 disables the watchdog.
     pub timeout: u64,
+    /// Seconds (fractions ok): warn when a worker's event-loop delay (p99,
+    /// from its heartbeats) stays at or above this for LOOP_WARN_AFTER
+    /// heartbeats in a row. 0 = never.
+    pub loop_delay_warn: f64,
 }
+
+/// Heartbeats (about seconds) in a row the event-loop delay must stay high
+/// before `loop_delay_warn` warns: a single slow second is not news.
+pub const LOOP_WARN_AFTER: u32 = 10;
 
 /// Graceful recycling (zero downtime: replacement first).
 #[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
@@ -616,7 +624,7 @@ impl Default for Reload {
 
 impl Default for Watchdog {
     fn default() -> Self {
-        Self { timeout: 60 }
+        Self { timeout: 60, loop_delay_warn: 0.5 }
     }
 }
 
@@ -745,6 +753,10 @@ impl Config {
                      Lower long_lived_timeout or raise grace_period"
                 ));
             }
+        }
+        let warn = self.watchdog.loop_delay_warn;
+        if !warn.is_finite() || !(0.0..=3600.0).contains(&warn) {
+            return Err(format!("watchdog.loop_delay_warn = {warn} must be a number of seconds from 0 (off) to 3600"));
         }
         if let Some(expr) = &self.restart.schedule {
             crate::schedule::Cron::parse(expr).map_err(|e| format!("restart.schedule = {expr:?}: {e}"))?;
@@ -1365,6 +1377,7 @@ mod tests {
         assert_eq!(c.logging.rotate, Rotate::default());
         assert_eq!(c.shutdown.long_lived_timeout, Some(DEFAULT_LONG_LIVED_TIMEOUT));
         assert_eq!(c.reload.surge, Reload::default().surge);
+        assert_eq!(c.watchdog.loop_delay_warn, Watchdog::default().loop_delay_warn);
         assert!(c.app.pin_release);
         // The commented [static] block is valid too.
         let uncommented: String = text

@@ -773,14 +773,14 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += "\n";
     }
     o += &format!(
-        "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
-        "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Health", "Last exit"
+        "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
+        "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Loop p99", "Health", "Last exit"
     );
     // Workers by number, then hot standbys as `s1`, `s2`…
     let rows = s.workers.iter().map(|w| (w.id.to_string(), w)).chain(s.standbys.iter().map(|w| (standby_name(w), w)));
     for (name, w) in rows {
         o += &format!(
-            "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
+            "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<9} {:<8} {}\n",
             name,
             w.state,
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
@@ -788,6 +788,7 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
             w.restarts,
             w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
             w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
+            loop_p99(w),
             health_word(w.healthy),
             w.last_exit.as_deref().unwrap_or("-"),
         );
@@ -798,6 +799,25 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
 /// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
 fn standby_name(w: &crate::control::WorkerStatus) -> String {
     format!("s{}", w.id)
+}
+
+/// The Loop p99 column: the event-loop delay's 99th percentile over the
+/// last second (`-`: no shim, or no recent heartbeat).
+fn loop_p99(w: &crate::control::WorkerStatus) -> String {
+    w.loop_delay.map(|d| millis(d.p99_ms)).unwrap_or_else(|| "-".into())
+}
+
+/// `0.41ms`, `12.3ms`, `250ms`, `1.20s`.
+pub fn millis(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.2}ms")
+    } else if ms < 100.0 {
+        format!("{ms:.1}ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.2}s", ms / 1000.0)
+    }
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -831,10 +851,23 @@ pub(crate) fn table(rows: &[Vec<String>]) -> String {
 /// `warden list`: one row per worker, like `pm2 list`.
 pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> String {
     let mut rows = vec![
-        ["App", "Namespace", "Worker", "Status", "PID", "Uptime", "Restarts", "CPU", "Memory", "Health", "Last exit"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
+        [
+            "App",
+            "Namespace",
+            "Worker",
+            "Status",
+            "PID",
+            "Uptime",
+            "Restarts",
+            "CPU",
+            "Memory",
+            "Loop p99",
+            "Health",
+            "Last exit",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>(),
     ];
     let mut notes = Vec::new();
     for (app, st) in all {
@@ -853,6 +886,7 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                         w.restarts.to_string(),
                         w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into()),
                         w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into()),
+                        loop_p99(w),
                         health_word(w.healthy).into(),
                         w.last_exit.clone().unwrap_or_else(|| "-".into()),
                     ]);
@@ -874,6 +908,7 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                     app.namespace.clone(),
                     "-".into(),
                     what.into(),
+                    "-".into(),
                     "-".into(),
                     "-".into(),
                     "-".into(),
@@ -1006,6 +1041,26 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
             0 => "off (the heartbeat still reports event-loop delay)".into(),
             t => format!("hung after {t} s without an event-loop heartbeat"),
         },
+    );
+    let delays: Vec<String> = s
+        .workers
+        .iter()
+        .filter_map(|w| {
+            w.loop_delay.map(|d| format!("{} {}/{}/{}", w.id, millis(d.p50_ms), millis(d.p99_ms), millis(d.max_ms)))
+        })
+        .collect();
+    let warn = c("/watchdog/loop_delay_warn").as_f64().unwrap_or(0.0);
+    row(
+        "event loop",
+        format!(
+            "delay p50/p99/max over the last second: {}; {}",
+            if delays.is_empty() { "- (needs the shim)".to_string() } else { delays.join(", ") },
+            if warn > 0.0 {
+                format!("warns when p99 stays at {} or more for 10 s", millis(warn * 1000.0))
+            } else {
+                "no warning (loop_delay_warn = 0)".into()
+            }
+        ),
     );
     row(
         "logs",
@@ -1234,5 +1289,9 @@ mod tests {
         assert_eq!(duration(90_000), "1d01h");
         assert_eq!(bytes(64 * 1024 * 1024), "64.0 MB");
         assert_eq!(table(&[vec!["a".into(), "bb".into()], vec!["ccc".into(), "d".into()]]), "a    bb\nccc  d\n");
+        assert_eq!(
+            [millis(0.414), millis(12.34), millis(250.4), millis(1200.0)],
+            ["0.41ms", "12.3ms", "250ms", "1.20s"].map(String::from)
+        );
     }
 }

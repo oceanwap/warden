@@ -1099,6 +1099,7 @@ on = ["all"]
                 cpu_percent: None,
                 last_exit: Some("exit code 1".into()),
                 healthy: None,
+                loop_delay: None,
             })
             .collect();
         a.attached(&api, &s, Instant::now());

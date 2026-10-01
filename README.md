@@ -191,6 +191,7 @@ warning.
 | Crash, without the startup time | A hot standby (started, app initialized, not listening) takes the dead worker's slot in a few milliseconds; a new standby starts in the background | `[workers] standby` |
 | Unhealthy worker | Replaced gracefully (new worker ready first) after `failure_threshold` failed checks | `[health] on_failure = "replace"` |
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
+| Slow event loop | Each heartbeat carries the worker's event-loop delay over the last second (p50/p99/max, sampled natively every 100 ms: no cost per request). `warden list`/`top`/`describe` show p99 (`Loop p99`), `status --json` all three (`loop_delay`), Prometheus `warden_worker_event_loop_delay_{p50,p99,max}_seconds`; a WARN when p99 stays high for 10 s | `[watchdog] loop_delay_warn` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
@@ -336,11 +337,11 @@ Memory:      4.0 MB (supervisor)
 Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
              health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...
 
-Worker   Status      PID      Uptime   Restarts  RSS        CPU     Health   Last exit
-1        RUNNING     8172     25s      1         40.1 MB    0.0%    ok       -
-2        RUNNING     8180     13s      1         40.1 MB    0.0%    ok       -
-3        RUNNING     8188     10s      1         40.2 MB    0.0%    ok       -
-4        RUNNING     8196     8s       1         40.2 MB    0.0%    ok       -
+Worker   Status      PID      Uptime   Restarts  RSS        CPU     Loop p99  Health   Last exit
+1        RUNNING     8172     25s      1         40.1 MB    0.0%    0.21ms    ok       -
+2        RUNNING     8180     13s      1         40.1 MB    0.0%    0.18ms    ok       -
+3        RUNNING     8188     10s      1         40.2 MB    0.0%    0.20ms    ok       -
+4        RUNNING     8196     8s       1         40.2 MB    0.0%    0.19ms    ok       -
 ```
 
 The CLI talks to the running supervisor over a Unix socket with mode 0600.

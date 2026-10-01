@@ -324,6 +324,7 @@ pub(crate) mod tests {
             cpu_percent: cpu,
             last_exit: None,
             healthy: Some(true),
+            loop_delay: None,
         }
     }
 

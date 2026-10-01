@@ -647,6 +647,7 @@ impl Supervisor {
         i.ready_at = None;
         // Its heartbeats and socket were reported under the standby id (0).
         i.heartbeats.clear();
+        i.loop_delay.clear();
         let sockets: Vec<PathBuf> = std::mem::take(&mut i.sockets).into_values().collect();
         for s in sockets {
             i.sockets.insert(slot_id, s);
@@ -710,19 +711,23 @@ impl Supervisor {
         let (restarts, crashes) = (self.pool.restarts, self.pool.crashes);
         let last_exit = self.pool.disabled.clone().or_else(|| self.pool.last_exit.clone());
         let row =
-            |id: usize, state: &str, pid, uptime, stats: Option<(metrics::ProcStats, f64)>, healthy| WorkerStatus {
-                id,
-                state: state.into(),
-                pid,
-                uptime_secs: uptime,
-                restarts,
-                crashes,
-                rss_bytes: stats.map(|x| x.0.rss_bytes),
-                cpu_seconds: stats.map(|x| x.0.cpu_seconds),
-                cpu_percent: stats.map(|x| x.1),
-                last_exit: last_exit.clone(),
-                healthy,
+            |id: usize, state: &str, pid, uptime, stats: Option<(metrics::ProcStats, f64)>, healthy, loop_delay| {
+                WorkerStatus {
+                    id,
+                    state: state.into(),
+                    pid,
+                    uptime_secs: uptime,
+                    restarts,
+                    crashes,
+                    rss_bytes: stats.map(|x| x.0.rss_bytes),
+                    cpu_seconds: stats.map(|x| x.0.cpu_seconds),
+                    cpu_percent: stats.map(|x| x.1),
+                    last_exit: last_exit.clone(),
+                    healthy,
+                    loop_delay,
+                }
             };
+        let now = Instant::now();
         let first = rows.len();
         let mut live = std::collections::BTreeSet::new();
         for id in ids {
@@ -740,7 +745,9 @@ impl Supervisor {
             }
             let (pid, started) = (i.handle.pid, i.started);
             let stats = sample(pid, &mut i.cpu_prev, started);
-            rows.push(row(n, state, Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy));
+            // A standby's heartbeats come as worker 0 (process mode, slot 0).
+            let delay = i.loop_delay.get(&STANDBY_SLOT).and_then(|l| l.current(now));
+            rows.push(row(n, state, Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy, delay));
         }
         let missing = if self.pool.failed_at.is_some() {
             Some(State::Failed)
@@ -753,7 +760,7 @@ impl Supervisor {
         };
         if let Some(state) = missing {
             for n in (1..=target).filter(|n| !live.contains(n)) {
-                rows.push(row(n, state.as_str(), None, None, None, None));
+                rows.push(row(n, state.as_str(), None, None, None, None, None));
             }
         }
         // By number; a standby being replaced (older) before its successor.

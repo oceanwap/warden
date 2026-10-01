@@ -21,7 +21,7 @@ use crate::events::{self, WorkerEvent};
 use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
-use crate::worker::{Instance, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
+use crate::worker::{Instance, LoopState, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
 use crate::{debug, error, info, metrics, networking, systemd, warn};
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
@@ -817,7 +817,32 @@ impl Supervisor {
         let worker = if worker_mode { msg.worker.unwrap_or(0) } else { inst.slot };
         match msg.ev.as_str() {
             "heartbeat" => {
-                inst.heartbeats.insert(worker, Instant::now());
+                let now = Instant::now();
+                inst.heartbeats.insert(worker, now);
+                let Some(d) = msg.loop_delay() else { return };
+                let warn_ms = self.cfg.watchdog.loop_delay_warn * 1000.0;
+                let state = inst.loop_delay.entry(worker).or_insert_with(|| LoopState::new(d, now));
+                if state.observe(d, now, warn_ms) {
+                    // The process (`s1`: a standby), or in worker mode the Worker thread.
+                    let who = match inst.standby_number.filter(|_| inst.role == Role::Standby) {
+                        _ if worker_mode => worker.to_string(),
+                        Some(n) => standby_label(n),
+                        None => inst.slot.to_string(),
+                    };
+                    warn!(
+                        "worker event loop delay is high",
+                        worker = who,
+                        pid = inst.handle.pid,
+                        p99_ms = d.p99_ms,
+                        max_ms = d.max_ms,
+                        for_s = state.high,
+                        threshold_ms = warn_ms,
+                        hint = "requests wait this long before their handler starts: synchronous work on the event \
+                                loop (large JSON, sync fs or crypto, a CPU-heavy route) or a starved host (`warden \
+                                top`, the host's load). Profile it (node --cpu-prof, bun --inspect), move heavy work \
+                                to a Worker, or add workers; [watchdog] loop_delay_warn sets the threshold (0 = off)",
+                    );
+                }
             }
             "listening" => {
                 // Other servers the app may start (metrics, admin) don't count.
@@ -1913,18 +1938,22 @@ impl Supervisor {
                     cpu_percent: None,
                     last_exit: t.and_then(|t| t.last_exit.clone()),
                     healthy: inst.and_then(|i| i.healthy),
+                    // Each Worker thread has its own event loop and heartbeat.
+                    loop_delay: inst.and_then(|i| i.loop_delay.get(&id)).and_then(|l| l.current(now)),
                 });
             }
         } else {
             for s in self.slots.values() {
                 let inst = s.current.and_then(|c| self.insts.get_mut(&c));
-                let (pid, uptime, stats, healthy) = match inst {
+                let (pid, uptime, stats, healthy, loop_delay) = match inst {
                     Some(i) => {
                         let started = i.started;
                         let pid = i.handle.pid;
-                        (Some(pid), Some(started.elapsed().as_secs()), sample(pid, &mut i.cpu_prev, started), i.healthy)
+                        let stats = sample(pid, &mut i.cpu_prev, started);
+                        let loop_delay = i.loop_delay.get(&s.id).and_then(|l| l.current(now));
+                        (Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy, loop_delay)
                     }
-                    None => (None, None, None, None),
+                    None => (None, None, None, None, None),
                 };
                 if s.state == State::Running {
                     ready += 1;
@@ -1941,6 +1970,7 @@ impl Supervisor {
                     cpu_percent: stats.map(|x| x.1),
                     last_exit: s.last_exit.clone(),
                     healthy,
+                    loop_delay,
                 });
             }
             // Hot standbys: their own list (`Status.standbys`).

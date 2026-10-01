@@ -454,6 +454,10 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         table::column(h("Restarts"), |(_, w): WorkerRow<'a>| cell(w.restarts.to_string())),
         table::column(h("CPU"), |(_, w): WorkerRow<'a>| cell(format::opt(w.cpu_percent, format::percent))),
         table::column(h("RSS"), |(_, w): WorkerRow<'a>| cell(format::opt(w.rss_bytes, format::bytes))),
+        // The event-loop delay's p99 over the last second, as `warden list` shows it.
+        table::column(h("Loop p99"), |(_, w): WorkerRow<'a>| {
+            cell(format::opt(w.loop_delay.map(|d| d.p99_ms), format::millis))
+        }),
         table::column(h("Health"), |(_, w): WorkerRow<'a>| {
             let t = cell(format::health(w.healthy).into());
             match w.healthy {

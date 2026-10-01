@@ -85,6 +85,24 @@ pub struct IpcMsg {
     pub ws: Option<u64>,
     #[serde(default)]
     pub sse: Option<u64>,
+    /// `heartbeat`: the event-loop delay of the interval, `{p50, p99, max}`
+    /// in ms. Kept loose (any JSON) so a bad value costs the figure, never
+    /// the heartbeat the watchdog waits for; read with [`IpcMsg::loop_delay`].
+    #[serde(default, rename = "loop")]
+    pub loop_ms: Option<serde_json::Value>,
+}
+
+impl IpcMsg {
+    /// The heartbeat's event-loop delay, if it has a sane one: three
+    /// numbers, finite, from 0 to a day (ms); p99 and max are raised to
+    /// the figure below them if a histogram's rounding put them lower.
+    pub fn loop_delay(&self) -> Option<crate::control::LoopDelay> {
+        let v = self.loop_ms.as_ref()?;
+        let num = |k: &str| v.get(k)?.as_f64().filter(|x| x.is_finite() && (0.0..=86_400_000.0).contains(x));
+        let (p50, p99, max) = (num("p50")?, num("p99")?, num("max")?);
+        let p99 = p99.max(p50);
+        Some(crate::control::LoopDelay { p50_ms: p50, p99_ms: p99, max_ms: max.max(p99) })
+    }
 }
 
 #[derive(Debug)]
@@ -769,6 +787,31 @@ async fn pump_ipc(mut rx: tokio::net::UnixStream, inst: u64, events: mpsc::Unbou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A heartbeat's event-loop delay is taken when sane; a bad one costs
+    /// the figure, never the heartbeat the watchdog needs.
+    #[test]
+    fn heartbeat_loop_delay() {
+        let parse = |s: &str| serde_json::from_str::<IpcMsg>(s).unwrap();
+        let m = parse(r#"{"ev":"heartbeat","worker":1,"loop":{"p50":0.12,"p99":3.5,"max":40}}"#);
+        assert_eq!(m.loop_delay(), Some(crate::control::LoopDelay { p50_ms: 0.12, p99_ms: 3.5, max_ms: 40.0 }));
+        // A histogram's rounding can put p99 above max: raised, not dropped.
+        let m = parse(r#"{"ev":"heartbeat","loop":{"p50":1,"p99":27.3,"max":27.2}}"#);
+        assert_eq!(m.loop_delay().map(|d| (d.p99_ms, d.max_ms)), Some((27.3, 27.3)));
+        for bad in [
+            r#"{"ev":"heartbeat"}"#,
+            r#"{"ev":"heartbeat","loop":null}"#,
+            r#"{"ev":"heartbeat","loop":"slow"}"#,
+            r#"{"ev":"heartbeat","loop":{"p50":-1,"p99":1,"max":1}}"#,
+            r#"{"ev":"heartbeat","loop":{"p50":1,"p99":1}}"#,
+            r#"{"ev":"heartbeat","loop":{"p50":1,"p99":1,"max":1e300}}"#,
+            r#"{"ev":"heartbeat","loop":{"p50":"1","p99":1,"max":1}}"#,
+        ] {
+            let m = parse(bad);
+            assert_eq!(m.ev, "heartbeat", "{bad}");
+            assert_eq!(m.loop_delay(), None, "{bad}");
+        }
+    }
 
     #[test]
     fn rate_limit_window() {
