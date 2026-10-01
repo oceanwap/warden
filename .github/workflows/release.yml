@@ -15,15 +15,15 @@
 #     "Publish the release" ticked. The tag v<version> is created at that
 #     commit once everything is built and tested, so a failed build leaves no
 #     tag behind. Needs a green CI run on the commit (see docs/releasing.md).
-# Pushes to ci-portability and manual runs without the box ticked are dry
-# runs: everything is built, packaged, checksummed and install-tested, and
-# uploaded as workflow artifacts only.
+# Manual runs without the box ticked are dry runs: everything is built,
+# packaged, checksummed and install-tested, and uploaded as workflow
+# artifacts only. (Not on a branch push: the macOS jobs here are the most
+# expensive minutes of the repository, ten times a Linux minute.)
 name: Release
 
 on:
   push:
     tags: ["v*"]
-    branches: [ci-portability]
   workflow_dispatch:
     inputs:
       release:

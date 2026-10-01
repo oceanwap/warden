@@ -12,10 +12,15 @@
 # .github/service-managers/. Job logs need a login to read, so every failed
 # check is also an error annotation (the command, its output, the unit or job
 # state and the logs), and each step ends with a notice counting what passed.
+#
+# systemd runs on every push that changes more than documentation; launchd
+# (macOS minutes count ten times) on pushes to main, pull requests and by
+# hand (Actions > Service managers > Run workflow, on any branch).
 name: Service managers
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -31,8 +36,28 @@ env:
   BUN_VERSION: "1.3.13"
 
 jobs:
+  changes:
+    name: what changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          SHA: ${{ github.sha }}
+        run: bash .github/code-changed.sh
+
   systemd:
     name: systemd (Ubuntu)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -68,6 +93,8 @@ jobs:
 
   launchd:
     name: launchd (macOS)
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (github.ref == 'refs/heads/main' || github.event_name != 'push')
     runs-on: macos-latest
     timeout-minutes: 30
     steps:

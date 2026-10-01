@@ -4,19 +4,20 @@
 #
 # - Linux, as root: its own pid namespace, the tmpfs for disk-full, and a
 #   memory cgroup for oom-kill (the runner allows all three), against a
-#   release build.
+#   release build. Pushes to main, daily, and by hand.
 # - macOS: what macOS supports (no namespace, tmpfs, cgroup or /proc: the
-#   run lists what it leaves out), release build too.
+#   run lists what it leaves out), release build too. By hand only (Actions >
+#   Chaos > Run workflow, "Also run on macOS"; ticked by default): a macOS
+#   minute counts ten times, and a daily run would use up a Free plan's
+#   included minutes by itself. Run it before a release.
 #
 # Job logs need a login to read, so the verdict, recovery per fault and the
 # request counts are notice annotations, and each violation an error one.
 name: Chaos
 
 on:
-  # Not every branch: macOS minutes count ten times (the account's spending
-  # limit stopped jobs once). main, the scratch branch, daily, and by hand.
   push:
-    branches: [main, ci-portability]
+    branches: [main]
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
@@ -27,6 +28,10 @@ on:
       seed:
         description: "Seed"
         default: "20261001"
+      macos:
+        description: "Also run on macOS (ten times the minutes)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -49,15 +54,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: linux
-            runner: ubuntu-latest
-            # Root: the pid namespace, the tmpfs, the memory cgroup.
-            as: sudo env "PATH=$PATH"
-          - os: macos
-            runner: macos-latest
-            as: ""
-    runs-on: ${{ matrix.runner }}
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.macos && '["linux","macos"]' || '["linux"]') }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -83,7 +81,7 @@ jobs:
       - name: cargo xtask chaos --release --minutes ${{ env.MINUTES }} --seed ${{ env.SEED }}
         run: |
           set -o pipefail
-          ${{ matrix.as }} target/debug/xtask chaos --release --warden "$PWD/target/release/warden" \
+          ${{ matrix.os == 'linux' && 'sudo env "PATH=$PATH"' || '' }} target/debug/xtask chaos --release --warden "$PWD/target/release/warden" \
             --minutes "$MINUTES" --seed "$SEED" --out "$PWD/chaos.json" 2>&1 | tee chaos.log
       - name: Annotations
         if: ${{ !cancelled() }}

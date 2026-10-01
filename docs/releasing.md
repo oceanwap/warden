@@ -131,10 +131,9 @@ hour, enough to follow a release at a slower pace.
 - **publish**: the GitHub Release, with generated notes; a version with a
   `-` (`0.2.0-rc.1`) is marked as a pre-release.
 
-Nothing is published unless every build and install test passed. Pushes to
-the `ci-portability` branch and manual runs without the box ticked do
-everything but publish (the files are kept as workflow artifacts for 14
-days).
+Nothing is published unless every build and install test passed. Manual runs
+without the box ticked do everything but publish (the files are kept as
+workflow artifacts for 14 days).
 
 ## Where the artifacts land
 
@@ -164,6 +163,27 @@ where you can push tags, or use the workflow by hand.
 GitHub Actions must be able to run: with a failed payment or a spending limit
 reached, every job is refused ("recent account payments have failed…"), and
 so is a release (**Settings → Billing & plans**).
+
+## Minutes
+
+On a private repository every runner minute is billed against the plan's
+included minutes (Free: 2,000 a month, no carry-over), and a macOS minute
+counts ten times a Linux one. So the workflows spend them where they matter:
+
+| Workflow | Linux x86_64 | Linux ARM64 | macOS |
+|---|---|---|---|
+| **CI** | every push and pull request | main, pull requests, by hand | main, pull requests, by hand |
+| **Service managers** | every push | | main, pull requests, by hand |
+| **Chaos** | main, daily, by hand | | by hand only |
+| **Bench** | `bench` branch, by hand | `bench` branch, by hand | |
+| **Release** | tag, by hand | tag, by hand | tag, by hand |
+
+A commit that only changes docs, `*.md` files or `bench/results/` skips every
+job but the Linux x86_64 ones (`.github/code-changed.sh` decides; Linux x86_64
+still runs so the commit has a green CI run to release). To test a scratch
+branch on macOS or ARM64, start CI by hand on it (**Actions → CI → Run
+workflow**). Run **Chaos** by hand, macOS ticked, before a release; the
+Release workflow itself runs four macOS builds and two macOS install tests.
 
 ## When something fails
 
