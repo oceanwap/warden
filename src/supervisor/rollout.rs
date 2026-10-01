@@ -538,6 +538,7 @@ impl Supervisor {
             }
         }
         let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
+        let Some(kind) = self.roll.as_ref().map(|r| r.kind) else { return };
         for slot_id in ids {
             let Some(slot) = self.slots.get_mut(&slot_id) else { continue };
             slot.token += 1; // cancel a pending restart timer; this rollout takes over
@@ -550,7 +551,7 @@ impl Supervisor {
                     self.stop_instance(old);
                     At::Draining { old, then_spawn: true }
                 }
-                (Some(old), _) => match self.spawn_instance(slot_id, Role::Replacement) {
+                (Some(old), _) => match self.start_replacement(slot_id, kind) {
                     Ok(new) => At::Starting { new, old: Some(old), deadline },
                     Err(e) => {
                         self.fail_at(Some(slot_id), format!("could not start a new worker: {e}"));
@@ -1182,6 +1183,7 @@ impl Supervisor {
             });
         }
         self.last_rollout = Some(outcome);
+        self.standby_after_rollout(roll.kind, ok, roll.total);
     }
 
     /// What `rollout_status().phase` says, without its countdowns (soak time
@@ -1362,7 +1364,7 @@ fn command_exists(cmd: &str, env: &std::collections::BTreeMap<String, String>) -
 }
 
 /// Run `sh -c <cmd>` with a timeout; `Err` carries the last output line.
-async fn run_shell(
+pub(super) async fn run_shell(
     cmd: String,
     cwd: Option<PathBuf>,
     env: Vec<(String, String)>,

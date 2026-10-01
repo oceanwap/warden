@@ -28,6 +28,7 @@ impl Supervisor {
         }
         self.check_lifetime();
         self.retry_failed();
+        self.standby_tick();
         if self.cfg.health.enabled && self.ticks % self.cfg.health.interval.max(1) == 0 {
             self.check_workers_health();
         }
@@ -83,10 +84,16 @@ impl Supervisor {
             return;
         }
         let now = Instant::now();
+        // Workers once ready, standbys once initialized (their heartbeats
+        // come from the event loop all the same).
         let hung: Vec<(u64, usize, Duration)> = self
             .insts
             .iter()
-            .filter(|(_, i)| !i.stopping && !i.hung && i.ready_at.is_some())
+            .filter(|(_, i)| {
+                !i.stopping
+                    && !i.hung
+                    && (i.ready_at.is_some() || i.standby.as_ref().is_some_and(|s| s.ready_at.is_some()))
+            })
             .filter_map(|(id, i)| {
                 i.heartbeats
                     .iter()
@@ -201,11 +208,18 @@ impl Supervisor {
         let timeout = Duration::from_secs(self.cfg.health.timeout);
         let initial_delay = Duration::from_secs(self.cfg.health.initial_delay);
         for (id, i) in self.insts.iter_mut() {
-            if i.role != Role::Current || i.stopping || i.health_inflight || i.sockets.is_empty() {
+            // Workers, and standbys that passed their gates (so a standby
+            // that went bad while idle is never promoted).
+            let since = match i.role {
+                Role::Current => i.ready_at,
+                Role::Standby => i.standby.as_ref().filter(|s| s.available).and_then(|s| s.ready_at),
+                Role::Replacement | Role::Retiring => None,
+            };
+            if since.is_none() || i.stopping || i.health_inflight || i.sockets.is_empty() {
                 continue;
             }
             // W9: give a freshly started worker time to warm up.
-            if i.ready_at.is_none_or(|t| t.elapsed() < initial_delay) {
+            if since.is_none_or(|t| t.elapsed() < initial_delay) {
                 continue;
             }
             i.health_inflight = true;

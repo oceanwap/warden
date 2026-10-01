@@ -241,6 +241,21 @@ fn main_screen_with_fake_data() {
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
 }
 
+/// Hot standbys (`status.standbys`) are listed after the workers, as standbys.
+#[test]
+fn standbys_are_listed_after_the_workers() {
+    let mut g = connected();
+    let mut web = status("web", vec![worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None)], 1, json!(null));
+    web["standbys"] = json!([worker(1, "STANDBY", Some(5150), 61, 0.0, 0, None)]);
+    let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": web})).unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    for t in ["standby 1", "STANDBY", "5150", "5101"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not on the web app's screen");
+    }
+}
+
 #[test]
 fn an_app_that_gave_up_shows_its_problem_and_start() {
     let mut g = connected();

@@ -419,6 +419,9 @@ fn rollout(a: &App) -> Option<Element<'_, Message>> {
     (a.rollout.is_some() || a.last_outcome.is_some()).then(|| c.into())
 }
 
+/// A row of the worker table: (a hot standby, its status).
+type WorkerRow<'a> = (bool, &'a WorkerStatus);
+
 fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let Some(s) = &a.status else {
         return text("No workers to show: the supervisor is not running (or wardend does not watch it yet).")
@@ -433,37 +436,42 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let cell = |t: String| text(t).size(13);
     let can_restart = g.connected() && a.supervisor_up() && !s.stopped;
     let app = a.name().to_string();
+    // Workers, then hot standbys (`Status.standbys`): `(standby, row)`.
     let columns = vec![
-        table::column(h("Worker"), |w: &WorkerStatus| cell(w.id.to_string())),
-        table::column(h("State"), |w: &WorkerStatus| {
+        table::column(h("Worker"), |(standby, w): WorkerRow<'a>| {
+            cell(if standby { format!("standby {}", w.id) } else { w.id.to_string() })
+        }),
+        table::column(h("State"), |(_, w): WorkerRow<'a>| {
             let t = cell(w.state.clone());
             match w.state.as_str() {
-                "RUNNING" => t.style(good),
+                "RUNNING" | "STANDBY" => t.style(good),
                 "FAILED" | "CRASHED" => t.style(text::danger),
                 _ => t.style(text::warning),
             }
         }),
-        table::column(h("PID"), |w: &WorkerStatus| cell(format::opt(w.pid, |p| p.to_string()))),
-        table::column(h("Uptime"), |w: &WorkerStatus| cell(format::opt(w.uptime_secs, format::duration))),
-        table::column(h("Restarts"), |w: &WorkerStatus| cell(w.restarts.to_string())),
-        table::column(h("CPU"), |w: &WorkerStatus| cell(format::opt(w.cpu_percent, format::percent))),
-        table::column(h("RSS"), |w: &WorkerStatus| cell(format::opt(w.rss_bytes, format::bytes))),
-        table::column(h("Health"), |w: &WorkerStatus| {
+        table::column(h("PID"), |(_, w): WorkerRow<'a>| cell(format::opt(w.pid, |p| p.to_string()))),
+        table::column(h("Uptime"), |(_, w): WorkerRow<'a>| cell(format::opt(w.uptime_secs, format::duration))),
+        table::column(h("Restarts"), |(_, w): WorkerRow<'a>| cell(w.restarts.to_string())),
+        table::column(h("CPU"), |(_, w): WorkerRow<'a>| cell(format::opt(w.cpu_percent, format::percent))),
+        table::column(h("RSS"), |(_, w): WorkerRow<'a>| cell(format::opt(w.rss_bytes, format::bytes))),
+        table::column(h("Health"), |(_, w): WorkerRow<'a>| {
             let t = cell(format::health(w.healthy).into());
             match w.healthy {
                 Some(false) => t.style(text::danger),
                 _ => t,
             }
         }),
-        table::column(h("Last exit"), |w: &WorkerStatus| cell(w.last_exit.clone().unwrap_or_else(|| "-".into()))),
-        table::column(h(""), move |w: &WorkerStatus| {
+        table::column(h("Last exit"), |(_, w): WorkerRow<'a>| cell(w.last_exit.clone().unwrap_or_else(|| "-".into()))),
+        // A standby is not restarted on its own (it is replaced when it fails).
+        table::column(h(""), move |(standby, w): WorkerRow<'a>| {
             button(text("restart").size(SMALL))
                 .padding([2, 8])
                 .style(button::secondary)
-                .on_press_maybe(can_restart.then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))))
+                .on_press_maybe((can_restart && !standby).then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))))
         }),
     ];
-    let t = table(columns, s.workers.iter()).padding_x(10).padding_y(4);
+    let rows = s.workers.iter().map(|w| (false, w)).chain(s.standbys.iter().map(|w| (true, w)));
+    let t = table(columns, rows).padding_x(10).padding_y(4);
     container(scrollable(t).width(Fill)).max_height(240).into()
 }
 

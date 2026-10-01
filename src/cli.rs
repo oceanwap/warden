@@ -728,6 +728,10 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += &format!("Mode:        {}\n", s.mode);
         o += &format!("Workers:     {}\n", s.workers_configured);
         o += &format!("Ready:       {}\n", s.workers_ready);
+        if !s.standbys.is_empty() {
+            let up = s.standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
+            o += &format!("Standby:     {up}/{} ready to take over a crashed worker\n", s.standbys.len());
+        }
         o += &format!("PID:         {}\n", s.pid);
         o += &format!("Uptime:      {}\n", duration(s.uptime_secs));
         if let Some(r) = &s.release {
@@ -767,10 +771,12 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
         "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Health", "Last exit"
     );
-    for w in &s.workers {
+    // Workers by number, then hot standbys as `s1`, `s2`…
+    let rows = s.workers.iter().map(|w| (w.id.to_string(), w)).chain(s.standbys.iter().map(|w| (standby_name(w), w)));
+    for (name, w) in rows {
         o += &format!(
             "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
-            w.id,
+            name,
             w.state,
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -782,6 +788,11 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         );
     }
     o
+}
+
+/// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
+fn standby_name(w: &crate::control::WorkerStatus) -> String {
+    format!("s{}", w.id)
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -824,12 +835,13 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
     for (app, st) in all {
         match st {
             Ok(s) => {
-                for w in &s.workers {
+                let all = s.workers.iter().map(|w| (w.id.to_string(), w));
+                for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
                     let state = if s.stopped && w.state == "STOPPED" { "stopped".to_string() } else { w.state.clone() };
                     rows.push(vec![
                         app.name.clone(),
                         s.namespace.clone(),
-                        w.id.to_string(),
+                        name,
                         state,
                         w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                         w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -927,6 +939,15 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         },
     );
     row("mode", format!("{}, {} worker(s)", s.mode, s.workers_configured));
+    if num("/workers/standby") > 0 {
+        row(
+            "standby",
+            format!(
+                "{} hot standby(s): started, not listening; one takes a crashed worker's slot in milliseconds",
+                num("/workers/standby")
+            ),
+        );
+    }
     row(
         "restart",
         if c("/restart/enabled").as_bool() == Some(false) {

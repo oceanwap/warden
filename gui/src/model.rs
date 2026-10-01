@@ -64,20 +64,27 @@ impl App {
         self.status.as_ref().map(|s| (s.workers_ready, s.workers_configured))
     }
 
-    /// CPU % of the app's processes (workers, and the Bun host in worker
-    /// mode); `None` when nothing reports it (no /proc: macOS).
+    /// CPU % of the app's processes (workers, hot standbys, and the Bun host
+    /// in worker mode); `None` when nothing reports it (no /proc: macOS).
     pub fn cpu_percent(&self) -> Option<f64> {
         let s = self.status.as_ref()?;
-        let parts = s.workers.iter().map(|w| w.cpu_percent).chain([s.host.as_ref().and_then(|h| h.cpu_percent)]);
+        let parts = s
+            .workers
+            .iter()
+            .chain(&s.standbys)
+            .map(|w| w.cpu_percent)
+            .chain([s.host.as_ref().and_then(|h| h.cpu_percent)]);
         sum_some(parts)
     }
 
-    /// Resident memory of the app: workers, the worker-mode host, and the supervisor.
+    /// Resident memory of the app: workers, hot standbys (what they cost),
+    /// the worker-mode host, and the supervisor.
     pub fn rss_bytes(&self) -> Option<u64> {
         let s = self.status.as_ref()?;
         let parts = s
             .workers
             .iter()
+            .chain(&s.standbys)
             .map(|w| w.rss_bytes)
             .chain([s.host.as_ref().and_then(|h| h.rss_bytes), s.supervisor_rss_bytes]);
         let mut total = None;
@@ -346,6 +353,7 @@ pub(crate) mod tests {
             last_rollout: None,
             workers: (1..=n).map(|i| worker(i, Some(40 << 20), Some(1.5))).collect(),
             release: None,
+            standbys: vec![],
         }
     }
 
@@ -404,6 +412,23 @@ pub(crate) mod tests {
         // A status for an app not in the snapshot is ignored.
         m.apply(Event::Status { app: "ghost".into(), status: Box::new(status("ghost", 1)) }, 0);
         assert!(!m.apps.contains_key("ghost"));
+    }
+
+    /// Hot standbys (`Status.standbys`) cost memory and CPU, so they count
+    /// there; they are not workers, so not in "ready".
+    #[test]
+    fn standbys_count_in_resources_not_in_workers() {
+        let mut m = Model::default();
+        let mut s = status("api", 2);
+        let mut sb = worker(1, Some(40 << 20), Some(0.5));
+        sb.state = "STANDBY".into();
+        s.standbys.push(sb);
+        m.apply(apps(vec![entry("api", AppState::Running, Some(s))]), 0);
+        let api = &m.apps["api"];
+        assert_eq!(api.workers(), Some((2, 2)));
+        assert_eq!(api.rss_bytes(), Some(124 << 20));
+        assert_eq!(api.cpu_percent(), Some(3.5));
+        assert_eq!(api.state_label(), "running");
     }
 
     #[test]

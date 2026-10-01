@@ -1,5 +1,5 @@
 //! Spawning and owning one OS process: stdout/stderr capture, the fd-3 IPC
-//! pipe used by the shim, signal delivery, and exit reporting.
+//! socket used by the shim, signal delivery, and exit reporting.
 //!
 //! Each process is owned by a task that holds its `Child`. Signals go through
 //! that task, so a signal is only ever sent while the child is still unreaped
@@ -8,9 +8,11 @@
 pub mod exit;
 
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::rc::Rc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -103,13 +105,55 @@ pub enum ProcEvent {
     },
 }
 
+/// The `worker=` label on a process's captured output. Shared with its
+/// output readers, so a promoted standby's lines carry the slot it took.
+#[derive(Clone)]
+pub struct Label(Rc<RefCell<Rc<str>>>);
+
+impl Label {
+    fn new(s: &str) -> Label {
+        Label(Rc::new(RefCell::new(s.into())))
+    }
+    fn get(&self) -> Rc<str> {
+        self.0.borrow().clone()
+    }
+}
+
 /// Handle to a running process. Dropping it does not kill the process.
 pub struct Handle {
     pub pid: u32,
     ctl: mpsc::UnboundedSender<(i32, bool)>,
+    /// Warden's end of the fd-3 socket (a non-blocking duplicate of the one
+    /// the IPC reader owns), for messages to the worker (read by the shim
+    /// only in a standby).
+    ipc: Option<std::os::unix::net::UnixStream>,
+    label: Label,
 }
 
 impl Handle {
+    /// Send one line to the worker on fd 3 without waiting: the message is
+    /// tiny and the socket buffer empty, so anything short of a whole write
+    /// (the worker stopped reading, the channel is gone) is an error.
+    pub fn send(&self, line: &[u8]) -> std::io::Result<()> {
+        use std::os::fd::AsFd as _;
+        let Some(ipc) = self.ipc.as_ref() else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "no IPC channel to this worker"));
+        };
+        // A worker gone is EPIPE here, never a SIGPIPE.
+        match crate::sys::send(ipc.as_fd(), line, false)? {
+            n if n == line.len() => Ok(()),
+            n => Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                format!("only {n} of {} bytes written", line.len()),
+            )),
+        }
+    }
+
+    /// From now on, label this process's captured output `label`.
+    pub fn relabel(&self, label: &str) {
+        *self.label.0.borrow_mut() = label.into();
+    }
+
     /// SIGTERM and SIGKILL go to the whole process group (like supervisord's
     /// stopasgroup/killasgroup), so `bun run <script>` wrappers or helpers the
     /// app spawned are not orphaned. Other signals go to the process only.
@@ -124,8 +168,9 @@ impl Handle {
 }
 
 pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) -> std::io::Result<Handle> {
-    let (ipc_read, ipc_write) = pipe()?;
-    let write_fd = std::os::fd::AsRawFd::as_raw_fd(&ipc_write);
+    // fd 3: a socket, so Warden can also send to the worker (`Handle::send`).
+    let (ipc_ours, ipc_child) = crate::sys::socketpair_cloexec()?;
+    let child_fd = std::os::fd::AsRawFd::as_raw_fd(&ipc_child);
 
     let mut cmd = Command::new(&spec.program);
     // Direct mode: our own pipes (read end, file, stream), spliced into
@@ -174,18 +219,19 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
-            crate::sys::child_dup_ipc(write_fd, IPC_FD)?;
+            crate::sys::child_dup_ipc(child_fd, IPC_FD)?;
             // If Warden dies without cleaning up (SIGKILL), take the workers with it.
             crate::sys::child_parent_death_signal(libc::SIGTERM)
         });
     }
     let mut child = cmd.spawn()?;
-    // Our copies of the pipes' write ends (in `cmd`): only the worker's
-    // remain, so its exit is EOF.
+    // Our copies of the pipes' write ends (in `cmd`) and of the worker's end
+    // of the IPC socket: only the worker's remain, so its exit is EOF.
     drop(cmd);
-    drop(ipc_write);
+    drop(ipc_child);
     let pid = child.id().unwrap_or(0);
     let label = spec.label.clone();
+    let shared_label = Label::new(&label);
     let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<(i32, bool)>();
 
     // Readers of the worker's output and IPC pipe. If one of them fails, the
@@ -205,7 +251,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     };
     if let Some(out) = child.stdout.take().and_then(|o| output_receiver(o.into_owned_fd(), &label, "stdout")) {
         let on_fail = reader_failed("stdout", ctl_tx.clone(), label.clone());
-        let fut = pump_output(out, label.clone(), "stdout", spec.max_lines_per_sec);
+        let fut = pump_output(out, shared_label.clone(), "stdout", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
             if let Err(m) = crate::guard::catch_unwind(fut).await {
                 on_fail(m);
@@ -214,7 +260,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     }
     if let Some(err) = child.stderr.take().and_then(|e| output_receiver(e.into_owned_fd(), &label, "stderr")) {
         let on_fail = reader_failed("stderr", ctl_tx.clone(), label.clone());
-        let fut = pump_output(err, label.clone(), "stderr", spec.max_lines_per_sec);
+        let fut = pump_output(err, shared_label.clone(), "stderr", spec.max_lines_per_sec);
         tokio::task::spawn_local(async move {
             if let Err(m) = crate::guard::catch_unwind(fut).await {
                 on_fail(m);
@@ -227,8 +273,10 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             start_direct(fd, path, files.policy.clone(), label.clone(), stream, on_fail);
         }
     }
-    match tokio::net::unix::pipe::Receiver::from_owned_fd(ipc_read) {
-        Ok(rx) => {
+    let mut ipc = None;
+    match ipc_stream(ipc_ours) {
+        Ok((rx, tx)) => {
+            ipc = Some(tx);
             let on_fail = reader_failed("ipc", ctl_tx.clone(), label.clone());
             let fut = pump_ipc(rx, inst, events.clone(), label.clone());
             tokio::task::spawn_local(async move {
@@ -238,9 +286,10 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             });
         }
         Err(e) => crate::warn!(
-            "cannot read the worker's IPC pipe; readiness falls back to /proc and the watchdog is off for it",
+            "cannot use the worker's IPC socket; readiness falls back to /proc, the watchdog is off for it and it cannot be promoted from standby",
             worker = label,
             error = e,
+            hint = "this is a Warden bug: please report it",
         ),
     }
 
@@ -310,7 +359,17 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
-    Ok(Handle { pid, ctl: ctl_tx })
+    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label })
+}
+
+/// Warden's end of the IPC socket, non-blocking: a tokio stream for the
+/// reader, and a duplicate for `Handle::send`, which writes directly (no
+/// reactor state involved: a send right after spawn must work too).
+fn ipc_stream(fd: OwnedFd) -> std::io::Result<(tokio::net::UnixStream, std::os::unix::net::UnixStream)> {
+    let s = std::os::unix::net::UnixStream::from(fd);
+    s.set_nonblocking(true)?;
+    let writer = s.try_clone()?;
+    Ok((tokio::net::UnixStream::from_std(s)?, writer))
 }
 
 /// A worker's stdout/stderr pipe as a non-blocking receiver. If that fails
@@ -413,17 +472,17 @@ thread_local! {
 }
 
 /// Forward a child stream line by line to the log, capping line length and rate.
-async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream: &'static str, limit: u32) {
+async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream: &'static str, limit: u32) {
     crate::guard::fault(stream);
     let mut line: Vec<u8> = Vec::new();
     let mut rate = RateLimit::new(if limit == 0 { u32::MAX } else { limit });
     loop {
         if let Err(e) = rx.readable().await {
-            crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
+            crate::warn!("stopped reading worker output", worker = label.get(), stream = stream, error = e);
             break;
         }
         // Everything this read produced goes to the log as one batch.
-        let mut batch = crate::logging::OutputBatch::new(&label, stream);
+        let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
         let read = READ_BUF.with(|buf| {
             let mut buf = buf.borrow_mut();
             let n = rx.try_read(&mut buf)?;
@@ -436,7 +495,7 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                crate::warn!("stopped reading worker output", worker = label, stream = stream, error = e);
+                crate::warn!("stopped reading worker output", worker = label.get(), stream = stream, error = e);
                 break;
             }
         }
@@ -450,7 +509,7 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream
         if let Some(n) = rate.report() {
             crate::warn!(
                 "worker writes too much output; lines dropped",
-                worker = label,
+                worker = label.get(),
                 stream = stream,
                 dropped = n,
                 limit_per_s = limit,
@@ -459,7 +518,7 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: String, stream
         }
     }
     if !line.is_empty() {
-        let mut batch = crate::logging::OutputBatch::new(&label, stream);
+        let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
         keep(&mut batch, &mut line, &mut rate);
         crate::logging::worker_output_batch(batch);
     }
@@ -619,12 +678,7 @@ fn keep(batch: &mut crate::logging::OutputBatch, line: &mut Vec<u8>, rate: &mut 
     line.clear();
 }
 
-async fn pump_ipc(
-    mut rx: tokio::net::unix::pipe::Receiver,
-    inst: u64,
-    events: mpsc::UnboundedSender<ProcEvent>,
-    label: String,
-) {
+async fn pump_ipc(mut rx: tokio::net::UnixStream, inst: u64, events: mpsc::UnboundedSender<ProcEvent>, label: String) {
     crate::guard::fault("ipc");
     let mut chunk = [0u8; 4096];
     let mut buf: Vec<u8> = Vec::new();
@@ -825,6 +879,46 @@ mod tests {
                         }
                     }
                 }
+            })
+            .await;
+    }
+
+    /// fd 3 is two-way: the worker reads what Warden sends (a standby's
+    /// `promote`) and answers on the same descriptor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sends_lines_to_the_worker_on_fd3() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let spec = Spec {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), r#"read -r l <&3; echo "{\"ev\":\"$l\"}" >&3"#.into()],
+                    cwd: None,
+                    env: vec![],
+                    label: "t".into(),
+                    output: Output::Capture,
+                    max_lines_per_sec: 0,
+                };
+                let h = spawn(spec, 9, tx).unwrap();
+                h.relabel("2");
+                assert_eq!(&*h.label.get(), "2");
+                h.send(b"promoted\n").unwrap();
+                let (mut got_ipc, mut got_exit) = (false, false);
+                while !(got_ipc && got_exit) {
+                    match rx.recv().await.unwrap() {
+                        ProcEvent::Ipc { msg, .. } => {
+                            assert_eq!(msg.ev, "promoted");
+                            got_ipc = true;
+                        }
+                        ProcEvent::Exited { code, .. } => {
+                            assert_eq!(code, Some(0));
+                            got_exit = true;
+                        }
+                    }
+                }
+                // The worker is gone: sending fails cleanly instead of blocking.
+                assert!(h.send(b"again\n").is_err());
             })
             .await;
     }

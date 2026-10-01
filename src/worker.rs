@@ -10,6 +10,10 @@
 //! A slot is one supervised unit: in process mode one slot per worker process;
 //! in worker mode a single slot holding the Bun host process, whose Workers
 //! (threads) are tracked as `ThreadInfo`s on the instance.
+//!
+//! Hot standbys (`[workers] standby`, process mode) are instances outside the
+//! slots (slot 0, `Role::Standby`): started, not listening. When a worker
+//! dies one is promoted into its slot (`Role::Current`).
 
 use crate::process::Handle;
 use crate::restart::Tracker;
@@ -84,6 +88,28 @@ pub enum Role {
     Replacement,
     /// Replaced; draining and exiting.
     Retiring,
+    /// A hot standby: initialized, its listen deferred, outside the slots
+    /// (`slot` is 0) until promoted.
+    Standby,
+}
+
+/// The slot number of standbys (process-mode slots start at 1).
+pub const STANDBY_SLOT: usize = 0;
+
+/// A standby's way to "available": initialized, then the rollout gates a
+/// new worker must pass (health checks, verify_command).
+#[derive(Debug, Default, Clone)]
+pub struct StandbyGates {
+    /// Reported `standby_ready` (its listen is deferred).
+    pub ready_at: Option<Instant>,
+    /// Consecutive health checks passed / failed (`reload.health_passes`).
+    pub passes: u32,
+    pub fails: u32,
+    /// A check or verify_command is running.
+    pub checking: bool,
+    pub verified: bool,
+    /// Passed every gate: may be promoted.
+    pub available: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,11 +153,21 @@ pub struct Instance {
     pub mem_strikes: u8,
     /// `limits.max_lifetime` (with jitter) deadline.
     pub recycle_at: Option<Instant>,
+    /// `Role::Standby`: its gates.
+    pub standby: Option<StandbyGates>,
+    /// A standby promoted into a slot: when (until it listens, then too).
+    pub promoted_at: Option<Instant>,
+    /// `Role::Standby`: the release (pinned working directory) it started
+    /// in; it is promoted only while that is still the workers' release.
+    pub release: Option<PathBuf>,
 }
 
 impl Instance {
     pub fn new(slot: usize, handle: Handle, role: Role) -> Self {
         Instance {
+            standby: (role == Role::Standby).then(StandbyGates::default),
+            promoted_at: None,
+            release: None,
             slot,
             handle,
             started: Instant::now(),

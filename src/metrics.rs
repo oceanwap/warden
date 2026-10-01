@@ -69,6 +69,29 @@ pub fn render_prometheus(s: &Status) -> String {
     let per = |f: &dyn Fn(&crate::control::WorkerStatus) -> Option<f64>| -> Vec<(String, f64)> {
         s.workers.iter().filter_map(|w| f(w).map(|v| (format!(",worker=\"{}\"", w.id), v))).collect()
     };
+    // Hot standbys: gauges of their own (not worker series).
+    let standbys = &s.standbys;
+    if !standbys.is_empty() {
+        let ready = standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
+        gauge(
+            "warden_standbys_ready",
+            "Hot standbys ready to take over a crashed worker.",
+            "gauge",
+            vec![(String::new(), ready as f64)],
+        );
+        gauge(
+            "warden_standbys_rss_bytes",
+            "Resident memory of the hot standbys, together.",
+            "gauge",
+            vec![(String::new(), standbys.iter().filter_map(|w| w.rss_bytes).sum::<u64>() as f64)],
+        );
+        gauge(
+            "warden_standby_restarts_total",
+            "Standbys started again after one crashed or failed its checks.",
+            "counter",
+            vec![(String::new(), standbys.first().map(|w| w.restarts).unwrap_or(0) as f64)],
+        );
+    }
     gauge(
         "warden_worker_up",
         "1 if the worker is running.",
@@ -243,6 +266,7 @@ mod tests {
                 healthy: Some(false),
             }],
             release: None,
+            standbys: vec![],
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));
@@ -250,5 +274,29 @@ mod tests {
         assert!(t.contains("warden_worker_up{app=\"api\",worker=\"1\"} 1"));
         assert!(t.contains("# TYPE warden_worker_crashes_total counter"));
         assert!(t.contains("warden_worker_healthy{app=\"api\",worker=\"1\"} 0"));
+        assert!(!t.contains("standby"), "no standby series without standbys");
+
+        // Hot standbys get gauges of their own, never worker series.
+        let mut st = st;
+        let standby = |state: &str, rss| WorkerStatus {
+            id: 1,
+            state: state.into(),
+            pid: Some(9),
+            uptime_secs: Some(1),
+            restarts: 3,
+            crashes: 3,
+            rss_bytes: Some(rss),
+            cpu_seconds: Some(0.1),
+            cpu_percent: None,
+            last_exit: None,
+            healthy: None,
+        };
+        st.standbys.push(standby(crate::control::STANDBY, 1000));
+        st.standbys.push(standby(crate::control::WARMING, 500));
+        let t = render_prometheus(&st);
+        assert_eq!(t.matches("warden_worker_up{").count(), 1, "{t}");
+        assert!(t.contains("warden_standbys_ready{app=\"api\"} 1"), "{t}");
+        assert!(t.contains("warden_standbys_rss_bytes{app=\"api\"} 1500"), "{t}");
+        assert!(t.contains("warden_standby_restarts_total{app=\"api\"} 3"), "{t}");
     }
 }

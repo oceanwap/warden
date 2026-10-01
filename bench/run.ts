@@ -20,6 +20,7 @@
 //   warden-surge    the same with [reload] surge = "all" (every new worker at once); only startup,
 //                   idle memory and the rolling restart are measured (the rest is warden-process's)
 //   warden-worker   Warden, N worker threads in one Bun process
+//   warden-standby  Warden, N worker processes + 1 hot standby ([workers] standby = 1)
 //
 // Needs: Linux (/proc), bun, node >= 22.12, oha (cargo install oha),
 // target/release/warden (cargo build --release), `npm install` in bench/
@@ -87,6 +88,8 @@ const apps: Record<string, AppDef> = {
     scenarios: ["bare", "pm2", "watt", "warden-process", "warden-surge"],
   },
 };
+// Every app also runs under Warden with a hot standby (see startWardenStandby).
+for (const a of Object.values(apps)) a.scenarios.push("warden-standby");
 const app = apps[APP];
 if (!app) throw new Error(`unknown app ${APP}; one of ${Object.keys(apps).join(", ")}`);
 const SCENARIOS = (args.scenarios ?? app.scenarios.join(",")).split(",");
@@ -294,10 +297,11 @@ async function startWatt(): Promise<Running> {
   };
 }
 
-/** `surge`: `[reload] surge` (rolling restarts start that many new workers at once). */
-async function startWarden(mode: "process" | "worker", surge?: string): Promise<Running> {
+/** `surge`: `[reload] surge` (rolling restarts start that many new workers at once).
+ *  `workersExtra`: more `[workers]` keys (`standby = 1`). */
+async function startWarden(mode: "process" | "worker", surge?: string, workersExtra = ""): Promise<Running> {
   if (!existsSync(WARDEN)) throw new Error("build first: cargo build --release");
-  const tag = surge ? `${mode}-surge` : mode;
+  const tag = surge ? `${mode}-surge` : workersExtra ? `${mode}-standby` : mode;
   const sock = join(TMP, `warden-${tag}.sock`);
   const cfg = join(TMP, `warden-${tag}.toml`);
   const appCfg =
@@ -307,7 +311,7 @@ async function startWarden(mode: "process" | "worker", surge?: string): Promise<
   writeFileSync(
     cfg,
     `[app]\nname = "bench-${tag}"\n${appCfg}\nworking_directory = ${JSON.stringify(app.cwd)}\nport = ${PORT}\n` +
-      `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n` +
+      `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n${workersExtra}` +
       (surge ? `[reload]\nsurge = ${JSON.stringify(surge)}\n` : "") +
       `[shutdown]\ngrace_period = 10\ndrain_ms = 0\n[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(sock)}\n`,
   );
@@ -347,8 +351,36 @@ function start(name: string): Promise<Running> {
       return startWarden("process", "all");
     case "warden-worker":
       return startWarden("worker");
+    case "warden-standby":
+      return startWardenStandby();
   }
   throw new Error(`unknown scenario ${name}`);
+}
+
+// ------------------------------------------------------------------ standby
+// warden-standby: Warden processes plus one hot standby, started (app
+// initialized) but not listening; when a worker dies the standby takes its
+// slot, so "crash recovery" is a promotion instead of a cold start. It
+// counts in the RAM rows (its pid is in `warden status`, under `standbys`),
+// which shows what it costs. It answers no request until promoted, so
+// startup and throughput see the same N workers.
+async function startWardenStandby(): Promise<Running> {
+  const run = await startWarden("process", undefined, "standby = 1\n");
+  const sock = join(TMP, "warden-process-standby.sock");
+  const status = () => {
+    const r = spawnSync([WARDEN, "status", "--json", "--socket", sock]);
+    return r.exitCode === 0 ? JSON.parse(r.stdout.toString()) : null;
+  };
+  const standbyPids = (): number[] => (status()?.standbys ?? []).filter((w: any) => w.state === "STANDBY").map((w: any) => w.pid);
+  return {
+    ...run,
+    // The standby starts once the workers serve (after the startup timing):
+    // memory is first sampled when it is ready, and includes it.
+    appPids: async () => {
+      await waitFor(() => standbyPids().length > 0, 120_000);
+      return uniq([...(await run.appPids()), ...standbyPids()]);
+    },
+  };
 }
 
 // --------------------------------------------------------------------- measure

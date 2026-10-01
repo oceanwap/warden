@@ -48,6 +48,11 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
 | `longlived.ts` | WebSocket and SSE clients held through a rolling restart: PM2 (cluster mode for Node, fork mode for Bun) vs Warden (processes; Bun also worker mode) |
 
+Every `run.ts` app also runs `warden-standby`: Warden's processes plus one
+hot standby (`[workers] standby = 1`), so its crash recovery is a promotion
+instead of a cold start. The standby counts in the RAM rows (that is its
+cost); it answers no request until promoted.
+
 Common options: `--duration S` (seconds per load test, default 10),
 `--connections N` (64), `--workers N` (4), `--scenarios a,b` (a subset).
 `logs.ts` takes `--rate`, `--seconds` and `--mb`; `fleet.ts` takes `--apps`;

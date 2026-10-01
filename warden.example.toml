@@ -28,6 +28,10 @@ wait_ready = false                           # ready on process.send('ready') in
 min_uptime = 1000                            # ms an app without a port must stay up to count as ready
 # overlap = true                             # start the new worker before stopping the old one in rolling
                                              # restarts (default: yes when the port can be shared)
+standby = 0                                  # hot standbys: extra workers kept started (app initialized)
+                                             # but not listening; when a worker dies one takes its slot in
+                                             # a few ms instead of a cold start. Each costs about one
+                                             # worker's memory. Process mode, shared port, bun/node shim
 
 [restart]
 enabled = true

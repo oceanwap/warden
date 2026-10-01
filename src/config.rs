@@ -203,6 +203,10 @@ pub struct Workers {
     /// Start the new worker before stopping the old one in rolling restarts.
     /// Default: yes, unless the app can't share its port (see `overlap()`).
     pub overlap: Option<bool>,
+    /// Hot standbys (process mode): extra workers kept started but not
+    /// listening; when a worker dies one takes its slot within milliseconds.
+    /// Each costs about one worker's memory. 0 = none.
+    pub standby: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -563,6 +567,7 @@ impl Default for Workers {
             wait_ready: false,
             min_uptime: 1000,
             overlap: None,
+            standby: 0,
         }
     }
 }
@@ -800,6 +805,9 @@ impl Config {
                 }
             }
         }
+        if self.workers.standby > 0 {
+            self.check_standby()?;
+        }
         if self.workers.port_strategy == PortStrategy::Offset {
             match a.port {
                 None => return Err("workers.port_strategy = \"offset\" needs app.port".into()),
@@ -924,14 +932,56 @@ impl Config {
         Ok(())
     }
 
+    /// `[workers] standby`: the shim defers the app's listen on its port until
+    /// a standby is promoted into a slot (process mode only).
+    fn check_standby(&self) -> Result<(), String> {
+        let n = self.workers.standby;
+        if self.workers.mode == Mode::Worker {
+            return Err(format!(
+                "workers.standby = {n} is for process mode: in worker mode the unit is the whole host process. \
+                 Fix: set standby = 0, or workers.mode = \"process\""
+            ));
+        }
+        if self.static_files.is_some() {
+            return Err("workers.standby: [static] runs Warden's own file server, which starts in milliseconds; \
+                        remove standby"
+                .into());
+        }
+        if !self.shim_enabled() {
+            return Err("workers.standby needs Warden's shim (bun and node commands, app.shim not false): it is \
+                        what holds a standby's listen back until it is promoted"
+                .into());
+        }
+        if self.app.port.is_none() {
+            return Err("workers.standby needs app.port: a standby defers its listen on that port until it is \
+                        promoted"
+                .into());
+        }
+        if self.workers.port_strategy != PortStrategy::Shared {
+            return Err("workers.standby needs workers.port_strategy = \"shared\": a promoted standby joins the \
+                        shared port"
+                .into());
+        }
+        if self.logging.worker_output == WorkerOutput::Direct {
+            return Err("workers.standby does not work with logging.worker_output = \"direct\": a standby's output \
+                        file could not follow it into the slot it takes. Fix: worker_output = \"capture\" (the \
+                        default)"
+                .into());
+        }
+        // No socket path to check: a Bun standby's stand-in server uses the
+        // private health socket (checked above) or an ephemeral TCP port.
+        Ok(())
+    }
+
     /// Upper bounds on every number, so no value can overflow time arithmetic
     /// (`Instant + Duration`) or counters at runtime. Generous: they only
     /// exclude values that are certainly mistakes.
     fn check_bounds(&self) -> Result<(), String> {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86_400;
-        let checks: [(&str, u64, u64); 25] = [
+        let checks: [(&str, u64, u64); 26] = [
             ("workers.ready_timeout", self.workers.ready_timeout, HOUR),
+            ("workers.standby", self.workers.standby as u64, 1024),
             ("restart.max_restarts", self.restart.max_restarts as u64, 10_000),
             ("restart.restart_window", self.restart.restart_window, 30 * DAY),
             ("restart.backoff_initial", self.restart.backoff_initial, HOUR * 1000),
@@ -1499,6 +1549,40 @@ level = "info"
         assert!(c.log_files().out_file.is_some());
         let err = direct("[logging]\nworker_output = \"inherit\"\nout_file = \"/tmp/o.log\"\n").unwrap_err();
         assert!(err.contains("\"capture\" or \"direct\""), "{err}");
+    }
+
+    #[test]
+    fn standby_rules() {
+        let ok = format!("{MIN}port = 3000\n[workers]\ncount = 2\nstandby = 1\n");
+        let c = Config::parse(&ok).unwrap();
+        assert_eq!(c.workers.standby, 1);
+        assert_eq!(Config::parse(MIN).unwrap().workers.standby, 0, "off by default");
+        let node =
+            "[app]\nname = \"api\"\ncommand = \"node\"\nargs = [\"s.js\"]\nport = 3000\n[workers]\nstandby = 2\n";
+        assert!(Config::parse(node).is_ok());
+        let err = |toml: &str| Config::parse(toml).unwrap_err();
+        let e = err(&format!("{MIN}[workers]\nstandby = 1\n"));
+        assert!(e.contains("needs app.port"), "{e}");
+        let e =
+            err("[app]\nname = \"a\"\nentry = \"main.js\"\nport = 3000\n[workers]\nmode = \"worker\"\nstandby = 1\n");
+        assert!(e.contains("for process mode"), "{e}");
+        let e = err(&format!("{MIN}port = 3000\nshim = false\n[workers]\nstandby = 1\n"));
+        assert!(e.contains("needs Warden's shim"), "{e}");
+        let e = err("[app]\nname = \"a\"\ncommand = \"python3\"\nport = 3000\n[workers]\nstandby = 1\n");
+        assert!(e.contains("needs Warden's shim"), "{e}");
+        let e = err(&format!("{MIN}port = 3000\n[workers]\ncount = 2\nstandby = 1\nport_strategy = \"offset\"\n"));
+        assert!(e.contains("port_strategy = \"shared\""), "{e}");
+        let e = err(&format!(
+            "{MIN}port = 3000\n[workers]\nstandby = 1\n[logging]\nworker_output = \"direct\"\nout_file = \"/tmp/o.log\"\n"
+        ));
+        assert!(e.contains("\"direct\""), "{e}");
+        let e = err(&format!("{MIN}port = 3000\n[static]\nroot = \"/srv\"\n[workers]\nstandby = 1\n"));
+        assert!(e.contains("[static]"), "{e}");
+        let e = err(&format!("{MIN}port = 3000\n[workers]\nstandby = 2000\n"));
+        assert!(e.contains("out of range"), "{e}");
+        // Any checkout path: standbys need no socket path of their own.
+        let long = format!("{ok}[control]\nsocket = \"/tmp/{}/c.sock\"\n", "d".repeat(150));
+        assert!(Config::parse(&long).is_ok());
     }
 
     #[test]

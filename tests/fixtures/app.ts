@@ -9,6 +9,7 @@
 //                              first, and the app server 400 ms later
 //   FIXTURE_SPAM=1             write stdout lines as fast as possible (stalled-log tests)
 //   FIXTURE_IPC_FLOOD=1        write messages and junk to fd 3 as fast as possible
+//   FIXTURE_STANDBY_EXIT=<ms>  exit 4 after <ms> if still a hot standby (standby crash loop)
 // Endpoints:
 //   /whoami  pid:thread      /health  200 or 503
 //   /throw   uncaught error  /exit    exit 3
@@ -23,6 +24,11 @@ if (process.env.FIXTURE_THROW_AFTER) {
   setTimeout(() => { throw new Error("fixture: delayed crash"); }, Number(process.env.FIXTURE_THROW_AFTER));
 }
 if (process.env.FIXTURE_IGNORE_TERM) process.on("SIGTERM", () => console.log("ignoring SIGTERM"));
+if (process.env.FIXTURE_STANDBY_EXIT) {
+  setTimeout(() => {
+    if (process.env.WARDEN_STANDBY === "1") process.exit(4);
+  }, Number(process.env.FIXTURE_STANDBY_EXIT));
+}
 
 const who = `${process.pid}:${threadId}`;
 

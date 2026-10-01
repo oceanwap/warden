@@ -36,6 +36,7 @@ below comes from running them, not from documentation.
 | F12 | Inherited fds / Worker env | A Bun process can write JSON lines to an inherited fd 3. `new Worker(url, { env })` gives each Worker its own `process.env`. |
 | F13 | Can one Bun process serve the same app on a second, private Unix socket? | **Yes**, for `Bun.serve` fetch apps, plain `node:http` and NestJS: calling the original `Bun.serve` with the app's own options object plus `unix: <path>` gives a second listener with the same handler. This is how Warden health-checks one specific worker. |
 | F14 | Worker‑mode reload under load | 9–15 resets per ~100 k requests with `tcp_migrate_req = 0`, **0** with `1` (3 runs). Same for fresh-connection clients in process mode (~1 reset per replaced worker → 0). |
+| F15 | Can an app start completely but listen later (hot standby)? | **Yes, from the shim.** `Bun.serve`: start the app's options on a private Unix socket or an ephemeral 127.0.0.1 port (a stand-in) and hand the app a Proxy whose target becomes the real server later; WebSocket `publish`, `subscriberCount`, `stop()` through the app's reference reach the real server. Bun's `node:http` **rejects a Proxy** ("The "server" argument must be of type bun.Server"): it gets the stand-in itself, keeps it under `Symbol(::bunternal::)` and emits `listening` through `EventEmitter.prototype.emit`, where the shim finds it; swapping the symbol to the real server makes `address()` and `close()` act on it. Node: `listen()` is recorded and replayed. Measured promote → port answering: Bun.serve 0.7–1.5 ms, node:http on Bun 1.4 ms, NestJS on Bun 2 ms, node:http on Node **9–13 ms** (first `listen` compiles and loads its path) → **2–3 ms** with a warm-up listen on an ephemeral port during standby, NestJS on Node 2–3 ms. `fs.read` on fd 3 (a blocking socket) runs on the thread pool in both runtimes; the event loop keeps running (49 timer ticks during a 500 ms read). |
 
 Note: the sandbox these probes first ran in exported `BUN_OPTIONS=--smol`;
 F5/F6 were re-measured without it (numbers above). The benchmark harness
@@ -131,7 +132,13 @@ in worker mode. Enabled by default when `command` is `bun`. It:
    The app's own SIGTERM handlers (NestJS `enableShutdownHooks`) are deferred
    until the drain is done — otherwise Nest closes every connection at once
    (39 resets per reload measured) — and still run afterwards;
-5. in Workers, closes all listeners from a `process.on("exit")` hook (F8).
+5. in Workers, closes all listeners from a `process.on("exit")` hook (F8);
+6. in a hot standby (`WARDEN_STANDBY=1`, §4.5a), holds back the app's listen
+   on its port until Warden sends `promote` on fd 3 (F15).
+
+fd 3 is a Unix socketpair (`sys::socketpair_cloexec`): the worker writes its
+reports as JSON lines; Warden writes to it only to promote a standby, and
+only a standby's shim reads it.
 
 Apps that are not Bun (Node) run without the shim: they must pass
 `reusePort: true` themselves (Node ≥ 22.12) or use `port_strategy = "offset"`.
@@ -175,6 +182,76 @@ resets after a worker stays up for `restart_window` seconds. More than
 `max_restarts` restarts inside `restart_window` → `FAILED`; retried after
 `failed_cooldown` (if restarts are enabled), or cleared by `warden restart <id>`
 (process mode) / `warden reload` (worker mode).
+
+### 4.5a Hot standbys (`[workers] standby = N`, `src/supervisor/standby.rs`)
+
+A restart costs the runtime's and the app's startup (Bun 47 ms, node:http
+113 ms, NestJS on Node ~800 ms). A standby pays it before the crash:
+
+```
+spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─promote─► listening ─► RUNNING in slot k
+  (WARMING: app initialized,   (health_passes,                  (fd 3)    (~1-3 ms)
+   listen held back, F15)       verify_command)
+```
+
+- **Pool.** N instances outside the slots (`Role::Standby`, slot 0), started
+  once no worker is starting (they would compete for the CPU). `status`
+  lists them in `standbys` (`WARMING`, `STANDBY`; additive, so older
+  clients just don't show them), the GUI counts their memory and CPU, and
+  Prometheus gets `warden_standbys_*`. A Bun standby's stand-in server
+  serves on its private health socket when there is one, else on an
+  ephemeral 127.0.0.1 port: no socket path of its own, so no length limit.
+- **Gates.** Promotable only after `standby_ready` (initialized: the app
+  called `Bun.serve`/`listen` on its port) and what a rollout's new worker
+  must pass before taking traffic: `reload.health_passes` checks on its
+  private socket (the stand-in serves the app there) and
+  `reload.verify_command`. Idle standbys get the liveness checks and the
+  watchdog; a failing one is replaced, never promoted. A standby found
+  listening on the port before promotion (an app that listens in a way the
+  shim does not hold back) turns standbys off with an error.
+- **Promotion.** On a crash, the slot goes through `on_slot_crash` as
+  always (counted, backed off, FAILED after `max_restarts`); when its
+  restart is due, an available standby is told
+  `{"cmd":"promote","worker":k,"count":n}` instead of spawning a process. The
+  shim listens for real and takes worker id k (`WARDEN_WORKER_ID`,
+  `NODE_APP_INSTANCE`, `process.emit("warden:promote")`), Warden relabels its
+  output `worker=k` and gives it `PROMOTE_TIMEOUT` (5 s) to listen. Events:
+  `starting` and `ready` of worker k with detail `promoted from standby`; log
+  `worker promoted from standby worker=k pid=… promote_ms=…`. A new standby
+  starts once the promoted one listens.
+- **Crash loops.** Standby exits (and failed gates) share one restart
+  tracker with the slots' policy: backoff, then FAILED (a `FAILED` row) until
+  `failed_cooldown` or `warden reset`; crashed workers restart cold meanwhile.
+- **Deploys.** A standby runs the code it started with. While a reload,
+  safe-reload or restart runs, standbys are neither promoted nor started
+  (a crash restarts cold, on the new code like before). When it succeeds,
+  every standby is stopped and fresh ones go through the gates; when it fails
+  or rolls back they stay, matching the workers that kept the previous
+  version. Recycling (`Kind::Replace`: memory, lifetime, health, hang) keeps
+  the code, so an available standby is the replacement: it listens next to
+  the old worker, passes the remaining gates, then the old one drains.
+  `scale` changes only the slots. With `[reload] surge` a batch of new
+  workers starts next to the old ones; the standbys stay out of it (they
+  are paused, and kept if the batch rolls back), so a surge's peak memory
+  is 2 × batch + standbys.
+- **Release pinning.** A standby starts in the release workers start in
+  (`[app] pin_release`: pinned command, arguments and directory) and
+  records it; it is promoted only while that is still the workers' release.
+  A deploy re-pins at its start (standbys paused), so after a successful one
+  they are replaced in the new release, and after a rollback the pin and the
+  standbys are the previous ones again. If the pin moves otherwise (the
+  pinned directory was deleted), standbys on the old one are replaced.
+- **Memory.** A standby is a fully initialized app without a listener: about
+  one idle worker (measured idle RSS, worker vs standby: Bun fixture 42.9 /
+  42.4 MB, Node fixture 57.6 / 56.5 MB, NestJS on Bun 85.3 / 84.0 MB, NestJS
+  on Node 99.9 / 102.8 MB), not less. Much of it is the runtime's pages,
+  shared with the workers: in the benchmark harness (Bun.serve app, 2
+  workers) one standby added 41 MB RSS but 11 MB PSS. It does not grow with
+  traffic as workers do. Measured there too: crash recovery 56 ms cold, 17 ms
+  with the standby (debug build of Warden), with no extra failed requests.
+- Process mode only, with `app.port`, `port_strategy = "shared"`, the shim
+  and captured output (a `direct` output file could not follow the standby
+  into its slot); config validation says so.
 
 ### 4.6 Shutdown (SIGTERM / SIGINT from systemd)
 
