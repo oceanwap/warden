@@ -416,6 +416,9 @@ pub struct Optional {
     pub oom: bool,
     /// Warden reads workers' RSS here (Linux /proc): `max_memory` works.
     pub rss: bool,
+    /// Node can share a port (libuv's reusePort: Linux, not macOS): the
+    /// `api-node` app, 3 Node workers with surge rollouts.
+    pub node_shared_port: bool,
 }
 
 /// The apps of the soak; ports are picked free.
@@ -453,6 +456,9 @@ pub fn specs(opt: &Optional) -> Result<Vec<AppSpec>, String> {
         // Crash-looped on purpose; no client load.
         AppSpec { name: "crashy", count: 1, chaos_app: true, crashy: true, load: None, ..base.clone() },
     ];
+    if !opt.node_shared_port {
+        v.retain(|a| a.name != "api-node");
+    }
     if opt.rss {
         // `[limits] max_memory`: a worker made to grow is recycled gracefully.
         v.push(AppSpec { name: "memhog", chaos_app: true, max_memory: MEMHOG_LIMIT_MB, ..base.clone() });
@@ -477,7 +483,7 @@ mod tests {
 
     #[test]
     fn configs_have_one_table_each() {
-        let all = specs(&Optional { nest: true, oom: true, rss: true }).unwrap();
+        let all = specs(&Optional { nest: true, oom: true, rss: true, node_shared_port: true }).unwrap();
         let paths = Paths {
             home: Path::new("/h"),
             logs: Path::new("/h/logs"),
@@ -501,7 +507,10 @@ mod tests {
         assert!(t.contains("args = [\"main.ts\"]") && t.contains("working_directory = \"/r/bench/nest\""), "{t}");
         assert!(t.contains("path = \"/health\""), "gated like the other apps: {t}");
         let names = |o: Optional| specs(&o).unwrap().iter().map(|s| s.name).collect::<Vec<_>>();
-        let none = names(Optional { nest: false, oom: false, rss: false });
-        assert!(!none.contains(&"nest") && !none.contains(&"oom") && !none.contains(&"memhog"), "{none:?}");
+        let none = names(Optional { nest: false, oom: false, rss: false, node_shared_port: false });
+        for left_out in ["nest", "oom", "memhog", "api-node"] {
+            assert!(!none.contains(&left_out), "{left_out}: {none:?}");
+        }
+        assert!(none.contains(&"api-bun") && none.contains(&"ws-bun"), "{none:?}");
     }
 }

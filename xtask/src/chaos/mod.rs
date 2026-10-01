@@ -465,10 +465,16 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
                 .into(),
         );
     }
+    // Node's reusePort (libuv) is Linux's (and some BSDs'): not macOS's.
+    let node_shared_port = cfg!(target_os = "linux");
+    if !node_shared_port {
+        notes.push("Node cannot share a port on this OS (no reusePort in libuv): no `api-node` app".into());
+    }
     for n in &notes {
         println!("chaos: note: {n}");
     }
-    let specs: Vec<AppSpec> = fleet::specs(&fleet::Optional { nest, oom: cgroup.is_some(), rss })?;
+    let opt = fleet::Optional { nest, oom: cgroup.is_some(), rss, node_shared_port };
+    let specs: Vec<AppSpec> = fleet::specs(&opt)?;
     let logs = home.join("logs");
     let crash_flag = home.join("crash-flag");
     let alerts_file = home.join("alerts.jsonl");
