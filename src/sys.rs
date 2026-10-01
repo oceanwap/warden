@@ -18,8 +18,8 @@
 //!
 //! Tools: Miri cannot execute these FFI calls and the sandbox has no nightly
 //! toolchain for sanitizers, so the test binary is also run under Valgrind
-//! memcheck (`cargo test --bin warden sys::` then valgrind on the binary; see
-//! docs/review-process.md).
+//! memcheck: its `sys::` tests, steps and flags in docs/review-process.md
+//! ("Valgrind for the `unsafe` code").
 
 use std::io;
 use std::net::SocketAddr;

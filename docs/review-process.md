@@ -223,6 +223,39 @@ rg -n 'Instant::now\(\) \+|now \+ ' src   # must go through restart::later
 systemd-analyze verify contrib/warden@.service   # with ExecStart pointed at /bin/true
 ```
 
+### Valgrind for the `unsafe` code
+
+Miri can't run the system calls in `src/sys.rs` and `src/sys/uring.rs`, so
+their tests also run under Valgrind's memcheck: invalid reads and writes,
+uninitialised bytes handed to a system call, definite leaks.
+
+```sh
+# 1. Build the unit-test binary (a debug build) without running it, and take
+#    its path from cargo's "Executable unittests src/main.rs (…)" line.
+bin=$(cargo test --bin warden --no-run 2>&1 | sed -n 's/.*Executable unittests src\/main.rs (\(.*\))$/\1/p')
+echo "$bin"    # target/debug/deps/warden-<hash>
+# 2. The sys:: tests under memcheck, one at a time (~30 s).
+valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=definite \
+  --errors-for-leak-kinds=definite --track-origins=yes --quiet \
+  "$bin" sys:: --test-threads=1 --skip sys::tests::nofile_limit_matches_proc
+echo $?        # 0: every test passed and memcheck found nothing
+```
+
+- Expected: `test result: ok. 52 passed` (the count grows with the tests),
+  no `==PID==` lines, exit 0. Exit 1 is a memcheck error (`Invalid read`,
+  `Syscall param … points to uninitialised byte(s)`, `definitely lost`):
+  a finding. Exit 101 is a failed test.
+- `nofile_limit_matches_proc` is skipped: Valgrind keeps 12 descriptors for
+  itself and lowers `RLIMIT_NOFILE` by them, so `getrlimit` and
+  `/proc/self/limits` disagree under it, by design.
+- The io_uring tests' timeouts are 20× longer under Valgrind (they find it
+  in `LD_PRELOAD`; `WARDEN_TEST_TIMEOUT_SCALE=N` sets the factor anywhere
+  else that is slow), and they yield between ring waits: memcheck runs one
+  thread at a time and does not switch during `io_uring_enter`.
+- memcheck checks the system calls it sees. It does not follow what the
+  kernel reads and writes later through io_uring entries: for those, the
+  ownership argument at the top of `src/sys/uring.rs` is the review.
+
 ## 5. Report format
 
 Findings ordered by severity, each with:

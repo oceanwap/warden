@@ -421,13 +421,38 @@ mod tests {
         (Arc::new(s), c)
     }
 
-    /// Run the ring until `n` completions arrived (5 s at most).
+    /// How much longer than usual a test may wait: `WARDEN_TEST_TIMEOUT_SCALE`
+    /// if set, else 20 under Valgrind (its preload is in LD_PRELOAD; the
+    /// 3 MB send to a slow reader takes ~10× longer there), else 1.
+    fn time_scale() -> u32 {
+        if let Some(n) = std::env::var("WARDEN_TEST_TIMEOUT_SCALE").ok().and_then(|v| v.parse().ok()) {
+            return n;
+        }
+        if std::env::var("LD_PRELOAD").is_ok_and(|p| p.contains("vgpreload")) { 20 } else { 1 }
+    }
+
+    #[test]
+    fn timeouts_scale_under_valgrind() {
+        let valgrind = std::env::var("LD_PRELOAD").is_ok_and(|p| p.contains("vgpreload"));
+        if std::env::var_os("WARDEN_TEST_TIMEOUT_SCALE").is_none() {
+            assert_eq!(time_scale(), if valgrind { 20 } else { 1 });
+        }
+    }
+
+    /// Run the ring until `n` completions arrived (5 s at most, scaled).
     fn collect(r: &mut Ring, n: usize) -> Vec<(OpId, Done)> {
         let mut out = Vec::new();
         let t0 = Instant::now();
+        let scale = time_scale();
+        let limit = Duration::from_secs(5) * scale;
         while out.len() < n {
-            assert!(t0.elapsed() < Duration::from_secs(5), "only {} of {n} completions", out.len());
-            r.wait(Duration::from_millis(20)).unwrap();
+            assert!(t0.elapsed() < limit, "only {} of {n} completions within {limit:?}", out.len());
+            // Valgrind runs one thread at a time and does not switch during
+            // io_uring_enter: a test's reader thread runs only after it, at
+            // the yield (without which a send to it never completes). Shorter
+            // waits there let it run more often.
+            r.wait(Duration::from_millis(20) / scale.max(1)).unwrap();
+            std::thread::yield_now();
             r.complete(|id, d| out.push((id, d)));
         }
         out
