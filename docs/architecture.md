@@ -378,7 +378,9 @@ worker 3:                           new ─gates─► old 3 drains ────
 - **End.** The rollout (and the CLI, systemd's `READY=1`, `rollout_done`)
   ends once every old worker it stopped has exited, by itself or by SIGKILL
   at `grace_period`; until then its phase reads `every worker replaced; 2
-  old workers draining (pid …)`. `done` counts workers whose new process
+  old workers draining (pid …)`. One still there 10 s after its SIGKILL is
+  held by the kernel: the rollout stops waiting for it (logged once) and it
+  stays listed as draining until it is reaped. `done` counts workers whose new process
   took over (their old one may still be draining).
 - **Failures.** A gate failure rolls back the batch in progress at once (its
   old workers never stopped) and logs the failure; old workers of earlier

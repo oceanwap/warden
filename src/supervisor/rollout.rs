@@ -112,7 +112,17 @@ pub(super) struct Roll {
 struct Drain {
     slot: usize,
     old: u64,
+    /// When it was told to stop: past `grace_period` it got SIGKILL, and
+    /// past that plus `DRAIN_SLACK` the rollout stops waiting for it.
+    since: Instant,
 }
+
+/// How long past `grace_period` (its SIGKILL) a rollout still waits for an
+/// old worker to exit. A SIGKILLed process ends at once unless the kernel
+/// holds it (uninterruptible I/O, a hung network filesystem); then the
+/// rollout ends without it rather than never (it stays listed as draining
+/// until it is reaped).
+const DRAIN_SLACK: Duration = Duration::from_secs(10);
 
 struct Snapshot {
     cfg: Config,
@@ -535,7 +545,8 @@ impl Supervisor {
     pub(super) fn advance_rollout(&mut self) {
         let overlap = self.cfg.overlap();
         let max_draining = self.cfg.reload.max_draining;
-        let draining_now = self.draining_count();
+        // The drains this rollout waits for (not one it gave up on, below).
+        let draining_now = self.roll.as_ref().map_or(0, |r| r.draining.len());
         let worker_mode = self.is_worker_mode();
         let mut ids = Vec::new();
         {
@@ -988,7 +999,7 @@ impl Supervisor {
                     } else {
                         self.stop_instance(old)
                     }
-                    drains.push(Drain { slot: slot_id, old });
+                    drains.push(Drain { slot: slot_id, old, since: Instant::now() });
                 }
                 None => info!("worker passed its gates", worker = label, pid = new_pid),
             }
@@ -1046,8 +1057,28 @@ impl Supervisor {
     /// A drain ended, or the ticker found one gone: the batch waiting for
     /// room may start, or a rollout waiting for its last drains ends.
     fn after_drain(&mut self) {
+        let limit = self.cfg.grace_period().saturating_add(DRAIN_SLACK);
         let Some(roll) = &mut self.roll else { return };
         roll.draining.retain(|d| self.insts.contains_key(&d.old));
+        // SIGKILLed at grace_period and still not gone: held by the kernel.
+        let (stuck, waiting): (Vec<Drain>, Vec<Drain>) =
+            std::mem::take(&mut roll.draining).into_iter().partition(|d| d.since.elapsed() > limit);
+        roll.draining = waiting;
+        for d in stuck {
+            let pid = self.insts.get(&d.old).map(|i| i.handle.pid).unwrap_or(0);
+            warn!(
+                "old worker did not exit after its SIGKILL; the rollout stops waiting for it",
+                worker = self.label(d.slot),
+                pid = pid,
+                waited_s = d.since.elapsed().as_secs(),
+                hint = format!(
+                    "the kernel holds it (uninterruptible I/O, a hung network filesystem): `cat /proc/{pid}/stack` \
+                     shows where. Its replacement serves; Warden reaps it when it ends, and `warden status` lists \
+                     it as DRAINING until then"
+                ),
+            );
+        }
+        let Some(roll) = &mut self.roll else { return };
         match &mut roll.step {
             Step::Idle => self.advance_rollout(),
             Step::Ending { ok, message } if roll.draining.is_empty() => {
@@ -1776,6 +1807,39 @@ wait $!
             assert!(!r.sup.insts.contains_key(&old[0]), "worker 1's old process drained and exited");
             assert_ne!(r.sup.slots[&1].current, Some(old[0]), "worker 1 runs the new version");
             assert_eq!((r.sup.slots[&2].current, r.sup.slots[&3].current), (Some(old[1]), Some(old[2])));
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// An old worker still there long after its grace-period SIGKILL (the
+    /// kernel holds it) no longer holds the rollout: it ends, the process
+    /// stays tracked (and listed as draining) until it is reaped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_drain_stuck_past_its_sigkill_stops_holding_the_rollout() {
+        local(async {
+            let mut r = drainers("stuck", 1, "30", "[shutdown]\ngrace_period = 30\n").await;
+            let old = currents(&r.sup)[0];
+            r.sup.cfg.app.env.remove("FAKE_DRAIN"); // the new worker stops at once
+            r.sup.begin_rollout(Kind::Restart, vec![1], String::new(), false).unwrap();
+            r.until("replaced, the old one draining", |s| {
+                matches!(s.roll, Some(Roll { step: Step::Ending { .. }, .. }))
+            })
+            .await;
+            r.sup.after_drain();
+            assert!(r.sup.roll.is_some(), "within grace_period it is waited for");
+            // As if SIGKILLed at grace_period and still there DRAIN_SLACK later.
+            let long_ago = Instant::now().checked_sub(Duration::from_secs(30) + DRAIN_SLACK + Duration::from_secs(1));
+            let Some(long_ago) = long_ago else { return r.shutdown().await }; // a clock too young to go back
+            if let Some(roll) = &mut r.sup.roll {
+                roll.draining[0].since = long_ago;
+            }
+            r.sup.after_drain();
+            assert!(r.sup.roll.is_none(), "the rollout ended without it");
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true));
+            assert_eq!(r.sup.status().draining.len(), 1, "still listed while it is there");
+            r.kill(old);
+            r.until("the old one reaped", |s| !s.insts.contains_key(&old)).await;
             r.shutdown().await;
         })
         .await;
