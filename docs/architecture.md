@@ -281,6 +281,13 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
 A second SIGTERM/SIGINT skips the wait. Recommended unit uses `KillMode=mixed`
 so only Warden gets the first SIGTERM and orchestrates the drain.
 
+Seen from a proxy in front, a drain is: pooled connections answered with
+`Connection: close` for `drain_ms`, requests in flight completed, long-lived
+streams ended cleanly, and a port that never stops answering. What a proxy
+or load balancer must set to agree with it (idle timeouts, retries, health
+checks, deregistration) is in [`proxies.md`](proxies.md), with
+`contrib/nginx.conf`, which a test restarts workers through under load.
+
 ### 4.7 Rollouts: reload, safe-reload, restart N, recycling
 
 Replacing a running worker falls out of `SO_REUSEPORT`: start the new process

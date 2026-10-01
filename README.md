@@ -43,7 +43,7 @@ Every release on [GitHub Releases](https://github.com/oceanwap/warden/releases)
 has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
 
 - **CLI only**: `warden-<version>-<os>-<arch>.tar.gz` with the `warden`
-  binary, this README and `contrib/` (systemd units, sysctl file). The Linux
+  binary, this README and `contrib/` (systemd units, sysctl file, nginx site). The Linux
   binaries need glibc 2.28 or newer (RHEL 8, Debian 10, Ubuntu 18.10+).
 - **GUI + CLI**: `warden-gui-<version>-<os>-<arch>` (`.tar.gz` on Linux, a
   zipped `Warden.app` on macOS) with `warden-gui` next to `warden` (see
@@ -345,8 +345,13 @@ cache. With `access_log = true` each line ends in `cache=hit` or
   `net.ipv4.tcp_migrate_req = 1`. Without it, a few connections queued on a
   closing listener get reset during reloads. Measured: 9–15 per worker-mode
   reload, 0 with the setting. Warden logs a warning at startup when it's off.
-- nginx: `upstream api { server 127.0.0.1:3000; keepalive 64; }` A single
-  upstream entry is enough; the kernel does the balancing.
+- nginx: [`contrib/nginx.conf`](contrib/nginx.conf), a commented site file:
+  one upstream address (the kernel does the balancing) with keep-alive,
+  retries for idempotent requests only, WebSockets and SSE, X-Forwarded-*
+  headers, a `/health` for a load balancer. A test restarts the workers
+  under load through it without a failed request. Load balancers (AWS
+  ALB/NLB, GCP, Cloudflare), no proxy at all, and the timeouts that must
+  agree with Warden's drain: [`docs/proxies.md`](docs/proxies.md).
 - Logs go to stdout in journald format (timestamps dropped, priority prefixes
   added). Use `journalctl -u warden@api`.
 - Metrics: set `[metrics] listen = "127.0.0.1:9464"` to get Prometheus text at `/metrics`.

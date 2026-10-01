@@ -160,6 +160,19 @@ carries the same reason with a `hint=`.
 | `the resource history on disk is newer than the clock; dropping the samples from the future` | The system clock is behind the newest saved sample (it went back, or was not set yet at boot) | Check the clock (`timedatectl`, NTP); the charts continue from now |
 | `the last save of the resource history is still running; not saving it again at exit` | At a clean exit the previous snapshot's fsync had not finished within 2 s: the disk is very slow or hung | The file on disk is the previous snapshot (up to a minute old); check the disk (`dmesg`) |
 
+## Behind nginx or a load balancer
+
+[`docs/proxies.md`](proxies.md) has the timeouts that must agree; the usual symptoms:
+
+| You see | Why | Fix |
+|---|---|---|
+| A few 502s during a deploy (nginx: `recv() failed (104: Connection reset by peer) while reading response header from upstream`) | Connections queued on a closing worker's listener are reset (`net.ipv4.tcp_migrate_req` is 0; Warden warns at start), and nginx does not retry them | `contrib/99-warden.conf` (`sysctl -w net.ipv4.tcp_migrate_req=1`); use `contrib/nginx.conf`, whose backup entry lets nginx retry idempotent requests |
+| Occasional 502s at any time, not only during deploys | The proxy or load balancer keeps idle connections to the app longer than the app does (Node 5 s, Bun 10 s), and sends a request on one the app is closing | nginx: upstream `keepalive_timeout` below the app's (4 s in `contrib/nginx.conf`); a load balancer straight to the app: raise the app's idle timeout above the load balancer's (ALB 60 s, GCP 600 s), or put nginx between |
+| WebSocket clients see 1006 (or a reset) after a restart through nginx, instead of 1001 | nginx closed the client connection before reading the client's close reply | `lingering_close always;` in the WebSocket location (in `contrib/nginx.conf`) |
+| SSE events arrive in bursts, or only when the stream ends | The proxy buffers the response | nginx: `proxy_buffering off` for the SSE location, or the app sends `X-Accel-Buffering: no` |
+| WebSockets or SSE streams end after 60 s (ALB), 100 s (Cloudflare) or 30 s (GCP) | The load balancer's idle or backend timeout | Ping (or send an SSE comment) more often than the idle timeout; GCP: raise the backend service timeout |
+| Requests fail for a while after `systemctl stop warden@api` on a host behind a load balancer | The load balancer still sends to the host until its health check fails | Deregister the host first, wait for the deregistration delay (≥ `grace_period`), then stop Warden. Deploys (`reload`, `safe-reload`) need no deregistration |
+
 ## The GUI over SSH (`warden-gui --ssh`)
 
 The GUI shows ssh's own message with the fix; the usual ones:

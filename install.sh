@@ -155,6 +155,6 @@ Next steps:
   $cmd startup    start your saved apps at boot
   $cmd --help     everything else
 
-The archive also has the systemd units and sysctl file (contrib/):
+The archive also has the systemd units, the sysctl file and an nginx example (contrib/):
   $base/$archive
 EOF

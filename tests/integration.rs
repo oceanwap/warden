@@ -4374,7 +4374,11 @@ struct LongLivedRun {
 /// One client per path (`/ws` or an SSE path) plus a plain-request loop,
 /// held through `warden reload`.
 fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
-    let port = w.port;
+    reload_holding_via(w, w.port, workers, paths)
+}
+
+/// `reload_holding`, the clients connecting to `port` (a proxy in front).
+fn reload_holding_via(w: &Warden, port: u16, workers: u64, paths: &[&'static str]) -> LongLivedRun {
     let before = pid_set(&w.wait_for("ready", T, ready(workers)));
     let stop = Arc::new(AtomicBool::new(false));
     let connected = Arc::new(AtomicUsize::new(0));
@@ -4556,6 +4560,153 @@ fn drain_without_long_lived_connections_is_unchanged() {
     assert!(!log.contains("closed long-lived connections"), "{log}");
 }
 
+// ------------------------------------------------------------ behind nginx
+
+/// nginx run by this test in front of `app_port`, with the site file Warden
+/// ships (contrib/nginx.conf): its own prefix, temp directories, logs, pid
+/// file and a free port; nothing of the system's nginx is used. As root it
+/// runs as nobody (setpriv), like any user. None (with the reason printed)
+/// without nginx.
+struct Nginx {
+    child: Child,
+    dir: PathBuf,
+    port: u16,
+}
+
+impl Nginx {
+    fn start(name: &str, app_port: u16) -> Option<Nginx> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let bin = ["/usr/sbin", "/usr/local/sbin", "/usr/local/nginx/sbin"]
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::env::split_paths(&path))
+            .map(|d| d.join("nginx"))
+            .find(|p| p.is_file());
+        let Some(bin) = bin else {
+            eprintln!("skipping: nginx is not installed (`apt-get install nginx`)");
+            return None;
+        };
+        let dir = std::env::temp_dir().join(format!("warden-it-nginx-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let port = free_port();
+        // The shipped file, with the test's ports, the fixture's SSE path, and
+        // no IPv6 listener (a CI runner may have none).
+        let site = std::fs::read_to_string(format!("{}/contrib/nginx.conf", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .replace("server 127.0.0.1:3000 ", &format!("server 127.0.0.1:{app_port} "))
+            .replace("    listen 80;\n", &format!("    listen 127.0.0.1:{port};\n"))
+            .replace("    listen [::]:80;\n", "")
+            .replace("location /events {", "location /sse {");
+        assert_eq!(site.matches(&format!("127.0.0.1:{app_port} max_fails=0")).count(), 2, "{site}");
+        assert!(site.contains(&format!("listen 127.0.0.1:{port};")) && site.contains("location /sse {"), "{site}");
+        std::fs::write(dir.join("site.conf"), site).unwrap();
+        let d = dir.display();
+        let main = format!(
+            "worker_processes 2;\npid {d}/nginx.pid;\nerror_log {d}/error.log info;\n\
+             events {{ worker_connections 1024; }}\n\
+             http {{\n    access_log {d}/access.log;\n    client_body_temp_path {d}/client_body;\n    \
+             proxy_temp_path {d}/proxy;\n    fastcgi_temp_path {d}/fastcgi;\n    uwsgi_temp_path {d}/uwsgi;\n    \
+             scgi_temp_path {d}/scgi;\n    include {d}/site.conf;\n}}\n"
+        );
+        std::fs::write(dir.join("nginx.conf"), main).unwrap();
+        let out = std::fs::File::create(dir.join("nginx.out")).unwrap();
+        let mut cmd = Command::new(&bin);
+        let root = unsafe { libc::geteuid() } == 0;
+        if root && std::path::Path::new("/usr/bin/setpriv").is_file() {
+            std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+            for f in ["site.conf", "nginx.conf", "nginx.out"] {
+                std::os::unix::fs::chown(dir.join(f), Some(65534), Some(65534)).unwrap();
+            }
+            cmd = Command::new("/usr/bin/setpriv");
+            cmd.args(["--reuid=65534", "--regid=65534", "--clear-groups", "--"]).arg(&bin);
+        }
+        let child = cmd
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .arg("-p")
+            .arg(&dir)
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .args(["-g", "daemon off;"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out.try_clone().unwrap()))
+            .stderr(out)
+            .spawn()
+            .unwrap();
+        let mut n = Nginx { child, dir, port };
+        let t0 = Instant::now();
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if let Ok(Some(st)) = n.child.try_wait() {
+                panic!("nginx exited ({st}):\n{}", n.logs());
+            }
+            assert!(t0.elapsed() < T, "nginx does not listen:\n{}", n.logs());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(n)
+    }
+
+    fn logs(&self) -> String {
+        let read = |f: &str| std::fs::read_to_string(self.dir.join(f)).unwrap_or_default();
+        format!("{}{}", read("nginx.out"), read("error.log"))
+    }
+}
+
+impl Drop for Nginx {
+    fn drop(&mut self) {
+        // SIGTERM: a fast shutdown of the master and its workers.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let t0 = Instant::now();
+        while self.child.try_wait().ok().flatten().is_none() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A rolling restart under load through a real nginx with contrib/nginx.conf:
+/// not one request fails (fresh connections, keep-alive GETs, keep-alive
+/// POSTs), whatever net.ipv4.tcp_migrate_req says (nginx retries an
+/// idempotent request a closing worker's listener reset, over a new
+/// connection), and a WebSocket and an SSE stream held through it are ended
+/// cleanly by their old worker, through nginx, and reconnect to new ones.
+#[test]
+fn rolling_restart_through_nginx_drops_nothing() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 3", fixture("longlived.ts"));
+    let w = Warden::start("nginx", port, &long_lived_config("nginx", port, &app, ""));
+    let Some(ngx) = Nginx::start("restart", port) else { return };
+    w.wait_for("ready", T, ready(3));
+    assert!(get(ngx.port, "/health").is_some(), "the health location answers:\n{}", ngx.logs());
+
+    let post = "POST /orders HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                Content-Length: 13\r\n\r\n{\"item\":\"42\"}";
+    let ((run, ok, cut, failed), posted, post_cut, post_failed) =
+        keep_alive_requests(ngx.port, post.to_string(), || {
+            keep_alive_through(ngx.port, "/whoami", || reload_holding_via(&w, ngx.port, 3, &["/ws", "/sse"]))
+        });
+    let log = ngx.logs();
+    let retried = log.lines().filter(|l| l.contains("[error]") && l.contains("upstream")).count();
+    eprintln!(
+        "through nginx: fresh {} ok / {} failed; keep-alive GET {ok} ok, {cut} cut, {failed} failed; \
+         POST {posted} ok, {post_cut} cut, {post_failed} failed; {retried} upstream errors nginx retried",
+        run.ok, run.fail
+    );
+    assert_eq!(run.fail, 0, "requests on fresh connections failed through nginx\n{log}");
+    assert_eq!((cut, failed), (0, 0), "keep-alive GETs failed through nginx\n{log}");
+    assert_eq!((post_cut, post_failed), (0, 0), "POSTs failed through nginx\n{log}");
+    assert!(ok > 50 && posted > 50, "{ok} GETs, {posted} POSTs");
+    // The WebSocket and the SSE stream: closed 1001 / ended cleanly by an old
+    // worker (through nginx), reconnected to a new worker.
+    assert_clean_handover(&w, &run, Duration::from_secs(30));
+    assert!(!log.contains("no live upstreams"), "the port was never taken out of the upstream\n{log}");
+}
+
 // ------------------------------------------------------------ surge rollouts
 
 /// Requests on fresh connections from one client thread while `f` runs:
@@ -4587,6 +4738,12 @@ fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
 /// answered, requests cut on a connection that had served earlier ones,
 /// requests failed on a new connection).
 fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
+    keep_alive_requests(port, format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"), f)
+}
+
+/// `keep_alive_through` sending `request` (a whole HTTP/1.1 request; the
+/// answer must be a 200 with a Content-Length).
+fn keep_alive_requests<R>(port: u16, request: String, f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)]);
     let client = {
@@ -4594,7 +4751,7 @@ fn keep_alive_through<R>(port: u16, path: &'static str, f: impl FnOnce() -> R) -
         std::thread::spawn(move || {
             // One response off `s`: Some(the server asked to close).
             let exchange = |s: &mut TcpStream, buf: &mut Vec<u8>| -> Option<bool> {
-                write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").ok()?;
+                s.write_all(request.as_bytes()).ok()?;
                 let mut tmp = [0u8; 8192];
                 let end = loop {
                     if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
