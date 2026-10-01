@@ -1652,6 +1652,9 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
     std::fs::write(site.join("mid.bin"), &mid).unwrap();
     let big: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
     std::fs::write(site.join("big.bin"), &big).unwrap();
+    // Let the files go quiet (2 s) so the response cache takes them: each
+    // mode is then checked through the cache as well as the open path.
+    std::thread::sleep(Duration::from_millis(2200));
 
     for mode in ["cached", "beneath", "legacy"] {
         let port = free_port();
@@ -1667,18 +1670,23 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
             _ => "(files opened with realpath check)",
         };
         w.wait_log(how, T);
+        // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+        static_io_used(&w, &std::env::var("WARDEN_STATIC_IO").unwrap_or_default());
         let get = |p: &str| get_close(port, p, "");
-        assert_eq!(get("/").2, b"home", "{mode}");
-        assert_eq!(get("/sub/").2, b"sub home", "{mode}");
-        assert_eq!(get("/alias.css").2, b"a{}", "{mode}: relative symlink inside");
-        assert_eq!(get("/abs.css").2, b"a{}", "{mode}: absolute symlink inside");
-        assert_eq!(get("/subabs/").2, b"sub home", "{mode}: absolute directory symlink inside");
-        for bad in ["/escape.txt", "/up.txt", "/outdir/outside.txt", "/pipe.txt", "/missing.txt"] {
-            assert_eq!(get(bad).0, 404, "{mode}: {bad}");
+        // The first round fills the cache, the second is answered from it.
+        for _ in 0..2 {
+            assert_eq!(get("/").2, b"home", "{mode}");
+            assert_eq!(get("/sub/").2, b"sub home", "{mode}");
+            assert_eq!(get("/alias.css").2, b"a{}", "{mode}: relative symlink inside");
+            assert_eq!(get("/abs.css").2, b"a{}", "{mode}: absolute symlink inside");
+            assert_eq!(get("/subabs/").2, b"sub home", "{mode}: absolute directory symlink inside");
+            for bad in ["/escape.txt", "/up.txt", "/outdir/outside.txt", "/pipe.txt", "/missing.txt"] {
+                assert_eq!(get(bad).0, 404, "{mode}: {bad}");
+            }
+            assert_eq!(get("/%2e%2e/outside.txt").0, 403, "{mode}");
+            assert!(get("/mid.bin").2 == mid, "{mode}: small body");
+            assert!(get("/big.bin").2 == big, "{mode}: sendfile body");
         }
-        assert_eq!(get("/%2e%2e/outside.txt").0, 403, "{mode}");
-        assert!(get("/mid.bin").2 == mid, "{mode}: small body");
-        assert!(get("/big.bin").2 == big, "{mode}: sendfile body");
         // Keep-alive after a refused path: the connection still works.
         let (st, _, body) = http_raw(
             port,
@@ -1688,6 +1696,215 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
         assert!(String::from_utf8_lossy(&body).ends_with("a{}"), "{mode}: {}", String::from_utf8_lossy(&body));
         drop(w);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Everything the server sends back for `req` (pipelined requests too),
+/// until it closes the connection.
+fn raw_exchange(port: u16, req: &str) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = s.read_to_end(&mut buf);
+    buf
+}
+
+/// How the static worker says it serves: "via epoll", or "via io_uring"
+/// unless io_uring is unavailable here (then it must have said why).
+fn static_io_used(w: &Warden, io: &str) -> &'static str {
+    let log = w.wait_log("serving ", T);
+    if io != "uring" || log.contains("via io_uring") {
+        assert!(log.contains(if io == "uring" { "via io_uring" } else { "via epoll" }), "{log}");
+        return if io == "uring" { "io_uring" } else { "epoll" };
+    }
+    assert!(log.contains("io_uring is unavailable") && log.contains("via epoll"), "no fallback warning:\n{log}");
+    eprintln!("note: io_uring is unavailable here; tested the epoll fallback");
+    "epoll"
+}
+
+/// The static cache (default on): cached responses are byte-identical to
+/// an uncached server's (`cache_size = 0` behaves as before), in both I/O
+/// modes; an edited or deleted file shows within cache_valid_ms; a cached
+/// path swapped for a symlink out of the root is refused, not served.
+#[test]
+fn static_cache_hits_match_and_stay_fresh() {
+    for io in ["epoll", "uring"] {
+        static_cache_case(io);
+    }
+}
+
+fn static_cache_case(io: &str) {
+    let dir = std::env::temp_dir().join(format!("warden-it-cache-{io}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let site = dir.join("site");
+    std::fs::create_dir_all(site.join("docs")).unwrap();
+    std::fs::write(site.join("index.html"), "<h1>home</h1>").unwrap();
+    std::fs::write(site.join("docs/index.html"), "docs home").unwrap();
+    std::fs::write(site.join("a.css"), "a{}").unwrap();
+    std::fs::write(site.join("app.3f9a2c1b.js"), "console.log(1)").unwrap();
+    std::fs::write(site.join("style.css"), "body{color:red}").unwrap();
+    std::fs::write(site.join("style.css.gz"), "gzipped bytes").unwrap();
+    std::fs::write(site.join("style.css.br"), "brotli bytes").unwrap();
+    std::fs::write(site.join("edit.txt"), "version 1").unwrap();
+    std::fs::write(site.join("inplace.txt"), "rsync v1").unwrap();
+    std::fs::write(site.join("gone.txt"), "here").unwrap();
+    std::fs::write(site.join("swap.txt"), "inside").unwrap();
+    std::fs::write(dir.join("outside.txt"), "secret").unwrap();
+    // Between the single-write limit (16 KB) and cache_max_file (64 KB),
+    // and one above it (never cached).
+    let mid: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(site.join("mid.bin"), &mid).unwrap();
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
+    std::fs::write(site.join("big.bin"), &big).unwrap();
+    let written = Instant::now();
+
+    let (on, off) = (free_port(), free_port());
+    let toml = |name: &str, port: u16, extra: &str| {
+        format!(
+            "[app]\nname = \"{name}\"\nport = {port}\n[workers]\ncount = 1\n[static]\nroot = \"{}\"\naccess_log = true\n{extra}",
+            site.display()
+        )
+    };
+    let env = [("WARDEN_STATIC_IO", io)];
+    let mut w_on =
+        Warden::start_env(&format!("cache-on-{io}"), on, &toml("cache-on", on, "cache_valid_ms = 300\n"), &env);
+    let w_off = Warden::start_env(&format!("cache-off-{io}"), off, &toml("cache-off", off, "cache_size = 0\n"), &env);
+    w_on.wait_for("cached static worker ready", T, ready(1));
+    w_off.wait_for("uncached static worker ready", T, ready(1));
+    let used = static_io_used(&w_on, io);
+    assert_eq!(static_io_used(&w_off, io), used);
+    w_on.wait_log(&format!("via {used}, cache 16384 KB per worker"), T);
+    w_off.wait_log(&format!("via {used}, no cache"), T);
+    // Files changed in the last 2 s are served but not cached (a write in
+    // the same timestamp tick could go unnoticed): wait that out.
+    std::thread::sleep(Duration::from_millis(2200).saturating_sub(written.elapsed()));
+
+    let close = "GET /a.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    let (_, h, _) = get_close(on, "/a.css", "");
+    let (etag, lm) = (h["etag"].clone(), h["last-modified"].clone());
+    let requests = [
+        "GET /a.css HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        "HEAD /a.css HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+        format!("GET /a.css HTTP/1.1\r\nIf-None-Match: {etag}\r\n\r\n"),
+        format!("HEAD /a.css HTTP/1.1\r\nIf-None-Match: \"other\", {etag}\r\n\r\n"),
+        format!("GET /a.css HTTP/1.1\r\nIf-Modified-Since: {lm}\r\n\r\n"),
+        "GET /a.css HTTP/1.1\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.1\r\nIf-None-Match: \"nope\"\r\n\r\n".to_string(),
+        "GET /a.css?v=2 HTTP/1.1\r\nConnection: close\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.0\r\n\r\n".to_string(),
+        "GET /a.css HTTP/1.0\r\nConnection: keep-alive\r\n\r\n".to_string(),
+        "GET /app.3f9a2c1b.js HTTP/1.1\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nAccept-Encoding: gzip, deflate, br\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nAccept-Encoding: gzip\r\n\r\n".to_string(),
+        "HEAD /style.css HTTP/1.1\r\nAccept-Encoding: br\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\n\r\n".to_string(),
+        "GET /style.css HTTP/1.1\r\nRange: bytes=2-5\r\n\r\n".to_string(),
+        "GET / HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs/ HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs HTTP/1.1\r\n\r\n".to_string(),
+        "GET /docs/index.html/ HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=-10\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".to_string(),
+        "GET /big.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /missing.css HTTP/1.1\r\n\r\n".to_string(),
+        "GET /../a.css HTTP/1.1\r\n\r\n".to_string(),
+        "POST /a.css HTTP/1.1\r\nContent-Length: 0\r\n\r\n".to_string(),
+        // Pipelined: many requests in one write, answered in order.
+        "GET /a.css HTTP/1.1\r\n\r\nHEAD /a.css HTTP/1.1\r\n\r\n".repeat(25),
+    ];
+    for r in &requests {
+        let full = format!("{r}{close}");
+        let reference = raw_exchange(off, &full);
+        assert!(reference.starts_with(b"HTTP/1."), "{io}: {r:?}");
+        let miss = raw_exchange(on, &full);
+        let hit = raw_exchange(on, &full);
+        let show = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(600)]).to_string();
+        assert!(
+            miss == reference,
+            "{io}: first answer differs for {r:?}:\n{}\nvs uncached:\n{}",
+            show(&miss),
+            show(&reference)
+        );
+        assert!(
+            hit == reference,
+            "{io}: cached answer differs for {r:?}:\n{}\nvs uncached:\n{}",
+            show(&hit),
+            show(&reference)
+        );
+    }
+    // Ranges are still right (and not from the cache).
+    let (st, _, body) = get_close(on, "/mid.bin", "Range: bytes=100-199\r\n");
+    assert!(st == 206 && body == mid[100..200], "{io}");
+    assert!(get_close(on, "/mid.bin", "").2 == mid && get_close(on, "/big.bin", "").2 == big, "{io}");
+    // The hits really came from the cache; the uncached server never says so.
+    let log = w_on.log();
+    let hits = log.lines().filter(|l| l.contains("cache=hit")).count();
+    assert!(hits >= requests.len(), "{io}: only {hits} hits:\n{log}");
+    assert!(log.lines().any(|l| l.contains("GET /mid.bin 200 40000B") && l.contains("cache=hit")), "{io}");
+    assert!(log.lines().filter(|l| l.contains("GET /big.bin 200")).all(|l| l.contains("cache=miss")), "{io}: big.bin");
+    assert!(!w_off.log().contains("cache="), "cache_size = 0: no cache at all");
+
+    let valid = Duration::from_millis(300);
+    // Polls `path` until `done`; every answer before that must pass `ok`.
+    let until = |path: &str, what: &str, done: &dyn Fn(u16, &[u8]) -> bool, ok: &dyn Fn(u16, &[u8]) -> bool| {
+        let t0 = Instant::now();
+        loop {
+            let (st, _, body) = get_close(on, path, "");
+            if done(st, &body) {
+                return t0.elapsed();
+            }
+            assert!(ok(st, &body), "{io}: {path} answered {st} {:?} before {what}", String::from_utf8_lossy(&body));
+            assert!(t0.elapsed() < valid + Duration::from_millis(700), "{io}: {path} never {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // Edited in place (same inode, same size): fresh within cache_valid_ms.
+    for _ in 0..2 {
+        assert_eq!(get_close(on, "/edit.txt", "").2, b"version 1");
+    }
+    std::fs::OpenOptions::new().write(true).open(site.join("edit.txt")).unwrap().write_all(b"version 2").unwrap();
+    let took = until("/edit.txt", "showed the edit", &|_, b| b == b"version 2", &|_, b| b == b"version 1");
+    eprintln!("{io}: edit served after {took:?}");
+    // Rewritten with the old mtime put back (rsync --inplace): ctime tells.
+    assert_eq!(get_close(on, "/inplace.txt", "").2, b"rsync v1");
+    let old = std::fs::metadata(site.join("inplace.txt")).unwrap().modified().unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(site.join("inplace.txt")).unwrap();
+    (&f).write_all(b"rsync v2").unwrap();
+    f.set_modified(old).unwrap();
+    drop(f);
+    until("/inplace.txt", "showed the rewrite", &|_, b| b == b"rsync v2", &|_, b| b == b"rsync v1");
+    // Deleted: 404 within cache_valid_ms.
+    assert_eq!(get_close(on, "/gone.txt", "").2, b"here");
+    std::fs::remove_file(site.join("gone.txt")).unwrap();
+    until("/gone.txt", "went 404", &|st, _| st == 404, &|st, b| st == 200 && b == b"here");
+    // Cached, then swapped for a symlink leaving the root: the old content
+    // for at most cache_valid_ms, then refused; never the target.
+    for _ in 0..2 {
+        assert_eq!(get_close(on, "/swap.txt", "").2, b"inside");
+    }
+    std::os::unix::fs::symlink(dir.join("outside.txt"), site.join("swap.tmp")).unwrap();
+    std::fs::rename(site.join("swap.tmp"), site.join("swap.txt")).unwrap();
+    until("/swap.txt", "was refused", &|st, _| st == 404, &|st, b| st == 200 && b == b"inside");
+    for _ in 0..3 {
+        assert_eq!(get_close(on, "/swap.txt", "").0, 404, "{io}");
+    }
+    // A directory's index swapped the same way.
+    assert_eq!(get_close(on, "/docs/", "").2, b"docs home");
+    std::fs::remove_file(site.join("docs/index.html")).unwrap();
+    std::os::unix::fs::symlink("../../outside.txt", site.join("docs/index.html")).unwrap();
+    until("/docs/", "was refused", &|st, _| st == 404, &|st, b| st == 200 && b == b"docs home");
+
+    // On the way out the worker reports what the cache did.
+    w_on.terminate(T);
+    let log = w_on.wait_log("static cache: ", T);
+    let line = log.lines().find(|l| l.contains("static cache: ")).unwrap();
+    let n: u64 = line.split("static cache: ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+    assert!(n >= hits as u64, "{line}");
+    assert!(line.contains("dropped as changed on disk"), "{line}");
+    drop((w_on, w_off));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1869,6 +2086,18 @@ fn serve_static_files() {
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
     assert!(out.contains("site: online (2/2"), "{out}");
+    // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+    if std::env::var("WARDEN_STATIC_IO").as_deref() == Ok("uring") {
+        let t0 = Instant::now();
+        let logs = loop {
+            let logs = f.cli(&["logs", "site", "-n", "100"]).1;
+            if logs.contains("serving ") || t0.elapsed() > T {
+                break logs;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(logs.contains("via io_uring") || logs.contains("io_uring is unavailable"), "{logs}");
+    }
 
     let (st, h, body) = get_close(port, "/", "");
     assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));
@@ -2431,6 +2660,237 @@ fn wardend_gives_up_on_a_supervisor_that_keeps_dying() {
     f.ok(&["start", "api"]);
     let a = d.wait_app("api running", "api", |a| a["state"] == "running");
     assert!(a["problem"].is_null(), "{a:#}");
+}
+
+// ---- wardend: alerts and resource history
+
+/// A plain-http server standing in for a webhook: each request's path and
+/// body come back on the channel; it answers 200.
+fn webhook_server() -> (u16, std::sync::mpsc::Receiver<(String, String)>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { return };
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let (mut first, mut len) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if first.is_empty() {
+                    first = line.trim().to_string();
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            if tx.send((first, String::from_utf8_lossy(&body).into_owned())).is_err() {
+                return;
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// The alerts a `command` rule appended to `file`, one JSON object per line.
+fn alerts_in(file: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// Wait until wardend's log (written by a thread of its own) has `needle`.
+fn wait_log(d: &Wardend, needle: &str) {
+    let t0 = Instant::now();
+    while !d.log().contains(needle) {
+        assert!(t0.elapsed() < T, "{needle:?} is not in wardend's log:\n{}", d.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_alerts(file: &std::path::Path, what: &str, f: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let t0 = Instant::now();
+    loop {
+        let got = alerts_in(file);
+        if f(&got) {
+            return got;
+        }
+        assert!(t0.elapsed() < T, "timed out waiting for {what}; alerts so far: {got:#?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn wardend_alerts_a_crash_loop_once_and_counts_duplicates() {
+    if !have_bun() || Command::new("curl").arg("--version").output().is_err() {
+        return;
+    }
+    let f = Fleet::new("wd-alerts");
+    let (hook_port, hooks) = webhook_server();
+    let out = f.home.join("alerts.jsonl");
+    std::fs::write(
+        f.home.join("wardend.toml"),
+        format!(
+            r#"
+[[alert]]
+name = "hook"
+on = ["crash_loop"]
+webhook = "http://127.0.0.1:{hook_port}/services/T0/B0/s3cr3t"
+min_interval = "1h"
+
+[[alert]]
+name = "log"
+on = ["all"]
+command = ["/bin/sh", "-c", "cat >> '{out}'; echo >> '{out}'"]
+min_interval = "15s"
+"#,
+            out = out.display()
+        ),
+    )
+    .unwrap();
+    // A dead supervisor is restarted after 100 ms; the third death gives up.
+    let d = Wardend::start(&f, &[("WARDEN_DAEMON_POLICY", "initial_ms=100,max_ms=200,deaths=3,window_ms=60000")]);
+    wait_log(&d, "alert rules read rules=2");
+    assert!(f.list().iter().all(|a| a["app"] != "wardend"), "wardend.toml is not an app");
+    let mut ev = d.subscribe(r#"{"cmd":"subscribe"}"#);
+
+    // A worker that serves for a second, then exits 1: a crash loop, then FAILED.
+    let (fx, port) = (fixture("app.ts"), free_port().to_string());
+    let args = ["start", &fx, "--name", "boom", "--port", &port, "--env", "FIXTURE_EXIT_AFTER=1000"];
+    let (code, text) = f.cli(&[&args[..], &["--max-restarts", "5", "--restart-delay", "20", "--no-wait"]].concat());
+    assert_eq!(code, 0, "{text}");
+    ev.wait("boom failed", |v| v["type"] == "worker" && v["app"] == "boom" && v["event"] == "failed");
+
+    // The webhook gets the crash loop, once, as JSON with a text for people.
+    let (first, body) = hooks.recv_timeout(T).expect("a webhook POST");
+    assert_eq!(first, "POST /services/T0/B0/s3cr3t HTTP/1.1");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (v["kind"].as_str(), v["app"].as_str(), v["rule"].as_str()),
+        (Some("crash_loop"), Some("boom"), Some("hook"))
+    );
+    assert!(v["text"].as_str().unwrap().contains("boom crash loop: 3 worker crashes within 5m"), "{v}");
+    // The command gets every kind: the crash loop and the failed worker.
+    let got = wait_for_alerts(&out, "crash_loop and worker_failed", |a| {
+        a.iter().any(|v| v["kind"] == "crash_loop") && a.iter().any(|v| v["kind"] == "worker_failed")
+    });
+    let wf = got.iter().find(|v| v["kind"] == "worker_failed").unwrap();
+    assert!(wf["detail"].as_str().unwrap().contains("warden reset boom"), "{wf}");
+    assert_eq!((wf["app"].as_str(), wf["count"].as_u64()), (Some("boom"), Some(1)), "{wf}");
+
+    // A supervisor killed three times: `died` goes out once, the two deaths
+    // within min_interval follow in one alert (count 2), `gave_up` on its own.
+    let p2 = free_port().to_string();
+    f.ok(&["start", &fx, "--name", "api", "--port", &p2]);
+    let mut pid = d.wait_app("api watched", "api", |a| a["state"] == "running")["supervisor_pid"].as_u64().unwrap();
+    for death in 1..=3 {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        ev.wait("api died", sup_event("api", "died"));
+        if death < 3 {
+            pid = ev.wait("api started", sup_event("api", "started"))["pid"].as_u64().unwrap();
+            d.wait_app("api running again", "api", |a| a["state"] == "running");
+        }
+    }
+    ev.wait("api gave up", sup_event("api", "gave_up"));
+    let got = wait_for_alerts(&out, "the held-back deaths", |a| {
+        a.iter().filter(|v| v["kind"] == "died" && v["app"] == "api").count() >= 2
+    });
+    let died: Vec<&Value> = got.iter().filter(|v| v["kind"] == "died").collect();
+    assert_eq!(died.len(), 2, "{got:#?}");
+    assert_eq!((died[0]["count"].as_u64(), died[1]["count"].as_u64()), (Some(1), Some(2)), "{died:#?}");
+    assert!(died[1]["text"].as_str().unwrap().contains("(×2 since"), "{}", died[1]);
+    let gave_up = got.iter().find(|v| v["kind"] == "gave_up").expect("gave_up");
+    assert!(gave_up["detail"].as_str().unwrap().contains("warden start api"), "{gave_up}");
+    assert_eq!(got.iter().filter(|v| v["kind"] == "crash_loop").count(), 1, "one loop, one alert: {got:#?}");
+    assert!(hooks.recv_timeout(Duration::from_millis(300)).is_err(), "no second webhook");
+    assert!(!d.log().contains("s3cr3t"), "the webhook's secret never reaches the log:\n{}", d.log());
+
+    // The resource history has boom's restarts (committed every 10 s).
+    let t0 = Instant::now();
+    loop {
+        let h = d.request(r#"{"cmd":"history","app":"boom"}"#);
+        assert_eq!(h["ok"], true, "{h}");
+        let hist = &h["history"];
+        let sum = |key: &str| -> u64 {
+            hist["apps"][0][key].as_array().map(|a| a.iter().filter_map(Value::as_u64).sum()).unwrap_or(0)
+        };
+        if sum("restarts") > 0 && sum("rss_bytes") > 0 {
+            assert_eq!(hist["step_s"], 10);
+            let n = hist["points"].as_u64().unwrap() as usize;
+            assert_eq!(hist["apps"][0]["workers_ready"].as_array().unwrap().len(), n);
+            assert_eq!(hist["host"]["cpu_percent"].as_array().unwrap().len(), n);
+            assert!(hist["host"]["mem_total_bytes"].as_u64() > Some(0), "{hist}");
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(40), "no restarts in the history: {hist}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn wardend_alert_rules_are_checked_and_reloaded() {
+    let f = Fleet::new("wd-alert-rules");
+    let file = f.home.join("wardend.toml");
+    // No file: nothing to check, no alerts.
+    let out = f.ok(&["daemon", "check"]);
+    assert!(out.contains("wardend sends no alerts"), "{out}");
+    // Every problem, with where it is and how to fix it.
+    std::fs::write(&file, "[[alert]]\non = [\"crashes\"]\nwebhook = \"ftp://x/s3cr3t\"\n\n[[alert]]\non = [\"all\"]\n")
+        .unwrap();
+    let (code, out) = f.cli(&["daemon", "check"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("has 3 problems"), "{out}");
+    assert!(out.contains("alert #1 (line 1): unknown event \"crashes\""), "{out}");
+    assert!(out.contains("alert #1 (line 1): webhook ftp://x/… must start with https://"), "{out}");
+    assert!(out.contains("alert #2 (line 5): needs `command"), "{out}");
+    assert!(!out.contains("s3cr3t"), "{out}");
+    let good = "[[alert]]\nname = \"ops\"\non = [\"gave_up\", \"died\"]\ncommand = [\"/bin/sh\"]\n";
+    std::fs::write(&file, good).unwrap();
+    let out = f.ok(&["daemon", "check"]);
+    assert!(out.contains("ok, 1 alert rule"), "{out}");
+    assert!(out.contains("ops: gave_up, died of every app → command /bin/sh (min_interval 5m)"), "{out}");
+    let other = f.home.join("other.toml.txt");
+    std::fs::write(&other, "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\napps = [\"ghost\"]\n").unwrap();
+    let out = f.ok(&["daemon", "check", "-c", other.to_str().unwrap()]);
+    assert!(out.contains("no app \"ghost\" on this host"), "{out}");
+    let (code, out) = f.cli(&["daemon", "reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("wardend is not running"), "{out}");
+
+    let mut d = Wardend::start(&f, &[]);
+    wait_log(&d, "alert rules read rules=1");
+    // A bad file: the running rules stay, and the reload says why.
+    std::fs::write(&file, "[[alert]]\non = [\"all\"]\ncommand = \"/bin/sh\"\n").unwrap();
+    let (code, out) = f.cli(&["daemon", "reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("keeps the 1 rule in force") && out.contains("line 3"), "{out}");
+    wait_log(&d, "wardend.toml has errors; keeping the alert rules in force");
+    // Fixed, and read again on SIGHUP (which no longer stops wardend).
+    std::fs::write(&file, format!("{good}\n[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\n")).unwrap();
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    wait_log(&d, "alert rules read rules=2 file=");
+    assert!(d.log().contains("on=SIGHUP"), "{}", d.log());
+    assert!(d.child.try_wait().unwrap().is_none(), "still running after SIGHUP");
+    let out = f.ok(&["daemon", "reload"]);
+    assert!(out.contains("2 alert rules loaded from"), "{out}");
+
+    // The history answers at once, with the host's series on one grid.
+    let h = d.request(r#"{"cmd":"history","app":"","step_s":60}"#);
+    assert_eq!(h["ok"], true, "{h}");
+    assert_eq!(h["history"]["step_s"], 60);
+    let n = h["history"]["points"].as_u64().unwrap();
+    assert!((1440..=1442).contains(&n), "24 h at one point a minute: {n}");
+    assert_eq!(h["history"]["host"]["load1"].as_array().unwrap().len() as u64, n);
+    assert_eq!(h["history"]["apps"], serde_json::json!([]), "\"\" asks for the host only");
 }
 
 // ---- subscribe (event stream)
@@ -3345,19 +3805,911 @@ fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
     assert!(fakes.take().contains("stop wardend.service"));
 }
 
+// ---- long-lived connections
+//
+// WebSocket and SSE clients held through `warden reload`: the old workers
+// must end them cleanly (close 1001, a terminated chunked stream) within
+// shutdown.long_lived_timeout, and the clients reconnect to new workers.
+
+/// How a long-lived connection ended, as its client saw it.
+#[derive(Debug, Clone, PartialEq)]
+enum Ended {
+    /// Still open when the test stopped watching (after the reload).
+    Open,
+    /// A WebSocket close frame with this code, answered, then FIN.
+    WsClose(u16),
+    /// The chunked SSE stream terminated; `complete`: after a whole event.
+    SseEnd { complete: bool },
+    /// Anything else: EOF without a close frame (WebSocket 1006) or without
+    /// the last chunk, a reset, an error.
+    Broken(String),
+}
+
+#[derive(Debug)]
+struct Session {
+    /// "<pid>:<thread>" (Bun) or "<pid>" (Node), from the first message / event.
+    who: String,
+    ended: Ended,
+}
+
+impl Session {
+    fn pid(&self) -> u64 {
+        self.who.split(':').next().and_then(|p| p.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// Reads into `buf` until `parse` takes what it needs from it. `Ok(None)`:
+/// `stop` was set first. `Err`: EOF, a reset or another error.
+fn read_for<T>(
+    s: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    stop: Option<&AtomicBool>,
+    deadline: Instant,
+    mut parse: impl FnMut(&mut Vec<u8>) -> Option<T>,
+) -> Result<Option<T>, String> {
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some(t) = parse(buf) {
+            return Ok(Some(t));
+        }
+        if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+            return Ok(None);
+        }
+        if Instant::now() > deadline {
+            return Err("timed out".into());
+        }
+        match s.read(&mut tmp) {
+            Ok(0) => return Err("EOF".into()),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err("connection reset".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+fn http_head(b: &mut Vec<u8>) -> Option<String> {
+    let i = b.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&b[..i]).to_string();
+    b.drain(..i + 4);
+    Some(head)
+}
+
+/// One server frame (unmasked) off the front of `buf`: (opcode, payload).
+fn ws_frame(b: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+    if b.len() < 2 {
+        return None;
+    }
+    let (len, off) = match b[1] & 0x7f {
+        126 if b.len() >= 4 => (u16::from_be_bytes([b[2], b[3]]) as usize, 4),
+        127 if b.len() >= 10 => (u64::from_be_bytes(b[2..10].try_into().unwrap()) as usize, 10),
+        126 | 127 => return None,
+        n => (n as usize, 2),
+    };
+    if b.len() < off + len {
+        return None;
+    }
+    let frame = (b[0] & 0x0f, b[off..off + len].to_vec());
+    b.drain(..off + len);
+    Some(frame)
+}
+
+/// A client frame (masked, short payload).
+fn ws_client_frame(op: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [0x37, 0xfa, 0x21, 0x3d];
+    let mut f = vec![0x80 | op, 0x80 | payload.len() as u8, mask[0], mask[1], mask[2], mask[3]];
+    f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    f
+}
+
+fn connect_long_lived(port: u16, request: &str) -> Result<TcpStream, String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    s.write_all(request.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    Ok(s)
+}
+
+/// A WebSocket on /ws until the server closes it (answered like a browser
+/// does) or `stop` is set. `hello` runs once the server's first message is in.
+fn ws_session(port: u16, stop: &AtomicBool, hello: &dyn Fn()) -> Result<Session, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut s = connect_long_lived(
+        port,
+        "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )?;
+    let mut buf = Vec::new();
+    let head = read_for(&mut s, &mut buf, None, deadline, http_head)?.unwrap_or_default();
+    if !head.starts_with("HTTP/1.1 101") {
+        return Err(format!("no upgrade: {head}"));
+    }
+    let who = match read_for(&mut s, &mut buf, None, deadline, ws_frame)? {
+        Some((1, p)) => String::from_utf8_lossy(&p).to_string(),
+        other => return Err(format!("expected the server's hello, got {other:?}")),
+    };
+    hello();
+    let ended = loop {
+        match read_for(&mut s, &mut buf, Some(stop), deadline, ws_frame) {
+            Ok(None) => break Ended::Open,
+            Ok(Some((8, p))) => {
+                let code = if p.len() >= 2 { u16::from_be_bytes([p[0], p[1]]) } else { 1005 };
+                let _ = s.write_all(&ws_client_frame(8, &p[..p.len().min(2)]));
+                break match read_for(&mut s, &mut buf, None, deadline, |_| None::<()>) {
+                    Err(e) if e == "EOF" => Ended::WsClose(code),
+                    Err(e) => Ended::Broken(format!("close {code}, then {e}")),
+                    Ok(_) => Ended::Broken("unreachable".into()),
+                };
+            }
+            Ok(Some(_)) => {}
+            Err(e) => break Ended::Broken(format!("{e} without a close frame (a browser reports 1006)")),
+        }
+    };
+    Ok(Session { who, ended })
+}
+
+/// One chunk of a chunked body off the front of `buf` (empty: the last one).
+fn http_chunk(b: &mut Vec<u8>) -> Option<Result<Vec<u8>, String>> {
+    let i = b.windows(2).position(|w| w == b"\r\n")?;
+    let line = String::from_utf8_lossy(&b[..i]).to_string();
+    let Ok(size) = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16) else {
+        return Some(Err(format!("bad chunk size line {line:?}")));
+    };
+    if b.len() < i + 2 + size + 2 {
+        return None;
+    }
+    let data = b[i + 2..i + 2 + size].to_vec();
+    b.drain(..i + 2 + size + 2);
+    Some(Ok(data))
+}
+
+/// An SSE stream (an EventSource's request) until the server ends it or
+/// `stop` is set. `hello` runs once the first event is in.
+fn sse_session(port: u16, path: &str, stop: &AtomicBool, hello: &dyn Fn()) -> Result<Session, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut s = connect_long_lived(
+        port,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\n\r\n"
+        ),
+    )?;
+    let mut buf = Vec::new();
+    let head = read_for(&mut s, &mut buf, None, deadline, http_head)?.unwrap_or_default();
+    let lower = head.to_ascii_lowercase();
+    if !head.starts_with("HTTP/1.1 200")
+        || !lower.contains("content-type: text/event-stream")
+        || !lower.contains("transfer-encoding: chunked")
+    {
+        return Err(format!("not a chunked event stream: {head}"));
+    }
+    let mut body = String::new();
+    let mut who: Option<String> = None;
+    let ended = loop {
+        match read_for(&mut s, &mut buf, who.as_ref().map(|_| stop), deadline, http_chunk) {
+            Ok(None) => break Ended::Open,
+            Ok(Some(Err(e))) => break Ended::Broken(e),
+            Ok(Some(Ok(data))) if data.is_empty() => break Ended::SseEnd { complete: body.ends_with("\n\n") },
+            Ok(Some(Ok(data))) => {
+                body.push_str(&String::from_utf8_lossy(&data));
+                if who.is_none() {
+                    // "id: 0\ndata: <who> 0\n\n"
+                    if let Some(w) = body.lines().find_map(|l| l.strip_prefix("data: ")) {
+                        who = w.split(' ').next().map(str::to_string);
+                        hello();
+                    }
+                }
+            }
+            Err(e) => break Ended::Broken(format!("{e} before the stream's last chunk")),
+        }
+    };
+    Ok(Session { who: who.unwrap_or_default(), ended })
+}
+
+/// A client that reconnects at once whenever its connection ends, until it
+/// sits on a connection still open when `stop` is set.
+fn hold(
+    port: u16,
+    path: &'static str,
+    stop: Arc<AtomicBool>,
+    connected: Arc<AtomicUsize>,
+) -> std::thread::JoinHandle<Vec<Result<Session, String>>> {
+    std::thread::spawn(move || {
+        let mut sessions = Vec::new();
+        let first = AtomicBool::new(true);
+        let hello = || {
+            if first.swap(false, Ordering::Relaxed) {
+                connected.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        while sessions.len() < 20 {
+            let r =
+                if path == "/ws" { ws_session(port, &stop, &hello) } else { sse_session(port, path, &stop, &hello) };
+            let open = matches!(&r, Ok(s) if s.ended == Ended::Open);
+            if r.is_err() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            sessions.push(r);
+            if open || stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        sessions
+    })
+}
+
+struct LongLivedRun {
+    before: HashSet<u64>,
+    after: HashSet<u64>,
+    took: Duration,
+    clients: Vec<(&'static str, Vec<Result<Session, String>>)>,
+    ok: usize,
+    fail: usize,
+}
+
+/// One client per path (`/ws` or an SSE path) plus a plain-request loop,
+/// held through `warden reload`.
+fn reload_holding(w: &Warden, workers: u64, paths: &[&'static str]) -> LongLivedRun {
+    let port = w.port;
+    let before = pid_set(&w.wait_for("ready", T, ready(workers)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let connected = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = paths.iter().map(|p| (*p, hold(port, p, stop.clone(), connected.clone()))).collect();
+    let t0 = Instant::now();
+    while connected.load(Ordering::Relaxed) < paths.len() {
+        assert!(t0.elapsed() < T, "long-lived clients did not connect\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let plain_stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let plain = {
+        let (stop, ok, fail) = (plain_stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match get(port, "/whoami") {
+                    Some(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    None => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let t0 = Instant::now();
+    let (code, out) = w.cli(&["reload"]);
+    let took = t0.elapsed();
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let after = pid_set(&w.status().unwrap());
+    // Give the last reconnects a moment to land, then stop watching.
+    std::thread::sleep(Duration::from_millis(300));
+    plain_stop.store(true, Ordering::Relaxed);
+    plain.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    let clients = handles.into_iter().map(|(p, h)| (p, h.join().unwrap())).collect();
+    LongLivedRun { before, after, took, clients, ok: ok.load(Ordering::Relaxed), fail: fail.load(Ordering::Relaxed) }
+}
+
+/// Every client was ended cleanly by an old worker, reconnected, and ends up
+/// on a new one; plain requests didn't fail; the reload didn't wait for
+/// grace_period.
+fn assert_clean_handover(w: &Warden, run: &LongLivedRun, max_took: Duration) {
+    let log = w.log();
+    eprintln!("reload took {:?}; plain requests: {} ok, {} failed", run.took, run.ok, run.fail);
+    assert!(run.before.is_disjoint(&run.after), "every worker replaced: {:?} -> {:?}", run.before, run.after);
+    for (path, sessions) in &run.clients {
+        eprintln!("{path}: {sessions:?}");
+        let sessions: Vec<&Session> = sessions
+            .iter()
+            .map(|s| s.as_ref().unwrap_or_else(|e| panic!("{path}: a connection failed: {e}\n{log}")))
+            .collect();
+        assert!(sessions.len() >= 2, "{path}: never handed over: {sessions:?}\n{log}");
+        let (last, ended) = sessions.split_last().unwrap();
+        for s in ended {
+            let clean = if *path == "/ws" { Ended::WsClose(1001) } else { Ended::SseEnd { complete: true } };
+            assert_eq!(s.ended, clean, "{path}: {s:?}\n{log}");
+            assert!(run.before.contains(&s.pid()), "{path}: only old workers end connections: {s:?}");
+        }
+        assert_eq!(last.ended, Ended::Open, "{path}: {last:?}");
+        assert!(run.after.contains(&last.pid()), "{path}: reconnected to a new worker: {last:?}, new {:?}", run.after);
+    }
+    assert!(run.ok > 20, "plain requests kept being served: {} ok", run.ok);
+    assert!(run.fail <= allowed_resets(), "plain requests failed during the reload: {}", run.fail);
+    assert!(log.contains("closed long-lived connections so their clients reconnect to new workers"), "{log}");
+    assert!(!log.contains("did not exit within grace period"), "{log}");
+    assert!(run.took < max_took, "reload took {:?} (limit {max_took:?})\n{log}", run.took);
+}
+
+fn long_lived_config(name: &str, port: u16, app: &str, extra: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nport = {port}\n{app}\n[restart]\nbackoff_initial = 50\n\
+         [shutdown]\ngrace_period = 30\ndrain_ms = 100\nlong_lived_timeout = 1\n{extra}"
+    )
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_a_bun_reload() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("args = [\"{}\"]\n[workers]\ncount = 2", fixture("longlived.ts"));
+    let w = Warden::start("ll-bun", port, &long_lived_config("ll-bun", port, &app, ""));
+    // Every kind of SSE body: a ReadableStream, a `type: "direct"` one, an async generator.
+    let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-direct", "/sse-gen"]);
+    // Two workers, each: start (~0.3 s), then at most long_lived_timeout (1 s)
+    // + the closing handshakes. Without the shim ending them: grace_period (30 s) each.
+    assert_clean_handover(&w, &run, Duration::from_secs(10));
+    let log = w.log();
+    assert!(log.contains("websockets=1") && log.contains("sse="), "{log}");
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_a_node_reload() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("command = \"node\"\nargs = [\"{}\"]\n[workers]\ncount = 2", fixture("longlived_node.mjs"));
+    let w = Warden::start("ll-node", port, &long_lived_config("ll-node", port, &app, ""));
+    let run = reload_holding(&w, 2, &["/ws", "/sse"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(10));
+}
+
+#[test]
+fn long_lived_connections_hand_over_in_bun_worker_mode() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let app = format!("entry = \"{}\"\n[workers]\ncount = 2\nmode = \"worker\"", fixture("longlived.ts"));
+    let w = Warden::start("ll-threads", port, &long_lived_config("ll-threads", port, &app, ""));
+    // The host is replaced as a whole: its Workers drain in parallel.
+    let run = reload_holding(&w, 2, &["/ws", "/sse", "/sse-gen"]);
+    assert_clean_handover(&w, &run, Duration::from_secs(8));
+}
+
+/// Without long-lived connections a drain is what it was: no wait for
+/// long_lived_timeout, nothing closed, and normal requests in flight —
+/// streamed downloads included — run to their end even past
+/// long_lived_timeout (only grace_period bounds them).
+#[test]
+fn drain_without_long_lived_connections_is_unchanged() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"ll-none\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+         [shutdown]\ngrace_period = 30\ndrain_ms = 100\nlong_lived_timeout = 3\n",
+        fixture("longlived.ts")
+    );
+    let w = Warden::start("ll-none", port, &cfg);
+    let run = reload_holding(&w, 2, &[]);
+    eprintln!("reload took {:?}; plain requests: {} ok, {} failed", run.took, run.ok, run.fail);
+    assert!(run.before.is_disjoint(&run.after));
+    assert!(run.fail <= allowed_resets(), "plain requests failed: {}", run.fail);
+    // Waiting for long_lived_timeout would take >= 2 x 3 s.
+    assert!(run.took < Duration::from_secs(5), "reload took {:?}\n{}", run.took, w.log());
+
+    // A download and a slow request in flight through a reload, both longer
+    // than long_lived_timeout: they finish, complete.
+    let download = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "GET /download?ms=4000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        let r = s.read_to_end(&mut out);
+        (r.map_err(|e| e.to_string()), String::from_utf8_lossy(&out).to_string())
+    });
+    let slow = std::thread::spawn(move || {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(s, "GET /slow?ms=4000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let r = s.read_to_string(&mut out);
+        (r.map_err(|e| e.to_string()), out)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let (r, body) = download.join().unwrap();
+    assert!(r.is_ok(), "download: {r:?}");
+    assert!(body.contains("line 9\nend\n") && body.ends_with("0\r\n\r\n"), "download cut short: {body:?}");
+    let (r, body) = slow.join().unwrap();
+    assert!(r.is_ok() && body.starts_with("HTTP/1.1 200"), "slow request: {r:?} {body:?}");
+    let log = w.log();
+    assert!(!log.contains("closed long-lived connections"), "{log}");
+}
+
+// ------------------------------------------------------------ surge rollouts
+
+/// Requests on fresh connections from one client thread while `f` runs:
+/// (what `f` returned, requests that succeeded, requests that failed).
+fn under_load<R>(port: u16, f: impl FnOnce() -> R) -> (R, usize, usize) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let client = {
+        let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match get(port, "/whoami") {
+                    Some(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    None => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let r = f();
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    (r, ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed))
+}
+
+/// None of the requests sent during a rolling replacement failed. Without
+/// net.ipv4.tcp_migrate_req=1 the kernel resets connections queued on a
+/// listener that closes, whatever the order of replacement (one at a time
+/// too): then up to 1% may fail, as in `process_mode_lifecycle`.
+fn no_dropped_requests(ok: usize, fail: usize) {
+    if allowed_resets() == 0 {
+        assert_eq!(fail, 0, "{fail} requests failed during the rollout ({ok} ok)");
+    } else {
+        assert!(fail * 100 <= ok, "{fail} requests failed during the rollout ({ok} ok)");
+    }
+}
+
+/// `warden reload`, waited for: its duration and the CLI's output.
+fn timed_reload(w: &Warden) -> (f64, String) {
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let s = w.status().unwrap();
+    (s["last_rollout"]["duration_secs"].as_f64().unwrap(), out)
+}
+
+/// The `workers=` of each "starting new workers next to the old ones" log line.
+fn batch_lines(w: &Warden) -> Vec<String> {
+    w.log()
+        .lines()
+        .filter(|l| l.contains("starting new workers next to the old ones"))
+        .filter_map(|l| l.split(" workers=").nth(1))
+        .map(|rest| match rest.strip_prefix('"') {
+            Some(q) => q.split('"').next().unwrap_or("").to_string(),
+            None => rest.split(' ').next().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn surge_replaces_workers_in_batches_without_dropping_requests() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("surge", port, &gated("surge", port, 4, ""));
+    let mut before = pid_set(&w.wait_for("ready", T, ready(4)));
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+
+    // One at a time (the default)...
+    let ((one, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge 1: {one}s, {ok} ok, {fail} failed");
+    assert!(out.contains("reload complete: 4 worker(s) replaced") && !out.contains("batch"), "{out}");
+    no_dropped_requests(ok, fail);
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before));
+    before = pid_set(&s);
+    assert!(batch_lines(&w).is_empty());
+
+    // ...then two at a time: 2 batches, faster, nothing dropped.
+    std::fs::write(&w.cfg, good.replace("[reload]\n", "[reload]\nsurge = 2\n")).unwrap();
+    let ((two, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge 2: {two}s, {ok} ok, {fail} failed");
+    assert!(out.contains("4 worker(s) replaced") && out.contains("(2 batches of up to 2)"), "{out}");
+    // Phases name the batch, and `done` counts the workers it finished.
+    assert!(out.contains("[0/4] workers 1, 2: ") && out.contains("[2/4] workers 3, 4: "), "{out}");
+    no_dropped_requests(ok, fail);
+    assert!(ok > 20, "{ok}");
+    assert_eq!(batch_lines(&w), ["1, 2", "3, 4"], "{}", w.log());
+    assert!(two < one, "surge 2 ({two}s) should be faster than one at a time ({one}s)");
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new");
+    assert_eq!(s["workers_ready"], 4);
+    assert!(w.log().contains("reload started workers=4 seq=2 surge=2"), "{}", w.log());
+    before = pid_set(&s);
+
+    // "all": every new worker at once, one batch.
+    std::fs::write(&w.cfg, good.replace("[reload]\n", "[reload]\nsurge = \"all\"\n")).unwrap();
+    let ((all, out), ok, fail) = under_load(port, || timed_reload(&w));
+    eprintln!("surge all: {all}s, {ok} ok, {fail} failed");
+    assert!(out.contains("4 worker(s) replaced") && out.contains("(1 batch of up to 4)"), "{out}");
+    no_dropped_requests(ok, fail);
+    assert_eq!(batch_lines(&w), ["1, 2", "3, 4", "1-4"]);
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4, "the old workers are gone, the new ones serve");
+
+    // A rolling `restart` uses the same batches.
+    let (code, out) = w.cli(&["restart"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("restart complete") && out.contains("(1 batch of up to 4)"), "{out}");
+}
+
+#[test]
+fn surge_failure_rolls_back_the_whole_batch() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("surgefail", port, 4, "").replace("[reload]\n", "[reload]\nsurge = 2\n");
+    let w = Warden::start("surgefail", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(4)));
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+    let with = |extra: &str| good.replace("[reload]\n", &format!("[reload]\n{extra}\n"));
+
+    // Worker 2's new process fails its check; worker 1's passed, and is stopped too.
+    std::fs::write(&w.cfg, with("verify_command = \"test $WARDEN_WORKER_ID != 2\"")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("reload failed at worker 2: verify_command failed"), "{out}");
+    assert!(out.contains("Rolled back: the 2 new workers started together were stopped"), "{out}");
+    let s = w.status().unwrap();
+    assert_eq!(pid_set(&s), before, "the old workers keep serving");
+    assert_eq!(s["workers_ready"], 4);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4, "no new worker left behind");
+
+    // safe-reload: a failing canary rolls back before any batch starts.
+    std::fs::write(&w.cfg, good.replace("[workers]", "env = { FIXTURE_HEALTH_FAIL = \"1\" }\n[workers]")).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("safe-reload failed at worker 1") && out.contains("Rolled back"), "{out}");
+    assert_eq!(pid_set(&w.status().unwrap()), before);
+
+    // The canary passes, then the next batch fails at worker 3: the canary
+    // stays, both new workers of that batch are stopped.
+    std::fs::write(&w.cfg, with("verify_command = \"test $WARDEN_WORKER_ID != 3\"")).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("safe-reload halted at worker 3") && out.contains("1/4 workers were replaced"), "{out}");
+    let s = w.status().unwrap();
+    let pid = |i: usize| s["workers"][i]["pid"].as_u64().unwrap();
+    assert!(!before.contains(&pid(0)), "the canary took over worker 1");
+    assert!((1..4).all(|i| before.contains(&pid(i))), "workers 2-4 still run the old version: {s:#?}");
+    assert_eq!(batch_lines(&w).last().map(String::as_str), Some("2, 3"), "{}", w.log());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(listeners(port), 4);
+}
+
+// ------------------------------------------------------------ release pinning
+
+/// releases/v1..v3 (each a copy of the release fixture) and `current` -> v1.
+fn release_tree(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("warden-it-rel-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for v in ["v1", "v2", "v3"] {
+        std::fs::create_dir_all(dir.join("releases").join(v)).unwrap();
+        std::fs::copy(fixture("release_app.ts"), dir.join("releases").join(v).join("app.ts")).unwrap();
+    }
+    std::os::unix::fs::symlink(dir.join("releases/v1"), dir.join("current")).unwrap();
+    dir
+}
+
+/// Point `current` at another release, atomically (as deploy tools do).
+fn swap_current(dir: &std::path::Path, to: &str) {
+    let tmp = dir.join("current.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(dir.join("releases").join(to), &tmp).unwrap();
+    std::fs::rename(&tmp, dir.join("current")).unwrap();
+}
+
+/// The releases the workers answer from (their cwd). `script`: also check
+/// that the script runs from the same release ("(mixed)" when it doesn't).
+fn releases_seen(port: u16, script: bool) -> std::collections::BTreeSet<String> {
+    let rel = |s: &str| s.split("releases/").nth(1).and_then(|r| r.split('/').next()).unwrap_or("?").to_string();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let Some(w) = get(port, "/where") else { continue };
+        let Some((cwd, path)) = w.split_once('|') else { continue };
+        let mixed = script && rel(cwd) != rel(path);
+        seen.insert(format!("{}{}", rel(cwd), if mixed { "(mixed)" } else { "" }));
+    }
+    seen
+}
+
+fn release_config(name: &str, port: u16, dir: &std::path::Path, extra: &str) -> String {
+    format!(
+        "[app]\nname = \"{name}\"\nargs = [\"{}\"]\nworking_directory = \"{}\"\nport = {port}\n{extra}\n\
+         [workers]\ncount = 2\n[restart]\nbackoff_initial = 50\n[shutdown]\ndrain_ms = 100\n",
+        dir.join("current/app.ts").display(),
+        dir.join("current").display(),
+    )
+}
+
+/// kill -9 worker `idx` (0-based) and wait until it runs again; its old pid.
+fn kill_worker(w: &Warden, idx: usize) -> u64 {
+    let pid = w.status().unwrap()["workers"][idx]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    w.wait_for("worker restarted", T, |s| {
+        let x = &s["workers"][idx];
+        x["state"] == "RUNNING" && x["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    pid
+}
+
+#[test]
+fn pinned_release_survives_a_symlink_swap_until_reload() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let dir = release_tree("pin");
+    let w = Warden::start("pin", port, &release_config("pin", port, &dir, ""));
+    let s = w.wait_for("ready", T, ready(2));
+    let rel = |s: &Value| s["release"].as_str().unwrap_or("").to_string();
+    assert!(rel(&s).ends_with("releases/v1"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "cwd and script both in the pinned release");
+    assert!(w.log().contains("release pinned"));
+    let (_, out) = w.cli(&["status"]);
+    assert!(out.contains("Release:") && out.contains("releases/v1"), "{out}");
+
+    // Deploy, step 1: the symlink is swapped, and a worker crashes before the
+    // reload. It comes back on the release the others run.
+    swap_current(&dir, "v2");
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
+    assert!(rel(&s).ends_with("releases/v1"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "no mixed versions after a crash");
+    let log = w.wait_log("something outside Warden sent SIGKILL", T);
+    assert!(log.contains("worker crashed") && log.contains("killed by another process (SIGKILL)"), "{log}");
+
+    // Step 2: the reload moves every worker to the new release.
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.status().unwrap();
+    assert!(rel(&s).ends_with("releases/v2"), "{s:#?}");
+    assert_eq!(releases_seen(port, true), ["v2".to_string()].into());
+    let log = w.log();
+    let started = log.lines().find(|l| l.contains("reload started")).unwrap_or_default();
+    assert!(started.contains("release=") && started.contains("releases/v2"), "{started}");
+    let (_, out) = w.cli(&["describe"]);
+    assert!(out.contains("releases/v2 (pinned"), "{out}");
+
+    // Old releases cleaned up while still pinned: the next crash restart
+    // can't use v2 any more; it falls back to `current` (v3) and says so.
+    swap_current(&dir, "v3");
+    std::fs::remove_dir_all(dir.join("releases/v2")).unwrap();
+    kill_worker(&w, 1);
+    let log = w.wait_log("the pinned release directory is gone", T);
+    assert!(log.contains("reload has moved every worker off them"), "{log}");
+    let s = w.status().unwrap();
+    assert!(rel(&s).ends_with("releases/v3"), "{s:#?}");
+    let t0 = Instant::now();
+    while !releases_seen(port, true).contains("v3") {
+        assert!(t0.elapsed() < T, "the restarted worker should run v3");
+    }
+
+    // A failed rollout keeps the pin it had.
+    swap_current(&dir, "v1");
+    let cfg = std::fs::read_to_string(&w.cfg).unwrap();
+    std::fs::write(&w.cfg, cfg.replace("[workers]", "[reload]\nverify_command = \"false\"\n[workers]")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(rel(&w.status().unwrap()).ends_with("releases/v3"), "the failed reload's pin must be dropped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_pinning_a_crash_restart_picks_up_the_new_release() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let dir = release_tree("nopin");
+    let w = Warden::start("nopin", port, &release_config("nopin", port, &dir, "pin_release = false"));
+    let s = w.wait_for("ready", T, ready(2));
+    assert!(s["release"].is_null(), "{s:#?}");
+    swap_current(&dir, "v2");
+    kill_worker(&w, 0);
+    // Today's behaviour without a pin, and why it is on by default: two
+    // versions serve side by side.
+    let t0 = Instant::now();
+    while releases_seen(port, false) != ["v1".to_string(), "v2".to_string()].into() {
+        assert!(t0.elapsed() < T, "expected v1 and v2 side by side");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --------------------------------------------------------------- exit reasons
+
+/// A plain program that kills itself with `sig` after a moment.
+fn self_killer(name: &str, sig: &str) -> Warden {
+    Warden::start(
+        name,
+        0,
+        &format!(
+            "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"sleep 0.3; kill -{sig} $$\"]\n\
+             [workers]\nmin_uptime = 100\n[restart]\nbackoff_initial = 2000\nbackoff_max = 2000\n"
+        ),
+    )
+}
+
+#[test]
+fn exit_reasons_name_crashes_and_who_stopped_a_worker() {
+    // A segfault and an abort, as the kernel reports them.
+    let w = self_killer("segv", "SEGV");
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGSEGV (segmentation fault)");
+    let log = w.wait_log("coredumpctl", T);
+    assert!(log.contains("worker crashed") && log.contains("reason=\"crashed: SIGSEGV"), "{log}");
+    let w = self_killer("abrt", "ABRT");
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGABRT (aborted)");
+    w.wait_log("aborted itself", T);
+    if !have_bun() {
+        return;
+    }
+
+    // Bun's own process.abort().
+    let w = Warden::start(
+        "bunabort",
+        0,
+        "[app]\nname = \"bunabort\"\nargs = [\"-e\", \"setTimeout(() => process.abort(), 300)\"]\n\
+         [workers]\nmin_uptime = 100\n[restart]\nbackoff_initial = 2000\nbackoff_max = 2000\n",
+    );
+    let s = w.wait_for("a crash", T, |s| s["workers"][0]["crashes"].as_u64() >= Some(1));
+    assert_eq!(s["workers"][0]["last_exit"], "crashed: SIGABRT (aborted)");
+
+    // `warden stop`: an exit after Warden's stop signal...
+    let port = free_port();
+    let w = Warden::start("stopsig", port, &simple("stopsig", port, 1, ""));
+    w.wait_for("ready", T, ready(1));
+    assert_eq!(w.cli(&["stop"]).0, 0);
+    let s = w.wait_for("stopped", T, |s| s["workers"][0]["state"] == "STOPPED");
+    let why = s["workers"][0]["last_exit"].as_str().unwrap();
+    assert!(why == "exit code 0 after Warden's SIGTERM" || why == "stopped by Warden's SIGTERM", "{why}");
+
+    // ...and Warden's SIGKILL once the grace period is over.
+    let port = free_port();
+    let w = Warden::start(
+        "gracekill",
+        port,
+        &format!(
+            "[app]\nname = \"gracekill\"\nargs = [\"{}\"]\nport = {port}\nshim = false\n\
+             env = {{ FIXTURE_IGNORE_TERM = \"1\" }}\n[shutdown]\ngrace_period = 1\n",
+            fixture("app.ts")
+        ),
+    );
+    w.wait_for("ready", T, ready(1));
+    assert_eq!(w.cli(&["stop"]).0, 0);
+    let s = w.wait_for("stopped", T, |s| s["workers"][0]["state"] == "STOPPED");
+    assert_eq!(s["workers"][0]["last_exit"], "killed by Warden (SIGKILL)");
+}
+
+/// OOM kills are told apart by the cgroup's oom_kill counter. A fake
+/// `memory.events` (debug builds only) stands in for the kernel's here.
+#[test]
+fn oom_kill_is_told_apart_from_a_kill_9() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let events = std::env::temp_dir().join(format!("warden-it-memory.events-{}", std::process::id()));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
+    let ev = events.display().to_string();
+    let w = Warden::start_env("oomfake", port, &simple("oomfake", port, 1, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
+    w.wait_for("ready", T, ready(1));
+    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)");
+    let log = w.wait_log("raise memory.max / MemoryMax= or lower `[limits] max_memory`", T);
+    assert!(log.contains("worker crashed") && log.contains("OOM killer"), "{log}");
+    // The counter didn't move this time: someone's kill -9.
+    kill_worker(&w, 0);
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"][0]["last_exit"], "killed by another process (SIGKILL)");
+    w.wait_log("OOM killer was ruled out", T);
+    let _ = std::fs::remove_file(&events);
+}
+
+/// A child of our own memory cgroup with `limit` bytes (cgroup v1 or v2), if
+/// this machine lets us make one: (its directory, its cgroup.procs).
+fn memory_cgroup(limit: u64) -> Option<(PathBuf, PathBuf)> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let name = format!("warden-it-{}", std::process::id());
+    for line in cgroup.lines() {
+        let mut f = line.splitn(3, ':');
+        let (Some(_), Some(ctl), Some(path)) = (f.next(), f.next(), f.next()) else { continue };
+        let rel = path.trim_start_matches('/');
+        let (dir, files) = if ctl.split(',').any(|c| c == "memory") {
+            let dir = PathBuf::from("/sys/fs/cgroup/memory").join(rel).join(&name);
+            (dir, [("memory.limit_in_bytes", limit.to_string()), ("memory.memsw.limit_in_bytes", limit.to_string())])
+        } else if ctl.is_empty() && std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            let dir = PathBuf::from("/sys/fs/cgroup").join(rel).join(&name);
+            (dir, [("memory.max", limit.to_string()), ("memory.swap.max", "0".to_string())])
+        } else {
+            continue;
+        };
+        if std::fs::create_dir(&dir).is_err() {
+            continue;
+        }
+        // The limit itself is required; a swap limit may not exist (no swap accounting).
+        if std::fs::write(dir.join(files[0].0), &files[0].1).is_ok() {
+            let _ = std::fs::write(dir.join(files[1].0), &files[1].1);
+            let procs = dir.join("cgroup.procs");
+            return Some((dir, procs));
+        }
+        let _ = std::fs::remove_dir(&dir);
+    }
+    None
+}
+
+impl Warden {
+    /// Like `start`, with Warden (and so its workers) in the cgroup whose
+    /// `cgroup.procs` is `procs`.
+    fn start_in_cgroup(name: &str, port: u16, toml: &str, procs: &std::path::Path) -> Warden {
+        let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("warden.toml");
+        let text = format!("{toml}\n[control]\nsocket = \"{}\"\n", dir.join("w.sock").display());
+        std::fs::write(&cfg, text).unwrap();
+        let log = std::fs::File::create(dir.join("warden.log")).unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "echo $$ > \"$0\" && exec \"$@\""])
+            .arg(procs)
+            .arg(BIN)
+            .args(["start", "-c"])
+            .arg(&cfg)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        Warden { child, cfg, dir, port }
+    }
+}
+
+/// A real OOM kill, where the sandbox lets us make a memory cgroup.
+#[test]
+fn a_real_oom_kill_is_reported_with_its_fix() {
+    if !have_bun() {
+        return;
+    }
+    let Some((cg, procs)) = memory_cgroup(192 << 20) else {
+        eprintln!("skipping: can't create a memory cgroup with a limit here");
+        return;
+    };
+    let port = free_port();
+    let w = Warden::start_in_cgroup("oomreal", port, &simple("oomreal", port, 1, ""), &procs);
+    let pid = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    let _ = get(port, "/leak"); // ~200 MB more than the worker had
+    let s = w.wait_for("OOM-killed and restarted", T, |s| {
+        s["workers"][0]["state"] == "RUNNING" && s["workers"][0]["pid"].as_u64().is_some_and(|p| p != pid)
+    });
+    assert_eq!(s["workers"][0]["last_exit"], "killed by the kernel OOM killer (out of memory)", "{}", w.log());
+    w.wait_log("raise memory.max / MemoryMax=", T);
+    drop(w);
+    for _ in 0..50 {
+        if std::fs::remove_dir(&cg).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 // ---- standby
 //
 // `[workers] standby = N`: hot standbys, initialized but not listening,
-// promoted into the slot of a worker that dies. Status lists them after the
-// workers with `id` 0.
+// promoted into the slot of a worker that dies. Status lists them in
+// `standbys` (absent without standbys), never in `workers`.
 
 /// Pids of the workers (not the standbys).
 fn worker_pids(s: &Value) -> HashSet<u64> {
-    s["workers"].as_array().unwrap().iter().filter(|w| w["id"] != 0).filter_map(|w| w["pid"].as_u64()).collect()
+    pid_set(s)
 }
 
 fn standby_rows(s: &Value) -> Vec<&Value> {
-    s["workers"].as_array().unwrap().iter().filter(|w| w["id"] == 0).collect()
+    s["standbys"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
 }
 
 /// The pid of a standby ready to take over, if any.
@@ -3425,7 +4777,8 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
         assert!(who.starts_with(&format!("{victim}:")), "{who}");
     }
     let (_, out) = w.cli(&["status"]);
-    assert!(out.contains("Standby:     1/1 ready") && out.contains("standby  STANDBY"), "{out}");
+    assert!(out.contains("Standby:     1/1 ready") && out.contains("\ns1       STANDBY"), "{out}");
+    assert_eq!(s["workers"].as_array().map(Vec::len), Some(1), "standbys are not workers");
 
     let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);
     let (who, took) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
@@ -3697,6 +5050,118 @@ fn an_unhealthy_worker_is_replaced_by_the_standby() {
     }
 }
 
+/// Standbys need no socket path of their own: a runtime directory so long
+/// that only the control socket still fits (a deep checkout) works, without
+/// a health path (the Bun stand-in then serves on an ephemeral port).
+#[test]
+fn standby_works_from_a_long_runtime_directory() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let name = format!("sb-long-{}", "x".repeat(55));
+    let cfg = simple("sb-long", port, 1, "").replace("[workers]\ncount = 1\n", "[workers]\ncount = 1\nstandby = 1\n");
+    let w = Warden::start(&name, port, &cfg);
+    assert!(w.socket().as_os_str().len() > 85, "{}", w.socket().display());
+    let s = w.wait_for("a worker and a standby", T, |s| s["workers_ready"] == 1 && ready_standby(s).is_some());
+    let (victim, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+    assert_eq!(listeners(port), 1, "the stand-in is not on the app's port");
+    let (who, _) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
+    assert!(who.starts_with(&format!("{standby}:")), "{who}");
+}
+
+/// Release pinning and surge: a standby starts in the pinned release, so
+/// after `current` is swapped a crashed worker's slot still gets the release
+/// the others run; a surge reload (every worker at once) drops nothing and
+/// then replaces the standby in the new release.
+#[test]
+fn standby_follows_the_pinned_release_and_a_surge_reload() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let dir = release_tree("sbpin");
+    let cfg = release_config("sbpin", port, &dir, "")
+        .replace("[workers]\ncount = 2\n", "[workers]\ncount = 2\nstandby = 1\n[reload]\nsurge = \"all\"\n");
+    let w = Warden::start("sbpin", port, &cfg);
+    let release_of = |pid: u64| {
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_default();
+        cwd.display().to_string().rsplit('/').next().unwrap_or_default().to_string()
+    };
+    let s = w.wait_for("ready with a standby", T, |s| s["workers_ready"] == 2 && ready_standby(s).is_some());
+    let standby = ready_standby(&s).unwrap();
+    assert_eq!(release_of(standby), "v1");
+
+    // The deploy swaps `current`; a worker crashes before the reload: the
+    // standby (v1) takes its slot, as the pin says, and its successor is v1.
+    swap_current(&dir, "v2");
+    let victim = s["workers"][0]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let s = w.wait_for("standby promoted, a new one ready", T, |s| {
+        s["workers"][0]["pid"].as_u64() == Some(standby)
+            && s["workers_ready"] == 2
+            && ready_standby(s).is_some_and(|p| p != standby)
+    });
+    assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "no mixed versions after a crash");
+    let second = ready_standby(&s).unwrap();
+    assert_eq!(release_of(second), "v1", "a standby started between swap and reload stays on the pin");
+
+    // The reload (surge: both workers at once) moves everyone to v2.
+    let before = worker_pids(&s);
+    let stop = Arc::new(AtomicBool::new(false));
+    let fail = Arc::new(AtomicUsize::new(0));
+    let client = {
+        let (stop, fail) = (stop.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if get(port, "/where").is_none() {
+                    fail.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let s = w.wait_for("new workers and a v2 standby", T, |s| {
+        worker_pids(s).is_disjoint(&before) && ready_standby(s).is_some_and(|p| p != second && release_of(p) == "v2")
+    });
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    assert!(fail.load(Ordering::Relaxed) <= allowed_resets(), "requests failed during the surge reload");
+    assert_eq!(releases_seen(port, true), ["v2".to_string()].into());
+    assert!(s["release"].as_str().unwrap_or("").ends_with("releases/v2"), "{s:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A promoted standby's listeners were made at promotion, not at startup:
+/// a reload must still end its WebSockets (1001) and SSE streams cleanly,
+/// on Bun and on Node. One worker, so every client is on the promoted one.
+#[test]
+fn a_promoted_standby_hands_over_long_lived_connections() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    for (name, app, paths) in [
+        ("sbll-bun", format!("args = [\"{}\"]", fixture("longlived.ts")), &["/ws", "/sse", "/sse-direct"][..]),
+        (
+            "sbll-node",
+            format!("command = \"node\"\nargs = [\"{}\"]", fixture("longlived_node.mjs")),
+            &["/ws", "/sse"][..],
+        ),
+    ] {
+        let port = free_port();
+        let app = format!("{app}\n[workers]\ncount = 1\nstandby = 1");
+        let w = Warden::start(name, port, &long_lived_config(name, port, &app, ""));
+        let s = w.wait_for("a worker and a standby", T, |s| s["workers_ready"] == 1 && ready_standby(s).is_some());
+        let (victim, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+        unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+        w.wait_for("promoted", T, |s| s["workers"][0]["pid"].as_u64() == Some(standby) && s["workers_ready"] == 1);
+        let run = reload_holding(&w, 1, paths);
+        assert_eq!(run.before, HashSet::from([standby]), "{name}: the clients held the promoted standby");
+        assert_clean_handover(&w, &run, Duration::from_secs(10));
+    }
+}
+
 /// `standby = 0` (the default): no standby rows, processes, sockets or
 /// env; a crash restarts cold, as before.
 #[test]
@@ -3708,17 +5173,13 @@ fn standby_zero_changes_nothing() {
     let w = Warden::start("sb-zero", port, &simple("sb-zero", port, 1, ""));
     let s = w.wait_for("ready", T, ready(1));
     assert_eq!(s["workers"].as_array().unwrap().len(), 1, "no standby rows: {s:#?}");
+    assert!(s.get("standbys").is_none(), "`standbys` is not even sent: {s:#?}");
     let victim = s["workers"][0]["pid"].as_u64().unwrap();
     assert!(!env_of(victim).contains("WARDEN_STANDBY"));
     let (_, took) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
     eprintln!("cold restart (no standby, Bun fixture): the port answered again {} after kill -9", ms(took));
     let log = w.wait_log("worker ready worker=1", T);
     assert!(!log.to_lowercase().contains("standby"), "{log}");
-    let stand_ins = std::fs::read_dir(&w.dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .any(|e| e.file_name().to_string_lossy().starts_with("sb-zero.s"));
-    assert!(!stand_ins, "no stand-in sockets");
     let s = w.status().unwrap();
     assert_eq!(s["workers"].as_array().unwrap().len(), 1);
     assert_eq!(s["workers"][0]["restarts"], 1);

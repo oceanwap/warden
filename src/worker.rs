@@ -157,6 +157,9 @@ pub struct Instance {
     pub standby: Option<StandbyGates>,
     /// A standby promoted into a slot: when (until it listens, then too).
     pub promoted_at: Option<Instant>,
+    /// `Role::Standby`: the release (pinned working directory) it started
+    /// in; it is promoted only while that is still the workers' release.
+    pub release: Option<PathBuf>,
 }
 
 impl Instance {
@@ -164,6 +167,7 @@ impl Instance {
         Instance {
             standby: (role == Role::Standby).then(StandbyGates::default),
             promoted_at: None,
+            release: None,
             slot,
             handle,
             started: Instant::now(),

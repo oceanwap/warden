@@ -164,6 +164,17 @@ pub struct Status {
     #[serde(default)]
     pub last_rollout: Option<RolloutOutcome>,
     pub workers: Vec<WorkerStatus>,
+    /// `[app] pin_release`: the real path workers start in (the target of a
+    /// `current` symlink when the pin was taken). Crash restarts reuse it;
+    /// reload, safe-reload and restart move it. None when not pinned.
+    #[serde(default)]
+    pub release: Option<String>,
+    /// Hot standbys (`[workers] standby`, process mode): started, not
+    /// listening; one takes the slot of a worker that dies. Absent (empty)
+    /// without standbys; their `restarts`, `crashes` and `last_exit` are
+    /// the pool's. Not in `workers`, so older clients don't see them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub standbys: Vec<WorkerStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,23 +205,20 @@ pub struct HostStatus {
     pub restarts: u64,
 }
 
-/// `WorkerStatus.id` of a hot standby (process mode, `[workers] standby`):
-/// standbys are listed after the workers, all with this id (workers are
-/// numbered from 1). Older clients show them as worker 0.
-pub const STANDBY_ID: usize = 0;
-/// `WorkerStatus.state` of a standby that can take over a crashed worker.
+/// `Status.standbys[].state` of a standby that can take over a crashed worker.
 pub const STANDBY: &str = "STANDBY";
-/// `WorkerStatus.state` of a standby still starting (initializing, or
+/// `Status.standbys[].state` of a standby still starting (initializing, or
 /// passing its health gates).
 pub const WARMING: &str = "WARMING";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerStatus {
-    /// The worker number (1..=count); [`STANDBY_ID`] for a hot standby.
+    /// The worker number (1..=count). In `Status.standbys`: the standby's
+    /// place in the list (1..=standby), not a worker number.
     pub id: usize,
     /// `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`, `CRASHED`,
-    /// `RESTARTING`, `FAILED`; standbys: [`WARMING`], [`STANDBY`] (or
-    /// `STOPPING`, and `RESTARTING` / `FAILED` / `STOPPED` for missing ones).
+    /// `RESTARTING`, `FAILED`. Standbys: [`WARMING`], [`STANDBY`],
+    /// `STOPPING`, and `RESTARTING` / `FAILED` / `STOPPED` for a missing one.
     pub state: String,
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
@@ -223,13 +231,6 @@ pub struct WorkerStatus {
     /// Per-worker health verdict (private-socket checks).
     #[serde(default)]
     pub healthy: Option<bool>,
-}
-
-impl WorkerStatus {
-    /// A hot standby's row, not a worker's.
-    pub fn is_standby(&self) -> bool {
-        self.id == STANDBY_ID
-    }
 }
 
 #[cfg(test)]
@@ -258,6 +259,35 @@ mod tests {
         );
     }
 
+    /// `standbys` is additive both ways: an older supervisor's status (none)
+    /// parses, and none is sent without standbys; they never mix with workers.
+    #[test]
+    fn standbys_are_additive() {
+        let old = r#"{"app":"api","mode":"process","pid":1,"uptime_secs":1,"workers_configured":1,"workers_ready":1,
+            "healthy":null,"supervisor_rss_bytes":null,"host":null,"reloading":false,"shutting_down":false,"workers":[]}"#;
+        let mut s: Status = serde_json::from_str(old).unwrap();
+        assert!(s.standbys.is_empty());
+        assert!(!serde_json::to_string(&s).unwrap().contains("standbys"), "not sent without standbys");
+        s.standbys.push(WorkerStatus {
+            id: 1,
+            state: STANDBY.into(),
+            pid: Some(7),
+            uptime_secs: Some(3),
+            restarts: 0,
+            crashes: 0,
+            rss_bytes: None,
+            cpu_seconds: None,
+            cpu_percent: None,
+            last_exit: None,
+            healthy: None,
+        });
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["standbys"][0]["state"], "STANDBY");
+        assert_eq!(v["workers"].as_array().map(Vec::len), Some(0));
+        let back: Status = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+    }
+
     #[test]
     fn response_wire_format() {
         assert_eq!(serde_json::to_string(&Response::ok("done")).unwrap(), r#"{"ok":true,"message":"done"}"#);
@@ -267,5 +297,17 @@ mod tests {
         );
         let r: Response = serde_json::from_str(r#"{"ok":false,"message":"no such worker"}"#).unwrap();
         assert!(!r.ok && r.message.as_deref() == Some("no such worker") && r.status.is_none());
+    }
+
+    #[test]
+    fn status_from_an_older_supervisor_has_no_release() {
+        let old = r#"{"app":"api","mode":"process","pid":1,"uptime_secs":0,"workers_configured":1,
+            "workers_ready":1,"healthy":null,"supervisor_rss_bytes":null,"host":null,"reloading":false,
+            "shutting_down":false,"workers":[]}"#;
+        let s: Status = serde_json::from_str(old).unwrap();
+        assert_eq!(s.release, None);
+        let with = old.replace(r#""workers":[]"#, r#""workers":[],"release":"/srv/api/releases/v2""#);
+        let s: Status = serde_json::from_str(&with).unwrap();
+        assert_eq!(s.release.as_deref(), Some("/srv/api/releases/v2"));
     }
 }

@@ -212,6 +212,22 @@ pub enum DaemonRequest {
         request: Request,
     },
     Shutdown,
+    /// The resource history (CPU, memory, workers, restarts) of the last
+    /// 24 h, in `history`. `app`: that app only (`""`: the host only);
+    /// none: every app. The host's series always come.
+    History {
+        #[serde(default)]
+        app: Option<String>,
+        /// From this Unix time in ms (default, and at most: 24 h ago).
+        #[serde(default)]
+        since_ms: Option<u64>,
+        /// Seconds per point (default 10, wardend's sampling period).
+        #[serde(default)]
+        step_s: Option<u32>,
+    },
+    /// Read `wardend.toml` (the alert rules) again, as SIGHUP does. On an
+    /// error the previous rules stay and the reply says what is wrong.
+    Reload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -226,6 +242,104 @@ pub struct DaemonReply {
     /// `app`: the supervisor's answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<Response>,
+    /// `history`: the series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<ResourceHistory>,
+}
+
+// ---------------------------------------------------------------- history
+
+/// The answer to `history` (docs/protocol.md, "Resource history"): series
+/// on one time grid. Point `i` covers `[start_ms + i * step_s * 1000, +
+/// step_s)`; `null` where nothing was sampled (wardend not running, the
+/// app not watched). Each array has `points` entries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResourceHistory {
+    #[serde(default)]
+    pub start_ms: u64,
+    #[serde(default)]
+    pub step_s: u32,
+    #[serde(default)]
+    pub points: u32,
+    #[serde(default)]
+    pub host: HostHistory,
+    #[serde(default)]
+    pub apps: Vec<AppHistory>,
+}
+
+/// The host: CPU % of all CPUs (mean per point), memory used (max), the
+/// 1-minute load average (mean).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HostHistory {
+    #[serde(default)]
+    pub cpu_percent: Vec<Option<f32>>,
+    #[serde(default)]
+    pub mem_used_bytes: Vec<Option<u64>>,
+    /// The newest total, in bytes.
+    #[serde(default)]
+    pub mem_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub load1: Vec<Option<f32>>,
+}
+
+/// One app: CPU % of one core, summed over its processes (mean per point),
+/// resident memory with the supervisor's (max), workers ready (min) and
+/// configured (max), and restarts (sum: how many happened in that point).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AppHistory {
+    pub app: String,
+    #[serde(default)]
+    pub cpu_percent: Vec<Option<f32>>,
+    #[serde(default)]
+    pub rss_bytes: Vec<Option<u64>>,
+    #[serde(default)]
+    pub workers_ready: Vec<Option<u32>>,
+    #[serde(default)]
+    pub workers_configured: Vec<Option<u32>>,
+    #[serde(default)]
+    pub restarts: Vec<Option<u32>>,
+}
+
+/// What the history samples from one `status`: wardend and the GUI (which
+/// appends live statuses to the series it fetched) count the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Usage {
+    /// CPU % of one core: the workers and the worker-mode host. `None`
+    /// when nothing reports it (no /proc: macOS).
+    pub cpu_percent: Option<f64>,
+    /// Resident memory: the workers, the worker-mode host and the supervisor.
+    pub rss_bytes: Option<u64>,
+    /// Restarts so far as this supervisor counts them (its workers', and
+    /// the worker-mode host's).
+    pub restarts: u64,
+}
+
+impl Usage {
+    pub fn of(s: &Status) -> Usage {
+        let mut u = Usage::default();
+        let host = s.host.as_ref();
+        for c in s.workers.iter().map(|w| w.cpu_percent).chain([host.and_then(|h| h.cpu_percent)]).flatten() {
+            u.cpu_percent = Some(u.cpu_percent.unwrap_or(0.0) + c);
+        }
+        let rss = s.workers.iter().map(|w| w.rss_bytes).chain([host.and_then(|h| h.rss_bytes), s.supervisor_rss_bytes]);
+        for b in rss.flatten() {
+            u.rss_bytes = Some(u.rss_bytes.unwrap_or(0).saturating_add(b));
+        }
+        u.restarts = s.workers.iter().map(|w| w.restarts).chain(host.map(|h| h.restarts)).fold(0, u64::saturating_add);
+        u
+    }
+}
+
+/// Restarts between two statuses of the same supervisor (`pid`): what the
+/// counters grew by. A new supervisor (its counters start at 0) counts
+/// everything it has; counters that shrank (a worker scaled away) count 0.
+pub fn restarts_since(prev: Option<(u32, u64)>, pid: u32, total: u64) -> u64 {
+    match prev {
+        Some((p, before)) if p == pid => total.saturating_sub(before),
+        Some(_) => total,
+        // The first status seen: what came before is not news.
+        None => 0,
+    }
 }
 
 /// Default and bounds for `interval_ms`.
@@ -274,6 +388,50 @@ mod tests {
         assert_eq!(s, DaemonRequest::Subscribe { interval_ms: None, logs: false, apps: vec![] });
         let sub: Request = serde_json::from_str(r#"{"cmd":"subscribe","interval_ms":500}"#).unwrap();
         assert_eq!(sub, Request::Subscribe { interval_ms: Some(500), logs: false });
+        let h: DaemonRequest = serde_json::from_str(r#"{"cmd":"history"}"#).unwrap();
+        assert_eq!(h, DaemonRequest::History { app: None, since_ms: None, step_s: None });
+        let h: DaemonRequest = serde_json::from_str(r#"{"cmd":"history","app":"api","step_s":60}"#).unwrap();
+        assert_eq!(h, DaemonRequest::History { app: Some("api".into()), since_ms: None, step_s: Some(60) });
+        assert_eq!(serde_json::from_str::<DaemonRequest>(r#"{"cmd":"reload"}"#).unwrap(), DaemonRequest::Reload);
+    }
+
+    #[test]
+    fn history_replies_parse_as_documented() {
+        let r: DaemonReply = serde_json::from_str(
+            r#"{"ok":true,"history":{"start_ms":1000,"step_s":60,"points":2,
+                "host":{"cpu_percent":[1.5,null],"mem_used_bytes":[10,null],"mem_total_bytes":20,"load1":[0.5,null]},
+                "apps":[{"app":"api","cpu_percent":[null,3.0],"rss_bytes":[null,4096],"workers_ready":[null,2],
+                         "workers_configured":[null,2],"restarts":[null,1]}]}}"#,
+        )
+        .unwrap();
+        let h = r.history.unwrap();
+        assert_eq!((h.start_ms, h.step_s, h.points), (1000, 60, 2));
+        assert_eq!(h.host.cpu_percent, [Some(1.5), None]);
+        assert_eq!(h.apps[0].rss_bytes, [None, Some(4096)]);
+        // An older wardend's reply has no history; a newer one's may have more fields.
+        let old: DaemonReply = serde_json::from_str(r#"{"ok":true,"history":{"later":1}}"#).unwrap();
+        assert_eq!(old.history, Some(ResourceHistory::default()));
+        assert!(!serde_json::to_string(&DaemonReply::default()).unwrap().contains("history"));
+    }
+
+    #[test]
+    fn usage_sums_the_processes_of_a_status() {
+        let s: Status = serde_json::from_value(serde_json::json!({
+            "app": "api", "mode": "process", "pid": 7, "uptime_secs": 1, "workers_configured": 2, "workers_ready": 2,
+            "healthy": null, "supervisor_rss_bytes": 100, "host": null, "reloading": false, "shutting_down": false,
+            "workers": [
+                {"id": 1, "state": "RUNNING", "pid": 8, "uptime_secs": 1, "restarts": 2, "crashes": 2, "rss_bytes": 1000,
+                 "cpu_seconds": null, "cpu_percent": 1.5, "last_exit": null},
+                {"id": 2, "state": "RUNNING", "pid": 9, "uptime_secs": 1, "restarts": 1, "crashes": 1, "rss_bytes": 2000,
+                 "cpu_seconds": null, "cpu_percent": null, "last_exit": null}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(Usage::of(&s), Usage { cpu_percent: Some(1.5), rss_bytes: Some(3100), restarts: 3 });
+        assert_eq!(restarts_since(None, 7, 3), 0, "the first status is the baseline");
+        assert_eq!(restarts_since(Some((7, 1)), 7, 3), 2);
+        assert_eq!(restarts_since(Some((7, 5)), 7, 3), 0, "a worker scaled away");
+        assert_eq!(restarts_since(Some((6, 9)), 7, 3), 3, "a new supervisor counts from 0");
     }
 
     #[test]

@@ -150,6 +150,39 @@ starts, and a failure can't be rolled back.
 `warden reload` (also SIGHUP) runs the same gates without the canary soak,
 fleet check or pauses. `warden restart N` replaces one worker through the gates.
 
+**WebSockets and SSE.** A long-lived connection never finishes by itself, so
+a draining worker would hold it until `grace_period` and then be killed, and
+its clients would see a reset (WebSocket 1006, a broken EventSource). Instead,
+the shim gives these connections `[shutdown] long_lived_timeout` (default
+2 s) to end by themselves, then closes each WebSocket with **1001 (Going
+Away)** and ends each SSE response cleanly after its last complete event.
+Clients reconnect, and land on the new workers: EventSource does this by
+itself, and WebSocket clients should reconnect on close. This covers `Bun.serve`
+(`websocket` handlers; `text/event-stream` bodies from a ReadableStream, a
+`type: "direct"` stream or an async generator) and `node:http` on Node and
+Bun (WebSockets taken over through `'upgrade'`, as the `ws` library does;
+SSE written with `res.write`), in process and worker mode. Other streamed
+responses, such as downloads, are never cut short: they finish like any
+request in flight, within `grace_period`. Each worker logs what it closed:
+`closed long-lived connections … websockets=3 sse=12`.
+
+**Faster rollouts**: `[reload] surge = 2` (or `"all"`) starts that many new
+workers at once, each next to the worker it replaces. Once every one of them has
+passed the gates, the old ones drain together, then the next batch starts. If one
+fails, every new worker of the batch is stopped and the old ones keep serving.
+safe-reload still runs its canary alone first. The cost is memory: surge N runs up
+to N extra workers for a few seconds (`"all"`: twice the workers). It needs
+workers that can overlap, so not with `port_strategy = "offset"`.
+
+**Release pinning** (`[app] pin_release`, on by default): Warden resolves a
+`current` symlink in `working_directory` when it starts and when a reload,
+safe-reload or restart begins, and starts workers in that real path (with
+`args` that go through the symlink rewritten too). A worker that crashes after
+you swapped the symlink but before you reloaded comes back on the release the
+others run, not the new one. `warden status` shows the pinned release. If
+that directory is deleted, the next restart falls back to `current` and logs a
+warning.
+
 ## Staying up for weeks
 
 | | What happens | Config |
@@ -160,7 +193,8 @@ fleet check or pauses. `warden restart N` replaces one worker through the gates.
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
-| Stop / shutdown | SIGTERM to each process group, drain, SIGKILL after `grace_period` | `[shutdown]` |
+| Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
+| Why it died | `last_exit` and the log line say who ended a worker: a crash (`SIGSEGV`, `SIGABRT`), the kernel's OOM killer (from the cgroup's `oom_kill` count), Warden, or another process, with a hint for the fix | |
 
 ### Hot standbys: crash recovery in milliseconds
 
@@ -202,9 +236,11 @@ app's startup time.
   number past the workers' in a standby; after promotion `NODE_APP_INSTANCE`
   is the slot's, and `process.on("warden:promote", ...)` runs late setup.
 
-`warden status` lists standbys after the workers (`standby`, `WARMING`
-then `STANDBY`). Process mode only, with `app.port`, a shared port and the
-shim (bun and node commands).
+`warden status` lists standbys after the workers as `s1`, `s2`… (`WARMING`
+then `STANDBY`; `standbys` in `--json`), and the GUI counts their memory.
+A standby starts in the pinned release (`pin_release`) and is promoted only
+while that is still the workers' release. Process mode only, with
+`app.port`, a shared port and the shim (bun and node commands).
 
 ## CLI
 
@@ -255,6 +291,7 @@ Workers:     4
 Ready:       4
 PID:         8139
 Uptime:      27s
+Release:     /srv/apps/travelerwe/api/releases/2026-09-30
 Memory:      4.0 MB (supervisor)
 Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
              health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...
@@ -270,6 +307,36 @@ The CLI talks to the running supervisor over a Unix socket with mode 0600.
 That socket's directory also holds the shim every worker preloads and the
 per-worker health sockets. Warden refuses to use the directory unless it
 owns it, it is not a symlink, and no other user can write to it.
+
+## Static files
+
+`warden serve dist 8080` (or a `[static]` section, see
+`warden.example.toml`) runs Warden's own file server as the app's workers:
+supervised, health-checked and reloaded like any app. It speaks HTTP/1.1
+with keep-alive: ETag / Last-Modified and 304s, single ranges,
+precompressed `.br` / `.gz` siblings, SPA fallback, `404.html`, Basic auth.
+Paths can't leave the root (`..`, symlinks out, NUL), and files are opened
+with `openat2(RESOLVE_BENEATH)` on Linux.
+
+Small files are served from memory. Each worker keeps complete responses
+(headers and body) of recently used files up to `cache_max_file` (64 KB), in
+at most `cache_size` (16 MB, least recently used out first; `0` turns it
+off), so a hit is one `send(2)`. HEAD and 304s come from the same entry;
+ranges and anything unusual take the normal path. A cached file is checked
+against the disk at most every `cache_valid_ms` (1 s): an edit, a deletion
+or a symlink swapped in shows within that time (on NFS, within the
+attribute cache time). A file changed in the last 2 s is served but not
+cached. A deploy that swaps a `current` symlink needs a rolling restart
+anyway (each worker resolves the root once), which starts with an empty
+cache. With `access_log = true` each line ends in `cache=hit` or
+`cache=miss`, and each worker prints its cache counters when it stops.
+
+`io = "uring"` (or `WARDEN_STATIC_IO=uring`) drives the workers' TCP
+connections with io_uring instead of epoll: one `io_uring_enter` submits the
+receives and sends of many connections at once. It is experimental and off
+by default. Where io_uring is unavailable (blocked by Docker's default
+seccomp profile, `kernel.io_uring_disabled`, kernels before 5.6, macOS),
+the worker logs why and serves with epoll.
 
 ## Production setup (systemd)
 
@@ -349,11 +416,44 @@ yours); a hung one is reported, never killed, because its workers are still
 serving. The protocol, for scripts and other clients:
 [`docs/protocol.md`](docs/protocol.md).
 
+**Alerts.** Put rules in `<config dir>/wardend.toml` (`/etc/warden` for
+root, `~/.config/warden` for a user) and wardend tells a command or a
+webhook when something goes wrong:
+
+```toml
+[[alert]]
+on = ["crash_loop", "gave_up", "rollout_failed", "unresponsive", "worker_failed", "oom"]   # or ["all"]
+apps = ["api"]                                    # optional; default every app
+webhook = "https://hooks.slack.com/services/…"    # POSTed as JSON, through curl
+min_interval = "5m"                               # repeats within it are counted and sent as one
+
+[[alert]]
+on = ["all"]
+command = ["/usr/local/bin/notify", "--channel", "ops"]   # the alert as JSON on stdin
+```
+
+The kinds also include `died`, `unhealthy`, `recycled` and `recovered`
+(healthy again after an alert). `warden daemon check` validates the file
+with every problem and its line; `warden daemon reload` (or SIGHUP) applies
+it, and a broken file keeps the rules in force. Deliveries never hold
+wardend up: a bounded queue, 10 s per try, one retry. Webhooks go through
+`curl` (Warden has no TLS stack of its own), with the URL on curl's stdin,
+never in a process list or a log line. Details:
+[Alerts](docs/protocol.md#alerts).
+
+**History.** wardend keeps the last 24 hours of every app's CPU, memory,
+workers ready and restarts, and the host's CPU, memory and load, from the
+statuses it already receives (a sample per 10 s; at most 135 KiB per app).
+The GUI charts them; scripts ask `{"cmd":"history"}`
+([Resource history](docs/protocol.md#resource-history)).
+
 ## GUI
 
 `warden-gui` is a native window (Rust, [iced](https://iced.rs)) on wardend:
 every app with its state, workers, CPU and memory, pushed live; each app's
-workers, rollout progress, events and logs; and the CLI's actions (reload,
+workers, rollout progress, events, logs and charts of its last 1, 6 or 24
+hours (CPU, memory, restarts, workers ready), with the host's CPU and memory
+as sparklines in the header; and the CLI's actions (reload,
 safe reload, rolling or hard restart, restart one worker, scale, stop,
 start, reset), adding an app (`warden start …`) and editing its config
 (checked with `warden check` before it is saved). It is a separate process:
@@ -364,7 +464,8 @@ warden-gui                                   # this machine's wardend (`Start wa
 warden-gui --ssh deploy@web-1                # a remote host, through an SSH tunnel (your agent and keys)
 ```
 
-It idles at about 21 MB resident and 0.1% CPU with 10 apps. Details, the SSH
+It idles at about 21 MB resident and 0.1–0.2% CPU with 10 apps (21.5 MB with
+the History tab showing a full day). Details, the SSH
 setup and the measurements: [`gui/README.md`](gui/README.md).
 
 ## Benchmarks

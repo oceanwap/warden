@@ -4,6 +4,7 @@
 
 use crate::client::{self, Endpoint, FeedMsg, FeedOptions};
 use crate::commands::{self, AddApp, Added, Host, Output};
+use crate::history::{AppChart, HostSpark, Load, Range};
 use crate::logs::{self, LogPane, Scroll};
 use crate::model::Model;
 use crate::ssh;
@@ -12,7 +13,7 @@ use iced::{Subscription, Task};
 use std::path::PathBuf;
 use std::time::Duration;
 use warden_protocol::control::Request;
-use warden_protocol::events::now_ms;
+use warden_protocol::events::{Event, ResourceHistory, now_ms};
 
 pub const FEED_ID: &str = "feed";
 pub const LOGS_ID: &str = "logs";
@@ -62,6 +63,8 @@ pub enum Conn {
 pub enum Tab {
     Events,
     Logs,
+    /// Charts of the last hours (`history` from wardend, then live).
+    History,
 }
 
 /// An action on an app (`DaemonRequest::App`, or wardend's `start`).
@@ -231,6 +234,12 @@ pub struct Gui {
     pub starting_wardend: bool,
     /// Actions in flight, per app (buttons show it).
     pub busy: Vec<(String, Act)>,
+    /// The History tab's range (kept across apps).
+    pub range: Range,
+    /// The selected app's charts, while the History tab shows.
+    pub chart: Option<AppChart>,
+    /// The header's host sparklines (the last hour).
+    pub host_spark: HostSpark,
 }
 
 #[derive(Debug, Clone)]
@@ -291,6 +300,13 @@ pub enum Message {
     Save,
     Saved(Result<String, String>),
     ReloadAfterSave,
+    HistoryRange(Range),
+    HistoryLoaded {
+        app: String,
+        range: Range,
+        result: Result<ResourceHistory, String>,
+    },
+    HostHistoryLoaded(Result<ResourceHistory, String>),
 }
 
 impl Gui {
@@ -339,6 +355,9 @@ impl Gui {
             modal: Modal::None,
             starting_wardend: false,
             busy: Vec::new(),
+            range: Range::Hour,
+            chart: None,
+            host_spark: HostSpark::default(),
         }
     }
 
@@ -376,7 +395,39 @@ impl Gui {
         }
         self.selected = Some(name);
         self.open_logs();
-        self.show_newest()
+        let chart = self.open_chart();
+        Task::batch([chart, self.show_newest()])
+    }
+
+    /// (Re)open the selected app's charts when the History tab shows, and
+    /// fetch them (once connected; `Connected` fetches otherwise).
+    fn open_chart(&mut self) -> Task<Message> {
+        self.chart = match (&self.selected, self.tab) {
+            (Some(app), Tab::History) => Some(AppChart::loading(app, self.range)),
+            _ => None,
+        };
+        self.fetch_chart()
+    }
+
+    fn fetch_chart(&mut self) -> Task<Message> {
+        let socket = self.request_socket();
+        let (Some(c), Ok(socket)) = (&mut self.chart, socket) else { return Task::none() };
+        c.load = Load::Loading;
+        let (app, range) = (c.app.clone(), c.range);
+        let since = now_ms().saturating_sub(range.secs() * 1000);
+        let step = range.step_s() as u32;
+        let asked = app.clone();
+        Task::perform(async move { client::history(&socket, &asked, since, step).await }, move |result| {
+            Message::HistoryLoaded { app: app.clone(), range, result }
+        })
+    }
+
+    /// The header's last hour of host metrics.
+    fn fetch_host(&self) -> Task<Message> {
+        let Ok(socket) = self.request_socket() else { return Task::none() };
+        let since = now_ms().saturating_sub(Range::Hour.secs() * 1000);
+        let step = Range::Hour.step_s() as u32;
+        Task::perform(async move { client::history(&socket, "", since, step).await }, Message::HostHistoryLoaded)
     }
 
     /// Show the newest lines (the lists keep their scroll offset across apps).
@@ -418,7 +469,36 @@ impl Gui {
                 }
                 self.tab = tab;
                 self.open_logs();
-                self.show_newest()
+                let chart = self.open_chart();
+                Task::batch([chart, self.show_newest()])
+            }
+            Message::HistoryRange(range) => {
+                self.range = range;
+                match &mut self.chart {
+                    // The charts shown so far stay (faded) until the new range arrives.
+                    Some(c) if c.range != range => {
+                        c.range = range;
+                        self.fetch_chart()
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::HistoryLoaded { app, range, result } => {
+                let Some(c) = self.chart.as_mut().filter(|c| c.app == app && c.range == range) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(h) => c.loaded(h),
+                    Err(e) => c.load = Load::Failed(e),
+                }
+                Task::none()
+            }
+            Message::HostHistoryLoaded(result) => {
+                // Without it (an older wardend) the sparklines fill from live events.
+                if let Ok(h) = result {
+                    self.host_spark.loaded(h);
+                }
+                Task::none()
             }
             Message::FeedScrolled(y) => {
                 self.feed_scroll.scrolled(y);
@@ -737,13 +817,15 @@ impl Gui {
             FeedMsg::Connected { socket } => {
                 self.conn = Conn::Connected;
                 self.socket = Some(socket);
-                Task::none()
+                // What happened while away (or before this window opened).
+                Task::batch([self.fetch_host(), self.fetch_chart()])
             }
             FeedMsg::Batch(b) => {
                 let now = now_ms();
                 self.model.events_skipped += b.events_dropped;
                 self.model.unknown_events += b.unknown;
                 for ev in b.events {
+                    self.sample(&ev, now / 1000);
                     self.model.apply(ev, now);
                 }
                 if b.events_dropped > 0 {
@@ -757,6 +839,7 @@ impl Gui {
                 if self.selected.as_ref().is_some_and(|s| !self.model.apps.contains_key(s)) {
                     self.selected = None;
                     self.logs = None;
+                    self.chart = None;
                 }
                 if self.selected.is_none()
                     && let Some(first) = self.model.sorted().first().map(|a| a.name().to_string())
@@ -775,6 +858,29 @@ impl Gui {
                 self.model.disconnected();
                 Task::none()
             }
+        }
+    }
+
+    /// Live samples for the charts: the host's metrics, and the charted
+    /// app's statuses and supervisor restarts.
+    fn sample(&mut self, ev: &Event, t_s: u64) {
+        match ev {
+            Event::Host { cpu_percent, mem_used_bytes, .. } => {
+                self.host_spark.sample(*cpu_percent, *mem_used_bytes, t_s)
+            }
+            Event::Status { app, status } => {
+                if let Some(c) = self.chart.as_mut().filter(|c| c.app == *app) {
+                    c.status(status, t_s);
+                }
+            }
+            Event::Apps { apps } => {
+                if let Some(c) = self.chart.as_mut()
+                    && let Some(e) = apps.iter().find(|e| e.name == c.app)
+                {
+                    c.supervisor_restarts(e.supervisor_restarts, t_s);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1018,6 +1124,86 @@ mod tests {
         assert_eq!(g.logs.as_ref().map(|l| l.app.as_str()), Some("web"), "a new pane for the new app");
         let _ = g.update(Message::Tab(Tab::Events));
         assert!(g.logs.is_none());
+    }
+
+    fn history(app: &str, step: u32, points: u32, start_s: u64) -> ResourceHistory {
+        let n = points as usize;
+        ResourceHistory {
+            start_ms: start_s * 1000,
+            step_s: step,
+            points,
+            host: warden_protocol::events::HostHistory {
+                cpu_percent: vec![Some(5.0); n],
+                mem_used_bytes: vec![Some(1 << 30); n],
+                mem_total_bytes: Some(4 << 30),
+                load1: vec![None; n],
+            },
+            apps: vec![warden_protocol::events::AppHistory {
+                app: app.into(),
+                cpu_percent: vec![Some(1.0); n],
+                rss_bytes: vec![Some(1 << 20); n],
+                workers_ready: vec![Some(2); n],
+                workers_configured: vec![Some(2); n],
+                restarts: vec![Some(0); n],
+            }],
+        }
+    }
+
+    #[test]
+    fn the_history_tab_fetches_follows_the_selection_and_adds_live_samples() {
+        let mut g = connected();
+        assert!(g.chart.is_none(), "no charts until the History tab shows");
+        let _ = g.update(Message::Tab(Tab::History));
+        let c = g.chart.as_ref().unwrap();
+        assert_eq!((c.app.as_str(), c.range, &c.load), ("api", Range::Hour, &Load::Loading));
+        // A reply for another app or range (an older request) is ignored.
+        let now = now_ms() / 1000;
+        let start = now - now % 10 - 50;
+        let _ = g.update(Message::HistoryLoaded {
+            app: "api".into(),
+            range: Range::Day,
+            result: Ok(history("api", 240, 3, start)),
+        });
+        assert_eq!(g.chart.as_ref().unwrap().load, Load::Loading);
+        let _ = g.update(Message::HistoryLoaded {
+            app: "api".into(),
+            range: Range::Hour,
+            result: Ok(history("api", 10, 5, start)),
+        });
+        let c = g.chart.as_ref().unwrap();
+        assert_eq!((c.load.clone(), c.grid.len()), (Load::Ready, 5));
+        // A live status of the app lands on the grid; another app's does not.
+        let _ = g.update(batch(vec![Event::Status { app: "web".into(), status: Box::new(status("web", 1)) }]));
+        let _ = g.update(batch(vec![Event::Status { app: "api".into(), status: Box::new(status("api", 2)) }]));
+        let c = g.chart.as_ref().unwrap();
+        assert!(c.grid.len() >= 5 && c.grid.series[crate::history::CPU].last() == Some(3.0), "{:?}", c.grid);
+        // Another range: the charts stay, faded, while it loads.
+        let _ = g.update(Message::HistoryRange(Range::SixHours));
+        let c = g.chart.as_ref().unwrap();
+        assert_eq!((c.range, c.load.clone(), c.grid.is_empty()), (Range::SixHours, Load::Loading, false));
+        let _ = g.update(Message::HistoryLoaded {
+            app: "api".into(),
+            range: Range::SixHours,
+            result: Err("this wardend keeps no history".into()),
+        });
+        assert!(matches!(&g.chart.as_ref().unwrap().load, Load::Failed(e) if e.contains("no history")));
+        // Another app: its own charts, in the range chosen.
+        let _ = g.update(Message::Select("web".into()));
+        let c = g.chart.as_ref().unwrap();
+        assert_eq!((c.app.as_str(), c.range, c.grid.is_empty()), ("web", Range::SixHours, true));
+        let _ = g.update(Message::Tab(Tab::Events));
+        assert!(g.chart.is_none());
+        // The header's sparklines: the reply, then host events.
+        let _ = g.update(Message::HostHistoryLoaded(Ok(history("", 10, 4, start))));
+        assert_eq!(g.host_spark.grid.len(), 4);
+        let _ = g.update(batch(vec![Event::Host {
+            cpu_percent: 50.0,
+            mem_used_bytes: 2 << 30,
+            mem_total_bytes: 4 << 30,
+            load: [0.0; 3],
+            at_ms: 0,
+        }]));
+        assert_eq!(g.host_spark.grid.series[crate::history::HOST_CPU].last(), Some(50.0));
     }
 
     #[test]

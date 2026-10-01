@@ -7,7 +7,8 @@
 //! expose (SO_REUSEPORT before bind, process groups, pdeathsig, openat2) or
 //! where it measurably pays on a hot path: the static file server
 //! (sendfile, openat2 instead of a realpath walk, cache-only preadv2,
-//! MSG_MORE, TCP_DEFER_ACCEPT) and worker log capture (vectorised memchr).
+//! MSG_MORE, TCP_DEFER_ACCEPT; and, opt-in, io_uring in `sys/uring.rs`)
+//! and worker log capture (vectorised memchr).
 //! Each is a plain system or C library call on borrowed descriptors and
 //! slices. Tried and dropped for lack of a measured win: bigger worker pipe
 //! buffers (F_SETPIPE_SZ: same throughput at 64 KB, 256 KB and 1 MB).
@@ -561,6 +562,14 @@ pub fn splice(pipe: BorrowedFd<'_>, out: BorrowedFd<'_>, off_out: Option<&mut u6
     }
     Ok(n as usize)
 }
+
+// ------------------------------------------------------------ io_uring
+//
+// `[static] io = "uring"`: the static server's sockets driven through an
+// io_uring (sys/uring.rs), whose ring owns every buffer and socket the
+// kernel may still touch until the operation's completion.
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 // ------------------------------------------------ between fork and exec
 //

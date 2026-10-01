@@ -15,6 +15,9 @@ env = { NODE_ENV = "production" }            # example
                                              # readiness, drain, health socket); false for anything else
 # namespace = "backend"                      # example; a group for `warden restart backend` (default "default")
 instance_var = "NODE_APP_INSTANCE"           # env var with the worker's 0-based index (PM2's instance_var); "" = none
+pin_release = true                           # start workers in the real path of working_directory (its `current`
+                                             # symlink resolved at start and at each reload / safe-reload / restart),
+                                             # so a crash restart after the symlink swap stays on the running release
 
 [workers]
 count = 4                                    # example (default 1); also "max" (one per CPU) or "max-1"
@@ -45,6 +48,9 @@ stop_exit_codes = []                         # exit codes that mean "done, don't
 grace_period = 30                            # s to exit after the stop signal before SIGKILL
 drain_ms = 500                               # ms the shim keeps answering with Connection: close
 signal = "SIGTERM"                           # or "SIGINT" for apps written for PM2 (its default)
+long_lived_timeout = 2                       # s (fractions ok) a draining worker lets WebSockets and SSE streams
+                                             # end by themselves, then closes them (1001 / end of stream) so clients
+                                             # reconnect to new workers; below grace_period; 0 = leave them open
 
 [health]
 enabled = true                               # example (default false): periodic per-worker checks
@@ -69,6 +75,10 @@ canary_soak = 30                             # s the safe-reload canary runs nex
 pause = 0                                    # s between workers (safe-reload)
 # preflight = "bun run check:deploy"         # example; runs before anything is touched
 timeout = 120                                # s allowed per worker for all gates
+surge = 1                                    # new workers started at once, each next to the one it replaces:
+                                             # 1, N or "all". The old ones drain once the whole batch passed the
+                                             # gates; a failure stops the batch's new workers. Briefly runs up to
+                                             # N extra workers (memory). Not with port_strategy = "offset"
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
@@ -136,3 +146,7 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # basic_auth = "user:password"               # example; keep the config file private (0600)
 # headers = { "X-Frame-Options" = "DENY" }   # example; extra response headers
 # access_log = false                         # one stdout line per request
+# cache_size = "16MB"                        # per worker: prebuilt responses of small files in memory (0 = off)
+# cache_max_file = "64KB"                    # larger files are not cached (sent with sendfile)
+# cache_valid_ms = 1000                      # a cached file is re-checked on disk at most this often
+# io = "epoll"                               # or "uring" (io_uring, Linux; experimental, falls back to epoll)

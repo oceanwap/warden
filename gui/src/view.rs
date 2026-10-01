@@ -5,13 +5,15 @@
 use crate::app::{
     Act, AddStatus, Conn, ConnForm, Editor, EditorStatus, FEED_ID, Gui, LOGS_ID, Message, Modal, Pending, Tab,
 };
+use crate::charts::{Chart, Hue, Sparkline, Unit};
 use crate::format;
+use crate::history::{self, Load, Range};
 use crate::logs::{History, Scroll, Stream};
 use crate::model::App;
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
-    Column, Id, button, center, checkbox, column, container, mouse_area, opaque, progress_bar, radio, responsive, row,
-    rule, scrollable, space, stack, table, text, text_editor, text_input,
+    Column, Id, Row, button, canvas, center, checkbox, column, container, mouse_area, opaque, progress_bar, radio,
+    responsive, row, rule, scrollable, space, stack, table, text, text_editor, text_input,
 };
 use iced::{Border, Center, Color, Element, Fill, Font, Length, Theme};
 use warden_protocol::control::WorkerStatus;
@@ -21,6 +23,9 @@ use warden_protocol::events::AppState;
 pub const LINE_H: f32 = 17.0;
 const LIST_W: f32 = 300.0;
 const SMALL: f32 = 12.0;
+/// The header's sparklines.
+const SPARK_W: f32 = 64.0;
+const SPARK_H: f32 = 18.0;
 
 pub fn view(g: &Gui) -> Element<'_, Message> {
     let main = column![connection_bar(g), rule::horizontal(1), body(g)].height(Fill);
@@ -156,17 +161,23 @@ fn connection_bar(g: &Gui) -> Element<'_, Message> {
         }
     };
     let host: Element<'_, Message> = match &g.model.host {
-        Some(h) => text(format!(
-            "CPU {} · Mem {} / {} · Load {:.2} {:.2} {:.2}",
-            format::percent(h.cpu_percent),
-            format::bytes(h.mem_used_bytes),
-            format::bytes(h.mem_total_bytes),
-            h.load[0],
-            h.load[1],
-            h.load[2]
-        ))
-        .size(13)
-        .into(),
+        Some(h) => {
+            let series = &g.host_spark.grid.series;
+            let spark = |s, hue, top: Option<f32>, floor| {
+                canvas(Sparkline { series: s, hue, top, floor }).width(SPARK_W).height(SPARK_H)
+            };
+            row![
+                text(format!("CPU {}", format::percent(h.cpu_percent))).size(13),
+                spark(&series[history::HOST_CPU], Hue::Blue, None, 10.0),
+                text(format!("· Mem {} / {}", format::bytes(h.mem_used_bytes), format::bytes(h.mem_total_bytes)))
+                    .size(13),
+                spark(&series[history::HOST_MEM], Hue::Aqua, Some(h.mem_total_bytes as f32), 0.0),
+                text(format!("· Load {:.2} {:.2} {:.2}", h.load[0], h.load[1], h.load[2])).size(13),
+            ]
+            .spacing(6)
+            .align_y(Center)
+            .into()
+        }
         None => space().into(),
     };
     row![
@@ -335,10 +346,11 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             .style(if g.tab == t { button::primary } else { button::secondary })
             .on_press(Message::Tab(t))
     };
-    c = c.push(row![tab("Events", Tab::Events), tab("Logs", Tab::Logs)].spacing(6));
+    c = c.push(row![tab("Events", Tab::Events), tab("Logs", Tab::Logs), tab("History", Tab::History)].spacing(6));
     c = c.push(match g.tab {
         Tab::Events => events(a, g.feed_scroll),
         Tab::Logs => logs_pane(g),
+        Tab::History => history_pane(g),
     });
     c.padding(12).width(Fill).height(Fill).into()
 }
@@ -407,6 +419,9 @@ fn rollout(a: &App) -> Option<Element<'_, Message>> {
     (a.rollout.is_some() || a.last_outcome.is_some()).then(|| c.into())
 }
 
+/// A row of the worker table: (a hot standby, its status).
+type WorkerRow<'a> = (bool, &'a WorkerStatus);
+
 fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let Some(s) = &a.status else {
         return text("No workers to show: the supervisor is not running (or wardend does not watch it yet).")
@@ -421,37 +436,42 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let cell = |t: String| text(t).size(13);
     let can_restart = g.connected() && a.supervisor_up() && !s.stopped;
     let app = a.name().to_string();
+    // Workers, then hot standbys (`Status.standbys`): `(standby, row)`.
     let columns = vec![
-        table::column(h("Worker"), |w: &WorkerStatus| cell(w.id.to_string())),
-        table::column(h("State"), |w: &WorkerStatus| {
+        table::column(h("Worker"), |(standby, w): WorkerRow<'a>| {
+            cell(if standby { format!("standby {}", w.id) } else { w.id.to_string() })
+        }),
+        table::column(h("State"), |(_, w): WorkerRow<'a>| {
             let t = cell(w.state.clone());
             match w.state.as_str() {
-                "RUNNING" => t.style(good),
+                "RUNNING" | "STANDBY" => t.style(good),
                 "FAILED" | "CRASHED" => t.style(text::danger),
                 _ => t.style(text::warning),
             }
         }),
-        table::column(h("PID"), |w: &WorkerStatus| cell(format::opt(w.pid, |p| p.to_string()))),
-        table::column(h("Uptime"), |w: &WorkerStatus| cell(format::opt(w.uptime_secs, format::duration))),
-        table::column(h("Restarts"), |w: &WorkerStatus| cell(w.restarts.to_string())),
-        table::column(h("CPU"), |w: &WorkerStatus| cell(format::opt(w.cpu_percent, format::percent))),
-        table::column(h("RSS"), |w: &WorkerStatus| cell(format::opt(w.rss_bytes, format::bytes))),
-        table::column(h("Health"), |w: &WorkerStatus| {
+        table::column(h("PID"), |(_, w): WorkerRow<'a>| cell(format::opt(w.pid, |p| p.to_string()))),
+        table::column(h("Uptime"), |(_, w): WorkerRow<'a>| cell(format::opt(w.uptime_secs, format::duration))),
+        table::column(h("Restarts"), |(_, w): WorkerRow<'a>| cell(w.restarts.to_string())),
+        table::column(h("CPU"), |(_, w): WorkerRow<'a>| cell(format::opt(w.cpu_percent, format::percent))),
+        table::column(h("RSS"), |(_, w): WorkerRow<'a>| cell(format::opt(w.rss_bytes, format::bytes))),
+        table::column(h("Health"), |(_, w): WorkerRow<'a>| {
             let t = cell(format::health(w.healthy).into());
             match w.healthy {
                 Some(false) => t.style(text::danger),
                 _ => t,
             }
         }),
-        table::column(h("Last exit"), |w: &WorkerStatus| cell(w.last_exit.clone().unwrap_or_else(|| "-".into()))),
-        table::column(h(""), move |w: &WorkerStatus| {
+        table::column(h("Last exit"), |(_, w): WorkerRow<'a>| cell(w.last_exit.clone().unwrap_or_else(|| "-".into()))),
+        // A standby is not restarted on its own (it is replaced when it fails).
+        table::column(h(""), move |(standby, w): WorkerRow<'a>| {
             button(text("restart").size(SMALL))
                 .padding([2, 8])
                 .style(button::secondary)
-                .on_press_maybe(can_restart.then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))))
+                .on_press_maybe((can_restart && !standby).then(|| Message::Act(app.clone(), Act::RestartWorker(w.id))))
         }),
     ];
-    let t = table(columns, s.workers.iter()).padding_x(10).padding_y(4);
+    let rows = s.workers.iter().map(|w| (false, w)).chain(s.standbys.iter().map(|w| (true, w)));
+    let t = table(columns, rows).padding_x(10).padding_y(4);
     container(scrollable(t).width(Fill)).max_height(240).into()
 }
 
@@ -550,6 +570,125 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
         lines(items, p.scroll, LOGS_ID, Message::LogsScrolled)
     };
     column![bar, body].spacing(8).height(Fill).into()
+}
+
+// ----------------------------------------------------------------- history
+
+/// How a chart draws its series.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// A line over a wash (CPU, memory).
+    Area,
+    /// A line only (a level that mostly sits at the top: workers ready).
+    Line,
+    /// A bar per point (restarts).
+    Bars,
+}
+
+/// The History tab: the range buttons, then CPU and memory, restarts and
+/// workers ready, each a chart card.
+fn history_pane(g: &Gui) -> Element<'_, Message> {
+    let Some(c) = &g.chart else { return space().into() };
+    let ranges = Row::with_children(Range::ALL.map(|r| {
+        button(text(r.label()).size(13))
+            .style(if c.range == r { button::primary } else { button::secondary })
+            .padding([4, 14])
+            .on_press(Message::HistoryRange(r))
+            .into()
+    }))
+    .spacing(4);
+    let per_point = match c.grid.step_s {
+        s if s < 60 => format!("{s} s per point"),
+        s => format!("{} min per point", s / 60),
+    };
+    let note: Element<'_, Message> = match &c.load {
+        Load::Loading => text("loading…").size(SMALL).style(muted).into(),
+        Load::Failed(e) => text(e.as_str()).size(SMALL).style(text::danger).into(),
+        Load::Ready => text(format!("{per_point} · from wardend, then live")).size(SMALL).style(muted).into(),
+    };
+    let bar = row![ranges, note].spacing(14).align_y(Center);
+    if c.grid.is_empty() && matches!(c.load, Load::Failed(_)) {
+        return column![bar].into();
+    }
+    let span = c.range.secs();
+    let s = &c.grid.series;
+    let range = c.range.label();
+    let cpu = match s[history::CPU].stats() {
+        Some((avg, peak)) => format!("avg {} · peak {}", format::percent(avg.into()), format::percent(peak.into())),
+        None => "no samples".into(),
+    };
+    let mem = match (s[history::MEM].last(), s[history::MEM].stats()) {
+        (Some(now), Some((_, peak))) => {
+            format!("now {} · peak {}", format::bytes(now as u64), format::bytes(peak as u64))
+        }
+        _ => "no samples".into(),
+    };
+    let restarts = match s[history::RESTARTS].sum() as u64 {
+        _ if s[history::RESTARTS].stats().is_none() => "no samples".into(),
+        0 => format!("none in {range}"),
+        n => format!("{n} in {range}"),
+    };
+    let ready = match (s[history::READY].stats(), s[history::CONFIGURED].stats()) {
+        (Some(_), Some((_, configured))) => {
+            let fewest = s[history::READY].values.iter().flatten().fold(f32::MAX, |m, v| m.min(*v));
+            if fewest >= configured {
+                format!("all {configured:.0} ready throughout")
+            } else {
+                format!("fewest {fewest:.0} of {configured:.0}")
+            }
+        }
+        _ => "no samples".into(),
+    };
+    let card = |title: &'static str, sub: &'static str, summary: String, i: usize, unit: Unit, hue: Hue, look: Look| {
+        let chart = Chart {
+            series: &s[i],
+            start_s: c.grid.start_s,
+            step_s: c.grid.step_s,
+            end_s: if c.grid.is_empty() { warden_protocol::events::now_ms() / 1000 } else { c.grid.end_s() },
+            span_s: span,
+            unit,
+            hue,
+            bars: look == Look::Bars,
+            area: look == Look::Area,
+            faded: c.load == Load::Loading,
+        };
+        container(
+            column![
+                row![
+                    text(title).size(14),
+                    text(sub).size(SMALL).style(muted),
+                    space::horizontal(),
+                    text(summary).size(SMALL).style(muted),
+                ]
+                .spacing(8)
+                .align_y(Center),
+                canvas(chart).width(Fill).height(Fill),
+            ]
+            .spacing(4),
+        )
+        .padding([8, 10])
+        .width(Fill)
+        .height(Fill)
+        .style(panel_style)
+    };
+    column![
+        bar,
+        row![
+            card("CPU", "% of one core", cpu, history::CPU, Unit::Percent, Hue::Blue, Look::Area),
+            card("Memory", "resident, with the supervisor", mem, history::MEM, Unit::Bytes, Hue::Aqua, Look::Area),
+        ]
+        .spacing(10)
+        .height(Length::FillPortion(1)),
+        row![
+            card("Restarts", "per point", restarts, history::RESTARTS, Unit::Count, Hue::Orange, Look::Bars),
+            card("Workers ready", "the fewest per point", ready, history::READY, Unit::Count, Hue::Violet, Look::Line),
+        ]
+        .spacing(10)
+        .height(Length::FillPortion(1)),
+    ]
+    .spacing(10)
+    .height(Fill)
+    .into()
 }
 
 // ----------------------------------------------------------------- dialogs

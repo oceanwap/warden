@@ -66,15 +66,11 @@ pub fn render_prometheus(s: &Status) -> String {
     if let Some(r) = s.supervisor_rss_bytes {
         gauge("warden_supervisor_rss_bytes", "Supervisor resident memory.", "gauge", vec![(String::new(), r as f64)]);
     }
-    // Workers only: hot standbys all have id 0 (their own gauges below).
     let per = |f: &dyn Fn(&crate::control::WorkerStatus) -> Option<f64>| -> Vec<(String, f64)> {
-        s.workers
-            .iter()
-            .filter(|w| !w.is_standby())
-            .filter_map(|w| f(w).map(|v| (format!(",worker=\"{}\"", w.id), v)))
-            .collect()
+        s.workers.iter().filter_map(|w| f(w).map(|v| (format!(",worker=\"{}\"", w.id), v))).collect()
     };
-    let standbys: Vec<&crate::control::WorkerStatus> = s.workers.iter().filter(|w| w.is_standby()).collect();
+    // Hot standbys: gauges of their own (not worker series).
+    let standbys = &s.standbys;
     if !standbys.is_empty() {
         let ready = standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
         gauge(
@@ -269,6 +265,8 @@ mod tests {
                 last_exit: None,
                 healthy: Some(false),
             }],
+            release: None,
+            standbys: vec![],
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));
@@ -278,10 +276,10 @@ mod tests {
         assert!(t.contains("warden_worker_healthy{app=\"api\",worker=\"1\"} 0"));
         assert!(!t.contains("standby"), "no standby series without standbys");
 
-        // Hot standbys (id 0) get their own gauges, never duplicate worker="0" series.
+        // Hot standbys get gauges of their own, never worker series.
         let mut st = st;
         let standby = |state: &str, rss| WorkerStatus {
-            id: crate::control::STANDBY_ID,
+            id: 1,
             state: state.into(),
             pid: Some(9),
             uptime_secs: Some(1),
@@ -293,10 +291,10 @@ mod tests {
             last_exit: None,
             healthy: None,
         };
-        st.workers.push(standby(crate::control::STANDBY, 1000));
-        st.workers.push(standby(crate::control::WARMING, 500));
+        st.standbys.push(standby(crate::control::STANDBY, 1000));
+        st.standbys.push(standby(crate::control::WARMING, 500));
         let t = render_prometheus(&st);
-        assert!(!t.contains("worker=\"0\""), "{t}");
+        assert_eq!(t.matches("warden_worker_up{").count(), 1, "{t}");
         assert!(t.contains("warden_standbys_ready{app=\"api\"} 1"), "{t}");
         assert!(t.contains("warden_standbys_rss_bytes{app=\"api\"} 1500"), "{t}");
         assert!(t.contains("warden_standby_restarts_total{app=\"api\"} 3"), "{t}");

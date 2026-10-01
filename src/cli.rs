@@ -69,6 +69,9 @@ for live events; apps never depend on it and keep running without it):
     daemon status    wardend's pid and every app it watches  [--json]; exit 1 when
                      it is not running
     daemon stop      Stop wardend; every app keeps running (`warden kill` stops it too)
+    daemon check     Validate the alert rules in <config dir>/wardend.toml (or -c FILE)
+    daemon reload    Make the running wardend read wardend.toml again (as SIGHUP does);
+                     on an error it keeps the rules it had
     events [target]  Live events, one line each: workers, rollouts, supervisors
                      [--json] (NDJSON)  [--logs] (log lines too)  [--interval MS]
                      From wardend when it runs, else from the apps' sockets
@@ -160,6 +163,10 @@ pub enum DaemonCmd {
     },
     Status,
     Stop,
+    /// `warden daemon check [-c FILE]`: validate wardend.toml.
+    Check,
+    /// `warden daemon reload`: the running wardend reads it again.
+    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,7 +606,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 None | Some("start") | Some("run") => DaemonCmd::Run { background, resurrect },
                 Some("status") => DaemonCmd::Status,
                 Some("stop") => DaemonCmd::Stop,
-                Some(other) => return Err(format!("daemon {other:?}: expected `status`, `stop` or nothing")),
+                Some("check") => DaemonCmd::Check,
+                Some("reload") => DaemonCmd::Reload,
+                Some(other) => {
+                    return Err(format!("daemon {other:?}: expected `status`, `stop`, `check`, `reload` or nothing"));
+                }
             })
         }
         "events" => {
@@ -717,13 +728,15 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += &format!("Mode:        {}\n", s.mode);
         o += &format!("Workers:     {}\n", s.workers_configured);
         o += &format!("Ready:       {}\n", s.workers_ready);
-        let standbys: Vec<&crate::control::WorkerStatus> = s.workers.iter().filter(|w| w.is_standby()).collect();
-        if !standbys.is_empty() {
-            let up = standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
-            o += &format!("Standby:     {up}/{} ready to take over a crashed worker\n", standbys.len());
+        if !s.standbys.is_empty() {
+            let up = s.standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
+            o += &format!("Standby:     {up}/{} ready to take over a crashed worker\n", s.standbys.len());
         }
         o += &format!("PID:         {}\n", s.pid);
         o += &format!("Uptime:      {}\n", duration(s.uptime_secs));
+        if let Some(r) = &s.release {
+            o += &format!("Release:     {r}\n");
+        }
         if let Some(r) = s.supervisor_rss_bytes {
             o += &format!("Memory:      {} (supervisor)\n", bytes(r));
         }
@@ -758,10 +771,12 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
         "Worker", "Status", "PID", "Uptime", "Restarts", "RSS", "CPU", "Health", "Last exit"
     );
-    for w in &s.workers {
+    // Workers by number, then hot standbys as `s1`, `s2`…
+    let rows = s.workers.iter().map(|w| (w.id.to_string(), w)).chain(s.standbys.iter().map(|w| (standby_name(w), w)));
+    for (name, w) in rows {
         o += &format!(
             "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
-            worker_name(w),
+            name,
             w.state,
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -775,9 +790,9 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
     o
 }
 
-/// The Worker column: the worker number, or `standby` for a hot standby.
-fn worker_name(w: &crate::control::WorkerStatus) -> String {
-    if w.is_standby() { "standby".into() } else { w.id.to_string() }
+/// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
+fn standby_name(w: &crate::control::WorkerStatus) -> String {
+    format!("s{}", w.id)
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -820,12 +835,13 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
     for (app, st) in all {
         match st {
             Ok(s) => {
-                for w in &s.workers {
+                let all = s.workers.iter().map(|w| (w.id.to_string(), w));
+                for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
                     let state = if s.stopped && w.state == "STOPPED" { "stopped".to_string() } else { w.state.clone() };
                     rows.push(vec![
                         app.name.clone(),
                         s.namespace.clone(),
-                        worker_name(w),
+                        name,
                         state,
                         w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                         w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -908,6 +924,14 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
     row("command", format!("{} {}", text(c("/app/command")), args.join(" ")).trim().to_string());
     row("cwd", text(c("/app/working_directory")));
     row(
+        "release",
+        match (&s.release, c("/app/pin_release").as_bool()) {
+            (Some(r), _) => format!("{r} (pinned: crash restarts stay on it; reload and restart move it)"),
+            (None, Some(false)) => "not pinned ([app] pin_release = false)".into(),
+            (None, _) => "-".into(),
+        },
+    );
+    row(
         "port",
         match c("/app/port").as_u64() {
             Some(p) => format!("{p} ({})", text(c("/workers/port_strategy"))),
@@ -949,6 +973,14 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         _ => "no health path: new workers are gated on listening only".into(),
     };
     row("health", health);
+    row(
+        "rollouts",
+        match c("/reload/surge") {
+            serde_json::Value::Number(n) if n.as_u64() == Some(1) => "one worker at a time".into(),
+            serde_json::Value::Null => "one worker at a time".into(),
+            v => format!("surge {}: that many new workers at a time, next to the old ones", text(v)),
+        },
+    );
     row("shutdown", format!("grace {} s, drain {} ms", num("/shutdown/grace_period"), num("/shutdown/drain_ms")));
     let mem = num("/limits/max_memory");
     let life = num("/limits/max_lifetime");
@@ -1101,6 +1133,11 @@ mod tests {
         assert_eq!(p("daemon status").unwrap().command, Command::Daemon(DaemonCmd::Status));
         assert!(p("daemon status --json").unwrap().json);
         assert_eq!(p("daemon stop").unwrap().command, Command::Daemon(DaemonCmd::Stop));
+        assert_eq!(p("daemon check").unwrap().command, Command::Daemon(DaemonCmd::Check));
+        let a = p("daemon check -c /tmp/wardend.toml").unwrap();
+        assert_eq!((a.command, a.config), (Command::Daemon(DaemonCmd::Check), Some("/tmp/wardend.toml".into())));
+        assert_eq!(p("wardend reload").unwrap().command, Command::Daemon(DaemonCmd::Reload));
+        assert!(p("daemon reload --background").is_err());
         assert!(p("daemon frobnicate").is_err());
         assert!(p("daemon stop now").is_err());
         assert!(p("start app.js --background").is_err(), "only for the daemon");

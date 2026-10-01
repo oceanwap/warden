@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use warden_protocol::control::{
     HostStatus, MAX_CONNECTIONS, MAX_STREAMS, REQUEST_TIMEOUT, Request, Response, RolloutOutcome, RolloutStatus,
-    STANDBY, STANDBY_ID, Status, WARMING, WorkerStatus,
+    STANDBY, Status, WARMING, WorkerStatus,
 };
 
 /// A connection's place in the budget: a request slot, until it becomes a
@@ -557,6 +557,8 @@ mod tests {
             rollout: None,
             last_rollout: None,
             workers: vec![],
+            release: None,
+            standbys: vec![],
         }
     }
 

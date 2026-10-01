@@ -9,6 +9,7 @@ cargo xtask bench              # every suite (~20 min on 2 CPUs); updates README
 cargo bench-all                # the same, shorter to type
 cargo xtask bench --quick      # 3 s per measurement: a smoke test, not results to publish
 cargo xtask bench --only static,logs --no-readme
+cargo xtask bench --only longlived --no-readme   # WebSockets and SSE through a rolling restart
 ```
 
 `cargo xtask` is a cargo alias (`.cargo/config.toml`) for the `xtask` crate
@@ -45,6 +46,7 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `static.ts` | `warden serve` vs nginx vs `pm2 serve` vs `serve`: a 1.5 KB page, a 48 KB script and a 1 MB file, keep-alive and a new connection per request |
 | `logs.ts` | Capturing worker output: steady logging (CPU, completeness) and a flood (throughput, CPU per GB) |
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
+| `longlived.ts` | WebSocket and SSE clients held through a rolling restart: PM2 (cluster mode for Node, fork mode for Bun) vs Warden (processes; Bun also worker mode) |
 
 Every `run.ts` app also runs `warden-standby`: Warden's processes plus one
 hot standby (`[workers] standby = 1`), so its crash recovery is a promotion
@@ -53,7 +55,12 @@ cost); it answers no request until promoted.
 
 Common options: `--duration S` (seconds per load test, default 10),
 `--connections N` (64), `--workers N` (4), `--scenarios a,b` (a subset).
-`logs.ts` takes `--rate`, `--seconds` and `--mb`; `fleet.ts` takes `--apps`.
+`logs.ts` takes `--rate`, `--seconds` and `--mb`; `fleet.ts` takes `--apps`;
+`longlived.ts` takes `--clients N` (50 of each kind), `--apps node,bun` and
+`--warden <path>` (a debug build for a smoke run; default
+`target/release/warden`), and has an extra scenario, `node-warden-off`
+(`long_lived_timeout = 0`, `grace_period = 5`: the behaviour before Warden
+closed these connections).
 
 ### What each number means
 
@@ -73,11 +80,36 @@ Common options: `--duration S` (seconds per load test, default 10),
 - **rolling restart under load**: each manager's zero-downtime restart
   (`pm2 reload`, `wattpm restart`, `warden restart`) with 8 clients running;
   done when the command has returned and N new workers have answered.
+  `warden-surge` is `warden-process` with `[reload] surge = "all"`: every new
+  worker starts at once next to the old ones, which drain once all have passed
+  the gates (briefly twice the workers). Only this row, startup and idle memory
+  are measured for it; its other cells are `-`.
 - **status command**: the median of 10 runs of the manager's status command
   (`pm2 jlist`, `wattpm ps`, `warden status --json`).
 - **req/s, p50/p99**: oha with 64 keep-alive connections for `--duration`
   seconds after a 2 s warm-up; `/plaintext` (13 bytes), `/json` (~1.2 KB) and
   `/cpu` (fib(27), CPU-bound).
+- **long-lived connections** (`longlived.ts`): N WebSocket and N SSE clients
+  (raw sockets, so close codes are exact; Bun's own WebSocket client reports a
+  1001 as 1000) connect, then the manager's rolling restart runs. A client
+  reconnects at once whenever its connection ends; counted from the restart
+  on:
+  - *WebSocket closes, clean / abnormal*: a close frame (its code is listed:
+    1001 Going Away from Warden) / the connection cut without one, which a
+    browser reports as 1006, or a reset;
+  - *SSE ends, clean / abnormal*: the chunked stream's last chunk (an
+    EventSource then reconnects quietly) / cut without it, or a reset;
+  - *failed reconnects*: connections refused or closed before the first
+    message, e.g. while no worker listens;
+  - *rolling restart*: until the command has returned and N new workers have
+    answered; *until every client is back*: until every client's connection
+    is on a worker that wasn't there before the restart.
+
+  The apps are the integration tests' fixtures
+  (`tests/fixtures/longlived.ts`, `tests/fixtures/longlived_node.mjs`).
+  Warden runs with its default `[shutdown]` settings, so a worker holding
+  such clients drains in about `long_lived_timeout` (2 s): its restart takes
+  longer than an abrupt one, by design.
 
 ## Fairness rules
 

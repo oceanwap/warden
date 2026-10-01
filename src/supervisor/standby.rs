@@ -24,7 +24,11 @@
 //!   promoted nor started (a crash restarts the normal way). When it
 //!   succeeds, every standby is replaced by a fresh one (through the gates);
 //!   when it fails or rolls back they stay, matching the workers that kept
-//!   the previous version.
+//!   the previous version. Surge batches change nothing here: the pool stays
+//!   paused for the whole rollout, and a batch that rolls back keeps it.
+//! - Release pinning (`release.rs`): a standby starts in the pinned release
+//!   and records it; it is promoted only while that is still the workers'
+//!   release, and replaced when the pin moved outside a deploy.
 //! - Recycling (memory, lifetime, health, hang) keeps the code: an available
 //!   standby is the replacement worker (it listens next to the old worker,
 //!   passes the gates, then the old one drains).
@@ -102,9 +106,21 @@ impl Supervisor {
         }
     }
 
+    /// The release workers start in now (`[app] pin_release`; None: unpinned).
+    fn pinned_release(&self) -> Option<PathBuf> {
+        self.release.as_ref().map(|p| p.real.clone())
+    }
+
     fn spawn_standby(&mut self) -> bool {
         match self.spawn_instance(STANDBY_SLOT, Role::Standby) {
-            Ok(_) => true,
+            Ok(id) => {
+                // `spawn_instance` checked the pin; this is the one it used.
+                let release = self.pinned_release();
+                if let Some(i) = self.insts.get_mut(&id) {
+                    i.release = release;
+                }
+                true
+            }
             Err(e) => {
                 error!(
                     "failed to start a standby",
@@ -428,7 +444,32 @@ impl Supervisor {
                 self.pool.tracker.reset();
             }
         }
+        self.replace_other_releases();
         self.fill_pool();
+    }
+
+    /// A standby started in another release than the workers' (the pin moved
+    /// outside a deploy: its release directory was deleted, see
+    /// `check_release`) is never promoted: replace it. Deploys replace
+    /// standbys themselves (`standby_after_rollout`).
+    fn replace_other_releases(&mut self) {
+        if self.deploy_in_progress() {
+            return;
+        }
+        let release = self.pinned_release();
+        let stale: Vec<u64> = self
+            .live_standbys()
+            .into_iter()
+            .filter(|id| self.insts.get(id).is_some_and(|i| i.release != release))
+            .collect();
+        for id in stale {
+            info!(
+                "replacing a standby: it runs another release than the workers",
+                pid = self.insts.get(&id).map(|i| i.handle.pid).unwrap_or(0),
+                release = release.as_ref().map(|r| r.display().to_string()).unwrap_or_default(),
+            );
+            self.stop_instance(id);
+        }
     }
 
     /// `warden reset` (all workers): standby counters too, FAILED retried now.
@@ -442,31 +483,30 @@ impl Supervisor {
         self.fill_pool();
     }
 
-    /// A Bun standby's stand-in sockets (`<app>.s<instance>-<n>.sock` in the
-    /// runtime directory): the shim removes them, unless it was killed.
-    pub(super) fn remove_stand_ins(&self, inst_id: u64) {
-        for n in 0..4 {
-            let _ = std::fs::remove_file(self.runtime_dir.join(format!("{}.s{inst_id}-{n}.sock", self.cfg.app.name)));
-        }
-    }
-
-    pub(super) fn on_standby_exit(&mut self, inst: &Instance, why: String, reason: String) {
+    /// `hint`: from the exit classification (the OOM killer, someone else's
+    /// signal), as for workers.
+    pub(super) fn on_standby_exit(&mut self, inst: &Instance, why: String, reason: String, hint: Option<&str>) {
         let pid = inst.handle.pid;
         if inst.stopping || self.shutting_down || self.stopped {
-            info!("standby stopped", pid = pid, reason = why);
+            match hint {
+                Some(h) => warn!("standby stopped", pid = pid, reason = why, hint = h),
+                None => info!("standby stopped", pid = pid, reason = why),
+            }
             self.emit_worker(STANDBY_SLOT, WorkerEvent::Stopped, Some(pid), || Some(why.clone()));
         } else {
             let uptime = inst.started.elapsed();
+            let logs = format!("its output is in `warden logs {} --worker standby`", self.cfg.app.name);
             warn!(
                 "standby crashed",
                 pid = pid,
                 reason = reason,
                 uptime_s = uptime.as_secs(),
-                hint = format!(
-                    "it had taken no traffic; its output is in `warden logs {} --worker standby`",
-                    self.cfg.app.name
-                ),
+                hint = match hint {
+                    Some(h) => format!("{h}; {logs}"),
+                    None => format!("it had taken no traffic; {logs}"),
+                },
             );
+            // The reason leads the detail: alerts match e.g. `oom-killed`.
             self.emit_worker(STANDBY_SLOT, WorkerEvent::Crashed, Some(pid), || Some(format!("{reason} (standby)")));
             self.pool.crashes += 1;
             self.pool.last_exit = Some(reason);
@@ -482,12 +522,14 @@ impl Supervisor {
         if self.standby_target() == 0 || self.shutting_down || self.stopped || self.deploy_in_progress() {
             return None;
         }
-        // Healthy, through its gates; the oldest first (warmest JIT).
+        // Healthy, through its gates, in the workers' release; the oldest
+        // first (warmest JIT).
+        let release = self.pinned_release();
         let id = self
             .insts
             .iter()
             .filter(|(_, i)| i.role == Role::Standby && !i.stopping && i.health_fails == 0 && i.healthy != Some(false))
-            .filter(|(_, i)| i.standby.as_ref().is_some_and(|s| s.available))
+            .filter(|(_, i)| i.standby.as_ref().is_some_and(|s| s.available) && i.release == release)
             .map(|(id, _)| *id)
             .min()?;
         let msg = format!("{{\"cmd\":\"promote\",\"worker\":{slot_id},\"count\":{}}}\n", self.count);
@@ -562,8 +604,8 @@ impl Supervisor {
         self.fill_pool();
     }
 
-    /// `status.workers` rows for the pool (after the slots, `id` 0):
-    /// standbys, then a row per missing one when it can't be refilled.
+    /// `status.standbys`: the pool's standbys (numbered from 1, oldest
+    /// first), then a row per missing one when it can't be refilled.
     pub(super) fn standby_rows(&mut self, rows: &mut Vec<WorkerStatus>, sample: &Sampler<'_>) {
         let target = self.standby_target();
         if target == 0 {
@@ -573,19 +615,20 @@ impl Supervisor {
         ids.sort_unstable();
         let (restarts, crashes) = (self.pool.restarts, self.pool.crashes);
         let last_exit = self.pool.disabled.clone().or_else(|| self.pool.last_exit.clone());
-        let row = |state: &str, pid, uptime, stats: Option<(metrics::ProcStats, f64)>, healthy| WorkerStatus {
-            id: control::STANDBY_ID,
-            state: state.into(),
-            pid,
-            uptime_secs: uptime,
-            restarts,
-            crashes,
-            rss_bytes: stats.map(|x| x.0.rss_bytes),
-            cpu_seconds: stats.map(|x| x.0.cpu_seconds),
-            cpu_percent: stats.map(|x| x.1),
-            last_exit: last_exit.clone(),
-            healthy,
-        };
+        let row =
+            |id: usize, state: &str, pid, uptime, stats: Option<(metrics::ProcStats, f64)>, healthy| WorkerStatus {
+                id,
+                state: state.into(),
+                pid,
+                uptime_secs: uptime,
+                restarts,
+                crashes,
+                rss_bytes: stats.map(|x| x.0.rss_bytes),
+                cpu_seconds: stats.map(|x| x.0.cpu_seconds),
+                cpu_percent: stats.map(|x| x.1),
+                last_exit: last_exit.clone(),
+                healthy,
+            };
         let mut live = 0;
         for id in ids {
             let Some(i) = self.insts.get_mut(&id) else { continue };
@@ -599,7 +642,8 @@ impl Supervisor {
             live += usize::from(!i.stopping);
             let (pid, started) = (i.handle.pid, i.started);
             let stats = sample(pid, &mut i.cpu_prev, started);
-            rows.push(row(state, Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy));
+            let n = rows.len() + 1;
+            rows.push(row(n, state, Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy));
         }
         let missing = if self.pool.failed_at.is_some() {
             Some(State::Failed)
@@ -612,7 +656,8 @@ impl Supervisor {
         };
         if let Some(state) = missing {
             for _ in live..target {
-                rows.push(row(state.as_str(), None, None, None, None));
+                let n = rows.len() + 1;
+                rows.push(row(n, state.as_str(), None, None, None, None));
             }
         }
     }
@@ -702,7 +747,7 @@ exec sleep 60
     }
 
     fn rows(s: &mut Supervisor) -> Vec<WorkerStatus> {
-        s.status().workers.into_iter().filter(|w| w.is_standby()).collect()
+        s.status().standbys
     }
 
     async fn local(f: impl std::future::Future<Output = ()>) {
@@ -837,6 +882,39 @@ exec sleep 60
             assert_eq!(disabled[0].state, "STOPPED");
             assert!(disabled[0].last_exit.as_deref().unwrap_or("").contains("before its promotion"), "{disabled:?}");
             r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A promoted standby runs the workers' release: one started in another
+    /// (the pin moved outside a deploy) is never promoted, and is replaced
+    /// by one in the pinned release.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_standby_in_the_pinned_release_is_promoted() {
+        local(async {
+            let mut r = Rig::new("pin", "");
+            r.sup.start_all();
+            r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
+            let old = available(&r.sup)[0];
+            assert_eq!(r.sup.insts[&old].release, None, "unpinned (no working_directory)");
+
+            // The workers' release is now another one.
+            let release = std::env::temp_dir().join(format!("warden-pool-pin-release-{}", std::process::id()));
+            std::fs::create_dir_all(&release).unwrap();
+            r.sup.release = Some(release::Pin::resolve(&release).unwrap());
+            let real = r.sup.release.as_ref().map(|p| p.real.clone());
+            assert_eq!(r.sup.promote_standby(1, Role::Current), None, "not in the workers' release");
+            r.sup.standby_tick();
+            assert!(r.sup.insts[&old].stopping, "replaced");
+            r.until("a standby in the pinned release", |s| available(s).len() == 1 && available(s)[0] != old).await;
+            let new = available(&r.sup)[0];
+            assert_eq!(r.sup.insts[&new].release, real);
+
+            let worker = r.sup.slots[&1].current.unwrap();
+            r.kill(worker);
+            r.until("promoted", |s| running(s) && s.slots[&1].current == Some(new)).await;
+            r.shutdown().await;
+            let _ = std::fs::remove_dir_all(&release);
         })
         .await;
     }

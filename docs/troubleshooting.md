@@ -31,6 +31,14 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `dependency outage suspected: holding worker replacements` | More than `health.outage_threshold` of the workers fail at once: probably a database or API is down, not the workers | Fix the dependency; Warden resumes replacements by itself. Use a `live_path` that checks the process only, and a `ready_path` for dependencies |
 | `net.ipv4.tcp_migrate_req is 0` | Connections waiting in a closing worker's accept queue get reset during restarts | `sysctl -w net.ipv4.tcp_migrate_req=1` and `contrib/99-warden.conf` (what `warden startup` installs) |
 | `worker did not exit within grace period; sending SIGKILL` | The app ignored the stop signal for `shutdown.grace_period` | Apps written for PM2 often listen for SIGINT: `shutdown.signal = "SIGINT"`. Otherwise close servers and DB pools on SIGTERM |
+| `closed long-lived connections so their clients reconnect to new workers … websockets=N sse=M` | A worker being replaced still had WebSockets or SSE streams `shutdown.long_lived_timeout` (2 s) after its drain began: they got close 1001 / a clean end of stream | Nothing to fix; clients must reconnect (EventSource does by itself; WebSocket clients: reconnect on close, with a little jitter). Raise `long_lived_timeout` to let streams that do end (an answer streamed as SSE) finish first |
+| A reload takes about 2 s more per worker | Workers with WebSocket or SSE clients wait `long_lived_timeout` for them to end by themselves before closing them | Lower `[shutdown] long_lived_timeout` (fractions work: `0.5`); `0` leaves them open until `grace_period` |
+| `shutdown.long_lived_timeout = X must be below shutdown.grace_period` (at start or `warden check`) | The worker needs time after closing them to finish and exit, or it is SIGKILLed and its clients see resets | Lower `long_lived_timeout` or raise `grace_period` |
+| An SSE stream still holds a draining worker until `grace_period` | The shim didn't see it as SSE: a Bun response returned straight from `fetch()` (a proxied stream), a content type other than `text/event-stream`, an HTTPS `node:http` server | Bun: rebuild it, `const r = await fetch(url); return new Response(r.body, r)`. Other long streams (downloads, NDJSON) are left to finish on purpose: ending them would make a cut-off body look complete |
+| `reload failed at worker 2 … Rolled back: the 2 new workers started together were stopped` | With `[reload] surge`, one worker of a batch failed a gate | Nothing to undo: the batch's new workers were stopped and the old ones keep serving. The message names the worker and the gate |
+| `reload.surge = N starts new workers next to the ones they replace, but …` (at start or `warden check`) | Surge needs a worker and its replacement to run at once; with `port_strategy = "offset"` each worker owns its port, and apps without the shim can't share one | Remove `surge` (one worker at a time), or let the workers share the port (`port_strategy = "shared"`) |
+| Workers still run the old release after a deploy, or a restarted worker did | `[app] pin_release` (default): workers start in the release `current` pointed to at the last start / reload / safe-reload / restart. A crash restart stays on it on purpose, so versions don't mix | Reload after swapping the symlink: `warden safe-reload` (or `reload`). `warden status` shows the pinned release |
+| `the pinned release directory is gone; starting the worker in the current release instead` | The pinned release was deleted (old releases cleaned up) before a reload moved the workers off it | Delete old releases only after the reload; then run `warden reload` so every worker runs the same release again |
 | `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count; `standby` too), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
 
 ## Hot standbys (`[workers] standby`)
@@ -38,7 +46,6 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | You see | Why | Fix |
 |---|---|---|
 | `workers.standby … is for process mode` / `needs app.port` / `needs Warden's shim` / `needs workers.port_strategy = "shared"` / `does not work with … "direct"` | Config validation: a standby defers the app's listen on its port through the shim, and joins the shared port when promoted | Do what the message says, or remove `standby` |
-| `stand-in sockets would need paths of up to N bytes` | Bun standbys serve on a Unix socket in the runtime directory until promoted; socket paths are limited to ~100 bytes | Use a shorter `[control] socket` directory |
 | `standby not initialized in time; killing` | The standby never called `Bun.serve`/`listen` on `app.port` within `workers.ready_timeout`: that call is what makes it ready (it is held back, not made) | The app's errors are in `warden logs <app> --worker standby`; raise `ready_timeout` for slow boots |
 | `standby crashed` … `standby restarting` … `standbys failed: too many standby crashes` | Standbys kept exiting before promotion (backoff like a worker, then FAILED until `failed_cooldown`) | `warden logs <app> --worker standby`; code that exits when idle, or that needs the port, fails here. `warden reset <app>` retries. Crashed workers restart the normal way meanwhile |
 | `standby keeps failing its health checks before promotion` / `standby unhealthy; replacing it` / `standby failed reload.verify_command` | A standby must pass the rollout gates on its private socket before it can be promoted, and stay healthy while idle | The health path must answer once the app is initialized, before it listens. A `verify_command` that tests `$PORT` reaches the workers, not the standby: use `$WARDEN_WORKER_SOCKET` |
@@ -46,7 +53,21 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `promoted standby did not listen in time; killing` | A promoted standby didn't report listening within 5 s (its listen failed, or it is stuck) | The slot restarts the normal way; `warden logs <app> --worker <n>`. If it repeats, set `standby = 0` and report it |
 | A crash during `reload`/`safe-reload` restarts cold | Standbys run the previous version, so they are not promoted while a deploy runs; they are replaced when it succeeds and kept when it rolls back | Intended |
 | A cron that runs on `NODE_APP_INSTANCE == 0` stops after worker 1 crashed | The standby started with a number past the workers' (so it doesn't run the job twice) and decided at startup | After promotion `process.env.NODE_APP_INSTANCE` is the slot's; start such jobs in `process.on("warden:promote", …)` as well |
-| `warden status` shows worker `0` rows (older CLI or GUI) | Standbys are listed after the workers with id 0 | Update the client; `warden status` shows them as `standby` |
+
+## Why a worker died
+
+`warden status` shows each worker's `last_exit`, and the log line of the death
+carries the same reason with a `hint=`.
+
+| You see | Why | Fix |
+|---|---|---|
+| `killed by the kernel OOM killer (out of memory)` | The cgroup Warden runs in (`MemoryMax=` of the unit, a container limit) ran out of memory and the kernel killed the worker; Warden saw the cgroup's `oom_kill` count go up | Raise `memory.max` / `MemoryMax=`, or set `[limits] max_memory` below it so Warden replaces a growing worker gracefully before the kernel kills it |
+| `killed by another process (SIGKILL)` | A SIGKILL Warden didn't send: `kill -9` by a person or script, a container runtime. With the cgroup counter readable, the OOM killer is ruled out | Find who sends it (`journalctl`, the audit log). Without a readable counter the hint says so: check `journalctl -k \| grep -i oom` |
+| `killed by another process (SIGTERM)` | Something else asked the worker to stop, often systemd stopping the unit with `KillMode=control-group` | Use `KillMode=mixed` (what `warden startup` writes), so only Warden gets the stop signal and drains its workers |
+| `crashed: SIGSEGV (segmentation fault)`, `SIGBUS`, `SIGILL` | A native crash in the runtime or a native module | The worker's last output (`warden logs <app>`) and core dumps (`coredumpctl list`) say where; try another Bun/Node version |
+| `crashed: SIGABRT (aborted)` | The program aborted itself: `process.abort()`, a failed native assertion, a fatal runtime error | Its last output lines say why |
+| `killed by Warden (SIGKILL)` | Warden killed it: it didn't exit within `shutdown.grace_period`, was hung (watchdog), or not ready in time | The line before it says which; see those entries |
+| `exit code 0 after Warden's SIGTERM` | A normal stop: the worker exited after Warden's stop signal | Nothing to do |
 
 ## Health
 
@@ -112,6 +133,12 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `supervisor is unresponsive; not killing it` | No event and no `status` answer for 3 s + 5 s; its workers probably still serve | `cat /proc/<pid>/stack` or `gdb -p <pid>` shows where it is stuck; restart it yourself if it stays stuck |
 | `supervisor died; not restarting it (it was not started in the background)` | It ran in a terminal (or under systemd, which restarts it itself) | `warden start <app>` runs it in the background, where wardend restarts it |
 | `a saved app's config is gone; not starting it` | `warden daemon --resurrect` found a saved app whose config was deleted | `warden save` again to forget it |
+| `wardend.toml has errors; keeping the alert rules in force` | The alert rules file did not parse or check (at start, SIGHUP or `warden daemon reload`); `errors=` lists every problem with its line | `warden daemon check` shows the same list; fix it, then `warden daemon reload`. Until then the previous rules (none at start) apply |
+| `alert delivery failed; trying once more` / `… failed twice; this alert is lost` | The rule's command exited non-zero or ran over 10 s (it is killed, with its children), or the webhook answered an HTTP error or could not be reached | `error=` has the exit status and the command's first stderr line, or curl's error; `hint=` the next step. Run the command by hand with a JSON alert on stdin; for a webhook, check the URL (a 404 often means a revoked Slack hook) and that this host reaches it (DNS, firewall, `https_proxy` in wardend's environment) |
+| `cannot send alerts to webhooks: curl is not installed` | Webhooks are POSTed by running `curl` (Warden has no TLS stack of its own); said once | `apt install curl` (`dnf`, `apk`, …), or use `command = [...]` |
+| `alert queue is full; dropping alerts` | More than 64 alerts wait: deliveries are slow (each may take 10 s, one retry) and many alerts fire | Make the command or webhook answer fast; raise `min_interval`; narrow `on` / `apps` |
+| `alert rules: a warning` | The file is valid, but: a plain `http://` webhook to another host (the token crosses the network unencrypted), or curl missing | Use `https://`; install curl |
+| `resource history is full; new apps get none` | 128 apps have a series and none has been gone 10 minutes | Unusual; the history of an app gone for 10 minutes makes room |
 
 ## Containers
 

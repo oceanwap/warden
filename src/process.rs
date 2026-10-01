@@ -5,6 +5,8 @@
 //! that task, so a signal is only ever sent while the child is still unreaped
 //! and its pid cannot have been reused.
 
+pub mod exit;
+
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
@@ -78,16 +80,24 @@ pub struct IpcMsg {
     /// Private per-worker health socket opened by the shim.
     #[serde(default)]
     pub socket: Option<String>,
+    /// `long_lived_closed`: WebSockets closed with 1001, SSE streams ended.
+    #[serde(default)]
+    pub ws: Option<u64>,
+    #[serde(default)]
+    pub sse: Option<u64>,
 }
 
 #[derive(Debug)]
 pub enum ProcEvent {
     /// `note` explains exits Warden didn't observe normally (lost track of it).
+    /// `sent`: the signals Warden delivered while the process was alive
+    /// (who killed it: see `exit::classify`).
     Exited {
         inst: u64,
         code: Option<i32>,
         signal: Option<i32>,
         note: Option<String>,
+        sent: exit::Sent,
     },
     Ipc {
         inst: u64,
@@ -283,6 +293,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         ),
     }
 
+    // Signals delivered, shared with the waiter's caller (it may panic).
+    let sent = std::rc::Rc::new(std::cell::Cell::new(exit::Sent::default()));
+    let sent_by_waiter = sent.clone();
     tokio::task::spawn_local(async move {
         let waited = crate::guard::catch_unwind(async move {
             crate::guard::fault("waiter");
@@ -294,6 +307,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                         // The group contains the process itself: signal once.
                         if let Some(p) = child.id() {
                             crate::sys::signal_child(p, sig, to_group);
+                            let mut s = sent_by_waiter.get();
+                            s.add(sig);
+                            sent_by_waiter.set(s);
                         }
                     }
                 }
@@ -340,7 +356,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
                 let _ = crate::sys::kill(-p, libc::SIGKILL);
             }
         }
-        let _ = events.send(ProcEvent::Exited { inst, code, signal, note });
+        let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
     Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label })
@@ -828,6 +844,8 @@ mod tests {
         assert_eq!(m.worker, Some(2));
         let m: IpcMsg = serde_json::from_str(r#"{"ev":"exit","worker":1,"code":1,"expected":false}"#).unwrap();
         assert_eq!(m.expected, Some(false));
+        let m: IpcMsg = serde_json::from_str(r#"{"ev":"long_lived_closed","ws":3,"sse":2,"worker":1}"#).unwrap();
+        assert_eq!((m.ws, m.sse), (Some(3), Some(2)));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -923,7 +941,11 @@ mod tests {
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);
                 match rx.recv().await.unwrap() {
-                    ProcEvent::Exited { signal, .. } => assert_eq!(signal, Some(libc::SIGTERM)),
+                    ProcEvent::Exited { signal, sent, .. } => {
+                        assert_eq!(signal, Some(libc::SIGTERM));
+                        // Recorded, so the exit reads "stopped by Warden's SIGTERM".
+                        assert!(sent.has(libc::SIGTERM) && !sent.has(libc::SIGKILL), "{sent:?}");
+                    }
                     e => panic!("unexpected {e:?}"),
                 }
             })

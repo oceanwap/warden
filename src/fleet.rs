@@ -119,6 +119,8 @@ pub fn discover() -> Vec<App> {
         let mut paths: Vec<PathBuf> = rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "toml") && p.is_file())
+            // wardend's own file (alert rules), not an app.
+            .filter(|p| p.file_name().is_none_or(|n| n != crate::daemon::alerts::FILE_NAME))
             .collect();
         paths.sort();
         for p in paths {
@@ -1203,7 +1205,7 @@ async fn wait_ready(app: &App, limit: Duration) -> i32 {
                 );
                 return 0;
             }
-            if st.workers.iter().any(|w| w.state == "FAILED" && !w.is_standby()) {
+            if st.workers.iter().any(|w| w.state == "FAILED") {
                 eprintln!("warden: {}: a worker is FAILED; `warden describe {}` shows why", app.name, app.name);
                 return 1;
             }

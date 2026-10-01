@@ -4,10 +4,10 @@
 // and errors. Results go to bench/results/<date>-<app>.json plus a Markdown
 // table on stdout. See bench/README.md.
 //
-//   bun bench/run.ts --app bun-http   (Bun.serve app)     scenarios: bare,pm2,warden-process,warden-worker
-//   bun bench/run.ts --app node-http  (node:http app)     scenarios: bare,pm2,watt,warden-process
-//   bun bench/run.ts --app nest-bun   (NestJS on Bun)     scenarios: bare,pm2,warden-process,warden-worker
-//   bun bench/run.ts --app nest-node  (NestJS on Node)    scenarios: bare,pm2,watt,warden-process
+//   bun bench/run.ts --app bun-http   (Bun.serve app)     scenarios: bare,pm2,warden-process,warden-surge,warden-worker
+//   bun bench/run.ts --app node-http  (node:http app)     scenarios: bare,pm2,watt,warden-process,warden-surge
+//   bun bench/run.ts --app nest-bun   (NestJS on Bun)     scenarios: bare,pm2,warden-process,warden-surge,warden-worker
+//   bun bench/run.ts --app nest-node  (NestJS on Node)    scenarios: bare,pm2,watt,warden-process,warden-surge
 //
 // Options: --duration 10  --connections 64  --workers 4  --scenarios a,b,...
 //
@@ -17,6 +17,8 @@
 //   pm2             PM2 the usual way: cluster mode for Node, fork mode for Bun
 //   watt            Platformatic Watt (wattpm), N worker threads (Node only)
 //   warden-process  Warden, N worker processes
+//   warden-surge    the same with [reload] surge = "all" (every new worker at once); only startup,
+//                   idle memory and the rolling restart are measured (the rest is warden-process's)
 //   warden-worker   Warden, N worker threads in one Bun process
 //   warden-standby  Warden, N worker processes + 1 hot standby ([workers] standby = 1)
 //
@@ -56,21 +58,21 @@ const apps: Record<string, AppDef> = {
     entry: join(ROOT, "bench/app/server.ts"),
     cwd: join(ROOT, "bench/app"),
     needsShim: false,
-    scenarios: ["bare", "pm2", "warden-process", "warden-worker"],
+    scenarios: ["bare", "pm2", "warden-process", "warden-surge", "warden-worker"],
   },
   "node-http": {
     runtime: "node",
     entry: join(ROOT, "bench/node/server.mjs"),
     cwd: join(ROOT, "bench/node"),
     needsShim: false,
-    scenarios: ["bare", "pm2", "watt", "warden-process"],
+    scenarios: ["bare", "pm2", "watt", "warden-process", "warden-surge"],
   },
   "nest-bun": {
     runtime: "bun",
     entry: join(ROOT, "bench/nest/main.ts"),
     cwd: join(ROOT, "bench/nest"),
     needsShim: true,
-    scenarios: ["bare", "pm2", "warden-process", "warden-worker"],
+    scenarios: ["bare", "pm2", "warden-process", "warden-surge", "warden-worker"],
   },
   "nest-node": {
     runtime: "node",
@@ -83,7 +85,7 @@ const apps: Record<string, AppDef> = {
       });
       if (r.exitCode !== 0) throw new Error("building the NestJS app for Node failed: " + r.stderr.toString());
     },
-    scenarios: ["bare", "pm2", "watt", "warden-process"],
+    scenarios: ["bare", "pm2", "watt", "warden-process", "warden-surge"],
   },
 };
 // Every app also runs under Warden with a hot standby (see startWardenStandby).
@@ -92,6 +94,9 @@ const app = apps[APP];
 if (!app) throw new Error(`unknown app ${APP}; one of ${Object.keys(apps).join(", ")}`);
 const SCENARIOS = (args.scenarios ?? app.scenarios.join(",")).split(",");
 const PATHS = ["/plaintext", "/json", "/cpu"];
+/** Scenarios that only differ from another in how they roll: just startup,
+ *  idle memory and the rolling restart are measured. */
+const ROLLING_ONLY = new Set(["warden-surge"]);
 
 /** A request that takes longer than this counts as failed (a hang). */
 const REQUEST_TIMEOUT_MS = 2000;
@@ -292,19 +297,22 @@ async function startWatt(): Promise<Running> {
   };
 }
 
-/** `workersExtra`: more `[workers]` keys (`standby = 1`). */
-async function startWarden(mode: "process" | "worker", workersExtra = ""): Promise<Running> {
+/** `surge`: `[reload] surge` (rolling restarts start that many new workers at once).
+ *  `workersExtra`: more `[workers]` keys (`standby = 1`). */
+async function startWarden(mode: "process" | "worker", surge?: string, workersExtra = ""): Promise<Running> {
   if (!existsSync(WARDEN)) throw new Error("build first: cargo build --release");
-  const sock = join(TMP, `warden-${mode}.sock`);
-  const cfg = join(TMP, `warden-${mode}.toml`);
+  const tag = surge ? `${mode}-surge` : workersExtra ? `${mode}-standby` : mode;
+  const sock = join(TMP, `warden-${tag}.sock`);
+  const cfg = join(TMP, `warden-${tag}.toml`);
   const appCfg =
     mode === "process"
       ? `command = ${JSON.stringify(runtimeBin)}\nargs = ${JSON.stringify([app.entry])}`
       : `entry = ${JSON.stringify(app.entry)}`;
   writeFileSync(
     cfg,
-    `[app]\nname = "bench-${mode}"\n${appCfg}\nworking_directory = ${JSON.stringify(app.cwd)}\nport = ${PORT}\n` +
+    `[app]\nname = "bench-${tag}"\n${appCfg}\nworking_directory = ${JSON.stringify(app.cwd)}\nport = ${PORT}\n` +
       `[workers]\ncount = ${WORKERS}\nmode = "${mode}"\n${workersExtra}` +
+      (surge ? `[reload]\nsurge = ${JSON.stringify(surge)}\n` : "") +
       `[shutdown]\ngrace_period = 10\ndrain_ms = 0\n[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(sock)}\n`,
   );
   const w = spawn(onAppCpus([WARDEN, "start", "-c", cfg]), { env: baseEnv, stdout: "ignore", stderr: "ignore" });
@@ -339,6 +347,8 @@ function start(name: string): Promise<Running> {
       return startWatt();
     case "warden-process":
       return startWarden("process");
+    case "warden-surge":
+      return startWarden("process", "all");
     case "warden-worker":
       return startWarden("worker");
     case "warden-standby":
@@ -351,23 +361,24 @@ function start(name: string): Promise<Running> {
 // warden-standby: Warden processes plus one hot standby, started (app
 // initialized) but not listening; when a worker dies the standby takes its
 // slot, so "crash recovery" is a promotion instead of a cold start. It
-// counts in the RAM rows (its pid is in `warden status`), which shows what
-// it costs. It answers no request until promoted, so startup and throughput
-// see the same N workers.
+// counts in the RAM rows (its pid is in `warden status`, under `standbys`),
+// which shows what it costs. It answers no request until promoted, so
+// startup and throughput see the same N workers.
 async function startWardenStandby(): Promise<Running> {
-  const run = await startWarden("process", "standby = 1\n");
-  const sock = join(TMP, "warden-process.sock");
-  const standbyReady = () => {
+  const run = await startWarden("process", undefined, "standby = 1\n");
+  const sock = join(TMP, "warden-process-standby.sock");
+  const status = () => {
     const r = spawnSync([WARDEN, "status", "--json", "--socket", sock]);
-    return r.exitCode === 0 && JSON.parse(r.stdout.toString()).workers.some((w: any) => w.id === 0 && w.state === "STANDBY");
+    return r.exitCode === 0 ? JSON.parse(r.stdout.toString()) : null;
   };
+  const standbyPids = (): number[] => (status()?.standbys ?? []).filter((w: any) => w.state === "STANDBY").map((w: any) => w.pid);
   return {
     ...run,
     // The standby starts once the workers serve (after the startup timing):
-    // memory is first sampled when it is ready too.
+    // memory is first sampled when it is ready, and includes it.
     appPids: async () => {
-      await waitFor(standbyReady, 120_000);
-      return run.appPids();
+      await waitFor(() => standbyPids().length > 0, 120_000);
+      return uniq([...(await run.appPids()), ...standbyPids()]);
     },
   };
 }
@@ -387,20 +398,26 @@ async function runScenario(name: string) {
   const mgrPids = await run.managerPids();
   const all = uniq([...appPids, ...mgrPids]);
   const idle = { total_rss_mb: mb(sum(all, rss)), total_pss_mb: mb(sum(all, pss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
+  const rollingOnly = ROLLING_ONLY.has(name);
 
   const endpoints: Record<string, any> = {};
-  for (const path of PATHS) {
+  for (const path of rollingOnly ? [] : PATHS) {
     oha(path, 2); // warm-up
     const a0 = sum(all, cpuSeconds);
     const r = oha(path, DURATION);
     endpoints[path] = { ...r, cpu_s: +(sum(all, cpuSeconds) - a0).toFixed(2) };
   }
-  const loaded = { total_rss_mb: mb(sum(all, rss)), total_pss_mb: mb(sum(all, pss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
+  const loaded = rollingOnly
+    ? null
+    : { total_rss_mb: mb(sum(all, rss)), total_pss_mb: mb(sum(all, pss)), manager_rss_mb: mb(sum(mgrPids, rss)) };
 
   // Manager idle CPU over 5 s (for Watt the manager is the whole process).
-  const m1 = sum(mgrPids, cpuSeconds);
-  await sleep(5000);
-  const manager_idle_cpu_pct = +(((sum(mgrPids, cpuSeconds) - m1) / 5) * 100).toFixed(2);
+  let manager_idle_cpu_pct: number | string = "-";
+  if (!rollingOnly) {
+    const m1 = sum(mgrPids, cpuSeconds);
+    await sleep(5000);
+    manager_idle_cpu_pct = +(((sum(mgrPids, cpuSeconds) - m1) / 5) * 100).toFixed(2);
+  }
 
   // Load for the disruption tests: 8 clients, a fresh connection per request.
   const underLoad = async (disrupt: () => Promise<void>) => {
@@ -442,8 +459,8 @@ async function runScenario(name: string) {
   }
 
   // CLI latency: the manager's status command, median of 10.
-  let cli_ms: any = "n/a";
-  if (run.statusCmd) {
+  let cli_ms: any = rollingOnly ? "-" : "n/a";
+  if (run.statusCmd && !rollingOnly) {
     const times: number[] = [];
     for (let i = 0; i < 10; i++) {
       const tc = performance.now();
@@ -457,9 +474,9 @@ async function runScenario(name: string) {
 
   // Crash recovery under load: one worker exits (GET /crash); time until a
   // replacement worker answers, and requests that failed meanwhile.
-  let recovery: any = "n/a (nothing restarts it)";
-  let crash: any = "n/a";
-  if (run.restarts) {
+  let recovery: any = rollingOnly ? "-" : "n/a (nothing restarts it)";
+  let crash: any = rollingOnly ? "-" : "n/a";
+  if (run.restarts && !rollingOnly) {
     const old = await currentWorkers(WORKERS);
     crash = await underLoad(async () => {
       const tk = performance.now();
@@ -510,8 +527,8 @@ const lines = [
   "",
   table(results, (r) => r.name, [
     ["total RAM idle: RSS / PSS (MB)", (r) => `${r.idle.total_rss_mb} / ${r.idle.total_pss_mb}`],
-    ["total RAM after load: RSS / PSS (MB)", (r) => `${r.loaded.total_rss_mb} / ${r.loaded.total_pss_mb}`],
-    ["manager RAM (MB)", (r) => (r.name === "watt" ? "(in total)" : r.loaded.manager_rss_mb)],
+    ["total RAM after load: RSS / PSS (MB)", (r) => (r.loaded ? `${r.loaded.total_rss_mb} / ${r.loaded.total_pss_mb}` : "-")],
+    ["manager RAM (MB)", (r) => (r.name === "watt" ? "(in total)" : (r.loaded ?? r.idle).manager_rss_mb)],
     ["manager idle CPU (%)", (r) => r.manager_idle_cpu_pct],
     [`startup to ${WORKERS} serving (ms)`, (r) => r.startup_ms],
     ["crash recovery (ms)", (r) => r.recovery_ms],
@@ -525,9 +542,9 @@ const lines = [
     ],
     ["status command (ms)", (r) => r.cli_ms],
     ...PATHS.flatMap((p): [string, (r: any) => string | number][] => [
-      [`${p} req/s`, (r) => r.endpoints[p].rps],
-      [`${p} p50 / p99 (ms)`, (r) => `${r.endpoints[p].p50_ms} / ${r.endpoints[p].p99_ms}`],
-      [`${p} errors`, (r) => r.endpoints[p].errors],
+      [`${p} req/s`, (r) => r.endpoints[p]?.rps ?? "-"],
+      [`${p} p50 / p99 (ms)`, (r) => (r.endpoints[p] ? `${r.endpoints[p].p50_ms} / ${r.endpoints[p].p99_ms}` : "-")],
+      [`${p} errors`, (r) => r.endpoints[p]?.errors ?? "-"],
     ]),
   ]),
 ];

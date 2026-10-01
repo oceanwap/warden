@@ -75,6 +75,41 @@ pub struct Static {
     /// One stdout line per request (method, path, status, bytes, ms).
     #[serde(default)]
     pub access_log: bool,
+    /// Per worker: memory for complete prebuilt responses of small files
+    /// ("16MB"; 0 turns the cache off). A hit is one send(2).
+    #[serde(default = "default_cache_size", deserialize_with = "size_bytes")]
+    pub cache_size: u64,
+    /// Files larger than this are not cached (they go out with sendfile).
+    /// At most 16M: a miss reads the whole file into memory first.
+    #[serde(default = "default_cache_max_file", deserialize_with = "size_bytes")]
+    pub cache_max_file: u64,
+    /// A cached file is checked against the disk at most this often (ms):
+    /// an edited or deleted file is served fresh within this time.
+    #[serde(default = "default_cache_valid_ms")]
+    pub cache_valid_ms: u64,
+    /// How connections are driven: "epoll" (default) or "uring" (io_uring,
+    /// Linux; falls back to epoll where it is unavailable).
+    /// `WARDEN_STATIC_IO` overrides it.
+    #[serde(default)]
+    pub io: StaticIo,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StaticIo {
+    #[default]
+    Epoll,
+    Uring,
+}
+
+fn default_cache_size() -> u64 {
+    16 << 20
+}
+fn default_cache_max_file() -> u64 {
+    64 << 10
+}
+fn default_cache_valid_ms() -> u64 {
+    1000
 }
 
 fn default_static_host() -> String {
@@ -125,6 +160,12 @@ pub struct App {
     /// apps that run cron jobs only on instance 0 keep working. "" = unset.
     #[serde(default = "default_instance_var")]
     pub instance_var: String,
+    /// Start workers in the real path of `working_directory` (a `current`
+    /// symlink resolved), taken at start and at each reload / safe-reload /
+    /// restart of every worker. Crash restarts reuse it, so a crash after
+    /// the symlink was swapped doesn't start the new release next to the old.
+    #[serde(default = "yes")]
+    pub pin_release: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -200,7 +241,17 @@ pub struct Shutdown {
     /// Signal that asks a worker to stop: SIGTERM, or SIGINT for apps written
     /// for PM2 (its default). SIGKILL follows after `grace_period`.
     pub signal: String,
+    /// Seconds (fractions allowed) a draining worker lets WebSockets and SSE
+    /// streams end by themselves; then the shim closes WebSockets with 1001
+    /// (Going Away) and ends SSE responses cleanly, so clients reconnect to
+    /// the new workers. Must be below `grace_period`. 0 = leave them alone
+    /// (they hold the worker until `grace_period`). Default: 2, or half of
+    /// `grace_period` when that is shorter (`long_lived_timeout()`).
+    pub long_lived_timeout: Option<f64>,
 }
+
+/// `long_lived_timeout` when it isn't set.
+pub const DEFAULT_LONG_LIVED_TIMEOUT: f64 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +314,67 @@ pub struct Reload {
     pub preflight: Option<String>,
     /// Seconds allowed for one worker's gates (ready, checks, verify, soak).
     pub timeout: u64,
+    /// New workers started at once in a rolling replacement, each next to
+    /// the one it replaces: 1 (one at a time), N, or "all". Each passes the
+    /// gates; then the N old ones drain together. Runs up to N extra workers
+    /// for a few seconds.
+    #[serde(deserialize_with = "surge_count")]
+    pub surge: Surge,
+}
+
+/// `[reload] surge`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surge {
+    Count(usize),
+    All,
+}
+
+impl Surge {
+    /// Workers per batch for a rollout of `total` workers.
+    pub fn batch(self, total: usize) -> usize {
+        match self {
+            Surge::Count(n) => n.clamp(1, total.max(1)),
+            Surge::All => total.max(1),
+        }
+    }
+    pub fn is_one(self) -> bool {
+        self == Surge::Count(1)
+    }
+}
+
+impl std::fmt::Display for Surge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Surge::Count(n) => write!(f, "{n}"),
+            Surge::All => f.write_str("all"),
+        }
+    }
+}
+
+impl serde::Serialize for Surge {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Surge::Count(n) => s.serialize_u64(*n as u64),
+            Surge::All => s.serialize_str("all"),
+        }
+    }
+}
+
+/// `surge = 2` or `surge = "all"`.
+fn surge_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Surge, D::Error> {
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum S {
+        Num(i64),
+        Text(String),
+    }
+    match S::deserialize(d)? {
+        S::Num(n) if (1..=1024).contains(&n) => Ok(Surge::Count(n as usize)),
+        S::Num(n) => Err(D::Error::custom(format!("reload.surge = {n}: must be between 1 and 1024, or \"all\""))),
+        S::Text(t) if t.trim() == "all" => Ok(Surge::All),
+        S::Text(t) => Err(D::Error::custom(format!("reload.surge = {t:?}: expected a number or \"all\""))),
+    }
 }
 
 /// Liveness: the shim sends a heartbeat from each worker's event loop. No
@@ -477,7 +589,7 @@ impl Default for Restart {
 
 impl Default for Shutdown {
     fn default() -> Self {
-        Self { grace_period: 30, drain_ms: 500, signal: "SIGTERM".into() }
+        Self { grace_period: 30, drain_ms: 500, signal: "SIGTERM".into(), long_lived_timeout: None }
     }
 }
 
@@ -510,6 +622,7 @@ impl Default for Reload {
             pause: 0,
             preflight: None,
             timeout: 120,
+            surge: Surge::Count(1),
         }
     }
 }
@@ -611,6 +724,15 @@ impl Config {
                     return Err("static.basic_auth must be \"user:password\"".into());
                 }
             }
+            for (name, value, max, unit) in [
+                ("static.cache_size", st.cache_size, 4 << 30, "4G"),
+                ("static.cache_max_file", st.cache_max_file, 16 << 20, "16M"),
+                ("static.cache_valid_ms", st.cache_valid_ms, 3_600_000, "3600000"),
+            ] {
+                if value > max {
+                    return Err(format!("{name} = {value} is out of range (maximum {unit})"));
+                }
+            }
         }
         if self.workers.wait_ready && !self.shim_enabled() {
             return Err("workers.wait_ready needs Warden's shim, which loads into bun and node commands \
@@ -622,6 +744,20 @@ impl Config {
                 "shutdown.signal = {:?} is not a signal name (use SIGTERM or SIGINT)",
                 self.shutdown.signal
             ));
+        }
+        if let Some(t) = self.shutdown.long_lived_timeout {
+            let grace = self.shutdown.grace_period;
+            if !t.is_finite() || t < 0.0 {
+                return Err(format!("shutdown.long_lived_timeout = {t} must be a number of seconds >= 0"));
+            }
+            if t > 0.0 && t >= grace as f64 {
+                return Err(format!(
+                    "shutdown.long_lived_timeout = {t} must be below shutdown.grace_period = {grace}: \
+                     WebSockets and SSE streams are closed at long_lived_timeout, and the worker needs the \
+                     rest of the grace period to finish (or it is SIGKILLed and clients see resets). \
+                     Lower long_lived_timeout or raise grace_period"
+                ));
+            }
         }
         if let Some(expr) = &self.restart.schedule {
             crate::schedule::Cron::parse(expr).map_err(|e| format!("restart.schedule = {expr:?}: {e}"))?;
@@ -728,6 +864,23 @@ impl Config {
         if rl.health_interval_ms < 50 || rl.timeout == 0 {
             return Err("reload.health_interval_ms must be >= 50 and reload.timeout > 0".into());
         }
+        if !rl.surge.is_one() && !self.overlap() {
+            let s = rl.surge;
+            return Err(if self.workers.port_strategy == PortStrategy::Offset {
+                format!(
+                    "reload.surge = {s} starts new workers next to the ones they replace, but with \
+                     workers.port_strategy = \"offset\" each worker owns its port, so a worker and its \
+                     replacement can't run at the same time. Fix: remove reload.surge (one worker at a \
+                     time, stopped then started), or use port_strategy = \"shared\""
+                )
+            } else {
+                format!(
+                    "reload.surge = {s} starts new workers next to the ones they replace, but this app's \
+                     workers can't overlap (workers.overlap = false, or a port without Warden's shim, so \
+                     no SO_REUSEPORT). Fix: remove reload.surge, or let the workers share the port"
+                )
+            });
+        }
         for (name, cmd) in [("reload.verify_command", &rl.verify_command), ("reload.preflight", &rl.preflight)] {
             if cmd.as_deref().is_some_and(|c| c.trim().is_empty()) {
                 return Err(format!("{name} must not be empty (omit it instead)"));
@@ -815,16 +968,8 @@ impl Config {
                         default)"
                 .into());
         }
-        // Bun standbys serve on a stand-in Unix socket until promoted:
-        // <runtime dir>/<name>.s<instance>-<n>.sock, within the ~104-byte limit.
-        let dir = self.socket_path().parent().map(|d| d.as_os_str().len()).unwrap_or(0);
-        let longest = dir + 1 + self.app.name.len() + ".s9999999999-99.sock".len();
-        if longest > 100 {
-            return Err(format!(
-                "workers.standby: stand-in sockets would need paths of up to {longest} bytes (limit 100): use a \
-                 shorter [control] socket directory"
-            ));
-        }
+        // No socket path to check: a Bun standby's stand-in server uses the
+        // private health socket (checked above) or an ephemeral TCP port.
         Ok(())
     }
 
@@ -930,6 +1075,16 @@ impl Config {
 
     pub fn grace_period(&self) -> Duration {
         Duration::from_secs(self.shutdown.grace_period)
+    }
+
+    /// When a draining worker closes its WebSockets and SSE streams (zero:
+    /// never). Unset: 2 s, or half the grace period when that is shorter, so
+    /// a short `grace_period` doesn't make the default invalid.
+    pub fn long_lived_timeout(&self) -> Duration {
+        let s = &self.shutdown;
+        let secs = s.long_lived_timeout.unwrap_or_else(|| DEFAULT_LONG_LIVED_TIMEOUT.min(s.grace_period as f64 / 2.0));
+        // Validated finite and >= 0 at load; clamp anyway (a Duration panics on NaN).
+        Duration::from_secs_f64(if secs.is_finite() { secs.clamp(0.0, 3600.0) } else { 0.0 })
     }
 
     /// HTTP path for per-worker checks: `health.path`, else the path of `health.url`.
@@ -1114,6 +1269,7 @@ mod tests {
             ("restart", "failed_cooldown"),
             ("shutdown", "grace_period"),
             ("shutdown", "drain_ms"),
+            ("shutdown", "long_lived_timeout"),
             ("health", "interval"),
             ("health", "timeout"),
             ("health", "failure_threshold"),
@@ -1158,6 +1314,7 @@ mod tests {
                         ] {
                             let _ = now + std::time::Duration::from_secs(secs);
                         }
+                        let _ = now + c.long_lived_timeout();
                     }
                 }
             }
@@ -1165,6 +1322,26 @@ mod tests {
         let e = Config::parse(&format!("{MIN}[reload]\ntimeout = 18446744073709551615\n")).unwrap_err();
         assert!(e.contains("reload.timeout") && e.contains("out of range"), "{e}");
         assert!(Config::parse(&format!("{MIN}[health]\noutage_threshold = 1.5\n")).is_err());
+    }
+
+    #[test]
+    fn long_lived_timeout_default_and_bounds() {
+        let ll = |extra: &str| Config::parse(&format!("{MIN}[shutdown]\n{extra}"));
+        assert_eq!(Config::parse(MIN).unwrap().long_lived_timeout(), Duration::from_secs(2));
+        // Unset with a short grace period: half of it, so the config stays valid.
+        assert_eq!(ll("grace_period = 1\n").unwrap().long_lived_timeout(), Duration::from_millis(500));
+        assert_eq!(ll("grace_period = 0\n").unwrap().long_lived_timeout(), Duration::ZERO);
+        assert_eq!(ll("long_lived_timeout = 0.25\n").unwrap().long_lived_timeout(), Duration::from_millis(250));
+        assert_eq!(ll("long_lived_timeout = 5\n").unwrap().long_lived_timeout(), Duration::from_secs(5));
+        // 0: leave them alone, whatever the grace period.
+        assert_eq!(ll("grace_period = 0\nlong_lived_timeout = 0\n").unwrap().long_lived_timeout(), Duration::ZERO);
+        let e = ll("grace_period = 5\nlong_lived_timeout = 5\n").unwrap_err();
+        assert!(e.contains("must be below shutdown.grace_period = 5") && e.contains("raise grace_period"), "{e}");
+        for bad in ["-1", "nan", "inf", "-inf"] {
+            let e = ll(&format!("long_lived_timeout = {bad}\n")).unwrap_err();
+            assert!(e.contains("long_lived_timeout"), "{bad}: {e}");
+        }
+        assert!(ll("long_lived_timeout = \"2s\"\n").is_err());
     }
 
     #[test]
@@ -1195,6 +1372,9 @@ mod tests {
         assert_eq!(c.workers.count, 4);
         assert_eq!(c.logging.max_lines_per_sec, Logging::default().max_lines_per_sec);
         assert_eq!(c.logging.rotate, Rotate::default());
+        assert_eq!(c.shutdown.long_lived_timeout, Some(DEFAULT_LONG_LIVED_TIMEOUT));
+        assert_eq!(c.reload.surge, Reload::default().surge);
+        assert!(c.app.pin_release);
         // The commented [static] block is valid too.
         let uncommented: String = text
             .split("# [static]")
@@ -1208,6 +1388,46 @@ mod tests {
         let c = Config::parse(&site).unwrap();
         let st = c.static_files.unwrap();
         assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
+        assert_eq!(st.io, StaticIo::Epoll);
+    }
+
+    #[test]
+    fn static_cache_and_io_settings() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        let st = Config::parse(base).unwrap().static_files.unwrap();
+        assert_eq!(
+            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
+            (16 << 20, 64 << 10, 1000, StaticIo::Epoll)
+        );
+        let st = Config::parse(&format!(
+            "{base}cache_size = \"64MB\"\ncache_max_file = \"256K\"\ncache_valid_ms = 0\nio = \"uring\"\n"
+        ))
+        .unwrap()
+        .static_files
+        .unwrap();
+        assert_eq!(
+            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
+            (64 << 20, 256 << 10, 0, StaticIo::Uring)
+        );
+        // 0 turns the cache off; plain numbers are bytes.
+        let st =
+            Config::parse(&format!("{base}cache_size = 0\ncache_max_file = 1000\n")).unwrap().static_files.unwrap();
+        assert_eq!((st.cache_size, st.cache_max_file), (0, 1000));
+        // Out of range or malformed values are refused with the key's name.
+        for (bad, why) in [
+            ("cache_size = \"5G\"", "static.cache_size"),
+            ("cache_max_file = \"17M\"", "static.cache_max_file"),
+            ("cache_valid_ms = 3600001", "static.cache_valid_ms"),
+            ("cache_size = \"lots\"", "not a size"),
+            ("io = \"kqueue\"", "unknown variant"),
+        ] {
+            let e = Config::parse(&format!("{base}{bad}\n")).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // The worker gets the section as JSON (WARDEN_STATIC); sizes survive the round trip.
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(serde_json::from_str::<Static>(&json).unwrap(), st);
     }
 
     #[test]
@@ -1360,8 +1580,9 @@ level = "info"
         assert!(e.contains("[static]"), "{e}");
         let e = err(&format!("{MIN}port = 3000\n[workers]\nstandby = 2000\n"));
         assert!(e.contains("out of range"), "{e}");
-        let long = format!("{ok}[control]\nsocket = \"/tmp/{}/c.sock\"\n", "d".repeat(90));
-        assert!(err(&long).contains("stand-in sockets"));
+        // Any checkout path: standbys need no socket path of their own.
+        let long = format!("{ok}[control]\nsocket = \"/tmp/{}/c.sock\"\n", "d".repeat(150));
+        assert!(Config::parse(&long).is_ok());
     }
 
     #[test]
@@ -1370,6 +1591,35 @@ level = "info"
         assert!(Config::parse(w).is_ok());
         assert!(Config::parse("[app]\nname = \"a\"\n[workers]\nmode = \"worker\"\n").is_err());
         assert!(Config::parse(&format!("{w}port_strategy = \"offset\"\n")).is_err());
+    }
+
+    #[test]
+    fn surge_values_and_rules() {
+        let c = Config::parse(MIN).unwrap();
+        assert_eq!(c.reload.surge, Surge::Count(1));
+        assert!(c.app.pin_release, "pinning is on by default");
+        let c = Config::parse(&format!("{MIN}[reload]\nsurge = 2\n")).unwrap();
+        assert_eq!((c.reload.surge, c.reload.surge.batch(4), c.reload.surge.batch(1)), (Surge::Count(2), 2, 1));
+        let c = Config::parse(&format!("{MIN}[reload]\nsurge = \"all\"\n")).unwrap();
+        assert_eq!((c.reload.surge, c.reload.surge.batch(4)), (Surge::All, 4));
+        assert_eq!(serde_json::to_value(c.reload.surge).unwrap(), serde_json::json!("all"));
+        assert_eq!(serde_json::to_value(Surge::Count(3)).unwrap(), serde_json::json!(3));
+        for bad in ["0", "-1", "2000", "\"most\""] {
+            let e = Config::parse(&format!("{MIN}[reload]\nsurge = {bad}\n")).unwrap_err();
+            assert!(e.contains("surge"), "{bad}: {e}");
+        }
+        // Workers that can't overlap can't surge.
+        let offset =
+            "[app]\nname = \"a\"\nargs = [\"s.ts\"]\nport = 3000\n[workers]\ncount = 4\nport_strategy = \"offset\"\n";
+        assert!(Config::parse(offset).is_ok());
+        let e = Config::parse(&format!("{offset}[reload]\nsurge = 2\n")).unwrap_err();
+        assert!(e.contains("port_strategy = \"offset\"") && e.contains("Fix:"), "{e}");
+        assert!(Config::parse(&format!("{offset}[reload]\nsurge = 1\n")).is_ok());
+        let py =
+            "[app]\nname = \"a\"\ncommand = \"python3\"\nargs = [\"s.py\"]\nport = 8000\n[reload]\nsurge = \"all\"\n";
+        assert!(Config::parse(py).unwrap_err().contains("can't overlap"));
+        let c = Config::parse(&format!("{MIN}pin_release = false\n")).unwrap();
+        assert!(!c.app.pin_release);
     }
 
     #[test]
