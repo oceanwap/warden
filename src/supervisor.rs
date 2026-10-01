@@ -857,8 +857,9 @@ impl Supervisor {
                         threshold_ms = warn_ms,
                         hint = "requests wait this long before their handler starts: synchronous work on the event \
                                 loop (large JSON, sync fs or crypto, a CPU-heavy route) or a starved host (`warden \
-                                top`, the host's load). Profile it (node --cpu-prof, bun --inspect), move heavy work \
-                                to a Worker, or add workers; [watchdog] loop_delay_warn sets the threshold (0 = off)",
+                                top`, the host's load). Warden only reports it (the watchdog acts when heartbeats \
+                                stop). Profile it (node --cpu-prof, bun --inspect), move heavy work to a Worker, or \
+                                add workers; [watchdog] loop_delay_warn sets the threshold (0 = off)",
                     );
                 }
             }

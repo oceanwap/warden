@@ -447,7 +447,8 @@ app-level check; their rollout gates fall back to it too.
   every interval; with no subscriber an event costs one atomic load.
 - Metrics (`warden status`, optional Prometheus endpoint): workers configured /
   running, restarts, crashes, uptime, RSS and CPU per worker from `/proc`,
-  health status.
+  health status, and each worker's event-loop delay (p50/p99/max over the
+  last second, from the shim's heartbeat, §4.3).
 - systemd: `READY=1` once all workers are ready (for `Type=notify`),
   `STOPPING=1`, `RELOADING=1`.
 
