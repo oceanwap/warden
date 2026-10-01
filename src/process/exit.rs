@@ -493,7 +493,8 @@ fn counter_path() -> Option<PathBuf> {
 /// controller's `memory.oom_control` (that cgroup only). Local counts keep a
 /// kill in a worker's own cgroup below Warden's from being counted in
 /// Warden's too. `cgroup`: /proc/<pid>/cgroup; `mountinfo`: /proc/self/mountinfo.
-#[cfg(any(target_os = "linux", test))]
+/// (Plain text parsing, so it builds everywhere: `OomTracker::attach` calls it
+/// on every platform, where the files simply don't exist.)
 pub fn counter_candidates(cgroup: &str, mountinfo: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     // "0::/system.slice/warden@api.service" (v2), "4:memory:/docker/abc" (v1).
