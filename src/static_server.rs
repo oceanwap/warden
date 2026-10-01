@@ -110,6 +110,7 @@ pub fn main() -> i32 {
     let io = match std::env::var("WARDEN_STATIC_IO").as_deref() {
         Ok("uring") => StaticIo::Uring,
         Ok("epoll") => StaticIo::Epoll,
+        Ok("") | Err(_) => cfg.io,
         Ok(other) => {
             crate::warn!(
                 "ignoring WARDEN_STATIC_IO: it is neither \"epoll\" nor \"uring\"",
@@ -119,7 +120,6 @@ pub fn main() -> i32 {
             );
             cfg.io
         }
-        Err(_) => cfg.io,
     };
     let site = Arc::new(Site {
         root,
@@ -193,8 +193,9 @@ impl Listener {
             }
             #[cfg(not(target_os = "linux"))]
             crate::warn!(
-                "io_uring is Linux-only, so this worker serves with the default I/O instead",
-                hint = "set [static] io = \"epoll\" (and unset WARDEN_STATIC_IO) to silence this"
+                "io_uring is unavailable (it is Linux-only), so this worker serves with kqueue instead",
+                hint = "set [static] io = \"epoll\" (the default; kqueue outside Linux) and unset WARDEN_STATIC_IO \
+                        to silence this"
             );
         }
         tokio::net::TcpListener::from_std(l).map(Listener::Tokio).map_err(|e| e.to_string())
@@ -202,7 +203,8 @@ impl Listener {
 
     fn name(&self) -> &'static str {
         match self {
-            Listener::Tokio(_) => "epoll",
+            Listener::Tokio(_) if cfg!(target_os = "linux") => "epoll",
+            Listener::Tokio(_) => "kqueue",
             #[cfg(target_os = "linux")]
             Listener::Uring(_) => "io_uring",
         }

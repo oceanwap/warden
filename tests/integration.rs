@@ -1670,6 +1670,8 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
             _ => "(files opened with realpath check)",
         };
         w.wait_log(how, T);
+        // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+        static_io_used(&w, &std::env::var("WARDEN_STATIC_IO").unwrap_or_default());
         let get = |p: &str| get_close(port, p, "");
         // The first round fills the cache, the second is answered from it.
         for _ in 0..2 {
@@ -2084,6 +2086,18 @@ fn serve_static_files() {
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
     assert!(out.contains("site: online (2/2"), "{out}");
+    // `WARDEN_STATIC_IO=uring cargo test` runs this through io_uring.
+    if std::env::var("WARDEN_STATIC_IO").as_deref() == Ok("uring") {
+        let t0 = Instant::now();
+        let logs = loop {
+            let logs = f.cli(&["logs", "site", "-n", "100"]).1;
+            if logs.contains("serving ") || t0.elapsed() > T {
+                break logs;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(logs.contains("via io_uring") || logs.contains("io_uring is unavailable"), "{logs}");
+    }
 
     let (st, h, body) = get_close(port, "/", "");
     assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));

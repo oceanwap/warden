@@ -226,6 +226,36 @@ That socket's directory also holds the shim every worker preloads and the
 per-worker health sockets. Warden refuses to use the directory unless it
 owns it, it is not a symlink, and no other user can write to it.
 
+## Static files
+
+`warden serve dist 8080` (or a `[static]` section, see
+`warden.example.toml`) runs Warden's own file server as the app's workers:
+supervised, health-checked and reloaded like any app. It speaks HTTP/1.1
+with keep-alive: ETag / Last-Modified and 304s, single ranges,
+precompressed `.br` / `.gz` siblings, SPA fallback, `404.html`, Basic auth.
+Paths can't leave the root (`..`, symlinks out, NUL), and files are opened
+with `openat2(RESOLVE_BENEATH)` on Linux.
+
+Small files are served from memory. Each worker keeps complete responses
+(headers and body) of recently used files up to `cache_max_file` (64 KB), in
+at most `cache_size` (16 MB, least recently used out first; `0` turns it
+off), so a hit is one `send(2)`. HEAD and 304s come from the same entry;
+ranges and anything unusual take the normal path. A cached file is checked
+against the disk at most every `cache_valid_ms` (1 s): an edit, a deletion
+or a symlink swapped in shows within that time (on NFS, within the
+attribute cache time). A file changed in the last 2 s is served but not
+cached. A deploy that swaps a `current` symlink needs a rolling restart
+anyway (each worker resolves the root once), which starts with an empty
+cache. With `access_log = true` each line ends in `cache=hit` or
+`cache=miss`, and each worker prints its cache counters when it stops.
+
+`io = "uring"` (or `WARDEN_STATIC_IO=uring`) drives the workers' TCP
+connections with io_uring instead of epoll: one `io_uring_enter` submits the
+receives and sends of many connections at once. It is experimental and off
+by default. Where io_uring is unavailable (blocked by Docker's default
+seccomp profile, `kernel.io_uring_disabled`, kernels before 5.6, macOS),
+the worker logs why and serves with epoll.
+
 ## Production setup (systemd)
 
 - [`contrib/warden@.service`](contrib/warden@.service): `Type=notify`, so the unit

@@ -80,6 +80,7 @@ pub struct Static {
     #[serde(default = "default_cache_size", deserialize_with = "size_bytes")]
     pub cache_size: u64,
     /// Files larger than this are not cached (they go out with sendfile).
+    /// At most 16M: a miss reads the whole file into memory first.
     #[serde(default = "default_cache_max_file", deserialize_with = "size_bytes")]
     pub cache_max_file: u64,
     /// A cached file is checked against the disk at most this often (ms):
@@ -642,7 +643,7 @@ impl Config {
             }
             for (name, value, max, unit) in [
                 ("static.cache_size", st.cache_size, 4 << 30, "4G"),
-                ("static.cache_max_file", st.cache_max_file, 1 << 30, "1G"),
+                ("static.cache_max_file", st.cache_max_file, 16 << 20, "16M"),
                 ("static.cache_valid_ms", st.cache_valid_ms, 3_600_000, "3600000"),
             ] {
                 if value > max {
@@ -1222,7 +1223,7 @@ mod tests {
         // Out of range or malformed values are refused with the key's name.
         for (bad, why) in [
             ("cache_size = \"5G\"", "static.cache_size"),
-            ("cache_max_file = \"2G\"", "static.cache_max_file"),
+            ("cache_max_file = \"17M\"", "static.cache_max_file"),
             ("cache_valid_ms = 3600001", "static.cache_valid_ms"),
             ("cache_size = \"lots\"", "not a size"),
             ("io = \"kqueue\"", "unknown variant"),

@@ -304,7 +304,8 @@ impl Cache {
         }
         Some(Cache {
             lru: Mutex::new(Lru::new(usize::try_from(size).unwrap_or(usize::MAX))),
-            max_file,
+            // A file the whole budget can't hold is never read in to try.
+            max_file: max_file.min(size),
             valid: Duration::from_millis(valid_ms),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
