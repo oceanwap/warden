@@ -18,6 +18,22 @@ pub struct Latency {
     pub cmd: &'static str,
     pub ms: f64,
     pub ok: bool,
+    /// A slow `list --json`: the apps that did not answer, with why.
+    pub slow: Option<String>,
+}
+
+/// From `warden list --json`: "app: error" for every app without a status.
+fn unanswered(json: &[u8]) -> String {
+    let v: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|e| e["status"].is_null())
+                .map(|e| format!("{}: {}", e["app"].as_str().unwrap_or("?"), e["error"].as_str().unwrap_or("?")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone)]
@@ -54,9 +70,14 @@ pub fn observer(sh: Arc<Shared>, fleet: Arc<Fleet>) {
         for (name, args) in cmds {
             let t = sh.now();
             let t0 = Instant::now();
-            let ok = fleet.command(&args).output().is_ok_and(|o| o.status.success());
+            let out = fleet.command(&args).output();
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            sh.with_mon(|m| m.latency.push(Latency { t, cmd: name, ms, ok }));
+            let ok = out.as_ref().is_ok_and(|o| o.status.success());
+            let slow = match &out {
+                Ok(o) if ms > 100.0 && name == "list --json" => Some(unanswered(&o.stdout)),
+                _ => None,
+            };
+            sh.with_mon(|m| m.latency.push(Latency { t, cmd: name, ms, ok, slow }));
         }
         i += 1;
         std::thread::sleep(Duration::from_millis(500));
@@ -75,8 +96,6 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
     let home_entry = format!("WARDEN_HOME={}", fleet.home.display());
     let me = std::process::id();
     let bin = fleet.bin.display().to_string();
-    // (pid, start) -> ours? (environ is read once per process)
-    let mut ours_cache: HashMap<(u32, u64), bool> = HashMap::new();
     // (pid, start) -> (first seen, scans seen) for zombies and orphans.
     let mut zombies: HashMap<(u32, u64), (f64, u32)> = HashMap::new();
     let mut orphans: HashMap<(u32, u64), f64> = HashMap::new();
@@ -84,20 +103,19 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
     let mut last_sample = Instant::now() - Duration::from_secs(60);
     while !sh.stopped() {
         let t = sh.now();
-        let stats: Vec<procfs::Stat> = procfs::pids().into_iter().filter_map(procfs::stat).collect();
+        let stats: Vec<procfs::Stat> = procfs::all_stats();
         let by_pid: HashMap<u32, &procfs::Stat> = stats.iter().map(|s| (s.pid, s)).collect();
+        // The run's processes: WARDEN_HOME in their environment.
+        let mine: Vec<u32> = procfs::ours(&home_entry, me);
+        let argvs = procfs::cmdlines(&mine);
         let mut role_of: HashMap<u32, (Role, String)> = HashMap::new();
         let mut ours: Vec<&procfs::Stat> = Vec::new();
         for s in &stats {
-            if s.pid == me || s.state == 'Z' {
-                continue;
-            }
-            let mine = *ours_cache.entry((s.pid, s.start)).or_insert_with(|| procfs::environ_has(s.pid, &home_entry));
-            if !mine {
+            if s.pid == me || s.state == 'Z' || !mine.contains(&s.pid) {
                 continue;
             }
             ours.push(s);
-            let argv = procfs::cmdline(s.pid);
+            let argv = argvs.get(&s.pid).cloned().unwrap_or_default();
             let role = if argv.first().is_some_and(|a| *a == bin) {
                 match argv.get(1).map(String::as_str) {
                     Some("start" | "run") if argv.iter().any(|a| a == "-c") => {
@@ -197,7 +215,6 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
             }
             sh.with_mon(|m| m.procs.extend(batch));
         }
-        ours_cache.retain(|k, _| by_pid.get(&k.0).is_some_and(|s| s.start == k.1));
         std::thread::sleep(Duration::from_secs(2));
     }
 }

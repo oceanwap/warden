@@ -5,6 +5,12 @@
 //   /flood?mb=N  writes N MB of log lines to stdout in the background, in
 //                64 KB slices so the event loop (and its heartbeat) keeps running
 //   /throw       an uncaught error (in worker mode: that Worker dies)
+//   /grow?mb=N&pid=P
+//                the worker whose pid is P (any worker without pid=) allocates
+//                N MB and keeps it, 8 MB at a time with the event loop running
+//                in between: over `[limits] max_memory` Warden recycles it,
+//                over a cgroup's memory limit the kernel's OOM killer kills it.
+//                Answers "growing <who>" at once, or "not <who>" from another worker.
 // CHAOS_CRASH_FILE=<path>: exit 1 at start while that file exists (a crash
 // loop on demand: the harness creates the file, kills the worker, removes it).
 import { existsSync } from "node:fs";
@@ -38,6 +44,18 @@ async function flood(bytes: number) {
   }
 }
 
+// What /grow allocated: kept for the life of the process.
+const hoard: Uint8Array[] = [];
+
+async function grow(mb: number) {
+  for (let i = 0; i < Math.ceil(mb / 8); i++) {
+    // fill() touches every page, so it counts in RSS and against the cgroup.
+    hoard.push(new Uint8Array(8 * 1024 * 1024).fill(i % 255 + 1));
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  console.log(`chaos: ${who} grew by ${mb} MB`);
+}
+
 Bun.serve({
   port: Number(process.env.PORT),
   reusePort: true,
@@ -46,6 +64,12 @@ Bun.serve({
     switch (url.pathname) {
       case "/health":
         return new Response(sick ? "sick" : "ok", { status: sick ? 503 : 200 });
+      case "/grow": {
+        const pid = url.searchParams.get("pid");
+        if (pid && Number(pid) !== process.pid) return new Response(`not ${who}`);
+        grow(Number(url.searchParams.get("mb") || 100));
+        return new Response(`growing ${who}`);
+      }
       case "/flood":
         flood(Number(url.searchParams.get("mb") || 10) * 1024 * 1024);
         break;

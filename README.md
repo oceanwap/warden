@@ -414,9 +414,10 @@ cache. With `access_log = true` each line ends in `cache=hit` or
 - Logs go to stdout in journald format (timestamps dropped, priority prefixes
   added). Use `journalctl -u warden@api`.
 - Metrics: set `[metrics] listen = "127.0.0.1:9464"` to get Prometheus text at `/metrics`.
-- `sudo warden startup` installs the unit (with this binary's path), the
-  sysctl file and [`contrib/wardend.service`](contrib/wardend.service) for
-  you: see the next section.
+- `sudo warden startup` installs the unit (with this binary's path, running
+  as root like `sudo warden start`), the sysctl file and
+  [`contrib/wardend.service`](contrib/wardend.service) for you: see the next
+  section.
 
 ## Surviving reboots and crashes
 
@@ -435,6 +436,11 @@ crash, with the service manager the host has:
   warden@api`), and wardend never starts apps there: it would start them
   twice. `wardend.service` adds `warden events` and restarts supervisors
   that `warden start` launched outside a unit.
+- The apps come back as the user that ran them: system units run as root,
+  like the `sudo warden start` that started the apps (with root's saved
+  worker counts and runtime directory, so `warden list` and wardend find
+  them). For another user, `systemctl edit warden@<app>` and set `User=`
+  and `Group=`; the app's files must then be theirs.
 - The unit reads `<config dir>/<app>.toml` (`/etc/warden` for root,
   `~/.config/warden` for a user); `startup` says how to link a config that
   lives elsewhere.
@@ -445,8 +451,14 @@ crash, with the service manager the host has:
   in and stop when you log out.
 - macOS LaunchAgents start at login to the desktop. On a Mac you only reach
   over SSH, use `sudo warden startup` (a LaunchDaemon).
-- `warden unstartup` removes all of it; running apps keep running. `warden
-  kill` stops wardend's unit or job too, so it stays down until the next boot.
+- `warden unstartup` removes all of it; running apps keep running. Under
+  systemd, `warden@.service` stays while apps still run under it (a running
+  unit whose file is removed is left half configured), disabled: `warden
+  kill`, then `warden unstartup` again removes it. `warden kill` stops
+  wardend's unit or job too, so it stays down until the next boot.
+- CI checks all of this against real systemd (system and user units, a
+  restart of the user manager) and launchd (LaunchAgent, LaunchDaemon):
+  `.github/workflows/service-managers.yml`.
 - In a container, run `warden daemon --resurrect` under an init
   (`docker run --init`, tini) that reaps orphaned processes.
 - `--resurrect` runs once per boot: when launchd restarts a crashed wardend,
@@ -545,7 +557,10 @@ What each suite does, what each number means and the fairness rules are in
 [`bench/README.md`](bench/README.md); findings, caveats and the before/after
 log of every optimisation are in [`docs/benchmarks.md`](docs/benchmarks.md).
 The machine is small (2 CPUs shared with the load generator), so compare
-columns, not absolute numbers.
+columns, not absolute numbers. The same suites also run on GitHub's hosted
+x86_64 and ARM64 runners (`.github/workflows/bench.yml`: push to the
+`bench` branch or run it by hand), each suite's table an annotation on the
+run.
 
 In short (this run, against PM2 6.0.14):
 
@@ -772,6 +787,11 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
   - `SO_REUSEPORT` does not load-balance on macOS: several workers can
     share the port, but connections are not spread across them. Use
     `[workers] count = 1` locally.
+  - Node has no `reusePort` on macOS at all (libuv offers it only where the
+    kernel balances), so only one Node worker can listen on the port, and a
+    reload, which starts the new worker next to the old one, fails: use
+    `warden restart --hard`, or `port_strategy = "offset"`. Warden says so
+    at start. Bun apps share the port as on Linux.
   - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
   - `warden serve` checks static paths with realpath instead of `openat2`
     (same confinement, slower).

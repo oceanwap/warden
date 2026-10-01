@@ -35,7 +35,12 @@ commit, a failure undoes the version edit, so the tree is as it was.
    owner and repo from `git remote get-url origin`) must show a passed run
    of the `CI` workflow. Still running: it stops, or waits with
    `--wait-ci`. This comes before the slow local checks, so a red CI stops
-   the release early.
+   the release early. Two more workflows are worth a look before a
+   release, though they do not gate it: **Service managers** (every push:
+   `warden startup`/`unstartup` on real systemd and launchd) and **Chaos**
+   (pushes to `main` and daily: a 3-minute `cargo xtask chaos --release`
+   with a fixed seed, Linux and macOS); their results are annotations on
+   the run.
 3. **Version.** If it differs, `[package] version` is set in `Cargo.toml`,
    `protocol/Cargo.toml` and `gui/Cargo.toml` (released together, always the
    same version: the workflow checks both `warden --version` and

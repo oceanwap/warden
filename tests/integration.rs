@@ -4142,7 +4142,8 @@ fn start_fails_fast_when_every_worker_crashes() {
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to
 /// `calls.log` and succeed, except for the (program, argument text, exit
-/// code, error line) cases in `fail`.
+/// code, error line) cases in `fail`. With exit code 0 the line is the
+/// command's output instead.
 struct Fakes {
     home: PathBuf,
 }
@@ -4160,7 +4161,8 @@ impl Fakes {
             let mut s = format!("#!/bin/sh\necho \"{prog} $*\" >> '{}'\ncase \"$*\" in\n", log.display());
             for (p, pat, code, err) in fail {
                 if *p == prog {
-                    s += &format!("  *'{pat}'*) echo '{err}' >&2; exit {code};;\n");
+                    let to = if *code == 0 { "" } else { " >&2" };
+                    s += &format!("  *'{pat}'*) echo '{err}'{to}; exit {code};;\n");
                 }
             }
             s += "esac\nexit 0\n";
@@ -4231,7 +4233,10 @@ fn startup_installs_system_units_and_wardend() {
     let unit = fakes.read("units/warden@.service");
     let config = format!("\"{}/%i.toml\"", f.home.display());
     assert!(unit.contains(&format!("ExecStart=\"{BIN}\" start --config {config}")), "{unit}");
-    assert!(unit.contains("User=www-data") && unit.contains("WantedBy=multi-user.target"), "{unit}");
+    // Root, as the apps ran; the runtime directory the CLI looks in, whatever User= a drop-in sets.
+    assert!(!unit.lines().any(|l| l.starts_with("User=")) && unit.contains("WantedBy=multi-user.target"), "{unit}");
+    let runtime = format!("Environment=\"WARDEN_RUNTIME_DIR={}\"", f.home.join("run").display());
+    assert!(unit.contains(&runtime), "{unit}");
     let wardend = fakes.read("units/wardend.service");
     assert!(wardend.contains(&format!("ExecStart=\"{BIN}\" daemon\n")), "no --resurrect under systemd:\n{wardend}");
     assert!(wardend.contains("KillMode=process") && wardend.contains("Restart=always"), "{wardend}");
@@ -4256,16 +4261,36 @@ fn startup_installs_system_units_and_wardend() {
     assert!(calls.contains("enable warden@api.service") && !calls.contains("warden@web"), "{calls}");
     std::fs::remove_file(f.home.join("state/dump.json")).unwrap();
 
-    // unstartup: the units disabled and removed; the apps are left alone.
+    // unstartup while an app still runs under its unit: disabled, but the
+    // template stays (a running unit whose file is reloaded away is left half
+    // configured: systemd killed it as hung every WatchdogSec on Ubuntu 24.04).
+    let running = ("systemctl", "list-units", 0, "warden@api.service loaded active running Warden: api");
+    let fakes = Fakes::new(&f, &[running]);
     let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
     assert_eq!(code, 0, "{out}");
     let calls = fakes.take();
-    for c in
-        ["systemctl disable warden@api.service", "systemctl disable --now wardend.service", "systemctl daemon-reload"]
-    {
+    for c in ["systemctl disable warden@api.service", "systemctl disable --now wardend.service"] {
         assert!(calls.lines().any(|l| l == c), "{c:?} in:\n{calls}");
     }
+    assert!(f.home.join("units/warden@.service").exists(), "kept while api runs under it: {out}");
+    assert!(!f.home.join("units/wardend.service").exists(), "{out}");
+    assert!(out.contains("kept, because api still runs under it") && out.contains("`warden kill api`"), "{out}");
+
+    // Once nothing runs under it: everything goes, the sysctl file too.
+    let fakes = Fakes::new(&f, &[]);
+    let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    let calls = fakes.take();
+    for c in ["systemctl disable warden@api.service", "systemctl daemon-reload"] {
+        assert!(calls.lines().any(|l| l == c), "{c:?} in:\n{calls}");
+    }
+    assert!(!calls.contains("wardend"), "its unit is gone already, nothing to disable:\n{calls}");
     assert!(!f.home.join("units/warden@.service").exists() && !f.home.join("units/wardend.service").exists());
+    assert!(!f.home.join("sysctl/99-warden.conf").exists(), "{out}");
+    // Nothing left to remove: nothing to disable either, and no error.
+    let (code, out) = run_with(&f, &["unstartup", "--system"], &fakes.env());
+    assert_eq!(code, 0, "{out}");
+    assert!(!fakes.take().contains("disable"), "{out}");
 
     // A wardend already running outside systemd hands over to the unit.
     let d = Wardend::start(&f, &[]);
@@ -4408,10 +4433,17 @@ fn startup_writes_a_launchd_job() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("Domain does not support") && out.contains("sudo warden startup"), "{out}");
 
-    let fakes = Fakes::new(&f, &[]);
+    // unstartup: bootout, then wait until launchd no longer lists the job
+    // (bootout returns while wardend is still exiting).
+    let gone = ("launchctl", "print", 113, "Could not find service \"io.github.oceanwap.warden.daemon\" in domain");
+    let fakes = Fakes::new(&f, &[gone]);
     let (code, out) = run_with(&f, &["unstartup", "--user"], &fakes.launchd_env());
     assert_eq!(code, 0, "{out}");
-    assert!(fakes.take().contains(&format!("launchctl bootout gui/{uid}/io.github.oceanwap.warden.daemon")));
+    let calls = fakes.take();
+    let target = format!("gui/{uid}/io.github.oceanwap.warden.daemon");
+    assert!(calls.contains(&format!("launchctl bootout {target}")), "{calls}");
+    assert!(calls.contains(&format!("launchctl print {target}")), "waits for the job to go:\n{calls}");
+    assert!(out.contains("unloaded; wardend stopped"), "{out}");
     assert!(!f.home.join(plist).exists(), "{out}");
 }
 

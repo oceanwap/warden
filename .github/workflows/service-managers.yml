@@ -1,0 +1,103 @@
+# `warden startup` / `unstartup` against real service managers, which the
+# unit and integration tests only fake (WARDEN_SYSTEMCTL, WARDEN_LAUNCHCTL):
+#
+# - systemd: GitHub's Ubuntu runners run systemd as PID 1, with passwordless
+#   sudo. System units as root, then user units with lingering (the runner
+#   user), including a restart of the user manager, the closest to a reboot
+#   a runner allows.
+# - launchd: GitHub's macOS runners. A LaunchAgent (the runner user), then a
+#   LaunchDaemon (sudo).
+#
+# What each step checks is at the top of its script in
+# .github/service-managers/. Job logs need a login to read, so every failed
+# check is also an error annotation (the command, its output, the unit or job
+# state and the logs), and each step ends with a notice counting what passed.
+name: Service managers
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: service-managers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+  BUN_VERSION: "1.3.13"
+
+jobs:
+  systemd:
+    name: systemd (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Build warden (release)
+        run: cargo build --release --bin warden
+      # As a package or install.sh would: warden and bun where root's
+      # secure_path (sudo) and systemd's default PATH find them.
+      - name: Install warden and bun into /usr/local/bin
+        run: |
+          sudo install -m 755 target/release/warden /usr/local/bin/warden
+          sudo install -m 755 "$(command -v bun)" /usr/local/bin/bun
+          echo "PID 1: $(ps -p 1 -o comm=); $(systemctl --version | head -1); $(warden --version); bun $(bun --version)"
+          test "$(ps -p 1 -o comm=)" = systemd
+      - name: "systemd: root, system units"
+        run: bash .github/service-managers/linux.sh system
+      # The script ends with unstartup and kill; this only matters when it
+      # did not get there (a root wardend.service would confuse the next step).
+      - name: Clean up after root
+        if: ${{ !cancelled() }}
+        run: |
+          sudo warden unstartup --system || true
+          sudo warden kill --yes || true
+      - name: "systemd: user units, lingering"
+        if: ${{ !cancelled() }}
+        run: bash .github/service-managers/linux.sh user
+
+  launchd:
+    name: launchd (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      # Node 22.12+ has reusePort on Linux only; the Node app checks that the
+      # shim lets it listen on macOS anyway.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - name: Build warden (release)
+        run: cargo build --release --bin warden
+      - name: Install warden and bun into /usr/local/bin
+        run: |
+          sudo mkdir -p /usr/local/bin
+          sudo install -m 755 target/release/warden /usr/local/bin/warden
+          sudo install -m 755 "$(command -v bun)" /usr/local/bin/bun
+          echo "$(sw_vers -productName) $(sw_vers -productVersion), $(warden --version), bun $(bun --version)"
+      - name: "launchd: LaunchAgent (user)"
+        run: bash .github/service-managers/macos.sh agent
+      - name: Clean up after the LaunchAgent
+        if: ${{ !cancelled() }}
+        run: |
+          warden unstartup || true
+          warden kill --yes || true
+      - name: "launchd: LaunchDaemon (root)"
+        if: ${{ !cancelled() }}
+        run: bash .github/service-managers/macos.sh daemon

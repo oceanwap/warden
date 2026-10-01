@@ -38,6 +38,31 @@ the README.
   sets). Without it, a rolling restart can reset connections that were queued
   on a closing listener, under every manager.
 
+## In CI: x86_64 and ARM64
+
+`.github/workflows/bench.yml` runs `cargo xtask bench --no-readme` on
+GitHub's hosted runners, `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`
+(ARM64): 4 vCPUs for public repositories, 2 otherwise (the first run, on
+2026-10-01, got 2 vCPUs and 8 GB on both, a Xeon 6973P-C and an ARM64
+part); the job's first annotation says what it got. Everything above is
+installed (oha from its release binaries, nginx and wrk from apt, the npm
+packages with `npm ci`), and `net.ipv4.tcp_migrate_req = 1`. Push to the
+`bench` branch, or "Run workflow" (Actions → Benchmarks) with:
+
+- `only`, `quick`, `duration`: as the options below;
+- `app_cpus`, `loadgen_cpus` (taskset lists, e.g. `0-1` and `2-3`) and
+  `loadgen` (`oha` or `wrk`): passed to the suites as `BENCH_APP_CPUS`,
+  `BENCH_LOADGEN_CPUS` and `BENCH_LOADGEN` (`bench/lib.ts`), only when set.
+  Without them nothing is pinned, and the load generator shares the 4 CPUs
+  with the apps.
+
+Each job writes `bench/results/latest.md` to its summary, uploads it with
+the raw JSON as the artifact `bench-<arch>`, and emits one notice
+annotation per suite (the machine first), which the public API serves
+without a login:
+`GET /repos/<owner>/<repo>/check-runs/<job id>/annotations`. README.md is
+not changed by these runs.
+
 ## Suites
 
 Each script runs on its own too, prints a Markdown table on stdout and writes

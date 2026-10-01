@@ -99,10 +99,12 @@ fn unit_quote(s: &str) -> String {
 }
 
 /// A unit from one of the annotated templates in contrib/: its header
-/// replaced by `header`, the lines `rewrite` returns replaced, and for the
-/// user's manager everything that only works for the system's dropped
-/// (`User=`, `Group=`, raising `LimitNOFILE=`, network-online.target, the
-/// comments written for root).
+/// replaced by `header`, the lines `rewrite` returns replaced, `User=` and
+/// `Group=` dropped (the apps come back as the user that ran them: root
+/// for system units, which `sudo warden start` started as root), and for
+/// the user's manager everything that only works for the system's dropped
+/// too (raising `LimitNOFILE=`, network-online.target, the comments
+/// written for root).
 fn render(
     template: &str,
     scope: Scope,
@@ -118,11 +120,11 @@ fn render(
             continue;
         }
         let key = line.split_once('=').map(|(k, _)| k.trim());
+        if matches!(key, Some("User" | "Group")) {
+            continue;
+        }
         if scope == Scope::User {
-            if line.starts_with('#')
-                || matches!(key, Some("User" | "Group" | "LimitNOFILE"))
-                || line.contains("network-online.target")
-            {
+            if line.starts_with('#') || key == Some("LimitNOFILE") || line.contains("network-online.target") {
                 continue;
             }
             if key == Some("WantedBy") {
@@ -155,8 +157,15 @@ fn scope_word(scope: Scope) -> &'static str {
 /// `warden@.service`: one instance per app, reading `<config dir>/<app>.toml`.
 pub(crate) fn warden_unit(scope: Scope, exe: &str, config_dir: &Path, env: &[(String, String)]) -> String {
     let config = format!("\"{}/%i.toml\"", unit_escape(&config_dir.display().to_string()));
+    let user = match scope {
+        Scope::System => {
+            "\n# Runs as root, like the `sudo warden start` that started the apps. For another user:\n\
+             # `systemctl edit warden@<app>` with User= and Group= (the app's files must be theirs)."
+        }
+        Scope::User => "",
+    };
     let header = format!(
-        "# Written by `warden startup` ({} units): one instance per app, reading {}/<app>.toml.\n\
+        "# Written by `warden startup` ({} units): one instance per app, reading {}/<app>.toml.{user}\n\
          # `warden unstartup` removes it; contrib/warden@.service has the annotated original.",
         scope_word(scope),
         config_dir.display()
@@ -398,7 +407,14 @@ async fn systemd_startup(args: &Args, scope: Scope) -> i32 {
         Err(code) => return code,
     };
     let dir = scope.unit_dir();
-    let env = carried_env(env_now, scope == Scope::User);
+    let mut env = carried_env(env_now, scope == Scope::User);
+    if scope == Scope::System && !env.iter().any(|(k, _)| k == "WARDEN_RUNTIME_DIR") {
+        // Where root's CLI and wardend look for the apps' sockets, and where
+        // RuntimeDirectory=warden/%i puts each app's directory, also when a
+        // drop-in runs the unit as another user (whose own default would be
+        // /tmp/warden-<uid>, where nobody looks).
+        env.push(("WARDEN_RUNTIME_DIR".into(), warden_protocol::paths::ROOT_RUNTIME_DIR.into()));
+    }
     let units = [
         ("warden@.service", warden_unit(scope, &exe, &fleet::config_dir(), &env)),
         ("wardend.service", wardend_unit(scope, &exe, &env)),
@@ -541,29 +557,71 @@ fn linger() -> i32 {
     }
 }
 
+/// The `warden@<app>` instances this manager runs (or is starting or stopping).
+fn running_instances(scope: Scope) -> Vec<String> {
+    let args = ["list-units", "--plain", "--no-legend", "--state=active,activating,deactivating,reloading"];
+    let out = fleet::systemctl_output(scope, &[&args[..], &["warden@*.service"]].concat()).unwrap_or_default();
+    let mut v: Vec<String> = out
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|u| u.starts_with("warden@") && u.ends_with(".service"))
+        .map(String::from)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 fn systemd_unstartup(args: &Args, scope: Scope) -> i32 {
     let ctx = fleet::context(args);
     let mut worst = 0;
-    for app in &ctx.apps {
-        let unit = format!("warden@{}.service", app.name);
-        match fleet::run_systemctl(scope, &["disable", &unit]) {
-            Ok(()) => println!("{}: {unit} disabled (still running until stopped)", app.name),
+    let dir = scope.unit_dir();
+    let template = dir.join("warden@.service");
+    if template.exists() {
+        for app in &ctx.apps {
+            let unit = format!("warden@{}.service", app.name);
+            match fleet::run_systemctl(scope, &["disable", &unit]) {
+                Ok(()) => println!("{}: {unit} disabled (still running until stopped)", app.name),
+                Err(e) => {
+                    eprintln!("warden: {}: {e}", app.name);
+                    worst = 1;
+                }
+            }
+        }
+    }
+    if dir.join("wardend.service").exists() {
+        match fleet::run_systemctl(scope, &["disable", "--now", "wardend.service"]) {
+            Ok(()) => println!("wardend.service: disabled and stopped (every app keeps running)"),
             Err(e) => {
-                eprintln!("warden: {}: {e}", app.name);
+                eprintln!("warden: {e}");
                 worst = 1;
             }
         }
     }
-    match fleet::run_systemctl(scope, &["disable", "--now", "wardend.service"]) {
-        Ok(()) => println!("wardend.service: disabled and stopped (every app keeps running)"),
-        Err(e) => {
-            eprintln!("warden: {e}");
-            worst = 1;
-        }
+    worst = worst.max(remove(&dir.join("wardend.service")));
+    // A running unit whose file is deleted and reloaded away is left half
+    // configured: on Ubuntu 24.04 (systemd 255) systemd then killed such a
+    // supervisor as hung every WatchdogSec and restarted it (CI,
+    // service-managers.yml). So the template stays until no app runs under it.
+    let running = running_instances(scope);
+    if running.is_empty() {
+        worst = worst.max(remove(&template));
+    } else if template.exists() {
+        let apps: Vec<&str> =
+            running.iter().filter_map(|u| u.strip_prefix("warden@")?.strip_suffix(".service")).collect();
+        let (verb, target) = if apps.len() == 1 { ("runs", apps[0]) } else { ("run", "all") };
+        println!(
+            "{}: kept, because {} still {verb} under it (disabled: nothing starts at boot). `warden kill {target}` \
+             stops them; `warden unstartup` again then removes it",
+            template.display(),
+            apps.join(", "),
+        );
     }
-    let dir = scope.unit_dir();
-    for file in ["warden@.service", "wardend.service"] {
-        worst = worst.max(remove(&dir.join(file)));
+    if scope == Scope::System {
+        let sysctl = sysctl_dir().join("99-warden.conf");
+        if sysctl.exists() && remove(&sysctl) == 0 {
+            println!("  (net.ipv4.tcp_migrate_req keeps its value until the next boot)");
+        }
     }
     let _ = fleet::run_systemctl(scope, &["daemon-reload"]);
     if scope == Scope::User {
@@ -660,15 +718,40 @@ async fn launchd_startup(system: bool) -> i32 {
     0
 }
 
+/// How long `unstartup` waits for launchd to let go of the job: wardend
+/// takes ~0.2 s to exit on SIGTERM, launchd SIGKILLs it after its exit
+/// timeout (5 s).
+const BOOTOUT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn launchd_unstartup(system: bool) -> i32 {
     let target = format!("{}/{LAUNCHD_LABEL}", launchd_domain(system));
     let path = plist_path(system);
-    match run(&launchctl(), &["bootout", &target]) {
-        Ok(()) => println!("{target}: unloaded; wardend stopped, every app keeps running (`warden kill` stops them)"),
+    let lc = launchctl();
+    let mut worst = 0;
+    match run(&lc, &["bootout", &target]) {
+        // `bootout` returns once launchd has sent SIGTERM: the job is still
+        // listed ("state = SIGTERMed") and wardend still answers until it
+        // has exited. Say it stopped only when it has.
+        Ok(()) => {
+            let t0 = std::time::Instant::now();
+            while run(&lc, &["print", &target]).is_ok() && t0.elapsed() < BOOTOUT_WAIT {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if run(&lc, &["print", &target]).is_ok() {
+                eprintln!(
+                    "warden: {target}: unloaded, but launchd still lists it {} s later (wardend has not exited).\n  \
+                     `launchctl print {target}` shows its state; `sudo kill -9` the pid it names if it stays",
+                    BOOTOUT_WAIT.as_secs()
+                );
+                worst = 1;
+            } else {
+                println!("{target}: unloaded; wardend stopped, every app keeps running (`warden kill` stops them)");
+            }
+        }
         Err(e) if path.exists() => println!("{target}: was not loaded ({e})"),
         Err(_) => {}
     }
-    remove(&path)
+    worst.max(remove(&path))
 }
 
 #[cfg(test)]
@@ -691,9 +774,14 @@ mod tests {
         assert!(l[0].starts_with("# Written by `warden startup` (system units)"), "{u}");
         assert!(l.contains(&r#"ExecStart="/opt/warden/bin/warden" start --config "/etc/warden/%i.toml""#), "{u}");
         assert!(l.contains(&r#"ExecReload="/opt/warden/bin/warden" safe-reload --config "/etc/warden/%i.toml""#));
-        for kept in ["User=www-data", "LimitNOFILE=65536", "WantedBy=multi-user.target", "RuntimeDirectory=warden/%i"] {
+        for kept in ["LimitNOFILE=65536", "WantedBy=multi-user.target", "RuntimeDirectory=warden/%i", "KillMode=mixed"]
+        {
             assert!(l.contains(&kept), "{kept} kept for system units:\n{u}");
         }
+        // As root, like `sudo warden start` ran the apps (www-data would come
+        // back with other files, another state dir, another runtime dir).
+        assert!(!l.iter().any(|x| x.starts_with("User=") || x.starts_with("Group=")), "{u}");
+        assert!(u.contains("# Runs as root") && u.contains("systemctl edit warden@<app>"), "{u}");
         assert!(!u.contains("/usr/local/bin/warden") && !u.contains("cp contrib"), "{u}");
         assert!(!u.contains("Environment="), "no environment for system units without overrides");
         let d = wardend_unit(Scope::System, "/opt/warden/bin/warden", &[]);

@@ -52,6 +52,12 @@ let workerId = Number(env.WARDEN_WORKER_ID || 0);
 const ipcFd = env.WARDEN_IPC_FD ? Number(env.WARDEN_IPC_FD) : null;
 const drainMs = Number(env.WARDEN_DRAIN_MS ?? 500);
 const forceReusePort = env.WARDEN_REUSE_PORT === "1";
+// Node's `reusePort` (libuv's UV_TCP_REUSEPORT) exists only where the kernel
+// spreads connections across the listeners: Linux, FreeBSD 12+, DragonFly,
+// Solaris 11.4, AIX 7.3. Elsewhere (macOS) listen() fails with ENOTSUP, so
+// a Node app could not listen at all; there it listens as it asked (one
+// worker per port: README, Platforms). Bun sets SO_REUSEPORT on macOS too.
+const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos", "aix"].includes(process.platform);
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);
@@ -385,7 +391,7 @@ if (!isBun) {
     if (this !== privateServer) {
       trackNodeServer(this);
       if (standby && !promoted && deferNodeListen(this, args)) return this;
-      if (forceReusePort) args = withReusePort(args);
+      if (nodeReusePort) args = withReusePort(args);
     }
     return origListen.apply(this, args);
   };
@@ -622,7 +628,7 @@ function warmNodeListen(args) {
     const net = require("node:net");
     const w = new net.Server();
     w.on("error", () => {});
-    nodeOrigListen.call(w, { port: 0, host, reusePort: forceReusePort }, () => w.close());
+    nodeOrigListen.call(w, { port: 0, host, reusePort: nodeReusePort }, () => w.close());
     w.unref();
   } catch {}
 }

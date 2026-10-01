@@ -32,7 +32,12 @@ pub const KINDS: &[&str] = &[
     "log-flood",
     "disk-full",
     "crash-loop",
+    "oom-kill",
+    "memory-recycle",
 ];
+
+/// What the kernel's OOM killer is reported as (`warden_protocol::events::OOM_KILLED`).
+pub const OOM_KILLED: &str = "killed by the kernel OOM killer (out of memory)";
 
 /// What a fault lets clients of its app see without it being a violation.
 #[derive(Debug, Clone, Default)]
@@ -106,6 +111,8 @@ pub fn run(kind: &'static str, n: usize, cx: &mut Ctx) -> Fault {
         "log-flood" => log_flood(cx, &mut f),
         "disk-full" => disk_full(cx, &mut f),
         "crash-loop" => crash_loop(cx, &mut f),
+        "oom-kill" => oom_kill(cx, &mut f),
+        "memory-recycle" => memory_recycle(cx, &mut f),
         _ => f.skipped = Some(format!("unknown fault {kind}")),
     }
     if f.end == 0.0 {
@@ -240,7 +247,9 @@ fn kill_standby(cx: &mut Ctx, f: &mut Fault) {
 
 fn kill_supervisor(cx: &mut Ctx, f: &mut Fault) {
     let apps = cx.fleet.apps.clone();
-    let Some(spec) = pick(cx, &apps, |_| true) else { return };
+    // Not the `oom` app: wardend restarts a supervisor in its own cgroup, so
+    // the app would leave the memory cgroup the oom-kill fault needs.
+    let Some(spec) = pick(cx, &apps, |a| !a.oom) else { return };
     f.app = Some(spec.name.into());
     let Some(st) = status(cx, spec.name) else { return };
     let Some(pid) = pid_of(&st) else { return };
@@ -756,4 +765,170 @@ fn crash_loop(cx: &mut Ctx, f: &mut Fault) {
         f.problems.push(format!("warden reset {app}: {}", r.brief()));
     }
     recover(cx, f, Instant::now());
+}
+
+// --------------------------------------------------------------- memory
+
+/// `GET /grow?mb=MB&pid=PID` on new connections until one reaches that
+/// worker (the kernel picks which worker accepts): its answer.
+fn grow_on(port: u16, pid: u32, mb: u64) -> Option<String> {
+    for _ in 0..100 {
+        if let Some(body) = get(port, &format!("/grow?mb={mb}&pid={pid}"))
+            && body.starts_with("growing")
+        {
+            return Some(body.trim().to_string());
+        }
+        sleep_s(0.02);
+    }
+    None
+}
+
+/// wardend's alerts of `kind` delivered so far (the run's alert rule
+/// appends each one to alerts.jsonl).
+fn alert_count(cx: &Ctx, kind: &str) -> usize {
+    let text = std::fs::read_to_string(cx.fleet.home.join("alerts.jsonl")).unwrap_or_default();
+    super::alert_values(&text).iter().filter(|v| v["kind"] == kind).count()
+}
+
+/// Wait up to 15 s for one more alert of `kind` than `before`.
+fn expect_alert(cx: &Ctx, f: &mut Fault, kind: &str, before: usize) {
+    let t0 = Instant::now();
+    while alert_count(cx, kind) <= before {
+        if t0.elapsed() > Duration::from_secs(15) {
+            f.problems.push(format!("wardend delivered no `{kind}` alert within 15 s"));
+            return;
+        }
+        sleep_s(0.2);
+    }
+}
+
+/// Warden's own log lines (`state/logs/<app>.log`) that contain all of `needles`.
+fn log_lines_with(cx: &Ctx, app: &str, needles: &[&str]) -> Vec<String> {
+    let text = std::fs::read_to_string(cx.fleet.home.join(format!("state/logs/{app}.log"))).unwrap_or_default();
+    text.lines().filter(|l| !l.contains(" OUT ") && needles.iter().all(|n| l.contains(n))).map(String::from).collect()
+}
+
+fn worker_row(st: &Value, id: u64) -> Option<Value> {
+    st["workers"].as_array()?.iter().find(|w| w["id"].as_u64() == Some(id)).cloned()
+}
+
+/// A worker of the app in the memory cgroup outgrows it: the kernel's OOM
+/// killer kills it. Warden must restart it and say why everywhere an
+/// operator looks: `last_exit`, the log line (with its hint), wardend's
+/// `oom` alert.
+fn oom_kill(cx: &mut Ctx, f: &mut Fault) {
+    let apps = cx.fleet.apps.clone();
+    let Some(spec) = pick(cx, &apps, |a| a.oom) else {
+        f.skipped = Some("no app runs in a memory cgroup (the start of the run says why)".into());
+        return;
+    };
+    let app = spec.name;
+    f.app = Some(app.into());
+    let limit = cx.fleet.cgroup.as_ref().map(|c| c.limit_mb).unwrap_or(0);
+    let Some(st) = status(cx, app) else {
+        f.skipped = Some(format!("{app} is not answering"));
+        return;
+    };
+    let Some((id, pid)) = running_worker(cx, &st) else {
+        f.skipped = Some(format!("{app} has no running worker"));
+        return;
+    };
+    let Some(start) = start_of(pid) else { return };
+    f.allow.killed = true;
+    let grow = 2 * limit;
+    f.detail = format!("worker {id} pid {pid} allocates {grow} MB in a {limit} MB memory cgroup");
+    let alerts = alert_count(cx, "oom");
+    cx.sh.doom_pid(pid);
+    if grow_on(spec.port, pid, grow).is_none() {
+        f.problems.push(format!("no request reached worker {id} pid {pid} to make it grow"));
+        recover(cx, f, Instant::now());
+        return;
+    }
+    let t0 = Instant::now();
+    while procfs::same(pid, start) && t0.elapsed() < Duration::from_secs(60) {
+        sleep_s(0.05);
+    }
+    if procfs::same(pid, start) {
+        f.problems
+            .push(format!("pid {pid} still runs 60 s after it began to outgrow the {limit} MB cgroup: no OOM kill"));
+        kill9(cx, pid);
+    } else {
+        f.detail += &format!("; killed {:.1}s later", t0.elapsed().as_secs_f64());
+    }
+    recover(cx, f, Instant::now());
+    let last = status(cx, app).and_then(|st| worker_row(&st, id)).map(|w| w["last_exit"].clone());
+    if last.as_ref().and_then(Value::as_str) != Some(OOM_KILLED) {
+        f.problems.push(format!(
+            "worker {id} (pid {pid}) was OOM-killed, but its last_exit is {}, not {OOM_KILLED:?}",
+            last.map(|v| v.to_string()).unwrap_or_else(|| "missing".into())
+        ));
+    }
+    let pid_kv = format!("pid={pid} ");
+    let lines = log_lines_with(cx, app, &["worker crashed", &pid_kv]);
+    match lines.first() {
+        None => f.problems.push(format!("no `worker crashed` line for pid {pid} in {app}'s log")),
+        Some(l) if !l.contains(OOM_KILLED) || !l.contains(" hint=") => {
+            f.problems.push(format!("the log line of pid {pid}'s death does not name the OOM killer with a hint: {l}"))
+        }
+        Some(_) => {}
+    }
+    expect_alert(cx, f, "oom", alerts);
+}
+
+/// A worker of the app with `[limits] max_memory` grows over it: Warden
+/// must replace it gracefully (the new worker ready first, the old one
+/// drained), with no request lost, and say why.
+fn memory_recycle(cx: &mut Ctx, f: &mut Fault) {
+    use super::fleet::{MEMHOG_GROW_MB, MEMHOG_LIMIT_MB};
+    let apps = cx.fleet.apps.clone();
+    let Some(spec) = pick(cx, &apps, |a| a.max_memory > 0) else {
+        f.skipped = Some("no app with [limits] max_memory (Warden reads workers' RSS from /proc: Linux)".into());
+        return;
+    };
+    let app = spec.name;
+    f.app = Some(app.into());
+    // A graceful replacement: only what any planned stop may cost.
+    f.allow.planned = true;
+    let Some(st) = status(cx, app) else {
+        f.skipped = Some(format!("{app} is not answering"));
+        return;
+    };
+    let Some((id, pid)) = running_worker(cx, &st) else {
+        f.skipped = Some(format!("{app} has no running worker"));
+        return;
+    };
+    let crashes = worker_row(&st, id).and_then(|w| w["crashes"].as_u64()).unwrap_or(0);
+    let Some(start) = start_of(pid) else { return };
+    f.detail = format!("worker {id} pid {pid} grows by {MEMHOG_GROW_MB} MB, over max_memory = {MEMHOG_LIMIT_MB} MB");
+    let alerts = alert_count(cx, "recycled");
+    if grow_on(spec.port, pid, MEMHOG_GROW_MB).is_none() {
+        f.problems.push(format!("no request reached worker {id} pid {pid} to make it grow"));
+        recover(cx, f, Instant::now());
+        return;
+    }
+    // RSS is sampled every 5 s; three samples over the limit in a row start
+    // the replacement, then the old worker drains.
+    let t0 = Instant::now();
+    while procfs::same(pid, start) && t0.elapsed() < Duration::from_secs(60) {
+        sleep_s(0.2);
+    }
+    if procfs::same(pid, start) {
+        f.problems.push(format!("pid {pid} is over max_memory but was not replaced within 60 s"));
+        cx.sh.doom_pid(pid);
+        kill9(cx, pid);
+    } else {
+        f.detail += &format!("; replaced {:.1}s later", t0.elapsed().as_secs_f64());
+    }
+    recover(cx, f, Instant::now());
+    if let Some(w) = status(cx, app).and_then(|st| worker_row(&st, id))
+        && w["crashes"].as_u64().unwrap_or(0) != crashes
+    {
+        f.problems.push(format!("worker {id}'s replacement counted as a crash (last_exit {})", w["last_exit"]));
+    }
+    let worker_kv = format!("worker={id} ");
+    if log_lines_with(cx, app, &["worker scheduled for replacement", &worker_kv, "max_memory"]).is_empty() {
+        f.problems
+            .push(format!("no `worker scheduled for replacement … max_memory` line for worker {id} in {app}'s log"));
+    }
+    expect_alert(cx, f, "recycled", alerts);
 }

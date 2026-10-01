@@ -730,7 +730,8 @@ async fn logs_history(sels: &[Sel], lines: Option<usize>, query: &crate::logview
                 Ok(r) => {
                     let info = r.info.unwrap_or_default();
                     let cfg: Option<Config> = serde_json::from_value(info["config"].clone()).ok();
-                    let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(), u.to_string()));
+                    let pid = info["pid"].as_u64().map(|p| p as u32);
+                    let unit = info["unit"].as_str().map(|u| (scope_of_running_unit(pid), u.to_string()));
                     let bg = info["log_file"].as_str().map(PathBuf::from);
                     (cfg.map(|c| (c, bg)), unit)
                 }
@@ -960,6 +961,27 @@ pub(crate) fn run_systemctl(scope: Scope, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// `systemctl [--user] <args>`: its standard output, or the last line of
+/// its error output.
+pub(crate) fn systemctl_output(scope: Scope, args: &[&str]) -> Result<String, String> {
+    let Some(bin) = systemctl_bin() else { return Err("systemd is not running on this host".into()) };
+    let out = std::process::Command::new(&bin)
+        .args(scope.flag())
+        .args(args)
+        .output()
+        .map_err(|e| format!("running {} {}{}: {e}", bin.display(), scope.shown(), args.join(" ")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(format!(
+            "`systemctl {}{}` failed: {}",
+            scope.shown(),
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("no output")
+        ))
+    }
+}
+
 /// `systemctl [--user] is-active --quiet <unit>`.
 pub(crate) fn unit_active(scope: Scope, unit: &str) -> bool {
     run_systemctl(scope, &["is-active", "--quiet", unit]).is_ok()
@@ -982,10 +1004,26 @@ pub(crate) fn unit_config_path(name: &str) -> PathBuf {
     config_dir().join(format!("{name}.toml"))
 }
 
-/// Which manager runs a supervisor that reports `unit`: the user's when we
-/// are not root and user units are installed, else the system's.
-fn scope_of_running_unit() -> Scope {
+/// Which manager runs the supervisor `pid` that reports a unit: the user's
+/// when its cgroup is inside a `user@<uid>.service`, else the system's.
+/// Without its cgroup (no pid, not Linux): the user's when we are not root
+/// and user units are installed. Not from the unit files alone: `warden
+/// unstartup` removes them while the apps keep running, and a `systemctl
+/// stop` sent to the wrong manager then fails.
+fn scope_of_running_unit(pid: Option<u32>) -> Scope {
+    if let Some(cg) = pid.and_then(|p| std::fs::read_to_string(format!("/proc/{p}/cgroup")).ok()) {
+        return scope_from_cgroup(&cg);
+    }
     if !is_root() && Scope::User.has_unit("warden@.service") { Scope::User } else { Scope::System }
+}
+
+/// `/proc/<pid>/cgroup` of a process in a unit: is it the user manager's?
+fn scope_from_cgroup(cgroup: &str) -> Scope {
+    let user = cgroup
+        .lines()
+        .filter_map(|l| l.splitn(3, ':').nth(2))
+        .any(|path| path.split('/').any(|c| c.starts_with("user@") && c.ends_with(".service")));
+    if user { Scope::User } else { Scope::System }
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -1795,7 +1833,7 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
 
 /// Stop the supervisor itself (systemd unit, or a background one).
 async fn stop_supervisor(app: &App, st: Option<&Status>, disable: bool) -> Result<String, String> {
-    let running_unit = st.and_then(|s| s.unit.clone()).map(|u| (scope_of_running_unit(), u));
+    let running_unit = st.and_then(|s| s.unit.clone().map(|u| (scope_of_running_unit(Some(s.pid)), u)));
     // A supervisor that answers and runs outside systemd (started in the
     // background before `warden startup` installed a unit for it) is not
     // the unit: `systemctl stop` would succeed on the inactive unit and
@@ -2193,6 +2231,20 @@ mod tests {
         // An older supervisor: its app variables only.
         let old = serde_json::json!({"config": {"app": {"env": {"A": "b"}}}});
         assert!(render_env(&old, true).starts_with("A=b\n# also set by Warden"));
+    }
+
+    #[test]
+    fn a_running_units_manager_comes_from_its_cgroup() {
+        let user = "0::/user.slice/user-1001.slice/user@1001.service/app.slice/app-warden.slice/warden@api.service\n";
+        assert_eq!(scope_from_cgroup(user), Scope::User);
+        let system = "0::/system.slice/system-warden.slice/warden@api.service\n";
+        assert_eq!(scope_from_cgroup(system), Scope::System);
+        // cgroup v1: the name=systemd hierarchy has the same path.
+        let v1 =
+            "4:memory:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/user@1000.service/warden@api.service\n";
+        assert_eq!(scope_from_cgroup(v1), Scope::User);
+        // A login session's scope is not a user manager's unit.
+        assert_eq!(scope_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n"), Scope::System);
     }
 
     #[test]
