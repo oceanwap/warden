@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-01T07:02:15.199Z",
+    "date": "2026-10-01T13:21:57.342Z",
     "kernel": "6.18.44-fc-v50 x86_64",
     "cpus": 2,
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -8,10 +8,11 @@
     "loadgen": "oha 1.16.0",
     "app_cpus": "all",
     "loadgen_cpus": "all",
-    "tcp_migrate_req": "1",
+    "tcp_migrate_req": "0",
     "workers": 4,
     "duration_s": 10,
     "connections": 64,
+    "rounds": 1,
     "node": "v22.22.2",
     "pm2": "6.0.14",
     "serve": "14.2.6",
@@ -21,288 +22,260 @@
     {
       "name": "warden",
       "processes": 5,
-      "startup_ms": 14,
-      "idle_mb": 29.1,
+      "startup_ms": 18,
+      "idle_mb": 28.8,
       "idle_pss_mb": 8,
-      "loaded_mb": 32.2,
-      "loaded_pss_mb": 10.5,
+      "loaded_mb": 31.1,
+      "loaded_pss_mb": 10.2,
       "manager_mb": 7.9,
       "loads": {
         "/index.html": {
-          "rps": 107596,
-          "p50_ms": 0.37,
-          "p95_ms": 2,
-          "p99_ms": 3.71,
-          "mb_per_s": 153.9,
-          "ok": 1076585,
-          "errors": 0
+          "rps": 101894,
+          "p50_ms": 0.42,
+          "p95_ms": 2.1,
+          "p99_ms": 3.85,
+          "mb_per_s": 145.8,
+          "ok": 1019447,
+          "errors": 0,
+          "cpu_us": 9.01
         },
         "/assets/app.3f9a2c1b.js": {
-          "rps": 74728,
-          "p50_ms": 0.71,
-          "p95_ms": 2.45,
-          "p99_ms": 4.11,
-          "mb_per_s": 3502.6,
-          "ok": 747570,
-          "errors": 0
+          "rps": 77934,
+          "p50_ms": 0.65,
+          "p95_ms": 2.48,
+          "p99_ms": 4.22,
+          "mb_per_s": 3652.9,
+          "ok": 779978,
+          "errors": 0,
+          "cpu_us": 11.39
         },
         "/media/video.bin": {
-          "rps": 5149,
-          "p50_ms": 12.01,
-          "p95_ms": 21.54,
-          "p99_ms": 26.76,
-          "mb_per_s": 5142.7,
-          "ok": 51470,
-          "errors": 0
+          "rps": 5991,
+          "p50_ms": 10.52,
+          "p95_ms": 17.92,
+          "p99_ms": 22.93,
+          "mb_per_s": 5985.1,
+          "ok": 59934,
+          "errors": 0,
+          "cpu_us": 202.07
         },
         "/index.html (new connection each)": {
-          "rps": 35343,
-          "p50_ms": 1.77,
-          "p95_ms": 3.22,
-          "p99_ms": 4.06,
-          "mb_per_s": 50.6,
-          "ok": 353480,
-          "errors": 0
-        }
-      }
-    },
-    {
-      "name": "warden-uring",
-      "processes": 5,
-      "startup_ms": 14,
-      "idle_mb": 31.5,
-      "idle_pss_mb": 9.6,
-      "loaded_mb": 32.9,
-      "loaded_pss_mb": 11,
-      "manager_mb": 9.5,
-      "loads": {
-        "/index.html": {
-          "rps": 94307,
-          "p50_ms": 0.52,
-          "p95_ms": 1.83,
-          "p99_ms": 3.3,
-          "mb_per_s": 134.9,
-          "ok": 943422,
-          "errors": 0
-        },
-        "/assets/app.3f9a2c1b.js": {
-          "rps": 64784,
-          "p50_ms": 0.82,
-          "p95_ms": 2.64,
-          "p99_ms": 4.17,
-          "mb_per_s": 3036.5,
-          "ok": 648053,
-          "errors": 0
-        },
-        "/media/video.bin": {
-          "rps": 6623,
-          "p50_ms": 9.42,
-          "p95_ms": 16.55,
-          "p99_ms": 20.5,
-          "mb_per_s": 6616.8,
-          "ok": 66261,
-          "errors": 0
-        },
-        "/index.html (new connection each)": {
-          "rps": 33496,
-          "p50_ms": 1.86,
-          "p95_ms": 3.42,
-          "p99_ms": 4.39,
-          "mb_per_s": 47.9,
-          "ok": 335053,
-          "errors": 0
+          "rps": 32547,
+          "p50_ms": 1.89,
+          "p95_ms": 3.56,
+          "p99_ms": 4.59,
+          "mb_per_s": 46.6,
+          "ok": 325566,
+          "errors": 0,
+          "cpu_us": 22.71
         }
       }
     },
     {
       "name": "warden-nocache",
       "processes": 5,
-      "startup_ms": 12,
-      "idle_mb": 29.8,
-      "idle_pss_mb": 8.6,
-      "loaded_mb": 32.6,
-      "loaded_pss_mb": 10.8,
-      "manager_mb": 8.7,
+      "startup_ms": 11,
+      "idle_mb": 30.7,
+      "idle_pss_mb": 9.6,
+      "loaded_mb": 33,
+      "loaded_pss_mb": 11.8,
+      "manager_mb": 9.6,
       "loads": {
         "/index.html": {
-          "rps": 99393,
-          "p50_ms": 0.51,
-          "p95_ms": 1.99,
-          "p99_ms": 3.3,
-          "mb_per_s": 142.2,
-          "ok": 994267,
-          "errors": 0
+          "rps": 77774,
+          "p50_ms": 0.6,
+          "p95_ms": 2.59,
+          "p99_ms": 4.69,
+          "mb_per_s": 111.2,
+          "ok": 777991,
+          "errors": 0,
+          "cpu_us": 13.9
         },
         "/assets/app.3f9a2c1b.js": {
-          "rps": 75882,
-          "p50_ms": 0.56,
-          "p95_ms": 3.11,
-          "p99_ms": 5.91,
-          "mb_per_s": 3556.8,
-          "ok": 759198,
-          "errors": 0
+          "rps": 72546,
+          "p50_ms": 0.61,
+          "p95_ms": 3.25,
+          "p99_ms": 6.47,
+          "mb_per_s": 3400.3,
+          "ok": 725772,
+          "errors": 0,
+          "cpu_us": 14.09
         },
         "/media/video.bin": {
-          "rps": 6674,
-          "p50_ms": 9.2,
-          "p95_ms": 16.75,
-          "p99_ms": 20.97,
-          "mb_per_s": 6667.7,
-          "ok": 66724,
-          "errors": 0
+          "rps": 5839,
+          "p50_ms": 10.76,
+          "p95_ms": 18.42,
+          "p99_ms": 23.8,
+          "mb_per_s": 5834.8,
+          "ok": 58428,
+          "errors": 0,
+          "cpu_us": 208.47
         },
         "/index.html (new connection each)": {
-          "rps": 32865,
-          "p50_ms": 1.88,
-          "p95_ms": 3.5,
-          "p99_ms": 4.42,
-          "mb_per_s": 47,
-          "ok": 328735,
-          "errors": 0
+          "rps": 28227,
+          "p50_ms": 2.08,
+          "p95_ms": 4.3,
+          "p99_ms": 6.86,
+          "mb_per_s": 40.4,
+          "ok": 282341,
+          "errors": 0,
+          "cpu_us": 28.83
         }
       }
     },
     {
       "name": "nginx",
       "processes": 5,
-      "startup_ms": 11,
-      "idle_mb": 24.4,
+      "startup_ms": 14,
+      "idle_mb": 24.3,
       "idle_pss_mb": 13,
       "loaded_mb": 25.8,
       "loaded_pss_mb": 13.2,
-      "manager_mb": 6.9,
+      "manager_mb": 6.8,
       "loads": {
         "/index.html": {
-          "rps": 100780,
-          "p50_ms": 0.26,
-          "p95_ms": 2.58,
-          "p99_ms": 6.11,
-          "mb_per_s": 144.2,
-          "ok": 1008099,
-          "errors": 0
+          "rps": 93387,
+          "p50_ms": 0.4,
+          "p95_ms": 2.55,
+          "p99_ms": 5.37,
+          "mb_per_s": 133.6,
+          "ok": 934427,
+          "errors": 0,
+          "cpu_us": 11.32
         },
         "/assets/app.3f9a2c1b.js": {
-          "rps": 82569,
-          "p50_ms": 0.61,
-          "p95_ms": 2.36,
-          "p99_ms": 4.18,
-          "mb_per_s": 3870.2,
-          "ok": 825987,
-          "errors": 0
+          "rps": 76847,
+          "p50_ms": 0.68,
+          "p95_ms": 2.48,
+          "p99_ms": 4.04,
+          "mb_per_s": 3601.9,
+          "ok": 768817,
+          "errors": 0,
+          "cpu_us": 12.61
         },
         "/media/video.bin": {
-          "rps": 4940,
-          "p50_ms": 12.35,
-          "p95_ms": 21.41,
-          "p99_ms": 26.07,
-          "mb_per_s": 4933.4,
-          "ok": 49363,
-          "errors": 0
+          "rps": 4972,
+          "p50_ms": 12.3,
+          "p95_ms": 21.66,
+          "p99_ms": 26.96,
+          "mb_per_s": 4965.6,
+          "ok": 49707,
+          "errors": 0,
+          "cpu_us": 266.57
         },
         "/index.html (new connection each)": {
-          "rps": 31602,
-          "p50_ms": 1.99,
-          "p95_ms": 3.66,
-          "p99_ms": 4.66,
-          "mb_per_s": 45.2,
-          "ok": 316068,
-          "errors": 0
+          "rps": 29666,
+          "p50_ms": 2.11,
+          "p95_ms": 3.87,
+          "p99_ms": 4.96,
+          "mb_per_s": 42.4,
+          "ok": 296721,
+          "errors": 0,
+          "cpu_us": 26.97
         }
       }
     },
     {
       "name": "pm2-serve",
       "processes": 5,
-      "startup_ms": 610,
-      "idle_mb": 317.4,
-      "idle_pss_mb": 133.8,
-      "loaded_mb": 529.3,
-      "loaded_pss_mb": 341.3,
-      "manager_mb": 69.9,
+      "startup_ms": 674,
+      "idle_mb": 320.3,
+      "idle_pss_mb": 135.8,
+      "loaded_mb": 592.9,
+      "loaded_pss_mb": 403.9,
+      "manager_mb": 70.1,
       "loads": {
         "/index.html": {
-          "rps": 18294,
-          "p50_ms": 2.92,
-          "p95_ms": 6.79,
-          "p99_ms": 11.29,
-          "mb_per_s": 26.2,
-          "ok": 182963,
-          "errors": 0
+          "rps": 14414,
+          "p50_ms": 3.45,
+          "p95_ms": 10.6,
+          "p99_ms": 20.32,
+          "mb_per_s": 20.6,
+          "ok": 144177,
+          "errors": 0,
+          "cpu_us": 122.66
         },
         "/assets/app.3f9a2c1b.js": {
-          "rps": 14937,
-          "p50_ms": 3.2,
-          "p95_ms": 9.62,
-          "p99_ms": 18.29,
-          "mb_per_s": 699.9,
-          "ok": 149379,
-          "errors": 0
+          "rps": 12291,
+          "p50_ms": 3.7,
+          "p95_ms": 12.32,
+          "p99_ms": 30.34,
+          "mb_per_s": 575.9,
+          "ok": 123033,
+          "errors": 0,
+          "cpu_us": 139.41
         },
         "/media/video.bin": {
-          "rps": 2722,
-          "p50_ms": 22.11,
-          "p95_ms": 41.07,
-          "p99_ms": 77.4,
-          "mb_per_s": 2715.4,
-          "ok": 27175,
-          "errors": 0
+          "rps": 2481,
+          "p50_ms": 22.01,
+          "p95_ms": 54.63,
+          "p99_ms": 82.3,
+          "mb_per_s": 2474.4,
+          "ok": 24858,
+          "errors": 0,
+          "cpu_us": 621.35
         },
         "/index.html (new connection each)": {
-          "rps": 5060,
-          "p50_ms": 11.05,
-          "p95_ms": 23.54,
-          "p99_ms": 39.25,
-          "mb_per_s": 7.2,
-          "ok": 50558,
-          "errors": 0
+          "rps": 4511,
+          "p50_ms": 13.3,
+          "p95_ms": 23.58,
+          "p99_ms": 36.36,
+          "mb_per_s": 6.4,
+          "ok": 45052,
+          "errors": 0,
+          "cpu_us": 365.75
         }
       }
     },
     {
       "name": "serve",
       "processes": 1,
-      "startup_ms": 258,
-      "idle_mb": 95.2,
-      "idle_pss_mb": 93.1,
-      "loaded_mb": 196.5,
-      "loaded_pss_mb": 194.4,
+      "startup_ms": 377,
+      "idle_mb": 101.1,
+      "idle_pss_mb": 99,
+      "loaded_mb": 190.4,
+      "loaded_pss_mb": 188.2,
       "manager_mb": 0,
       "loads": {
         "/index.html": {
-          "rps": 19295,
-          "p50_ms": 3.15,
-          "p95_ms": 4.01,
-          "p99_ms": 5.04,
+          "rps": 18095,
+          "p50_ms": 3.47,
+          "p95_ms": 4.24,
+          "p99_ms": 5.88,
           "mb_per_s": 0,
           "ok": 0,
-          "errors": 0
+          "errors": 0,
+          "cpu_us": 0
         },
         "/assets/app.3f9a2c1b.js": {
-          "rps": 2001,
-          "p50_ms": 30.88,
-          "p95_ms": 45.78,
-          "p99_ms": 52.67,
-          "mb_per_s": 47.1,
-          "ok": 19947,
-          "errors": 0
+          "rps": 1845,
+          "p50_ms": 33.68,
+          "p95_ms": 48.7,
+          "p99_ms": 57.26,
+          "mb_per_s": 43.4,
+          "ok": 18393,
+          "errors": 0,
+          "cpu_us": 857.35
         },
         "/media/video.bin": {
-          "rps": 1307,
-          "p50_ms": 45.17,
-          "p95_ms": 68.45,
-          "p99_ms": 82.25,
-          "mb_per_s": 1300.9,
-          "ok": 13018,
-          "errors": 0
+          "rps": 1222,
+          "p50_ms": 49.47,
+          "p95_ms": 70.46,
+          "p99_ms": 82.78,
+          "mb_per_s": 1215.5,
+          "ok": 12160,
+          "errors": 0,
+          "cpu_us": 1027.99
         },
         "/index.html (new connection each)": {
-          "rps": 10840,
-          "p50_ms": 5.45,
-          "p95_ms": 8.41,
-          "p99_ms": 12.63,
+          "rps": 9840,
+          "p50_ms": 6.23,
+          "p95_ms": 8.79,
+          "p99_ms": 11.49,
           "mb_per_s": 0,
           "ok": 0,
-          "errors": 0
+          "errors": 0,
+          "cpu_us": 0
         }
       }
     }

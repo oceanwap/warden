@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-01T06:58:18.197Z",
+    "date": "2026-10-01T13:17:59.101Z",
     "kernel": "6.18.44-fc-v50 x86_64",
     "cpus": 2,
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -8,7 +8,7 @@
     "loadgen": "oha 1.16.0",
     "app_cpus": "all",
     "loadgen_cpus": "all",
-    "tcp_migrate_req": "1",
+    "tcp_migrate_req": "0",
     "app": "nest-bun",
     "workers": 4,
     "duration_s": 10,
@@ -21,48 +21,51 @@
   "results": [
     {
       "name": "bare",
-      "startup_ms": 685,
+      "startup_ms": 729,
       "idle": {
-        "total_rss_mb": 340.8,
-        "total_pss_mb": 200,
+        "total_rss_mb": 339,
+        "total_pss_mb": 197.7,
         "manager_rss_mb": 0
       },
       "loaded": {
-        "total_rss_mb": 435.7,
-        "total_pss_mb": 292.7,
+        "total_rss_mb": 435.5,
+        "total_pss_mb": 292,
         "manager_rss_mb": 0
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 40054,
-          "p50_ms": 1.08,
-          "p95_ms": 4.39,
-          "p99_ms": 8.81,
-          "mb_per_s": 0.5,
-          "ok": 400650,
+          "rps": 30169,
+          "p50_ms": 1.41,
+          "p95_ms": 5.62,
+          "p99_ms": 10.59,
+          "mb_per_s": 0.4,
+          "ok": 301716,
           "errors": 0,
-          "cpu_s": 14.52
+          "cpu_s": 14.41,
+          "cpu_us": 47.77
         },
         "/json": {
-          "rps": 38120,
-          "p50_ms": 1.15,
-          "p95_ms": 4.47,
-          "p99_ms": 8.5,
-          "mb_per_s": 35.5,
-          "ok": 381355,
+          "rps": 28378,
+          "p50_ms": 1.42,
+          "p95_ms": 6.63,
+          "p99_ms": 11.62,
+          "mb_per_s": 26.4,
+          "ok": 283826,
           "errors": 0,
-          "cpu_s": 14.62
+          "cpu_s": 14.49,
+          "cpu_us": 51.04
         },
         "/cpu": {
-          "rps": 1364,
-          "p50_ms": 46.45,
-          "p95_ms": 60.85,
-          "p99_ms": 94.16,
+          "rps": 1268,
+          "p50_ms": 47.25,
+          "p95_ms": 74.66,
+          "p99_ms": 95.19,
           "mb_per_s": 0,
-          "ok": 13581,
+          "ok": 12622,
           "errors": 0,
-          "cpu_s": 19.58
+          "cpu_s": 15.7,
+          "cpu_us": 1243.87
         }
       },
       "recovery_ms": "n/a (nothing restarts it)",
@@ -72,129 +75,135 @@
     },
     {
       "name": "pm2",
-      "startup_ms": 1187,
+      "startup_ms": 1220,
       "idle": {
-        "total_rss_mb": 425.3,
-        "total_pss_mb": 279.9,
-        "manager_rss_mb": 69.9
+        "total_rss_mb": 421.6,
+        "total_pss_mb": 276,
+        "manager_rss_mb": 69.1
       },
       "loaded": {
-        "total_rss_mb": 515.5,
-        "total_pss_mb": 368.1,
-        "manager_rss_mb": 65.4
+        "total_rss_mb": 512.7,
+        "total_pss_mb": 365.2,
+        "manager_rss_mb": 64.8
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 35844,
-          "p50_ms": 1.23,
-          "p95_ms": 4.65,
-          "p99_ms": 11.02,
+          "rps": 32174,
+          "p50_ms": 1.36,
+          "p95_ms": 5.07,
+          "p99_ms": 12.45,
           "mb_per_s": 0.4,
-          "ok": 358552,
+          "ok": 321789,
           "errors": 0,
-          "cpu_s": 15.74
+          "cpu_s": 15.58,
+          "cpu_us": 48.43
         },
         "/json": {
-          "rps": 33690,
-          "p50_ms": 1.42,
-          "p95_ms": 4.63,
-          "p99_ms": 8.82,
-          "mb_per_s": 31.4,
-          "ok": 336984,
+          "rps": 33303,
+          "p50_ms": 1.47,
+          "p95_ms": 4.35,
+          "p99_ms": 8.89,
+          "mb_per_s": 31,
+          "ok": 333172,
           "errors": 0,
-          "cpu_s": 15.68
+          "cpu_s": 15.41,
+          "cpu_us": 46.25
         },
         "/cpu": {
-          "rps": 1294,
-          "p50_ms": 53.4,
-          "p95_ms": 73.64,
-          "p99_ms": 84.72,
+          "rps": 1197,
+          "p50_ms": 48.57,
+          "p95_ms": 78.95,
+          "p99_ms": 100.06,
           "mb_per_s": 0,
-          "ok": 12876,
+          "ok": 11908,
           "errors": 0,
-          "cpu_s": 19.55
+          "cpu_s": 19.28,
+          "cpu_us": 1619.19
         }
       },
-      "recovery_ms": 529,
+      "recovery_ms": 673,
       "crash": {
-        "ok": 5160,
-        "failed": 0
+        "ok": 6328,
+        "failed": 8
       },
       "rolling": {
-        "ok": 4321,
-        "failed": 1904,
-        "ms": 1119,
+        "ok": 4478,
+        "failed": 2093,
+        "ms": 1359,
         "replaced_all": true
       },
-      "cli_ms": 129.5
+      "cli_ms": 142
     },
     {
       "name": "warden-process",
-      "startup_ms": 830,
+      "startup_ms": 813,
       "idle": {
-        "total_rss_mb": 349.5,
-        "total_pss_mb": 205.6,
-        "manager_rss_mb": 7.7
+        "total_rss_mb": 348.6,
+        "total_pss_mb": 206.5,
+        "manager_rss_mb": 7.9
       },
       "loaded": {
-        "total_rss_mb": 430.7,
-        "total_pss_mb": 284.7,
-        "manager_rss_mb": 7.7
+        "total_rss_mb": 432.4,
+        "total_pss_mb": 286.3,
+        "manager_rss_mb": 7.9
       },
-      "manager_idle_cpu_pct": 0,
+      "manager_idle_cpu_pct": 0.2,
       "endpoints": {
         "/plaintext": {
-          "rps": 41050,
-          "p50_ms": 1.18,
-          "p95_ms": 3.97,
-          "p99_ms": 7.73,
+          "rps": 38060,
+          "p50_ms": 0.93,
+          "p95_ms": 5.08,
+          "p99_ms": 9.57,
           "mb_per_s": 0.5,
-          "ok": 410641,
+          "ok": 380709,
           "errors": 0,
-          "cpu_s": 14.58
+          "cpu_s": 14.58,
+          "cpu_us": 38.29
         },
         "/json": {
-          "rps": 38079,
-          "p50_ms": 0.95,
+          "rps": 32923,
+          "p50_ms": 1.42,
           "p95_ms": 5.07,
-          "p99_ms": 9.44,
-          "mb_per_s": 35.5,
-          "ok": 380906,
+          "p99_ms": 9.62,
+          "mb_per_s": 30.7,
+          "ok": 329340,
           "errors": 0,
-          "cpu_s": 14.56
+          "cpu_s": 14.15,
+          "cpu_us": 42.95
         },
         "/cpu": {
-          "rps": 1362,
-          "p50_ms": 48.92,
-          "p95_ms": 71.89,
-          "p99_ms": 96.98,
+          "rps": 1268,
+          "p50_ms": 50.63,
+          "p95_ms": 68.46,
+          "p99_ms": 106.35,
           "mb_per_s": 0,
-          "ok": 13561,
+          "ok": 12618,
           "errors": 0,
-          "cpu_s": 19.56
+          "cpu_s": 19.24,
+          "cpu_us": 1524.81
         }
       },
-      "recovery_ms": 406,
+      "recovery_ms": 467,
       "crash": {
-        "ok": 5332,
-        "failed": 0
+        "ok": 4635,
+        "failed": 5
       },
       "rolling": {
-        "ok": 3764,
+        "ok": 3582,
         "failed": 0,
-        "ms": 1297,
+        "ms": 1310,
         "replaced_all": true
       },
-      "cli_ms": 1.6
+      "cli_ms": 1.7
     },
     {
       "name": "warden-surge",
-      "startup_ms": 773,
+      "startup_ms": 872,
       "idle": {
-        "total_rss_mb": 351.8,
-        "total_pss_mb": 208.1,
-        "manager_rss_mb": 8.1
+        "total_rss_mb": 350.4,
+        "total_pss_mb": 206.6,
+        "manager_rss_mb": 9.9
       },
       "loaded": null,
       "manager_idle_cpu_pct": "-",
@@ -202,130 +211,136 @@
       "recovery_ms": "-",
       "crash": "-",
       "rolling": {
-        "ok": 2198,
+        "ok": 1849,
         "failed": 0,
-        "ms": 964,
+        "ms": 1108,
         "replaced_all": true
       },
       "cli_ms": "-"
     },
     {
       "name": "warden-worker",
-      "startup_ms": 749,
+      "startup_ms": 872,
       "idle": {
-        "total_rss_mb": 187.7,
-        "total_pss_mb": 166.2,
-        "manager_rss_mb": 8.2
+        "total_rss_mb": 188.6,
+        "total_pss_mb": 167,
+        "manager_rss_mb": 8.3
       },
       "loaded": {
-        "total_rss_mb": 279.6,
-        "total_pss_mb": 257.8,
-        "manager_rss_mb": 8.2
+        "total_rss_mb": 278.9,
+        "total_pss_mb": 257.1,
+        "manager_rss_mb": 8.3
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 34549,
-          "p50_ms": 1,
-          "p95_ms": 5.87,
-          "p99_ms": 15.05,
+          "rps": 32189,
+          "p50_ms": 1.06,
+          "p95_ms": 7.2,
+          "p99_ms": 17.02,
           "mb_per_s": 0.4,
-          "ok": 345526,
+          "ok": 321990,
           "errors": 0,
-          "cpu_s": 14.3
+          "cpu_s": 14.04,
+          "cpu_us": 43.62
         },
         "/json": {
-          "rps": 35367,
-          "p50_ms": 1.01,
-          "p95_ms": 5.61,
-          "p99_ms": 11.83,
-          "mb_per_s": 32.9,
-          "ok": 353726,
+          "rps": 28435,
+          "p50_ms": 1.27,
+          "p95_ms": 7.35,
+          "p99_ms": 15.53,
+          "mb_per_s": 26.5,
+          "ok": 284379,
           "errors": 0,
-          "cpu_s": 14.32
+          "cpu_s": 13.55,
+          "cpu_us": 47.66
         },
         "/cpu": {
-          "rps": 1359,
-          "p50_ms": 46.69,
-          "p95_ms": 62.64,
-          "p99_ms": 97.13,
+          "rps": 1090,
+          "p50_ms": 53.48,
+          "p95_ms": 110.82,
+          "p99_ms": 128.13,
           "mb_per_s": 0,
-          "ok": 13535,
+          "ok": 10835,
           "errors": 0,
-          "cpu_s": 19.57
+          "cpu_s": 16.76,
+          "cpu_us": 1546.7
         }
       },
-      "recovery_ms": 999,
+      "recovery_ms": 1094,
       "crash": {
-        "ok": 3836,
+        "ok": 3906,
         "failed": 0
       },
       "rolling": {
-        "ok": 3765,
+        "ok": 2949,
         "failed": 0,
-        "ms": 839,
+        "ms": 1069,
         "replaced_all": true
       },
-      "cli_ms": 2
+      "cli_ms": 2.1
     },
     {
       "name": "warden-standby",
-      "startup_ms": 877,
+      "startup_ms": 919,
       "idle": {
-        "total_rss_mb": 434.7,
-        "total_pss_mb": 248.4,
-        "manager_rss_mb": 8.3
+        "total_rss_mb": 436.3,
+        "total_pss_mb": 250.1,
+        "manager_rss_mb": 9.7
       },
       "loaded": {
-        "total_rss_mb": 517.1,
-        "total_pss_mb": 328.6,
-        "manager_rss_mb": 8.3
+        "total_rss_mb": 539.8,
+        "total_pss_mb": 351.3,
+        "manager_rss_mb": 9.7
       },
       "manager_idle_cpu_pct": 0,
       "endpoints": {
         "/plaintext": {
-          "rps": 39648,
-          "p50_ms": 1.11,
-          "p95_ms": 4.39,
-          "p99_ms": 8.31,
-          "mb_per_s": 0.5,
-          "ok": 396583,
+          "rps": 35693,
+          "p50_ms": 1.27,
+          "p95_ms": 4.72,
+          "p99_ms": 9.28,
+          "mb_per_s": 0.4,
+          "ok": 356981,
           "errors": 0,
-          "cpu_s": 14.59
+          "cpu_s": 14.39,
+          "cpu_us": 40.32
         },
         "/json": {
-          "rps": 36604,
-          "p50_ms": 1.14,
-          "p95_ms": 4.85,
-          "p99_ms": 8.45,
-          "mb_per_s": 34.1,
-          "ok": 366133,
+          "rps": 32241,
+          "p50_ms": 1.24,
+          "p95_ms": 5.91,
+          "p99_ms": 10.94,
+          "mb_per_s": 30,
+          "ok": 322497,
           "errors": 0,
-          "cpu_s": 14.74
+          "cpu_s": 13.53,
+          "cpu_us": 41.96
         },
         "/cpu": {
-          "rps": 1373,
-          "p50_ms": 43.59,
-          "p95_ms": 69.42,
-          "p99_ms": 92.85,
+          "rps": 1299,
+          "p50_ms": 48.63,
+          "p95_ms": 66.16,
+          "p99_ms": 94.28,
           "mb_per_s": 0,
-          "ok": 13672,
+          "ok": 12934,
           "errors": 0,
-          "cpu_s": 19.5
+          "cpu_s": 19.5,
+          "cpu_us": 1507.64
         }
       },
-      "recovery_ms": 45,
+      "recovery_ms": 52,
       "crash": {
-        "ok": 2898,
-        "failed": 0
+        "ok": 2724,
+        "failed": 3
       },
       "rolling": {
-        "ok": 4561,
+        "ok": 3691,
         "failed": 0,
-        "ms": 1376,
+        "ms": 1359,
         "replaced_all": true
       },
-      "cli_ms": 1.8
+      "cli_ms": 1.7
     }
   ]
 }

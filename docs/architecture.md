@@ -408,8 +408,8 @@ before the next replacement made a 4-worker restart with long-lived clients
 take ~8.5 s. Instead, once a batch's new workers have taken over (they
 listen and passed the gates, so capacity never drops below the worker
 count), their old ones are told to stop and drain in the background
-(`Role::Retiring`, `Roll::draining`) while the next batch starts: ~3 s for
-the same restart (benchmarks in [`benchmarks.md`](benchmarks.md)).
+(`Role::Retiring`, `Roll::draining`) while the next batch starts: 2.3-2.5 s
+for the same restart (benchmarks in [`benchmarks.md`](benchmarks.md)).
 
 ```
 worker 1: new ─gates─► old 1 drains ─────────────► exits

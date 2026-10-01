@@ -1,6 +1,6 @@
 {
   "meta": {
-    "date": "2026-10-01T07:07:10.264Z",
+    "date": "2026-10-01T13:26:04.219Z",
     "kernel": "6.18.44-fc-v50 x86_64",
     "cpus": 2,
     "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -8,7 +8,7 @@
     "loadgen": "oha 1.16.0",
     "app_cpus": "all",
     "loadgen_cpus": "all",
-    "tcp_migrate_req": "1",
+    "tcp_migrate_req": "0",
     "workers": 4,
     "rate": 5000,
     "seconds": 10,
@@ -23,12 +23,12 @@
       "workers": 4,
       "lines_written": 200000,
       "lines_in_log": 200000,
-      "worker_ms": 10130,
-      "wall_ms": 10214,
-      "manager_cpu_s": 0.29,
-      "manager_peak_rss_mb": 6.9,
+      "worker_ms": 10138,
+      "wall_ms": 10199,
+      "manager_cpu_s": 0.3,
+      "manager_peak_rss_mb": 7.1,
       "mb_per_s": 1.8,
-      "cpu_s_per_gb": 16.43
+      "cpu_s_per_gb": 16.99
     },
     {
       "name": "warden-direct",
@@ -36,11 +36,11 @@
       "workers": 4,
       "lines_written": 200000,
       "lines_in_log": 200000,
-      "worker_ms": 10129,
-      "wall_ms": 10203,
+      "worker_ms": 10351,
+      "wall_ms": 10442,
       "manager_cpu_s": 0.11,
-      "manager_peak_rss_mb": 6.5,
-      "mb_per_s": 1.8,
+      "manager_peak_rss_mb": 6.6,
+      "mb_per_s": 1.7,
       "cpu_s_per_gb": 6.23
     },
     {
@@ -49,12 +49,12 @@
       "workers": 4,
       "lines_written": 200000,
       "lines_in_log": 200000,
-      "worker_ms": 10129,
-      "wall_ms": 10741,
-      "manager_cpu_s": 1.23,
+      "worker_ms": 10122,
+      "wall_ms": 10753,
+      "manager_cpu_s": 1.27,
       "manager_peak_rss_mb": 74.6,
       "mb_per_s": 1.8,
-      "cpu_s_per_gb": 69.67
+      "cpu_s_per_gb": 71.94
     },
     {
       "name": "warden",
@@ -62,12 +62,12 @@
       "workers": 1,
       "lines_written": 2076388,
       "lines_in_log": 10000,
-      "worker_ms": 226,
-      "wall_ms": 244,
-      "manager_cpu_s": 0.12,
-      "manager_peak_rss_mb": 7,
-      "mb_per_s": 885,
-      "cpu_s_per_gb": 0.61
+      "worker_ms": 247,
+      "wall_ms": 264,
+      "manager_cpu_s": 0.13,
+      "manager_peak_rss_mb": 6.9,
+      "mb_per_s": 809.7,
+      "cpu_s_per_gb": 0.67
     },
     {
       "name": "warden-direct",
@@ -75,12 +75,12 @@
       "workers": 1,
       "lines_written": 2076388,
       "lines_in_log": 2076388,
-      "worker_ms": 243,
-      "wall_ms": 266,
-      "manager_cpu_s": 0.13,
+      "worker_ms": 235,
+      "wall_ms": 245,
+      "manager_cpu_s": 0.17,
       "manager_peak_rss_mb": 6.3,
-      "mb_per_s": 823,
-      "cpu_s_per_gb": 0.67
+      "mb_per_s": 851.1,
+      "cpu_s_per_gb": 0.87
     },
     {
       "name": "pm2",
@@ -88,12 +88,12 @@
       "workers": 1,
       "lines_written": 2076388,
       "lines_in_log": 2076388,
-      "worker_ms": 1226,
-      "wall_ms": 1627,
-      "manager_cpu_s": 1.5,
-      "manager_peak_rss_mb": 95.2,
-      "mb_per_s": 163.1,
-      "cpu_s_per_gb": 7.68
+      "worker_ms": 1130,
+      "wall_ms": 1528,
+      "manager_cpu_s": 1.4,
+      "manager_peak_rss_mb": 89.9,
+      "mb_per_s": 177,
+      "cpu_s_per_gb": 7.17
     },
     {
       "name": "warden-keep-all",
@@ -101,11 +101,11 @@
       "workers": 1,
       "lines_written": 2076388,
       "lines_in_log": 2076388,
-      "worker_ms": 603,
-      "wall_ms": 620,
+      "worker_ms": 528,
+      "wall_ms": 553,
       "manager_cpu_s": 0.66,
-      "manager_peak_rss_mb": 7.2,
-      "mb_per_s": 331.7,
+      "manager_peak_rss_mb": 7.1,
+      "mb_per_s": 378.8,
       "cpu_s_per_gb": 3.38
     }
   ]

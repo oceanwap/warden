@@ -23,68 +23,74 @@ claim an optimisation the data doesn't show).
 ## What the data says
 
 Numbers from the README run (2026-10-01, 2 CPUs, 4 workers,
-`tcp_migrate_req = 1`).
+`tcp_migrate_req = 0`: queued connections can be reset by a closing listener
+under every manager, and Warden's rolling restarts still lost none).
 
 - **Warden adds nothing on the request path.** In process mode the workers
   own the port (SO_REUSEPORT); req/s and latency match the same processes
-  run bare (node:http 76.2k vs 71.7k req/s, within noise, p99 2.4 vs
-  3.9 ms). PM2's cluster mode passes every connection through its daemon:
-  61.1k req/s, p99 8.0 ms. Watt: 66.7k, p99 3.1 ms.
+  run bare (node:http 73.5k vs 66.9k req/s bare and 69.8k with only the shim
+  preloaded: within the run-to-run noise of this machine, p99 2.4 vs
+  3.8 ms). The shim costs nothing per request outside a drain
+  (`bench/shim-cost.ts`). PM2's cluster mode passes every connection through
+  its daemon: 55.3k req/s, p99 8.5 ms. Watt: 50.2k, p99 5.3 ms.
 - **Manager cost.** Warden's supervisor: ~8 MB RSS, about 1 MB PSS per app
-  (10 apps: 11.6 MB PSS in all, wardend included), 0–0.2 % idle CPU. PM2's
-  daemon: ~65 MB RSS (34 MB PSS for 10 apps), 0.2–0.7 % idle CPU. Watt runs the app inside its
-  own runtime: about 4× the memory of 4 processes for the Node app (PSS 477
-  vs 109 MB) and 2–3 % idle CPU.
+  (10 apps: 11.9 MB PSS in all, wardend included), 0–0.2 % idle CPU. PM2's
+  daemon: ~65 MB RSS (40 MB PSS for 10 apps), 0–0.7 % idle CPU. Watt runs
+  the app inside its own runtime: about 4.5× the memory of 4 processes for
+  the Node app (PSS 478 vs 106 MB) and 2–3 % idle CPU.
 - **Startup and CLI.** Warden starts 4 workers about as fast as starting them
-  bare (node:http 215 vs 171 ms); PM2 needs 0.4–0.6 s more, Watt 3–4 s.
-  `warden status` answers in ~2 ms, `pm2 jlist` in ~130 ms, `wattpm ps` in
-  ~370 ms. With 10 apps: `warden list` 2.3 ms, `pm2 list` 150 ms; starting
-  10 apps 0.57 s vs 2.0 s.
-- **Recovery.** A crashed worker answers again 1.3–3× sooner under Warden
-  than under PM2: node:http 129 vs 289 ms, NestJS on Node 687 vs 1,182 ms,
-  Bun 54 vs 166 ms, NestJS on Bun 406 vs 529 ms; Watt 1.2–1.6 s. **With a
+  bare (node:http 204 vs 173 ms); PM2 needs 0.5–0.8 s more, Watt 3–4 s.
+  `warden status` answers in ~2 ms, `pm2 jlist` in ~145 ms, `wattpm ps` in
+  ~410 ms. With 10 apps: `warden list` 2.6 ms, `pm2 list` 156 ms; starting
+  10 apps 0.41 s vs 1.95 s.
+- **Recovery.** A crashed worker answers again 1.4–2.3× sooner under Warden
+  than under PM2: node:http 140 vs 320 ms, NestJS on Node 719 vs 1,554 ms,
+  Bun 74 vs 162 ms, NestJS on Bun 467 vs 673 ms; Watt 1.4–1.9 s. **With a
   hot standby** (`[workers] standby = 1`) recovery no longer waits for the
-  app to boot: 44 ms (node:http), 57 ms (NestJS on Node), 17 ms (Bun),
-  45 ms (NestJS on Bun): 7–12× faster than PM2 for NestJS. The standby
-  costs one idle worker (node:http +8 MB PSS idle, NestJS on Bun +43 MB).
+  app to boot: 48 ms (node:http), 54 ms (NestJS on Node), 25 ms (Bun),
+  52 ms (NestJS on Bun): 13–29× faster than PM2 for NestJS on Node. The
+  standby costs one idle worker (node:http +13 MB PSS idle, NestJS on Bun
+  +44 MB). The requests in flight on the crashed worker are lost under every
+  manager: with a standby 8 of ~3,600 failed in the node:http crash run (the
+  promotion is quick, but connections queued on the dead worker's socket
+  still get reset when `tcp_migrate_req` is 0).
 - **Rolling restarts.** Warden lost no request in any run, and finished
-  sooner (node:http 295 ms vs PM2 728 ms, Watt 3.5 s). `[reload] surge =
-  "all"` starts every new worker at once: NestJS on Node 1,268 vs 1,556 ms
-  one at a time, NestJS on Bun 964 vs 1,297 ms (the fast apps are already
+  sooner (node:http 302 ms vs PM2 798 ms, Watt 3.3 s). `[reload] surge =
+  "all"` starts every new worker at once: NestJS on Node 1,158 vs 1,566 ms
+  one at a time, NestJS on Bun 1,108 vs 1,310 ms (the fast apps are already
   bound by the drain, ~300 ms either way). PM2's `reload` is graceful only
   in cluster mode (Node): for Bun apps it runs fork mode, where reload is a
-  restart, and NestJS on Bun lost 1,904 of 6,225 requests during it.
+  restart, and NestJS on Bun lost 2,093 of 6,571 requests during it.
 - **WebSockets and SSE across a restart.** Every connection an old Warden
   worker held ended cleanly (WebSocket close 1001, SSE end of stream: 0
-  abnormal of ~150 per runtime), and every client was back on a new worker.
+  abnormal of 100 per runtime), and every client was back on a new worker.
   Under PM2 every one was cut (1006 / broken stream), and with Bun in fork
-  mode 300 reconnects failed outright. The price is time: each worker with
-  long-lived clients waits `long_lived_timeout` (2 s) first, so the
-  4-worker restart took ~8.5 s (worker mode 2.3 s); `surge` overlaps those
-  waits.
-- **Worker (thread) mode** (Bun only): by PSS it saves ~20 % idle (NestJS
-  166 vs 206 MB) and ~10 % after load (258 vs 285 MB), with a worse p99 for
-  NestJS (15.1 vs 7.7 ms), and one crash takes all workers down (crash
-  recovery 999 ms vs 406 ms). **Use process mode in production.** For Node,
-  threads don't save memory at all (4 `node:http` processes 96 MB PSS, one
-  process with 4 threads 104 MB), so Warden has no Node thread mode.
+  mode 202 reconnects failed outright. The price is time: each worker with
+  long-lived clients waits `long_lived_timeout` (2 s) first. The old workers
+  drain in the background while the next ones are replaced (`[reload]
+  max_draining`, default 4), so the 4-worker restart took 2.3–2.5 s instead
+  of ~8.5 s when the drains ran one after another.
+- **Worker (thread) mode** (Bun only): by PSS it saves ~19 % idle (NestJS
+  167 vs 206 MB) and ~10 % after load (257 vs 286 MB), with a worse p99 for
+  NestJS (17.0 vs 9.6 ms), and one crash takes all workers down (crash
+  recovery 1,094 ms vs 467 ms). **Use process mode in production.** For
+  Node, threads don't save memory at all (4 `node:http` processes 96 MB PSS,
+  one process with 4 threads 104 MB), so Warden has no Node thread mode.
 - **Static files.** With the response cache, `warden serve` is **ahead of
-  nginx** on small files (1.5 KB page 107.6k vs 100.8k req/s; without the
-  cache 99.4k), on a new connection per request (35.3k vs 31.6k) and on a
-  1 MB file (5.1–6.7 vs 4.9 GB/s), and behind on the 48 KB script (74.7k vs
-  82.6k; the cache neither helped nor hurt there: its send(2) copied the
-  body). Since then, cached bodies of 8 KB and more go out with sendfile
-  from a memfd: 28 % less CPU per request on that script, ahead of nginx in
-  an A/B on the same machine (optimisation log below; the README table is
-  from before). It uses 40 % less memory
-  (PSS 8.0 vs 13.0 MB), and delivers 4–37× what `pm2 serve` and `serve` do.
-- **Logs.** Warden reads a flooding worker at ~890 MB/s (PM2 163 MB/s) for
-  a twelfth of PM2's CPU per GB. Keeping every line costs more when lines
-  are parsed (`max_lines_per_sec = 0`: 332 MB/s, 3.4 CPU s/GB); with
+  nginx** on small files (1.5 KB page 101.9k vs 93.4k req/s; without the
+  cache 77.8k on this run, 99.4k on the last one: the machine is that noisy
+  for single numbers), on the 48 KB script (77.9k vs 76.8k, where it was
+  behind before cached bodies of 8 KB and more went out with sendfile from a
+  memfd), on a new connection per request (32.5k vs 29.7k) and on a 1 MB
+  file (6.0 vs 5.0 GB/s). It uses 40 % less memory (PSS 8.0 vs 13.0 MB),
+  and delivers 5–55× what `pm2 serve` and `serve` do.
+- **Logs.** Warden reads a flooding worker at ~810 MB/s (PM2 177 MB/s) for
+  a tenth of PM2's CPU per GB. Keeping every line costs more when lines
+  are parsed (`max_lines_per_sec = 0`: 379 MB/s, 3.4 CPU s/GB); with
   `worker_output = "direct"` the kernel splices the bytes into the file:
-  823 MB/s, 0.67 CPU s/GB, every line kept, 11× PM2's CPU efficiency.
-  Steady logging (20k lines/s): 0.29 s CPU per 10 s captured, 0.11 s direct,
-  PM2 1.23 s.
+  851 MB/s, 0.87 CPU s/GB, every line kept, 8× PM2's CPU efficiency.
+  Steady logging (20k lines/s): 0.30 s CPU per 10 s captured, 0.11 s direct,
+  PM2 1.27 s.
 
 ## Findings about the other managers
 
