@@ -4385,6 +4385,33 @@ fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
     }
 }
 
+/// Found by `cargo xtask chaos`: on Node, the shim's drain closed idle
+/// keep-alive connections at once (http.Server#close() does it on Node 19+,
+/// and so did its own sweep), so a request being sent on one was lost.
+#[test]
+fn node_drain_answers_keep_alive_requests_instead_of_cutting_them() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"ndrain\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("ndrain", port, &cfg);
+    w.wait_for("ready", T, ready(2));
+    let ((), ok, cut, fresh) = keep_alive_through(port, "/whoami", || {
+        for _ in 0..3 {
+            let (code, out) = w.cli(&["reload"]);
+            assert_eq!(code, 0, "{out}");
+        }
+    });
+    eprintln!("node: {ok} answered, {cut} cut, {fresh} failed on a new connection");
+    assert!(ok > 50, "{ok} answered");
+    assert_eq!(cut, 0, "keep-alive requests cut by a draining worker\n{}", w.log());
+    assert!(fresh <= 2 * allowed_resets(), "{fresh} failed on a new connection");
+}
+
 /// None of the requests sent during a rolling replacement failed. Without
 /// net.ipv4.tcp_migrate_req=1 the kernel resets connections queued on a
 /// listener that closes, whatever the order of replacement (one at a time
