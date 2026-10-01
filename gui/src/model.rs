@@ -355,6 +355,7 @@ pub(crate) mod tests {
             workers: (1..=n).map(|i| worker(i, Some(40 << 20), Some(1.5))).collect(),
             release: None,
             standbys: vec![],
+            start_failed: None,
         }
     }
 

@@ -3945,6 +3945,66 @@ fn event_loop_delay_is_reported() {
     assert!(delay(&s, 0, "p50_ms").unwrap() < 20.0, "Worker 1 is not blocked by Worker 2:\n{s:#}");
 }
 
+/// W5: `warden start` of an app that can't start fails fast, says why with
+/// the app's own error output, and leaves it listed as errored with its
+/// workers stopped (no restart loop); a later `warden start` tries again.
+#[test]
+fn start_fails_fast_when_every_worker_crashes() {
+    let f = Fleet::new("failfast");
+    let cfg = |name: &str, body: &str| std::fs::write(f.home.join(format!("{name}.toml")), body).unwrap();
+    // Crashes at once until a file appears.
+    cfg(
+        "broken",
+        &format!(
+            "[app]\nname = \"broken\"\ncommand = \"sh\"\nargs = [\"-c\", \"[ -f ok ] || {{ echo 'error: cannot find \
+             module express' >&2; exit 3; }}; exec sleep 300\"]\nworking_directory = \"{}\"\n[workers]\ncount = 2\n\
+             min_uptime = 300\n",
+            f.home.display()
+        ),
+    );
+    let t0 = Instant::now();
+    let (code, out) = f.cli(&["start", "broken"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(t0.elapsed() < Duration::from_secs(15), "took {:?}:\n{out}", t0.elapsed());
+    assert!(out.contains("broken: failed to start: all 2 workers crashed before one was ready (exit code 3)"), "{out}");
+    assert_eq!(out.matches("error: cannot find module express").count(), 1, "its error, once:\n{out}");
+    assert!(out.contains("hint:") && out.contains("`warden start broken` tries again"), "{out}");
+    // Listed as errored, workers stopped: nothing restarts behind our back.
+    let st = &f.app("broken")["status"];
+    assert_eq!((st["stopped"].as_bool(), st["start_failed"].as_str()), (Some(true), Some("exit code 3")), "{st:#}");
+    let restarts = |f: &Fleet| f.app("broken")["status"]["workers"][0]["restarts"].as_u64();
+    let before = restarts(&f);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(restarts(&f), before, "no restart loop");
+    // One app: `list` shows its detail view; the crash, not the stop, is the last exit.
+    let list = f.ok(&["list"]);
+    assert!(list.contains("State:       errored: its last start failed"), "{list}");
+    assert!(list.lines().filter(|l| l.contains("STOPPED") && l.ends_with("exit code 3")).count() == 2, "{list}");
+    // Warden's own log says it once, with a hint.
+    let events = f.ok(&["logs", "broken", "--events", "--nostream", "-n", "200"]);
+    assert_eq!(events.matches("app cannot start: every worker crashed before it was ready").count(), 1, "{events}");
+    // Fixed: the next start works and the error is gone.
+    std::fs::write(f.home.join("ok"), "").unwrap();
+    let out = f.ok(&["start", "broken"]);
+    assert!(out.contains("online (2/2 workers ready)"), "{out}");
+    assert!(f.app("broken")["status"]["start_failed"].is_null());
+
+    // An app that never listens on its port: killed at ready_timeout, then
+    // the same, with a hint about the port.
+    let port = free_port();
+    cfg(
+        "deaf",
+        &format!(
+            "[app]\nname = \"deaf\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 300\"]\nport = {port}\n\
+             [workers]\nready_timeout = 1\n"
+        ),
+    );
+    let (code, out) = f.cli(&["start", "deaf"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("(not ready in time)") && out.contains(&format!("sport = :{port}")), "{out}");
+    assert!(out.contains("no output from it"), "{out}");
+}
+
 // ---- startup (boot and crash survival)
 
 /// Fake systemctl, loginctl and launchctl that log their arguments to

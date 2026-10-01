@@ -163,6 +163,21 @@ STARTING ─ready─► RUNNING ─stop─► STOPPING ─► STOPPED
                  └── too many restarts in window ─► FAILED
 ```
 
+**Start attempts.** From `start_all` (the supervisor's start, `start` after
+`stop`, `restart --hard`) until the first worker is ready, the supervisor
+records which slots crashed. Once every slot has, the app can't start as it
+is: one `app cannot start` ERROR, and `Status.start_failed` (the last
+crash's reason). The restart policy is not changed by it: under systemd or
+at boot a dependency may still come up. An interactive `warden start` waits
+for the first worker (bounded by `ready_timeout` + 15 s), and on
+`start_failed` prints the app's last error output and stops the workers
+(`stop`): the app stays listed as `errored`, as PM2 leaves an app that keeps
+crashing, with nothing restarting it, rather than FAILED with its cooldown
+retry going on unseen. A `stop` before the workers were ever ready also
+sends systemd `READY=1`, so a `Type=notify` unit isn't killed and restarted
+(which would start the workers again). `warden resurrect` reports and leaves
+the policy at work.
+
 `READY` is the transition event into `RUNNING`, logged as `worker=N ready`.
 Readiness sources, first one wins: the shim's `listening` message; on Linux, the
 worker pid owning a `LISTEN` socket on the configured port (`/proc/<pid>/fd` ×

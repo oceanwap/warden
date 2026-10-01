@@ -1002,7 +1002,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     if let Ok(sels) = resolve(&ctx, Some(what), true) {
         let mut worst = 0;
         for s in sels {
-            worst = worst.max(start_app(&ctx, &s.app).await);
+            worst = worst.max(start_app(&ctx, &s.app, OnFailedStart::Stop).await);
         }
         return worst;
     }
@@ -1014,7 +1014,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
             eprintln!("warden: {p}");
             return 1;
         }
-        return start_app(&ctx, &app).await;
+        return start_app(&ctx, &app, OnFailedStart::Stop).await;
     }
     // 3. PM2 ecosystem files are imported once.
     let lower = what.to_ascii_lowercase();
@@ -1052,7 +1052,7 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
                 return 1;
             }
             println!("{name}: wrote {} (edit it for health checks, limits and more)", file.display());
-            start_app(&ctx, &app_from_config(&file)).await
+            start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
         }
         Err(e) => {
             eprintln!("warden: {e}");
@@ -1125,7 +1125,7 @@ pub async fn serve(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
         return 1;
     }
     println!("{name}: serving {} on port {port} (config {})", root.display(), file.display());
-    start_app(&ctx, &app_from_config(&file)).await
+    start_app(&ctx, &app_from_config(&file), OnFailedStart::Stop).await
 }
 
 /// What `warden start <what>` runs when `what` is not an app or a config.
@@ -1194,13 +1194,24 @@ fn sanitize_name(s: &str) -> String {
     if n.is_empty() || n == "all" { "app".into() } else { n }
 }
 
-async fn start_app(ctx: &Ctx, app: &App) -> i32 {
+/// What `warden start` does when every worker crashed before one was ready.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OnFailedStart {
+    /// Report it and stop the workers: an interactive `warden start`.
+    Stop,
+    /// Report it and leave the restart policy at work: `warden resurrect`
+    /// at boot, where a dependency may still be coming up.
+    Report,
+}
+
+async fn start_app(ctx: &Ctx, app: &App, on_fail: OnFailedStart) -> i32 {
     let prefix = format!("{}: ", app.name);
+    let log = format!("see {}", log_path(&app.name).display());
     if reachable(app) {
         return match call_with(app, &Request::Start, REQUEST_TIMEOUT).await {
             Ok(r) if r.ok => {
                 println!("{prefix}{}", r.message.unwrap_or_default());
-                ready_or_not(ctx, app, Duration::from_secs(30)).await
+                ready_or_not(ctx, app, on_fail, &log).await
             }
             Ok(r) => {
                 eprintln!("warden: {prefix}{}", r.message.unwrap_or_default());
@@ -1221,12 +1232,37 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
         return 2;
     };
     if let Some((scope, unit)) = systemd_unit_for(app) {
-        if let Err(e) = run_systemctl(scope, &["start", &unit]) {
-            eprintln!("warden: {prefix}{e}\n  see `journalctl {}-u {unit} -n 50`", scope.shown());
-            return 1;
+        let journal = format!("see `journalctl {}-u {unit} -n 50`", scope.shown());
+        if ctx.no_wait {
+            if let Err(e) = run_systemctl(scope, &["start", "--no-block", &unit]) {
+                eprintln!("warden: {prefix}{e}\n  {journal}");
+                return 1;
+            }
+            return ready_or_not(ctx, app, on_fail, &journal).await;
         }
-        println!("{prefix}started {unit}");
-        return ready_or_not(ctx, app, Duration::from_secs(60)).await;
+        println!("{prefix}starting {unit}");
+        // `systemctl start` returns once the unit is ready (Type=notify:
+        // every worker ready, or the workers stopped). Watch the app
+        // meanwhile, so a start that fails is reported (and stopped) at
+        // once rather than after the unit's TimeoutStartSec.
+        let job = {
+            let unit = unit.clone();
+            tokio::task::spawn_blocking(move || run_systemctl(scope, &["start", &unit]))
+        };
+        return tokio::select! {
+            r = job => match r {
+                Ok(Ok(())) => wait_ready(app, on_fail, &journal).await,
+                Ok(Err(e)) => {
+                    eprintln!("warden: {prefix}{e}\n  {journal}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("warden: {prefix}running systemctl failed ({e})\n  {journal}");
+                    1
+                }
+            },
+            code = wait_ready(app, on_fail, &journal) => code,
+        };
     }
     match spawn_background(&app.name, &cfg) {
         Ok(mut child) => {
@@ -1245,7 +1281,7 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
                     return 1;
                 }
                 if reachable(app) {
-                    return ready_or_not(ctx, app, Duration::from_secs(60)).await;
+                    return ready_or_not(ctx, app, on_fail, &format!("see {}", log.display())).await;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -1264,20 +1300,39 @@ async fn start_app(ctx: &Ctx, app: &App) -> i32 {
 
 /// `wait_ready`, unless `--no-wait` asked to return as soon as the supervisor
 /// answers (starting many apps at once; `warden list` shows how they came up).
-async fn ready_or_not(ctx: &Ctx, app: &App, limit: Duration) -> i32 {
+/// `log`: where the supervisor's own log is, for when it does not answer.
+async fn ready_or_not(ctx: &Ctx, app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
     if ctx.no_wait {
         println!("{}: starting (not waiting for readiness: `warden list` shows it)", app.name);
         return 0;
     }
-    wait_ready(app, limit).await
+    wait_ready(app, on_fail, log).await
 }
 
-/// Wait until every worker is ready (or the app is stopped), then print one line.
-async fn wait_ready(app: &App, limit: Duration) -> i32 {
-    let t0 = Instant::now();
+/// How long `warden start` waits for the first worker, and then for the
+/// rest: the app's `workers.ready_timeout` (after which Warden kills a
+/// worker that isn't listening, a crash) plus room for a restart.
+fn ready_wait(app: &App) -> Duration {
+    let ready = app.config.as_ref().and_then(|p| Config::load(p).ok()).map_or(30, |c| c.workers.ready_timeout);
+    Duration::from_secs(ready.saturating_add(15))
+}
+
+/// Wait until every worker is ready (or the app is stopped), then print one
+/// line. Fails fast when the supervisor says every worker crashed before
+/// one was ready (`Status.start_failed`): reports why, with the app's last
+/// error output, and with `OnFailedStart::Stop` stops the workers. The
+/// wait is bounded: `ready_wait` for the first worker, as long again for
+/// the rest once one is ready.
+async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
+    let bound = ready_wait(app);
+    let mut deadline = Instant::now() + bound;
+    let mut first_ready = false;
     let mut last = None;
-    while t0.elapsed() < limit {
+    while Instant::now() < deadline {
         if let Ok(st) = status_of(app).await {
+            if let Some(reason) = st.start_failed.clone() {
+                return failed_start(app, &st, &reason, on_fail).await;
+            }
             if st.stopped || (st.workers_ready >= st.workers_configured && st.workers_configured > 0) {
                 println!(
                     "{}: {} ({}/{} workers ready)",
@@ -1292,22 +1347,121 @@ async fn wait_ready(app: &App, limit: Duration) -> i32 {
                 eprintln!("warden: {}: a worker is FAILED; `warden describe {}` shows why", app.name, app.name);
                 return 1;
             }
+            if st.workers_ready > 0 && !first_ready {
+                // The app can start: give the others as long again.
+                first_ready = true;
+                deadline = Instant::now() + bound;
+            }
             last = Some(st);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     match last {
+        Some(st) if st.workers_ready == 0 => {
+            eprintln!(
+                "warden: {}: no worker ready after {} s, and not every one has crashed yet",
+                app.name,
+                bound.as_secs()
+            );
+            print_last_output(app).await;
+            eprintln!(
+                "  hint: the app is still starting: `warden list` shows its progress, `warden logs {}` its output; \
+                 a slow boot needs a higher [workers] ready_timeout",
+                app.name
+            );
+        }
         Some(st) => eprintln!(
             "warden: {}: only {}/{} workers ready after {} s; `warden logs {}` shows why",
             app.name,
             st.workers_ready,
             st.workers_configured,
-            limit.as_secs(),
+            bound.as_secs(),
             app.name
         ),
-        None => eprintln!("warden: {}: not answering; see {}", app.name, log_path(&app.name).display()),
+        None => eprintln!("warden: {}: not answering; {log}", app.name),
     }
     1
+}
+
+/// `warden start` of an app that can't start: every worker crashed before
+/// one was ready. What happened, why (the last crash and the app's last
+/// error output), what Warden did, and what to do; exit 1.
+///
+/// `OnFailedStart::Stop` stops the workers (the supervisor stays up): the
+/// app stays listed, as `errored` with its last exit, nothing restarts in
+/// the background, and `warden start` tries again, as `pm2 start` leaves
+/// an app that keeps crashing `errored`. FAILED with its cooldown retry
+/// would go on restarting every few minutes behind the operator's back.
+async fn failed_start(app: &App, st: &Status, reason: &str, on_fail: OnFailedStart) -> i32 {
+    let name = &app.name;
+    let stopped = on_fail == OnFailedStart::Stop
+        && match call_with(app, &Request::Stop, REQUEST_TIMEOUT).await {
+            Ok(r) => r.ok || st.stopped,
+            Err(_) => false,
+        };
+    eprintln!(
+        "warden: {name}: failed to start: {} crashed before one was ready ({reason})",
+        if st.workers_configured == 1 {
+            "its worker".to_string()
+        } else {
+            format!("all {} workers", st.workers_configured)
+        }
+    );
+    print_last_output(app).await;
+    let port = app.config.as_ref().and_then(|p| Config::load(p).ok()).and_then(|c| c.app.port);
+    let fix = match port {
+        Some(p) if reason == "not ready in time" => format!(
+            "it never listened on port {p} within [workers] ready_timeout: is another program on it (`ss -ltnp \
+             'sport = :{p}'`)? does the app listen on process.env.PORT?"
+        ),
+        _ if reason.starts_with("spawn failed") => {
+            "the command could not be run: check [app] command, args and working_directory (`warden check`)".into()
+        }
+        _ => format!("fix the error above (all of it: `warden logs {name} --err`)"),
+    };
+    let then = if stopped {
+        format!(
+            "Its workers are stopped: {name} stays listed (errored) and nothing restarts it; `warden start {name}` \
+             tries again"
+        )
+    } else {
+        format!("Warden keeps restarting it with backoff; `warden stop {name}` stops it")
+    };
+    eprintln!("  hint: {fix}. {then}");
+    1
+}
+
+/// The app's last error output (stderr; its stdout if it wrote none), each
+/// line once: workers that all fail print the same lines.
+async fn print_last_output(app: &App) {
+    for stream in ["stderr", "stdout"] {
+        let req = Request::Logs { lines: 200, follow: false, worker: None, events: false, stream: Some(stream.into()) };
+        let mut buf: Vec<u8> = Vec::new();
+        if tokio::time::timeout(REQUEST_TIMEOUT, control::call(&app.socket, &req, &mut buf)).await.is_err() {
+            return;
+        }
+        let lines = last_unique_output(&String::from_utf8_lossy(&buf), 15);
+        if !lines.is_empty() {
+            eprintln!("  its last {}:", if stream == "stderr" { "error output" } else { "output" });
+            for l in lines {
+                eprintln!("    {l}");
+            }
+            return;
+        }
+    }
+    eprintln!("  (no output from it in `warden logs {}`)", app.name);
+}
+
+/// The text of the last `n` distinct output lines (`<ts> OUT   worker=1
+/// stderr: text` → `text`), in the order first written.
+fn last_unique_output(text: &str, n: usize) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<String> = text
+        .lines()
+        .filter_map(|l| l.split_once(" OUT   worker=")?.1.split_once(": ").map(|(_, t)| t.to_string()))
+        .filter(|t| !t.trim().is_empty() && seen.insert(t.clone()))
+        .collect();
+    unique[unique.len().saturating_sub(n)..].to_vec()
 }
 
 /// Run a supervisor detached from this terminal, logging to a rotated file.
@@ -1910,7 +2064,7 @@ pub async fn resurrect(args: &Args) -> i32 {
             println!("{}: already running", s.name);
             continue;
         }
-        worst = worst.max(start_app(&ctx, &app).await);
+        worst = worst.max(start_app(&ctx, &app, OnFailedStart::Report).await);
     }
     worst
 }
@@ -1997,6 +2151,21 @@ mod tests {
         assert_eq!(path, std::env::var_os("PATH"));
         assert_eq!(me.cwd, std::env::current_dir().ok());
         assert_eq!(Origin::of(u32::MAX / 2), None, "no such process");
+    }
+
+    /// What a failed `warden start` prints of the app's output: each line
+    /// once (every worker prints the same error), the last ones.
+    #[test]
+    fn failed_start_shows_each_output_line_once() {
+        let text = "2026-10-01T10:00:00.000Z OUT   worker=1 stderr: error: Cannot find package 'x'\n\
+                    2026-10-01T10:00:00.001Z OUT   worker=2 stderr: error: Cannot find package 'x'\n\
+                    2026-10-01T10:00:00.002Z OUT   worker=1 stderr: Bun v1.3.13 (Linux x64)\n\
+                    2026-10-01T10:00:00.003Z OUT   worker=1 stderr: \n\
+                    2026-10-01T10:00:00.004Z OUT   worker=2 stderr: Bun v1.3.13 (Linux x64)\n\
+                    2026-10-01T10:00:00.005Z INFO  not output\n";
+        assert_eq!(last_unique_output(text, 15), vec!["error: Cannot find package 'x'", "Bun v1.3.13 (Linux x64)"]);
+        assert_eq!(last_unique_output(text, 1), vec!["Bun v1.3.13 (Linux x64)"]);
+        assert!(last_unique_output("", 15).is_empty());
     }
 
     #[test]

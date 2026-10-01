@@ -663,6 +663,7 @@ mod tests {
             workers: vec![],
             release: None,
             standbys: vec![],
+            start_failed: None,
         }
     }
 

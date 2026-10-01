@@ -83,6 +83,10 @@ pub fn status_summary(s: &Status) -> String {
         let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
         t += &format!(" ({})", parts.join(", "));
     }
+    if let Some(reason) = &s.start_failed {
+        // Every worker crashed before one was ready (`warden list`: errored).
+        t += &format!(", failed to start ({reason})");
+    }
     if s.stopped {
         t += ", stopped";
     }
@@ -255,6 +259,9 @@ mod tests {
         s.workers_ready = 1;
         s.stopped = true;
         assert_eq!(status_summary(&s), "1/2 workers ready (1 RUNNING, 1 STARTING), stopped");
+        s.start_failed = Some("exit code 3".into());
+        assert!(status_summary(&s).ends_with(", failed to start (exit code 3), stopped"));
+        s.start_failed = None;
         let a = AppEntry {
             name: "api".into(),
             namespace: String::new(),

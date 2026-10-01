@@ -138,6 +138,12 @@ processes share a number: `pid` tells them apart. In worker mode, `worker` 0
 is the host process (`starting`, `ready`, `crashed`, `stopping`, …) and
 1..=count its Worker threads (`ready` when one listens, `crashed`, `hung`).
 
+`status.start_failed` (a string, absent otherwise): since the workers were
+last started, every one crashed and none was ready; the value is the last
+crash's reason (`exit code 1`, `not ready in time`). It stays while the
+workers are stopped after it (`stopped` true: the app is `errored`) and is
+cleared by the next start. `warden start` fails fast on it.
+
 `status.workers[].loop_delay` (`{"p50_ms","p99_ms","max_ms"}`, absent
 without one) is the worker's event-loop delay over its last heartbeat
 interval (about a second), from Warden's shim; in worker mode each

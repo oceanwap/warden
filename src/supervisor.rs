@@ -130,6 +130,20 @@ pub struct Supervisor {
     release: Option<release::Pin>,
     /// The cgroup's OOM kill counter, to tell OOM kills from other SIGKILLs.
     oom: process::exit::OomCounter,
+    /// Since the workers were last started (`start_all`) and until one is
+    /// ready: the slots that crashed meanwhile. Every slot in it = the app
+    /// can't start (`Status.start_failed`; `warden start` fails fast on it).
+    start_attempt: Option<StartAttempt>,
+}
+
+/// A start of every worker that no worker has survived to be ready yet.
+#[derive(Debug, Default)]
+struct StartAttempt {
+    crashed: std::collections::BTreeSet<usize>,
+    /// The last crash's reason (`exit code 1`, `not ready in time`).
+    last_exit: Option<String>,
+    /// The ERROR line saying so was logged (once per attempt).
+    reported: bool,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -382,6 +396,7 @@ impl Supervisor {
             pool: standby::Pool::default(),
             release: None,
             oom: process::exit::OomCounter::new(),
+            start_attempt: None,
             cfg,
             cfg_path,
         }
@@ -464,6 +479,9 @@ impl Supervisor {
                 hint = "check working_directory and its `current` symlink; workers can't start until it resolves",
             );
         }
+        // Ends with the first worker ready; until then crashes are counted
+        // (a spawn that fails below is one too).
+        self.start_attempt = Some(StartAttempt::default());
         for id in self.slot_ids() {
             let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
             slot.tracker.reset();
@@ -960,6 +978,8 @@ impl Supervisor {
         let was = inst.standby_number.map(standby_label).unwrap_or_default();
         match role {
             Role::Current => {
+                // The app can start: a worker made it.
+                self.start_attempt = None;
                 if let Some(s) = self.slots.get_mut(&slot_id) {
                     s.state = State::Running;
                 }
@@ -1085,10 +1105,14 @@ impl Supervisor {
             self.emit_worker(slot_id, WorkerEvent::Stopped, Some(inst.handle.pid), || Some(why.clone()));
             if is_current {
                 let mut remove = false;
+                // Stopped after a start that failed: the crash says why, not the stop.
+                let keep_crash = self.start_failed().is_some();
                 if let Some(s) = self.slots.get_mut(&slot_id) {
                     s.current = None;
                     s.state = State::Stopped;
-                    s.last_exit = Some(why);
+                    if !keep_crash {
+                        s.last_exit = Some(why);
+                    }
                     remove = s.removing;
                 }
                 if remove {
@@ -1184,6 +1208,55 @@ impl Supervisor {
         self.on_slot_crash(slot_id, uptime.unwrap_or_default());
     }
 
+    /// A slot crashed while no worker has been ready since the workers were
+    /// started. Once every slot has, the app can't start as it is: one ERROR
+    /// line says so and why. The restart policy goes on as configured (a
+    /// dependency may come back); an interactive `warden start` stops the
+    /// workers instead (it sees `Status.start_failed`).
+    fn note_start_crash(&mut self, slot_id: usize) {
+        let last = self.slots.get(&slot_id).and_then(|s| s.last_exit.clone());
+        let ids = self.slot_ids();
+        let Some(a) = self.start_attempt.as_mut() else { return };
+        a.crashed.insert(slot_id);
+        if last.is_some() {
+            a.last_exit = last;
+        }
+        if a.reported || !ids.iter().all(|id| a.crashed.contains(id)) {
+            return;
+        }
+        a.reported = true;
+        let reason = a.last_exit.clone().unwrap_or_default();
+        let app = &self.cfg.app.name;
+        let why = match self.cfg.app.port {
+            Some(p) if reason == "not ready in time" => format!(
+                "no worker listened on port {p} within workers.ready_timeout ({} s): another program on the port \
+                 (`ss -ltnp 'sport = :{p}'`), an app that doesn't listen on process.env.PORT, or a slow boot (raise \
+                 ready_timeout); its output: `warden logs {app}`",
+                self.cfg.workers.ready_timeout
+            ),
+            _ => format!("the app's own error output says why: `warden logs {app} --err`"),
+        };
+        error!(
+            "app cannot start: every worker crashed before it was ready",
+            workers = ids.len(),
+            reason = reason,
+            hint = format!(
+                "{why}. Warden keeps restarting it with backoff (FAILED after restart.max_restarts in \
+                 restart.restart_window, then retried after restart.failed_cooldown); fix the cause, then `warden \
+                 restart {app}`, or `warden stop {app}` to stop trying"
+            ),
+        );
+    }
+
+    /// `Status.start_failed`: every worker crashed since the workers were
+    /// started and none was ready; the last crash's reason.
+    fn start_failed(&self) -> Option<String> {
+        let a = self.start_attempt.as_ref()?;
+        let ids = self.slot_ids();
+        (!ids.is_empty() && ids.iter().all(|id| a.crashed.contains(id)))
+            .then(|| a.last_exit.clone().unwrap_or_else(|| "crashed".into()))
+    }
+
     fn on_slot_crash(&mut self, slot_id: usize, uptime: Duration) {
         if self.shutting_down || self.stopped {
             return;
@@ -1208,6 +1281,7 @@ impl Supervisor {
             info!("old worker gone; its replacement takes over the slot", worker = self.label(slot_id));
             return;
         }
+        self.note_start_crash(slot_id);
         let label = self.label(slot_id);
         let wid = self.event_worker(slot_id);
         let policy = self.policy.clone();
@@ -1643,6 +1717,14 @@ impl Supervisor {
                 }
                 info!("stopping all workers (supervisor stays up)");
                 self.stopped = true;
+                // Under systemd (Type=notify) the unit is started all the
+                // same: else it would wait for READY=1 until its timeout and
+                // restart us, starting the workers again (a start that failed
+                // and was stopped by `warden start`, for one).
+                if !self.announced_ready {
+                    self.announced_ready = true;
+                    systemd::notify("READY=1\nSTATUS=workers stopped on request");
+                }
                 self.stop_all();
                 Response::ok("stopping workers; `warden restart` starts them again")
             }
@@ -2013,6 +2095,7 @@ impl Supervisor {
             workers,
             release: self.release_text(),
             standbys,
+            start_failed: self.start_failed(),
         }
     }
 }
@@ -2154,6 +2237,31 @@ mod tests {
         assert!(get(&env, "WARDEN_ENTRY").is_some_and(|(v, _)| v.ends_with("main.js")));
         assert!(get(&env, "WARDEN_WORKER_ID").is_none() && get(&env, "NODE_APP_INSTANCE").is_none());
         assert!(get(&env, "WARDEN_INSTANCE_VAR").is_none(), "instance_var = \"\" sets none");
+    }
+
+    /// W5: a start fails once every worker crashed before one was ready,
+    /// and says so once; a worker that crashes twice doesn't count twice.
+    #[test]
+    fn start_attempt_fails_when_every_worker_crashed() {
+        let mut s = sup("[app]\nname = \"api\"\ncommand = \"sh\"\n[workers]\ncount = 2\n");
+        for id in [1, 2] {
+            let mut slot = Slot::new(id);
+            slot.last_exit = Some(format!("exit code {id}"));
+            s.slots.insert(id, slot);
+        }
+        assert_eq!(s.start_failed(), None, "no start yet");
+        s.start_attempt = Some(StartAttempt::default());
+        s.note_start_crash(1);
+        s.note_start_crash(1);
+        assert_eq!(s.start_failed(), None, "worker 2 has not crashed");
+        assert!(!s.start_attempt.as_ref().unwrap().reported);
+        s.note_start_crash(2);
+        assert_eq!(s.start_failed().as_deref(), Some("exit code 2"), "the last crash's reason");
+        assert!(s.start_attempt.as_ref().unwrap().reported, "logged once");
+        // Once a worker was ready, crashes are ordinary ones.
+        s.start_attempt = None;
+        s.note_start_crash(1);
+        assert_eq!(s.start_failed(), None);
     }
 
     /// `warden env`: the effective environment, secrets hidden.

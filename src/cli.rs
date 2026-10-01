@@ -19,7 +19,9 @@ USAGE:
 
 APPS (familiar from PM2):
     start <app|config.toml|script>   Start an app. A script gets a config written for
-                     it: `warden start server.js --name api -i 4 --port 3000`
+                     it: `warden start server.js --name api -i 4 --port 3000`.
+                     Waits for it; if every worker crashes first, exits 1 with the
+                     app's errors and leaves it stopped (errored)
     list             Every app and worker (also: ls, ps, status)  [--json]
     describe <app>   Config, paths, restart policy, workers, last rollout (also: show)
     restart <target> Replace the workers one at a time through the health gates (no
@@ -764,7 +766,9 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         if let Some(r) = &s.last_rollout {
             o += &format!("Last:        {} {} - {}\n", r.kind, if r.ok { "ok" } else { "FAILED" }, r.message);
         }
-        if s.stopped {
+        if let Some(n) = start_failed_note(s) {
+            o += &format!("State:       {n}\n");
+        } else if s.stopped {
             o += "State:       stopped (`warden start` starts the workers)\n";
         }
         if s.shutting_down {
@@ -794,6 +798,24 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         );
     }
     o
+}
+
+/// What `Status.start_failed` means for this app now: stopped after it
+/// (errored), or still restarting with backoff.
+fn start_failed_note(s: &Status) -> Option<String> {
+    let reason = s.start_failed.as_ref()?;
+    let app = &s.app;
+    Some(if s.stopped {
+        format!(
+            "errored: its last start failed, every worker crashed before it was ready ({reason}); `warden logs {app} \
+             --err` shows why, `warden start {app}` tries again"
+        )
+    } else {
+        format!(
+            "not started: every worker crashed before it was ready ({reason}); restarting with backoff (`warden \
+             logs {app} --err` shows why, `warden stop {app}` stops it)"
+        )
+    })
 }
 
 /// The Worker column of a hot standby (`Status.standbys`): `s1`, `s2`…
@@ -875,7 +897,12 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
             Ok(s) => {
                 let all = s.workers.iter().map(|w| (w.id.to_string(), w));
                 for (name, w) in all.chain(s.standbys.iter().map(|w| (standby_name(w), w))) {
-                    let state = if s.stopped && w.state == "STOPPED" { "stopped".to_string() } else { w.state.clone() };
+                    // Stopped after a start that failed: PM2's `errored`.
+                    let state = match (s.stopped && w.state == "STOPPED", &s.start_failed) {
+                        (true, Some(_)) => "errored".to_string(),
+                        (true, None) => "stopped".to_string(),
+                        _ => w.state.clone(),
+                    };
                     rows.push(vec![
                         app.name.clone(),
                         s.namespace.clone(),
@@ -899,6 +926,9 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                         "{}: most workers fail health checks; replacements held (dependency outage?)",
                         app.name
                     ));
+                }
+                if let Some(n) = start_failed_note(s) {
+                    notes.push(format!("{}: {n}", app.name));
                 }
             }
             Err(e) => {
@@ -948,7 +978,9 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         v => v.to_string(),
     };
     let num = |p: &str| c(p).as_u64().unwrap_or(0);
-    let state = if s.stopped {
+    let state = if let Some(n) = start_failed_note(s) {
+        n
+    } else if s.stopped {
         "stopped".to_string()
     } else if s.shutting_down {
         "shutting down".to_string()
@@ -1279,6 +1311,39 @@ mod tests {
         assert_eq!(parse_mb("300M"), Ok(300));
         assert_eq!(parse_mb("512"), Ok(512));
         assert!(parse_mb("lots").is_err());
+    }
+
+    /// A start that failed: `errored` rows and a note while stopped after
+    /// it, a note while it still restarts; the Loop p99 column.
+    #[test]
+    fn list_shows_errored_apps_and_loop_delay() {
+        let st = |stopped: bool| -> Status {
+            serde_json::from_value(serde_json::json!({
+                "app": "api", "namespace": "default", "mode": "process", "pid": 1, "uptime_secs": 1,
+                "workers_configured": 1, "workers_ready": 0, "healthy": null, "supervisor_rss_bytes": null,
+                "host": null, "reloading": false, "shutting_down": false, "stopped": stopped,
+                "start_failed": "exit code 3",
+                "workers": [{"id": 1, "state": if stopped { "STOPPED" } else { "RESTARTING" }, "pid": null,
+                    "uptime_secs": null, "restarts": 1, "crashes": 1, "rss_bytes": null, "cpu_seconds": null,
+                    "cpu_percent": null, "last_exit": "exit code 3",
+                    "loop_delay": {"p50_ms": 0.1, "p99_ms": 12.34, "max_ms": 20.0}}]
+            }))
+            .unwrap()
+        };
+        let app = crate::fleet::App {
+            name: "api".into(),
+            namespace: "default".into(),
+            config: None,
+            socket: "/run/w/api/control.sock".into(),
+            problem: None,
+        };
+        let text = render_list(&[(app.clone(), Ok(st(true)))]);
+        assert!(text.contains("Loop p99") && text.contains("12.3ms"), "{text}");
+        assert!(text.lines().nth(1).is_some_and(|l| l.contains(" errored ")), "{text}");
+        assert!(text.contains("api: errored: its last start failed"), "{text}");
+        let text = render_list(&[(app, Ok(st(false)))]);
+        assert!(text.contains(" RESTARTING ") && text.contains("api: not started: every worker crashed"), "{text}");
+        assert!(render_status(&st(true), false).contains("State:       errored"));
     }
 
     #[test]

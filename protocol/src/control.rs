@@ -180,6 +180,13 @@ pub struct Status {
     /// the pool's. Not in `workers`, so older clients don't see them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub standbys: Vec<WorkerStatus>,
+    /// Since the workers were last started (the supervisor's start,
+    /// `start`, `restart --hard`), every one crashed and none was ready
+    /// yet: the app can't start as it is. The last crash's reason (`exit
+    /// code 1`, `not ready in time`). Stays while the workers are stopped
+    /// after it (`warden list` shows them `errored`); a start clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_failed: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

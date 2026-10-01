@@ -289,7 +289,7 @@ has everything; the differences are in the right column.
 
 | PM2 | Warden | Difference |
 |---|---|---|
-| `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). Any program or command line works, as with PM2 |
+| `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). An app that can't start (every worker crashes before one is ready: a syntax error, a missing module, a port in use) fails at once with exit 1, its last error output and a hint; its workers are stopped and it stays listed as `errored`, as PM2 leaves it, until `warden start` again. Any program or command line works, as with PM2 |
 | `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | ~2 ms instead of ~140-160 ms |
 | `pm2 describe api` | `warden describe api` | Also the last exits and the last rollout |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
