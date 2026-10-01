@@ -75,6 +75,40 @@ pub struct Static {
     /// One stdout line per request (method, path, status, bytes, ms).
     #[serde(default)]
     pub access_log: bool,
+    /// Per worker: memory for complete prebuilt responses of small files
+    /// ("16MB"; 0 turns the cache off). A hit is one send(2).
+    #[serde(default = "default_cache_size", deserialize_with = "size_bytes")]
+    pub cache_size: u64,
+    /// Files larger than this are not cached (they go out with sendfile).
+    #[serde(default = "default_cache_max_file", deserialize_with = "size_bytes")]
+    pub cache_max_file: u64,
+    /// A cached file is checked against the disk at most this often (ms):
+    /// an edited or deleted file is served fresh within this time.
+    #[serde(default = "default_cache_valid_ms")]
+    pub cache_valid_ms: u64,
+    /// How connections are driven: "epoll" (default) or "uring" (io_uring,
+    /// Linux; falls back to epoll where it is unavailable).
+    /// `WARDEN_STATIC_IO` overrides it.
+    #[serde(default)]
+    pub io: StaticIo,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StaticIo {
+    #[default]
+    Epoll,
+    Uring,
+}
+
+fn default_cache_size() -> u64 {
+    16 << 20
+}
+fn default_cache_max_file() -> u64 {
+    64 << 10
+}
+fn default_cache_valid_ms() -> u64 {
+    1000
 }
 
 fn default_static_host() -> String {
@@ -604,6 +638,15 @@ impl Config {
             if let Some(a) = &st.basic_auth {
                 if !a.contains(':') {
                     return Err("static.basic_auth must be \"user:password\"".into());
+                }
+            }
+            for (name, value, max, unit) in [
+                ("static.cache_size", st.cache_size, 4 << 30, "4G"),
+                ("static.cache_max_file", st.cache_max_file, 1 << 30, "1G"),
+                ("static.cache_valid_ms", st.cache_valid_ms, 3_600_000, "3600000"),
+            ] {
+                if value > max {
+                    return Err(format!("{name} = {value} is out of range (maximum {unit})"));
                 }
             }
         }
@@ -1150,6 +1193,46 @@ mod tests {
         let c = Config::parse(&site).unwrap();
         let st = c.static_files.unwrap();
         assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
+        assert_eq!(st.io, StaticIo::Epoll);
+    }
+
+    #[test]
+    fn static_cache_and_io_settings() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        let st = Config::parse(base).unwrap().static_files.unwrap();
+        assert_eq!(
+            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
+            (16 << 20, 64 << 10, 1000, StaticIo::Epoll)
+        );
+        let st = Config::parse(&format!(
+            "{base}cache_size = \"64MB\"\ncache_max_file = \"256K\"\ncache_valid_ms = 0\nio = \"uring\"\n"
+        ))
+        .unwrap()
+        .static_files
+        .unwrap();
+        assert_eq!(
+            (st.cache_size, st.cache_max_file, st.cache_valid_ms, st.io),
+            (64 << 20, 256 << 10, 0, StaticIo::Uring)
+        );
+        // 0 turns the cache off; plain numbers are bytes.
+        let st =
+            Config::parse(&format!("{base}cache_size = 0\ncache_max_file = 1000\n")).unwrap().static_files.unwrap();
+        assert_eq!((st.cache_size, st.cache_max_file), (0, 1000));
+        // Out of range or malformed values are refused with the key's name.
+        for (bad, why) in [
+            ("cache_size = \"5G\"", "static.cache_size"),
+            ("cache_max_file = \"2G\"", "static.cache_max_file"),
+            ("cache_valid_ms = 3600001", "static.cache_valid_ms"),
+            ("cache_size = \"lots\"", "not a size"),
+            ("io = \"kqueue\"", "unknown variant"),
+        ] {
+            let e = Config::parse(&format!("{base}{bad}\n")).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // The worker gets the section as JSON (WARDEN_STATIC); sizes survive the round trip.
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(serde_json::from_str::<Static>(&json).unwrap(), st);
     }
 
     #[test]
