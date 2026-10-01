@@ -12,7 +12,8 @@
 //! default, request heads are capped at 16 KB and must arrive within 10 s.
 //!
 //! Small files are answered from an in-memory cache of complete responses
-//! (`cache.rs`: one send(2) per hit). Connections are driven by tokio
+//! (`cache.rs`: one send(2) per hit, or one sendfile(2) from a sealed memfd
+//! for bodies of 8 KB and more). Connections are driven by tokio
 //! (epoll). An io_uring transport was tried and dropped: it was slower than
 //! epoll with the cache (docs/benchmarks.md).
 
@@ -104,7 +105,7 @@ pub fn main() -> i32 {
         Ok("legacy") => OPEN_LEGACY,
         _ => OPEN_CACHED,
     };
-    let cache = Cache::new(cfg.cache_size, cfg.cache_max_file, cfg.cache_valid_ms);
+    let cache = Cache::new(cfg.cache_size, cfg.cache_max_file, cfg.cache_valid_ms, crate::sys::nofile_limit().0);
     let site = Arc::new(Site {
         root,
         dir,
@@ -416,13 +417,15 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     if let Some(c) = &site.cache {
         let (files, used, cap) = c.usage();
         println!(
-            "static cache: {} hits, {} misses, {} dropped as changed on disk, {} evicted; {files} files in {} of {} KB",
+            "static cache: {} hits, {} misses, {} dropped as changed on disk, {} evicted; {files} files in {} of {} KB \
+             ({} of them in memfds)",
             c.hits.load(Ordering::Relaxed),
             c.misses.load(Ordering::Relaxed),
             c.stale.load(Ordering::Relaxed),
             c.evicted.load(Ordering::Relaxed),
             used.div_ceil(1024),
-            cap >> 10
+            cap >> 10,
+            c.memfds()
         );
     }
     Ok(())
@@ -508,6 +511,20 @@ impl Conn {
                 Ok(())
             }
             Conn::Unix(w) => w.write_all(b.as_slice()).await,
+        }
+    }
+
+    /// Send `count` bytes of a cached response's memfd from `offset`: on TCP
+    /// by page reference (sendfile); on the Unix health socket a plain copy
+    /// (a memfd read never waits for a disk).
+    async fn send_cached(&mut self, file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
+        match self {
+            Conn::Tcp(w) => sendfile_all(w.as_ref(), file, offset, count).await.map(|_| ()),
+            Conn::Unix(w) => {
+                let mut buf = vec![0u8; usize::try_from(count).map_err(std::io::Error::other)?];
+                file.read_exact_at(&mut buf, offset)?;
+                w.write_all(&buf).await
+            }
         }
     }
 
@@ -1168,7 +1185,23 @@ fn is_not_modified(req: &Request, etag: &str, mtime: u64) -> bool {
 /// Answer from a cached entry: 304, HEAD or the full response, the same
 /// bytes the normal path sends. Keep-alive: one send of the stored bytes.
 async fn respond_cached(w: &mut Conn, req: &Request, e: &Arc<Entry>, keep: bool) -> std::io::Result<(u16, u64)> {
-    let (buf, conn_at, end, status, bytes) = if is_not_modified(req, &e.etag, e.mtime) {
+    let not_modified = is_not_modified(req, &e.etag, e.mtime);
+    if let (Some(mem), false, false) = (&e.file, not_modified, req.method == "HEAD") {
+        // The whole response is in a memfd: one sendfile(2), no copy.
+        if keep {
+            w.send_cached(&mem.file, 0, (e.head_len as u64) + e.body_len).await?;
+        } else {
+            let mut head = Vec::with_capacity(e.head_len);
+            head.extend_from_slice(&e.resp[..e.conn_at]);
+            head.extend_from_slice(b"close");
+            head.extend_from_slice(&e.resp[e.conn_at + cache::KEEP_ALIVE.len()..e.head_len]);
+            w.write_head_more(head).await?;
+            w.send_cached(&mem.file, e.head_len as u64, e.body_len).await?;
+        }
+        w.flush().await?;
+        return Ok((200, e.body_len));
+    }
+    let (buf, conn_at, end, status, bytes) = if not_modified {
         (&e.not_modified, e.nm_conn_at, e.not_modified.len(), 304, 0)
     } else if req.method == "HEAD" {
         (&e.resp, e.conn_at, e.head_len, 200, 0)
@@ -1267,8 +1300,13 @@ async fn send_file(
             buf.resize(head_len + len as usize, 0);
             let (file, buf) = read_body(body.file, buf, head_len, 0).await?;
             let unchanged = file.metadata().is_ok_and(|m| Stamp::of(&m) == stamp);
+            // A big body goes into a memfd (sent by page reference); the
+            // head stays in memory too, for HEAD and `Connection: close`.
+            let mem = cache.memfd(&buf, len);
+            let resp: Arc<[u8]> = if mem.is_some() { buf[..head_len].into() } else { buf.into() };
             let entry = Arc::new(Entry {
-                resp: buf.into(),
+                resp,
+                file: mem,
                 head_len,
                 conn_at,
                 not_modified: not_modified.into_bytes().into(),

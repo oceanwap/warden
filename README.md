@@ -323,7 +323,11 @@ with `openat2(RESOLVE_BENEATH)` on Linux.
 Small files are served from memory. Each worker keeps complete responses
 (headers and body) of recently used files up to `cache_max_file` (64 KB), in
 at most `cache_size` (16 MB, least recently used out first; `0` turns it
-off), so a hit is one `send(2)`. HEAD and 304s come from the same entry;
+off), so a hit is one system call: a `send(2)` from memory, or, for a body
+of 8 KB or more, a `sendfile(2)` from a sealed in-memory file (memfd), where
+the kernel takes the pages by reference instead of copying them (48 KB
+script: 28 % less CPU per request, ahead of nginx; see
+[docs/benchmarks.md](docs/benchmarks.md)). HEAD and 304s come from the same entry;
 ranges and anything unusual take the normal path. A cached file is checked
 against the disk at most every `cache_valid_ms` (1 s): an edit, a deletion
 or a symlink swapped in shows within that time (on NFS, within the

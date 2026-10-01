@@ -39,7 +39,7 @@
 // Hardware counters (instructions, cycles) are used when the machine has them (perf stat); VMs often don't.
 
 import { spawn, spawnSync, type Subprocess } from "bun";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   ROOT, SHIM, TMP, baseEnv, cpuNs, listenersOnPort, machine, median, oha, onAppCpus, parseArgs, sleep, sum, table,
@@ -63,6 +63,9 @@ const PERF = process.argv.includes("--perf");
 const CALL_GRAPH = process.argv.includes("--call-graph");
 const TOP = Number(args.top ?? 25);
 const APP_PORT = 3920;
+// --file-size N: static targets also serve /blob-N.bin (N bytes), the default path.
+const FILE_SIZE = Number(args["file-size"] ?? 0);
+const STATIC_PATH = args.path ?? (FILE_SIZE ? `/blob-${FILE_SIZE}.bin` : "/index.html");
 
 // ------------------------------------------------------------------ targets
 
@@ -95,7 +98,6 @@ function parseTarget(spec: string): Target {
     })
     .join("");
   const fromStatic = (run: () => Promise<Running>) => async (): Promise<Started> => {
-    st.makeSite();
     const r = await run();
     await waitFor(async () => (await get(st.PORT, "/index.html")) !== null, 30_000);
     await r.ready?.();
@@ -109,12 +111,12 @@ function parseTarget(spec: string): Target {
       return {
         spec,
         port: st.PORT,
-        path: args.path ?? "/index.html",
+        path: STATIC_PATH,
         start: fromStatic(() => st.startWarden({ cache: name === "warden", bin: override ?? args.warden, staticExtra })),
       };
     case "nginx":
       if (override || keys) throw new Error("nginx takes no overrides");
-      return { spec, port: st.PORT, path: args.path ?? "/index.html", start: fromStatic(st.startNginx) };
+      return { spec, port: st.PORT, path: STATIC_PATH, start: fromStatic(st.startNginx) };
     case "bun":
     case "bun-shim":
     case "node":
@@ -321,6 +323,13 @@ function parseStrace(text: string, requests: number): Record<string, number> {
 
 mkdirSync(TMP, { recursive: true });
 const targets = TARGETS.map(parseTarget);
+if (targets.some((t) => t.port === st.PORT)) {
+  st.makeSite();
+  if (FILE_SIZE) writeFileSync(join(st.SITE, `blob-${FILE_SIZE}.bin`), new Uint8Array(FILE_SIZE).fill(97));
+  // Warden's cache leaves a file changed in the last 2 s uncached (by its
+  // ctime, which a new file can't set back): let the site age first.
+  await sleep(2500);
+}
 const meta = machine();
 console.error(
   JSON.stringify({ ...meta, targets: TARGETS, requests: REQUESTS, connections: CONNECTIONS, workers: WORKERS, rounds: ROUNDS, keepalive: KEEPALIVE }),

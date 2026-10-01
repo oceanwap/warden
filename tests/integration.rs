@@ -1910,8 +1910,8 @@ fn static_cache_hits_match_and_stay_fresh() {
     std::fs::write(site.join("gone.txt"), "here").unwrap();
     std::fs::write(site.join("swap.txt"), "inside").unwrap();
     std::fs::write(dir.join("outside.txt"), "secret").unwrap();
-    // Between the single-write limit (16 KB) and cache_max_file (64 KB),
-    // and one above it (never cached).
+    // Between the single-write limit (16 KB) and cache_max_file (64 KB):
+    // cached in a memfd (MEMFD_MIN, 8 KB); and one above it (never cached).
     let mid: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(site.join("mid.bin"), &mid).unwrap();
     let big: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
@@ -1963,6 +1963,10 @@ fn static_cache_hits_match_and_stay_fresh() {
         "GET /docs HTTP/1.1\r\n\r\n".to_string(),
         "GET /docs/index.html/ HTTP/1.1\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        // A memfd entry's other forms: HEAD, Connection: close, 304.
+        "HEAD /mid.bin HTTP/1.1\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.0\r\n\r\n".to_string(),
+        "GET /mid.bin HTTP/1.1\r\nIf-Modified-Since: Fri, 01 Jan 2100 00:00:00 GMT\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=100-199\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=-10\r\n\r\n".to_string(),
         "GET /mid.bin HTTP/1.1\r\nRange: bytes=99999-\r\n\r\n".to_string(),

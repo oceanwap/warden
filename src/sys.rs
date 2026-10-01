@@ -502,6 +502,35 @@ pub fn tcp_defer_accept(listener: BorrowedFd<'_>, secs: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// A sealed in-memory file holding exactly `data`: memfd_create(2)
+/// (close-on-exec), the bytes written, then sealed against every change
+/// (write, grow, shrink, more seals). sendfile(2) sends from it by page
+/// reference, without the copy a send(2) of the same bytes makes; it never
+/// waits for a disk. `Unsupported` outside Linux.
+#[cfg(target_os = "linux")]
+pub fn sealed_memfd(name: &std::ffi::CStr, data: &[u8]) -> io::Result<std::fs::File> {
+    use std::io::Write;
+    // SAFETY: `name` is NUL-terminated and outlives the call; the flags are
+    // constants; no other memory is passed.
+    let raw = check(unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) })?;
+    // SAFETY: memfd_create just returned `raw`; the File is its only owner,
+    // so every early return below closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.write_all(data)?;
+    let seals = libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+    // SAFETY: fcntl on a descriptor we own, with integer arguments only.
+    check(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) })?;
+    Ok(file)
+}
+
+/// Not Linux: no memfd; always `Unsupported` (callers keep the bytes in
+/// memory and send(2) them).
+#[cfg(not(target_os = "linux"))]
+pub fn sealed_memfd(name: &std::ffi::CStr, data: &[u8]) -> io::Result<std::fs::File> {
+    let _ = (name, data);
+    Err(io::Error::new(io::ErrorKind::Unsupported, "memfd is Linux-only"))
+}
+
 /// Index of the first `byte` in `hay`: the C library's memchr, which is
 /// vectorised (glibc: SSE2/AVX2/EVEX), far faster than a byte loop on long
 /// log chunks.
@@ -910,6 +939,74 @@ mod tests {
             assert!(listen_tcp("192.0.2.1:0".parse().unwrap(), true, 16).is_err());
         }
         assert_eq!(open_fds(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_memfd_holds_exactly_the_bytes_and_cannot_change() {
+        use std::os::unix::fs::FileExt;
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let f = sealed_memfd(c"warden-test", &data).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), data.len() as u64);
+        assert!(fd_flags(f.as_raw_fd()).0, "close-on-exec");
+        let mut back = vec![0u8; data.len()];
+        f.read_exact_at(&mut back, 0).unwrap();
+        assert!(back == data);
+        // Sealed: no write anywhere, no resize either way.
+        for at in [0, 99_999, 100_000] {
+            assert_eq!(f.write_at(b"x", at).unwrap_err().raw_os_error(), Some(libc::EPERM), "write at {at}");
+        }
+        assert!(f.set_len(10).is_err() && f.set_len(200_000).is_err());
+        f.read_exact_at(&mut back, 0).unwrap();
+        assert!(back == data, "unchanged");
+        // sendfile sends the exact bytes from any offset, and stops at the end.
+        use std::os::fd::AsFd;
+        for (off, len) in [(0usize, data.len()), (123, 4096), (99_999, 1), (50_000, 50_000)] {
+            let (tx, mut rx) = socket_pair();
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::new();
+                rx.read_to_end(&mut got).unwrap();
+                got
+            });
+            let mut o = off as i64;
+            let mut sent = 0;
+            while sent < len {
+                let n = sendfile(tx.as_fd(), f.as_fd(), &mut o, len - sent).unwrap();
+                assert!(n > 0, "EOF inside the memfd at {o}");
+                sent += n;
+            }
+            assert_eq!(sendfile(tx.as_fd(), f.as_fd(), &mut (data.len() as i64), 10).unwrap(), 0, "past the end");
+            drop(tx);
+            assert!(reader.join().unwrap() == data[off..off + len], "bytes differ at {off}+{len}");
+        }
+        // Empty is fine too.
+        assert_eq!(sealed_memfd(c"warden-empty", &[]).unwrap().metadata().unwrap().len(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_memfd_does_not_leak() {
+        run_isolated("sealed_memfd_leak_probe");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_memfd_leak_probe() {
+        if !in_probe() {
+            return;
+        }
+        let before = open_fds();
+        for i in 0..500 {
+            let f = sealed_memfd(c"warden-probe", &vec![i as u8; i * 7]).unwrap();
+            drop(f);
+        }
+        assert_eq!(open_fds(), before);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sealed_memfd_is_unsupported_outside_linux() {
+        assert_eq!(sealed_memfd(c"x", b"abc").unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 
     fn socket_pair() -> (std::net::TcpStream, std::net::TcpStream) {
