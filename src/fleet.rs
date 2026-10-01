@@ -1203,7 +1203,7 @@ async fn wait_ready(app: &App, limit: Duration) -> i32 {
                 );
                 return 0;
             }
-            if st.workers.iter().any(|w| w.state == "FAILED") {
+            if st.workers.iter().any(|w| w.state == "FAILED" && !w.is_standby()) {
                 eprintln!("warden: {}: a worker is FAILED; `warden describe {}` shows why", app.name, app.name);
                 return 1;
             }

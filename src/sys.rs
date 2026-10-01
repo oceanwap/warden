@@ -166,6 +166,38 @@ pub fn pipe_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok((r, w))
 }
 
+/// A connected pair of Unix stream sockets, both close-on-exec: Warden's
+/// two-way channel with a worker (the worker's end goes to fd 3 with
+/// `child_dup_ipc`, the only copy that survives exec). Both ends block;
+/// callers make their own end non-blocking.
+#[cfg(target_os = "linux")]
+pub fn socketpair_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a valid array of two ints for socketpair to fill.
+    check(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr()) })?;
+    // SAFETY: socketpair just created these descriptors; nothing else owns
+    // them, so wrapping each in exactly one OwnedFd is sound.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// A connected pair of Unix stream sockets, both close-on-exec. Not Linux:
+/// no SOCK_CLOEXEC, so socketpair(2) and then FD_CLOEXEC on each end (see
+/// `set_cloexec` for the window).
+#[cfg(not(target_os = "linux"))]
+pub fn socketpair_cloexec() -> io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::AsFd;
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: `fds` is a valid array of two ints for socketpair to fill.
+    check(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) })?;
+    // SAFETY: socketpair just created these descriptors; nothing else owns
+    // them, so wrapping each in exactly one OwnedFd is sound (and closes
+    // both if setting the flag fails below).
+    let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    set_cloexec(a.as_fd(), false)?;
+    set_cloexec(b.as_fd(), false)?;
+    Ok((a, b))
+}
+
 /// Broken-down local time for `secs` since the epoch.
 pub fn localtime(secs: i64) -> Option<libc::tm> {
     let t: libc::time_t = secs as libc::time_t;
@@ -535,13 +567,14 @@ pub fn splice(pipe: BorrowedFd<'_>, out: BorrowedFd<'_>, off_out: Option<&mut u6
 // These run in the child after fork(2) and before exec: only
 // async-signal-safe calls, no allocation, no locks (see `Command::pre_exec`).
 
-/// Put Warden's IPC pipe at `target` in the child (fd 3), inherited by exec.
-pub fn child_dup_ipc(write_fd: RawFd, target: RawFd) -> io::Result<()> {
+/// Put the worker's end of Warden's IPC channel (a socket, or any
+/// descriptor) at `target` in the child (fd 3), inherited by exec.
+pub fn child_dup_ipc(child_fd: RawFd, target: RawFd) -> io::Result<()> {
     // SAFETY: dup2/fcntl on descriptors that exist in the child; both are
     // async-signal-safe.
     unsafe {
-        check(libc::dup2(write_fd, target))?;
-        if write_fd == target {
+        check(libc::dup2(child_fd, target))?;
+        if child_fd == target {
             // dup2 onto itself keeps FD_CLOEXEC; clear it so the fd survives exec.
             check(libc::fcntl(target, libc::F_SETFD, 0))?;
         }
@@ -734,6 +767,61 @@ mod tests {
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert_eq!(s, "ping");
+    }
+
+    #[test]
+    fn socketpairs_are_cloexec_and_do_not_leak() {
+        run_isolated("socketpair_leak_probe");
+    }
+
+    #[test]
+    fn socketpair_leak_probe() {
+        if !in_probe() {
+            return;
+        }
+        let before = open_fds();
+        for _ in 0..2000 {
+            let (a, b) = socketpair_cloexec().unwrap();
+            assert_eq!(fd_flags(a.as_raw_fd()), (true, false), "CLOEXEC, blocking");
+            assert_eq!(fd_flags(b.as_raw_fd()), (true, false), "CLOEXEC, blocking");
+        }
+        assert_eq!(open_fds(), before, "every socket closed on drop");
+        // Both directions carry bytes; closing one end is EOF at the other.
+        let (a, b) = socketpair_cloexec().unwrap();
+        let mut a = std::os::unix::net::UnixStream::from(a);
+        let mut b = std::os::unix::net::UnixStream::from(b);
+        a.write_all(b"ping\n").unwrap();
+        b.write_all(b"pong\n").unwrap();
+        let (mut x, mut y) = ([0u8; 5], [0u8; 5]);
+        b.read_exact(&mut x).unwrap();
+        a.read_exact(&mut y).unwrap();
+        assert_eq!((&x, &y), (b"ping\n", b"pong\n"));
+        drop(a);
+        let mut rest = Vec::new();
+        assert_eq!(b.read_to_end(&mut rest).unwrap(), 0);
+    }
+
+    /// The worker's end of the IPC socket lands on fd 3 and works both ways:
+    /// the child reads a line Warden sends and answers on the same fd.
+    #[test]
+    fn socketpair_reaches_a_child_both_ways() {
+        use std::os::unix::process::CommandExt;
+        let (ours, theirs) = socketpair_cloexec().unwrap();
+        let cfd = theirs.as_raw_fd();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "read -r line <&3; echo \"got $line\" >&3"]);
+        // SAFETY (test): the closure only calls the async-signal-safe helper.
+        unsafe {
+            cmd.pre_exec(move || child_dup_ipc(cfd, 3));
+        }
+        let mut child = cmd.spawn().unwrap();
+        drop(theirs); // only the child's copy remains: its exit is EOF here
+        let mut s = std::os::unix::net::UnixStream::from(ours);
+        s.write_all(b"promote\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(out, "got promote\n");
     }
 
     #[test]

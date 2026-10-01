@@ -21,6 +21,9 @@
 //  5. In Workers, closes listeners from an exit hook: Bun does not close the
 //     listening socket of a Worker that dies, which would black-hole 1/N of
 //     new connections.
+//  6. Hot standby (WARDEN_STANDBY=1, `[workers] standby`): the app starts
+//     completely but its listen on the app's port is deferred until Warden
+//     sends `{"cmd":"promote"}` on fd 3 (see the "standby" section).
 
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -36,7 +39,8 @@ const http = () => (httpModule ??= require("node:http"));
 const env = process.env;
 const isBun = typeof Bun !== "undefined";
 const inWorker = !isMainThread;
-const workerId = Number(env.WARDEN_WORKER_ID || 0);
+// `let`: a promoted standby takes the worker id of the slot it fills.
+let workerId = Number(env.WARDEN_WORKER_ID || 0);
 const ipcFd = env.WARDEN_IPC_FD ? Number(env.WARDEN_IPC_FD) : null;
 const drainMs = Number(env.WARDEN_DRAIN_MS ?? 500);
 const forceReusePort = env.WARDEN_REUSE_PORT === "1";
@@ -72,6 +76,10 @@ const nodeConns = new Set();
 // The app has a node:http server (Bun: one went through Bun.serve), so
 // node:http is loaded and its responses need `Connection: close` in a drain.
 let appUsesNodeHttp = false;
+// Hot standby (process mode with a port only): listens on the app's port
+// deferred until promoted. See the "standby" section.
+const standby = env.WARDEN_STANDBY === "1" && !inWorker && ipcFd != null && appPort != null;
+let promoted = false;
 
 function report(msg) {
   msg.worker = workerId;
@@ -98,6 +106,7 @@ function privateSocketPath() {
 let originalServe = null;
 
 function wardenServe(options, ...rest) {
+  if (standby && !promoted && deferrableBun(options)) return deferBunServe(options, rest);
   let opts = options;
   if (opts && typeof opts === "object") {
     // Object.create keeps the caller's object (and its prototype methods)
@@ -245,16 +254,312 @@ function openPrivateNode(appServer, done) {
   }
 }
 
+let nodeOrigListen = null; // for the standby's warm-up listen
+
 if (!isBun) {
   const net = require("node:net");
   const origListen = net.Server.prototype.listen;
+  nodeOrigListen = origListen;
   net.Server.prototype.listen = function (...args) {
     if (this !== privateServer) {
       trackNodeServer(this);
+      if (standby && !promoted && deferNodeListen(this, args)) return this;
       if (forceReusePort) args = withReusePort(args);
     }
     return origListen.apply(this, args);
   };
+}
+
+// --------------------------------------------------------------- standby
+//
+// `[workers] standby = N`: Warden keeps N extra workers started but not
+// receiving traffic. The app initializes completely; only its listen on the
+// app's port is deferred (servers on other ports start as usual), and the
+// worker reports `standby_ready`. On `{"cmd":"promote","worker":W}` (fd 3 is
+// read only by standbys) it listens for real, takes worker id W (and its
+// instance variable), and reports `listening` as any worker does.
+//
+// - Bun.serve: the app gets a Proxy over a stand-in server (its own options
+//   on a private Unix socket: every method works, nothing reaches it from the
+//   network); at promotion the real server takes the stand-in's place.
+// - node:http under Bun: Bun's node:http insists on a real Bun server, so it
+//   gets the stand-in; the node:http server is found when it emits
+//   `listening`, and at promotion its internal server is swapped for the
+//   real one (address(), close() then act on the real listener).
+// - node:http / net under Node: listen() is recorded and called at promotion
+//   (its callback and `listening` come then).
+// The first stand-in doubles as the private health socket when Warden asked
+// for one, so Warden can health-check the standby before promoting it.
+
+// Bun: { options, rest, standIn, current, real, stopped, node, path, health }
+// Node: { server, args }
+const deferredListens = [];
+let standbyReported = false;
+let emitHook = null;
+
+// The port Bun.serve listens on for these options (Bun's own defaults).
+function bunPort(o) {
+  return Number(o.port ?? env.BUN_PORT ?? env.PORT ?? env.NODE_PORT ?? 3000);
+}
+
+function deferrableBun(o) {
+  return o && typeof o === "object" && !o.unix && bunPort(o) === appPort;
+}
+
+function standbyReady(socket) {
+  if (standbyReported) return;
+  standbyReported = true;
+  report(socket ? { ev: "standby_ready", port: appPort, socket } : { ev: "standby_ready", port: appPort });
+}
+
+// Listening for real would take traffic before promotion: refuse instead.
+function standbyCannotDefer(why) {
+  try {
+    process.stderr.write(`warden: standby cannot defer the app's listen on port ${appPort}: ${why}\n`);
+  } catch {}
+  process.exit(70);
+}
+
+function standInPath() {
+  if (!privateServer) {
+    const path = privateSocketPath();
+    if (path) return { path, health: true };
+  }
+  const dir = env.WARDEN_STANDBY_DIR || healthDir;
+  const path = dir ? `${dir}/${env.WARDEN_APP || "app"}.s${instance}-${deferredListens.length}.sock` : null;
+  return path && path.length <= 100 ? { path, health: false } : null;
+}
+
+function deferBunServe(options, rest) {
+  const at = standInPath();
+  if (!at) return standbyCannotDefer("no directory for its stand-in socket (WARDEN_STANDBY_DIR)");
+  let standIn;
+  try {
+    fs.rmSync(at.path, { force: true });
+    const p = Object.create(options);
+    p.unix = at.path;
+    p.port = undefined;
+    p.hostname = undefined;
+    p.reusePort = false;
+    standIn = originalServe.call(Bun, p);
+  } catch (e) {
+    return standbyCannotDefer(`its stand-in server failed: ${e && e.message}`);
+  }
+  if (at.health) {
+    privateServer = standIn;
+    privatePath = at.path;
+  }
+  const rec = { options, rest, standIn, current: standIn, real: null, stopped: false, node: null, ...at };
+  deferredListens.push(rec);
+  standbyReady(at.health ? at.path : null);
+  if (typeof options.onNodeHTTPRequest === "function") {
+    appUsesNodeHttp = true;
+    hookListeningEmit();
+    return standIn;
+  }
+  return standbyProxy(rec);
+}
+
+// What the app sees until promotion: the stand-in, except where it would
+// tell (its port and address are the app's).
+function standbyProxy(rec) {
+  const host = rec.options.hostname;
+  const before = {
+    port: () => appPort,
+    hostname: () => host || "localhost",
+    url: () => new URL(`http://${host || "localhost"}:${appPort}/`),
+    address: () => ({ address: host || "0.0.0.0", family: host && host.includes(":") ? "IPv6" : "IPv4", port: appPort }),
+    stop: () =>
+      function (...a) {
+        rec.stopped = true; // the app stopped it: don't listen at promotion either
+        return rec.standIn.stop(...a);
+      },
+  };
+  const bound = new Map();
+  return new Proxy(rec.standIn, {
+    get(_, prop) {
+      if (!rec.real && Object.hasOwn(before, prop)) return before[prop]();
+      const cur = rec.current;
+      const v = Reflect.get(cur, prop, cur);
+      if (typeof v !== "function" || prop === "constructor") return v;
+      let b = bound.get(prop);
+      if (!b || b.on !== cur || b.fn !== v) {
+        b = { on: cur, fn: v, call: v.bind(cur) };
+        bound.set(prop, b);
+      }
+      return b.call;
+    },
+    set(_, prop, value) {
+      return Reflect.set(rec.current, prop, value, rec.current);
+    },
+    has(_, prop) {
+      return prop in rec.current;
+    },
+  });
+}
+
+// Bun's node:http keeps the Bun server it got under a symbol and emits
+// `listening` right after: find it there (only while a standby).
+function hookListeningEmit() {
+  if (emitHook) return;
+  const EE = require("node:events");
+  const orig = EE.prototype.emit;
+  const hook = function (ev) {
+    if (ev === "listening" && !promoted) {
+      for (const r of deferredListens) {
+        if (!r.standIn || r.node) continue;
+        const key = Object.getOwnPropertySymbols(this).find((s) => this[s] === r.standIn);
+        if (key) {
+          r.node = { server: this, key };
+          const host = r.options.hostname;
+          const family = host && !host.includes(":") ? "IPv4" : "IPv6";
+          // Until promotion, address() is the app's port, not the stand-in's path.
+          Object.defineProperty(this, "address", {
+            configurable: true,
+            writable: true,
+            value: () => ({ address: host || "::", family, port: appPort }),
+          });
+        }
+      }
+    }
+    return orig.apply(this, arguments);
+  };
+  EE.prototype.emit = hook;
+  emitHook = { EE, orig, hook };
+}
+
+function unhookListeningEmit() {
+  // Only if nobody wrapped it since (then our hook stays, idle once promoted).
+  if (emitHook && emitHook.EE.prototype.emit === emitHook.hook) emitHook.EE.prototype.emit = emitHook.orig;
+}
+
+function promoteBun(rec) {
+  if (rec.stopped) return;
+  // `promoted` is set: this is the app's own Bun.serve call, made now
+  // (reusePort, drain wrapper, `listening` report).
+  const real = wardenServe.call(Bun, rec.options, ...rec.rest);
+  rec.real = real;
+  rec.current = real;
+  if (rec.node) {
+    rec.node.server[rec.node.key] = real;
+    delete rec.node.server.address;
+  } else if (typeof rec.options.onNodeHTTPRequest === "function") {
+    try {
+      process.stderr.write("warden: promoted, but the node:http server was not found; its address()/close() act on the stand-in\n");
+    } catch {}
+    return; // keep the stand-in it holds alive
+  }
+  if (!rec.health) {
+    try {
+      rec.standIn.stop(true);
+    } catch {}
+    try {
+      fs.rmSync(rec.path, { force: true });
+    } catch {}
+  }
+}
+
+// node:http / net under Node: `listen(port, …)` or `listen({ port }, …)` on
+// the app's port.
+function nodeListenPort(args) {
+  const a0 = args[0];
+  if (a0 && typeof a0 === "object" && !Array.isArray(a0)) {
+    if (a0.path !== undefined || a0.fd !== undefined || a0._handle || a0.handle) return null;
+    return Number(a0.port);
+  }
+  if (typeof a0 === "number" || (typeof a0 === "string" && /^\d+$/.test(a0))) return Number(a0);
+  return null;
+}
+
+function deferNodeListen(server, args) {
+  if (nodeListenPort(args) !== appPort) return false;
+  if (!deferredListens.length) warmNodeListen(args);
+  deferredListens.push({ server, args });
+  if (healthDir && !privateServer && isHttpServer(server)) {
+    openPrivateNode(server, (socket) => standbyReady(socket));
+  } else if (!privateServer || privatePath) {
+    standbyReady(privatePath);
+  }
+  return true;
+}
+
+// Node compiles and loads its listen path (dns, cluster, TCP binding) on
+// first use: ~10 ms that would land on the promotion. Run it once now, on
+// an ephemeral port nobody connects to (measured: promotion 9-13 ms → 3 ms).
+function warmNodeListen(args) {
+  if (!nodeOrigListen) return;
+  try {
+    const a0 = args[0];
+    const host = a0 && typeof a0 === "object" ? a0.host : typeof args[1] === "string" ? args[1] : undefined;
+    const net = require("node:net");
+    const w = new net.Server();
+    w.on("error", () => {});
+    nodeOrigListen.call(w, { port: 0, host, reusePort: forceReusePort }, () => w.close());
+    w.unref();
+  } catch {}
+}
+
+function promote(msg) {
+  if (promoted) return;
+  promoted = true;
+  if (Number.isInteger(msg.worker) && msg.worker > 0) {
+    workerId = msg.worker;
+    env.WARDEN_WORKER_ID = String(msg.worker);
+    if (env.WARDEN_INSTANCE_VAR) env[env.WARDEN_INSTANCE_VAR] = String(msg.worker - 1);
+  }
+  if (Number.isInteger(msg.count)) env.WARDEN_WORKER_COUNT = String(msg.count);
+  delete env.WARDEN_STANDBY;
+  unhookListeningEmit();
+  // A listen that throws (EADDRINUSE…) crashes the worker, as it would have
+  // at startup: Warden restarts the slot.
+  for (const d of deferredListens) {
+    if (d.server) d.server.listen(...d.args);
+    else promoteBun(d);
+  }
+  // For apps that start instance-specific work (cron on instance 0) late.
+  process.emit("warden:promote", { worker: workerId });
+}
+
+// Commands from Warden on fd 3 (a socket). Reads run on the runtime's
+// thread pool, so the event loop never waits; the pending read also keeps a
+// Node standby alive while nothing listens. No reads after promotion.
+function readWardenCommands() {
+  const buf = Buffer.alloc(4096);
+  let acc = "";
+  const next = () =>
+    fs.read(ipcFd, buf, 0, buf.length, null, (err, n) => {
+      if (err) {
+        if (err.code === "EAGAIN" || err.code === "EINTR") setTimeout(next, 10);
+        return; // fd 3 is gone: nothing can promote this worker
+      }
+      if (!n) return; // Warden closed its end (it is exiting)
+      acc += buf.toString("utf8", 0, n);
+      for (let i = acc.indexOf("\n"); i >= 0; i = acc.indexOf("\n")) {
+        const line = acc.slice(0, i);
+        acc = acc.slice(i + 1);
+        let msg = null;
+        try {
+          msg = JSON.parse(line);
+        } catch {}
+        if (msg && msg.cmd === "promote") promote(msg);
+      }
+      if (acc.length > 65536) acc = "";
+      if (!promoted) next();
+    });
+  next();
+}
+
+if (standby) {
+  readWardenCommands();
+  process.on("exit", () => {
+    for (const d of deferredListens) {
+      if (d.path && !d.health) {
+        try {
+          fs.rmSync(d.path, { force: true });
+        } catch {}
+      }
+    }
+  });
 }
 
 // ---------------------------------------------------------------- common

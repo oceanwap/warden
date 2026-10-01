@@ -392,6 +392,7 @@ impl Supervisor {
             if !matches!(roll.step, Step::Idle) || self.shutting_down || self.stopped {
                 return;
             }
+            let kind = roll.kind;
             let Some(slot_id) = roll.queue.pop_front() else {
                 self.finish_rollout(true, None);
                 return;
@@ -409,7 +410,7 @@ impl Supervisor {
                     self.stop_instance(old);
                     Step::Draining { slot: slot_id, old, then_spawn: true }
                 }
-                (Some(old), _) => match self.spawn_instance(slot_id, Role::Replacement) {
+                (Some(old), _) => match self.start_replacement(slot_id, kind) {
                     Ok(new) => Step::Starting { slot: slot_id, new, old: Some(old), deadline },
                     Err(e) => {
                         self.fail_rollout(format!("could not start a new worker: {e}"));
@@ -921,6 +922,7 @@ impl Supervisor {
             });
         }
         self.last_rollout = Some(outcome);
+        self.standby_after_rollout(roll.kind, ok, roll.total);
     }
 
     /// What `rollout_status().phase` says, without its countdowns (soak time
@@ -1013,7 +1015,7 @@ fn command_exists(cmd: &str, env: &std::collections::BTreeMap<String, String>) -
 }
 
 /// Run `sh -c <cmd>` with a timeout; `Err` carries the last output line.
-async fn run_shell(
+pub(super) async fn run_shell(
     cmd: String,
     cwd: Option<PathBuf>,
     env: Vec<(String, String)>,

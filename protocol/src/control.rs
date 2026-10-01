@@ -194,9 +194,23 @@ pub struct HostStatus {
     pub restarts: u64,
 }
 
+/// `WorkerStatus.id` of a hot standby (process mode, `[workers] standby`):
+/// standbys are listed after the workers, all with this id (workers are
+/// numbered from 1). Older clients show them as worker 0.
+pub const STANDBY_ID: usize = 0;
+/// `WorkerStatus.state` of a standby that can take over a crashed worker.
+pub const STANDBY: &str = "STANDBY";
+/// `WorkerStatus.state` of a standby still starting (initializing, or
+/// passing its health gates).
+pub const WARMING: &str = "WARMING";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkerStatus {
+    /// The worker number (1..=count); [`STANDBY_ID`] for a hot standby.
     pub id: usize,
+    /// `STARTING`, `RUNNING`, `STOPPING`, `STOPPED`, `CRASHED`,
+    /// `RESTARTING`, `FAILED`; standbys: [`WARMING`], [`STANDBY`] (or
+    /// `STOPPING`, and `RESTARTING` / `FAILED` / `STOPPED` for missing ones).
     pub state: String,
     pub pid: Option<u32>,
     pub uptime_secs: Option<u64>,
@@ -209,6 +223,13 @@ pub struct WorkerStatus {
     /// Per-worker health verdict (private-socket checks).
     #[serde(default)]
     pub healthy: Option<bool>,
+}
+
+impl WorkerStatus {
+    /// A hot standby's row, not a worker's.
+    pub fn is_standby(&self) -> bool {
+        self.id == STANDBY_ID
+    }
 }
 
 #[cfg(test)]

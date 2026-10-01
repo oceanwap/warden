@@ -717,6 +717,11 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         o += &format!("Mode:        {}\n", s.mode);
         o += &format!("Workers:     {}\n", s.workers_configured);
         o += &format!("Ready:       {}\n", s.workers_ready);
+        let standbys: Vec<&crate::control::WorkerStatus> = s.workers.iter().filter(|w| w.is_standby()).collect();
+        if !standbys.is_empty() {
+            let up = standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
+            o += &format!("Standby:     {up}/{} ready to take over a crashed worker\n", standbys.len());
+        }
         o += &format!("PID:         {}\n", s.pid);
         o += &format!("Uptime:      {}\n", duration(s.uptime_secs));
         if let Some(r) = s.supervisor_rss_bytes {
@@ -756,7 +761,7 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
     for w in &s.workers {
         o += &format!(
             "{:<8} {:<11} {:<8} {:<8} {:<9} {:<10} {:<7} {:<8} {}\n",
-            w.id,
+            worker_name(w),
             w.state,
             w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -768,6 +773,11 @@ pub fn render_status(s: &Status, table_only: bool) -> String {
         );
     }
     o
+}
+
+/// The Worker column: the worker number, or `standby` for a hot standby.
+fn worker_name(w: &crate::control::WorkerStatus) -> String {
+    if w.is_standby() { "standby".into() } else { w.id.to_string() }
 }
 
 fn health_word(h: Option<bool>) -> &'static str {
@@ -815,7 +825,7 @@ pub fn render_list(all: &[(crate::fleet::App, Result<Status, String>)]) -> Strin
                     rows.push(vec![
                         app.name.clone(),
                         s.namespace.clone(),
-                        w.id.to_string(),
+                        worker_name(w),
                         state,
                         w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
                         w.uptime_secs.map(duration).unwrap_or_else(|| "-".into()),
@@ -905,6 +915,15 @@ pub fn render_describe(s: &Status, info: &serde_json::Value) -> String {
         },
     );
     row("mode", format!("{}, {} worker(s)", s.mode, s.workers_configured));
+    if num("/workers/standby") > 0 {
+        row(
+            "standby",
+            format!(
+                "{} hot standby(s): started, not listening; one takes a crashed worker's slot in milliseconds",
+                num("/workers/standby")
+            ),
+        );
+    }
     row(
         "restart",
         if c("/restart/enabled").as_bool() == Some(false) {

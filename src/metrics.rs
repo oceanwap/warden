@@ -66,9 +66,36 @@ pub fn render_prometheus(s: &Status) -> String {
     if let Some(r) = s.supervisor_rss_bytes {
         gauge("warden_supervisor_rss_bytes", "Supervisor resident memory.", "gauge", vec![(String::new(), r as f64)]);
     }
+    // Workers only: hot standbys all have id 0 (their own gauges below).
     let per = |f: &dyn Fn(&crate::control::WorkerStatus) -> Option<f64>| -> Vec<(String, f64)> {
-        s.workers.iter().filter_map(|w| f(w).map(|v| (format!(",worker=\"{}\"", w.id), v))).collect()
+        s.workers
+            .iter()
+            .filter(|w| !w.is_standby())
+            .filter_map(|w| f(w).map(|v| (format!(",worker=\"{}\"", w.id), v)))
+            .collect()
     };
+    let standbys: Vec<&crate::control::WorkerStatus> = s.workers.iter().filter(|w| w.is_standby()).collect();
+    if !standbys.is_empty() {
+        let ready = standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
+        gauge(
+            "warden_standbys_ready",
+            "Hot standbys ready to take over a crashed worker.",
+            "gauge",
+            vec![(String::new(), ready as f64)],
+        );
+        gauge(
+            "warden_standbys_rss_bytes",
+            "Resident memory of the hot standbys, together.",
+            "gauge",
+            vec![(String::new(), standbys.iter().filter_map(|w| w.rss_bytes).sum::<u64>() as f64)],
+        );
+        gauge(
+            "warden_standby_restarts_total",
+            "Standbys started again after one crashed or failed its checks.",
+            "counter",
+            vec![(String::new(), standbys.first().map(|w| w.restarts).unwrap_or(0) as f64)],
+        );
+    }
     gauge(
         "warden_worker_up",
         "1 if the worker is running.",
@@ -249,5 +276,29 @@ mod tests {
         assert!(t.contains("warden_worker_up{app=\"api\",worker=\"1\"} 1"));
         assert!(t.contains("# TYPE warden_worker_crashes_total counter"));
         assert!(t.contains("warden_worker_healthy{app=\"api\",worker=\"1\"} 0"));
+        assert!(!t.contains("standby"), "no standby series without standbys");
+
+        // Hot standbys (id 0) get their own gauges, never duplicate worker="0" series.
+        let mut st = st;
+        let standby = |state: &str, rss| WorkerStatus {
+            id: crate::control::STANDBY_ID,
+            state: state.into(),
+            pid: Some(9),
+            uptime_secs: Some(1),
+            restarts: 3,
+            crashes: 3,
+            rss_bytes: Some(rss),
+            cpu_seconds: Some(0.1),
+            cpu_percent: None,
+            last_exit: None,
+            healthy: None,
+        };
+        st.workers.push(standby(crate::control::STANDBY, 1000));
+        st.workers.push(standby(crate::control::WARMING, 500));
+        let t = render_prometheus(&st);
+        assert!(!t.contains("worker=\"0\""), "{t}");
+        assert!(t.contains("warden_standbys_ready{app=\"api\"} 1"), "{t}");
+        assert!(t.contains("warden_standbys_rss_bytes{app=\"api\"} 1500"), "{t}");
+        assert!(t.contains("warden_standby_restarts_total{app=\"api\"} 3"), "{t}");
     }
 }

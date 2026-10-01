@@ -3344,3 +3344,375 @@ fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
     assert!(out.contains("wardend: stopped wardend.service"), "{out}");
     assert!(fakes.take().contains("stop wardend.service"));
 }
+
+// ---- standby
+//
+// `[workers] standby = N`: hot standbys, initialized but not listening,
+// promoted into the slot of a worker that dies. Status lists them after the
+// workers with `id` 0.
+
+/// Pids of the workers (not the standbys).
+fn worker_pids(s: &Value) -> HashSet<u64> {
+    s["workers"].as_array().unwrap().iter().filter(|w| w["id"] != 0).filter_map(|w| w["pid"].as_u64()).collect()
+}
+
+fn standby_rows(s: &Value) -> Vec<&Value> {
+    s["workers"].as_array().unwrap().iter().filter(|w| w["id"] == 0).collect()
+}
+
+/// The pid of a standby ready to take over, if any.
+fn ready_standby(s: &Value) -> Option<u64> {
+    standby_rows(s).into_iter().find(|w| w["state"] == "STANDBY").and_then(|w| w["pid"].as_u64())
+}
+
+/// `gated` (health gates on the private socket) with one hot standby.
+fn standby_config(name: &str, port: u16, count: usize, extra: &str) -> String {
+    gated(name, port, count, extra).replace("[workers]\n", "[workers]\nstandby = 1\n")
+}
+
+/// kill -9 `victim`, then poll the port until an answer satisfies `until`;
+/// returns it and the time since the kill.
+fn kill_and_wait_for(port: u16, victim: u64, path: &str, until: impl Fn(&str) -> bool) -> (String, Duration) {
+    let t0 = Instant::now();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    loop {
+        if let Some(body) = get(port, path).filter(|b| until(b)) {
+            return (body, t0.elapsed());
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "nothing new answered on {port} after kill -9 {victim}");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+fn env_of(pid: u64) -> String {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .map(|b| String::from_utf8_lossy(&b).replace('\0', "\n"))
+        .unwrap_or_default()
+}
+
+fn ms(d: Duration) -> String {
+    format!("{:.1} ms", d.as_secs_f64() * 1000.0)
+}
+
+/// Warden's own measure of the last promotion (promote message → listening).
+fn promote_ms(w: &Warden) -> String {
+    let log = w.wait_log("worker promoted from standby", T);
+    let line = log.lines().rfind(|l| l.contains("worker promoted from standby")).unwrap_or_default();
+    line.split("promote_ms=").nth(1).unwrap_or("?").trim().to_string()
+}
+
+/// The headline: kill -9 the only worker; the standby (initialized, never
+/// listening, so no traffic) answers on the port within milliseconds as
+/// worker 1, and a new standby starts in the background.
+#[test]
+fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("sb-bun", port, &standby_config("sb-bun", port, 1, ""));
+    let s = w.wait_for("a worker and a standby", T, |s| s["workers_ready"] == 1 && ready_standby(s).is_some());
+    let victim = s["workers"][0]["pid"].as_u64().unwrap();
+    let standby = ready_standby(&s).unwrap();
+    assert_eq!(standby_rows(&s).len(), 1);
+    assert!(env_of(standby).contains("WARDEN_STANDBY=1\n"), "{}", env_of(standby));
+    assert!(!env_of(victim).contains("WARDEN_STANDBY"), "workers are not standbys");
+
+    // No traffic before promotion: the worker owns the port's only listener.
+    assert_eq!(listeners(port), 1, "the standby must not join the port's listener group");
+    for _ in 0..50 {
+        let who = get(port, "/whoami").expect("request failed");
+        assert!(who.starts_with(&format!("{victim}:")), "{who}");
+    }
+    let (_, out) = w.cli(&["status"]);
+    assert!(out.contains("Standby:     1/1 ready") && out.contains("standby  STANDBY"), "{out}");
+
+    let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);
+    let (who, took) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
+    eprintln!(
+        "standby promotion (Bun.serve): the port answered again {} after kill -9 (promote → listening: {} ms)",
+        ms(took),
+        promote_ms(&w)
+    );
+    assert!(who.starts_with(&format!("{standby}:")), "the standby took over: {who}");
+    // ~5-15 ms on an idle machine; generous for loaded CI runners.
+    assert!(took < Duration::from_millis(500), "promotion took {took:?}\n{}", w.log());
+
+    // Events: the usual story of worker 1, the new process marked as promoted.
+    let events = ev.until("worker 1 ready", |e| is_worker(e, 1, "ready"));
+    assert_eq!(worker_story(&events, 1), ["crashed", "restarting", "starting", "ready"], "{events:#?}");
+    let promoted: Vec<&Value> = events.iter().filter(|e| e["worker"] == 1 && e["pid"] == standby).collect();
+    assert_eq!(promoted.len(), 2, "{events:#?}");
+    assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby")));
+
+    let s =
+        w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && s["workers_ready"] == 1);
+    let w1 = &s["workers"][0];
+    assert_eq!(
+        (w1["pid"].as_u64(), w1["restarts"].as_u64(), w1["crashes"].as_u64()),
+        (Some(standby), Some(1), Some(1))
+    );
+    assert!(w1["last_exit"].as_str().unwrap().contains("SIGKILL"), "{s:#?}");
+    let log = w.wait_log("worker promoted from standby worker=1", T);
+    assert!(log.contains(&format!("worker promoted from standby worker=1 pid={standby}")), "{log}");
+    assert_eq!(listeners(port), 1, "the new standby does not listen either");
+}
+
+/// Node (node:http, PM2 style): the standby gets no traffic, then takes
+/// worker 2's slot with its NODE_APP_INSTANCE.
+#[test]
+fn standby_node_worker_takes_the_slot_and_its_instance() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"sb-node\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\nstandby = 1\n\
+         [health]\npath = \"/whoami\"\n[reload]\nhealth_passes = 1\nhealth_interval_ms = 100\n[shutdown]\ndrain_ms = 100\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("sb-node", port, &cfg);
+    let s = w.wait_for("2 workers and a standby", T, |s| s["workers_ready"] == 2 && ready_standby(s).is_some());
+    let standby = ready_standby(&s).unwrap();
+    assert!(env_of(standby).contains("NODE_APP_INSTANCE=2\n"), "past the workers' numbers until promoted");
+    let mut seen = HashSet::new();
+    for _ in 0..60 {
+        seen.insert(get(port, "/whoami").expect("request failed"));
+    }
+    let pids: HashSet<u64> = seen.iter().map(|x| x.split(':').next().unwrap().parse().unwrap()).collect();
+    assert_eq!(pids, worker_pids(&s), "only workers answer, never the standby: {seen:?}");
+    assert_eq!(listeners(port), 2);
+
+    let victim = s["workers"][1]["pid"].as_u64().unwrap(); // worker 2: instance 1
+    let (who, took) = kill_and_wait_for(port, victim, "/whoami", |b| b.starts_with(&format!("{standby}:")));
+    eprintln!(
+        "standby promotion (node:http on Node): the standby answered {} after kill -9 (promote → listening: {} ms)",
+        ms(took),
+        promote_ms(&w)
+    );
+    assert_eq!(who, format!("{standby}:1"), "the promoted standby is worker 2, NODE_APP_INSTANCE 1");
+    let s =
+        w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && s["workers_ready"] == 2);
+    assert_eq!(s["workers"][1]["pid"].as_u64(), Some(standby));
+    assert_eq!(s["workers"][0]["restarts"], 0, "worker 1 untouched");
+}
+
+/// NestJS (Express on node:http), on Bun and on Node: the whole app starts
+/// in the standby; its `app.listen()` is held back until the promotion.
+#[test]
+fn standby_nestjs_on_bun_and_node() {
+    let nest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/nest");
+    if !have_bun() || !have_node() || !nest.join("node_modules/@nestjs/core").exists() {
+        eprintln!("skipping: NestJS is not installed in bench/nest (cd bench/nest && npm ci)");
+        return;
+    }
+    // Node runs the bundled build, as bench/run.ts makes it.
+    let built = Command::new("bun")
+        .args(["build", "main.ts", "--target=node", "--packages=external", "--outfile=dist/main.mjs"])
+        .current_dir(&nest)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    for (name, command, entry) in [("sb-nest-bun", "bun", "main.ts"), ("sb-nest-node", "node", "dist/main.mjs")] {
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\ncommand = \"{command}\"\nargs = [\"{entry}\"]\nworking_directory = \"{}\"\nport = {port}\n\
+             [workers]\nstandby = 1\nready_timeout = 60\n[health]\npath = \"/health\"\n[reload]\nhealth_passes = 1\n\
+             health_interval_ms = 100\n[shutdown]\ndrain_ms = 100\n",
+            nest.display()
+        );
+        let w = Warden::start(name, port, &cfg);
+        let s = w.wait_for("a worker and a standby", Duration::from_secs(60), |s| {
+            s["workers_ready"] == 1 && ready_standby(s).is_some()
+        });
+        let (victim, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+        assert_eq!(listeners(port), 1, "{name}: the standby must not listen");
+        let (_, took) = kill_and_wait_for(port, victim, "/whoami", |b| b.starts_with(&format!("{standby}:")));
+        eprintln!(
+            "standby promotion (NestJS, {command}): the port answered again {} after kill -9 (promote → listening: {} ms)",
+            ms(took),
+            promote_ms(&w)
+        );
+        assert!(took < Duration::from_millis(500), "{name}: {took:?}\n{}", w.log());
+        assert!(get(port, "/json").is_some_and(|b| b.contains("Hello")), "{name}: the app works after promotion");
+    }
+}
+
+/// A reload replaces the standby too (it runs the old code): after the
+/// workers, through the gates, with no failed request.
+#[test]
+fn reload_with_a_standby_drops_nothing_and_replaces_the_standby() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("sb-reload", port, &standby_config("sb-reload", port, 2, ""));
+    let s = w.wait_for("ready", T, |s| s["workers_ready"] == 2 && ready_standby(s).is_some());
+    let (before, old) = (worker_pids(&s), ready_standby(&s).unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let client = {
+        let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match get(port, "/whoami") {
+                    Some(_) => ok.fetch_add(1, Ordering::Relaxed),
+                    None => fail.fetch_add(1, Ordering::Relaxed),
+                };
+            }
+        })
+    };
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("new workers and a new standby", T, |s| {
+        s["workers_ready"] == 2
+            && worker_pids(s).is_disjoint(&before)
+            && ready_standby(s).is_some_and(|p| p != old && !before.contains(&p))
+    });
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    let (ok, fail) = (ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
+    eprintln!("reload with a standby: {ok} ok, {fail} failed");
+    assert!(ok > 50);
+    assert!(fail <= allowed_resets(), "requests failed during the reload: {fail}");
+    assert!(!worker_pids(&s).contains(&old), "the old standby was not promoted mid-reload");
+    let log = w.log();
+    let (done, replaced) = (log.find("reload complete").unwrap(), log.find("replacing standbys").unwrap());
+    assert!(done < replaced, "the standby is replaced after the workers:\n{log}");
+    let t0 = Instant::now();
+    while alive(old) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "old standby still running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A safe-reload that rolls back leaves the standby alone: like the
+/// workers, it runs the previous version. A good deploy then replaces it.
+#[test]
+fn safe_reload_rollback_keeps_the_previous_standby() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("sb-rollback", port, &standby_config("sb-rollback", port, 2, ""));
+    let s = w.wait_for("ready", T, |s| s["workers_ready"] == 2 && ready_standby(s).is_some());
+    let (before, standby) = (worker_pids(&s), ready_standby(&s).unwrap());
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+    std::fs::write(&w.cfg, good.replace("[workers]", "env = { FIXTURE_HEALTH_FAIL = \"1\" }\n[workers]")).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("Rolled back"), "{out}");
+    std::thread::sleep(Duration::from_millis(300));
+    let s = w.status().unwrap();
+    assert_eq!(worker_pids(&s), before);
+    assert_eq!(ready_standby(&s), Some(standby), "the previous version's standby stays: {s:#?}");
+    assert!(!w.log().contains("replacing standbys"));
+
+    std::fs::write(&w.cfg, &good).unwrap();
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 0, "{out}");
+    w.wait_for("a fresh standby", T, |s| ready_standby(s).is_some_and(|p| p != standby));
+}
+
+/// A standby that keeps crashing is restarted with backoff, then the pool
+/// is FAILED: a bounded number of starts, never a storm. Crashed workers
+/// restart the normal way meanwhile; `warden reset` retries the standbys.
+#[test]
+fn a_crashing_standby_backs_off_and_never_storms() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = standby_config("sb-crash", port, 1, "env = { FIXTURE_STANDBY_EXIT = \"300\" }").replace(
+        "[restart]\nbackoff_initial = 50\n",
+        "[restart]\nbackoff_initial = 100\nmax_restarts = 3\nfailed_cooldown = 0\n",
+    );
+    let w = Warden::start("sb-crash", port, &cfg);
+    let s = w.wait_for("standbys FAILED", T, |s| {
+        s["workers_ready"] == 1 && standby_rows(s).first().is_some_and(|x| x["state"] == "FAILED")
+    });
+    let log = w.wait_log("standbys failed: too many standby crashes", T);
+    assert_eq!(log.matches("standby starting").count(), 4, "a first start and 3 restarts:\n{log}");
+    let delays: Vec<u64> = log
+        .lines()
+        .filter(|l| l.contains("standby restarting"))
+        .filter_map(|l| l.split("in_ms=").nth(1)?.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert_eq!(delays, [0, 100, 200], "backoff like a worker's:\n{log}");
+    let row = standby_rows(&s)[0];
+    assert_eq!((row["crashes"].as_u64(), row["restarts"].as_u64()), (Some(4), Some(3)), "{s:#?}");
+    assert!(row["last_exit"].as_str().unwrap().contains("exit code 4"), "{s:#?}");
+
+    // No standby: a crashed worker restarts the normal way.
+    let victim = s["workers"][0]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    w.wait_for("worker 1 back", T, |s| s["workers_ready"] == 1 && s["workers"][0]["pid"].as_u64() != Some(victim));
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = w.log();
+    assert!(!log.contains("worker promoted from standby"), "{log}");
+    assert_eq!(log.matches("standby starting").count(), 4, "nothing started while FAILED");
+
+    let (code, out) = w.cli(&["reset"]);
+    assert_eq!(code, 0, "{out}");
+    let t0 = Instant::now();
+    while w.log().matches("standby starting").count() < 5 {
+        assert!(t0.elapsed() < T, "standbys not retried after reset:\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Recycling keeps the code: an available standby is the replacement for
+/// an unhealthy worker (it listens next to it, passes the gates, then the
+/// old one drains).
+#[test]
+fn an_unhealthy_worker_is_replaced_by_the_standby() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = standby_config("sb-sick", port, 1, "")
+        .replace("[health]\n", "[health]\nenabled = true\ninterval = 1\nfailure_threshold = 2\ninitial_delay = 0\n");
+    let w = Warden::start("sb-sick", port, &cfg);
+    let s = w.wait_for("ready with a standby", T, |s| s["workers_ready"] == 1 && ready_standby(s).is_some());
+    let (before, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+    let _ = get(port, "/sick");
+    let s = w.wait_for("replaced by the standby", T, |s| {
+        s["workers"][0]["pid"].as_u64() == Some(standby) && s["rollout"].is_null() && s["workers_ready"] == 1
+    });
+    assert_eq!(s["workers"][0]["crashes"], 0, "a graceful replacement is not a crash");
+    assert_eq!(s["last_rollout"]["kind"], "replace");
+    assert!(w.log().contains("standby promoted as the replacement"), "{}", w.log());
+    w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby));
+    let t0 = Instant::now();
+    while alive(before) {
+        assert!(t0.elapsed() < Duration::from_secs(5), "the unhealthy worker was not drained");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `standby = 0` (the default): no standby rows, processes, sockets or
+/// env; a crash restarts cold, as before.
+#[test]
+fn standby_zero_changes_nothing() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("sb-zero", port, &simple("sb-zero", port, 1, ""));
+    let s = w.wait_for("ready", T, ready(1));
+    assert_eq!(s["workers"].as_array().unwrap().len(), 1, "no standby rows: {s:#?}");
+    let victim = s["workers"][0]["pid"].as_u64().unwrap();
+    assert!(!env_of(victim).contains("WARDEN_STANDBY"));
+    let (_, took) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
+    eprintln!("cold restart (no standby, Bun fixture): the port answered again {} after kill -9", ms(took));
+    let log = w.wait_log("worker ready worker=1", T);
+    assert!(!log.to_lowercase().contains("standby"), "{log}");
+    let stand_ins = std::fs::read_dir(&w.dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .any(|e| e.file_name().to_string_lossy().starts_with("sb-zero.s"));
+    assert!(!stand_ins, "no stand-in sockets");
+    let s = w.status().unwrap();
+    assert_eq!(s["workers"].as_array().unwrap().len(), 1);
+    assert_eq!(s["workers"][0]["restarts"], 1);
+}

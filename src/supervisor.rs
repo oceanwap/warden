@@ -6,8 +6,11 @@
 //!   canary, restart N, recycling), preflight, rollback.
 //! - `upkeep.rs`: the 1 s maintenance tick (watchdog, per-worker health,
 //!   memory / lifetime recycling, FAILED cooldown).
+//! - `standby.rs`: hot standbys (`[workers] standby`), promoted into the
+//!   slot of a worker that died.
 
 mod rollout;
+mod standby;
 mod upkeep;
 
 use crate::config::{Config, Mode, OnHealthFailure, PortStrategy};
@@ -16,7 +19,7 @@ use crate::events::{self, WorkerEvent};
 use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
-use crate::worker::{Instance, Role, Slot, State, ThreadInfo, describe_exit};
+use crate::worker::{Instance, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit};
 use crate::{debug, error, info, metrics, networking, systemd, warn};
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
@@ -54,6 +57,22 @@ enum Event {
     },
     Gate(rollout::GateEvent),
     Snapshot(oneshot::Sender<Status>),
+    /// Standby pool: refill after backoff (stale when `token` changed).
+    StandbyDue {
+        token: u64,
+    },
+    /// Standby gates: next health check due, a check's or verify_command's result.
+    StandbyGateDue {
+        inst: u64,
+    },
+    StandbyChecked {
+        inst: u64,
+        result: Result<(), String>,
+    },
+    StandbyVerified {
+        inst: u64,
+        result: Result<(), String>,
+    },
 }
 
 struct HealthState {
@@ -103,6 +122,8 @@ pub struct Supervisor {
     shutdown_reason: String,
     /// Rollout phase last published as a `rollout` event.
     rollout_published: Option<rollout::PhaseKey>,
+    /// Hot standbys: the pool's restart policy state (members are in `insts`).
+    pool: standby::Pool,
 }
 
 pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
@@ -181,40 +202,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         });
     }
 
-    let mut sup = Supervisor {
-        policy: Policy::from(&cfg.restart),
-        count: cfg.workers.count,
-        slots: BTreeMap::new(),
-        insts: HashMap::new(),
-        next_inst: 1,
-        tx,
-        proc_tx,
-        roll: None,
-        roll_seq: 0,
-        last_rollout: None,
-        pending_replace: BTreeMap::new(),
-        shutting_down: false,
-        stopped: false,
-        start_after_stop: false,
-        app_health: HealthState { healthy: None, failures: 0 },
-        started: Instant::now(),
-        announced_ready: false,
-        runtime_dir,
-        shim_path,
-        host_path,
-        force_kill: false,
-        supervisor_cpu_prev: None,
-        ticks: 0,
-        outage: false,
-        last_tick: Instant::now(),
-        watchdog_enabled: systemd::watchdog_requested(),
-        schedule_token: 0,
-        exe: own_exe(),
-        shutdown_reason: "shutdown".into(),
-        rollout_published: None,
-        cfg,
-        cfg_path,
-    };
+    let mut sup = Supervisor::new(cfg, cfg_path, runtime_dir, (shim_path, host_path), tx, proc_tx);
 
     // `warden save` recorded a worker count / stopped state for this app:
     // honour it, as `pm2 resurrect` would after a reboot.
@@ -236,6 +224,13 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         pid = std::process::id(),
         control = socket.display(),
     );
+    if sup.cfg.workers.standby > 0 {
+        info!(
+            "hot standbys enabled: started once the workers are ready",
+            standby = sup.cfg.workers.standby,
+            note = "each costs about one worker's memory",
+        );
+    }
     warn_if_no_migrate_req(&sup.cfg);
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
@@ -334,6 +329,51 @@ fn mode_name(m: Mode) -> &'static str {
 }
 
 impl Supervisor {
+    fn new(
+        cfg: Config,
+        cfg_path: Option<PathBuf>,
+        runtime_dir: PathBuf,
+        (shim_path, host_path): (Option<PathBuf>, Option<PathBuf>),
+        tx: mpsc::UnboundedSender<Event>,
+        proc_tx: mpsc::UnboundedSender<ProcEvent>,
+    ) -> Supervisor {
+        Supervisor {
+            policy: Policy::from(&cfg.restart),
+            count: cfg.workers.count,
+            slots: BTreeMap::new(),
+            insts: HashMap::new(),
+            next_inst: 1,
+            tx,
+            proc_tx,
+            roll: None,
+            roll_seq: 0,
+            last_rollout: None,
+            pending_replace: BTreeMap::new(),
+            shutting_down: false,
+            stopped: false,
+            start_after_stop: false,
+            app_health: HealthState { healthy: None, failures: 0 },
+            started: Instant::now(),
+            announced_ready: false,
+            runtime_dir,
+            shim_path,
+            host_path,
+            force_kill: false,
+            supervisor_cpu_prev: None,
+            ticks: 0,
+            outage: false,
+            last_tick: Instant::now(),
+            watchdog_enabled: systemd::watchdog_requested(),
+            schedule_token: 0,
+            exe: own_exe(),
+            shutdown_reason: "shutdown".into(),
+            rollout_published: None,
+            pool: standby::Pool::default(),
+            cfg,
+            cfg_path,
+        }
+    }
+
     fn is_worker_mode(&self) -> bool {
         self.cfg.workers.mode == Mode::Worker
     }
@@ -346,7 +386,13 @@ impl Supervisor {
     }
 
     fn label(&self, slot: usize) -> String {
-        if self.is_worker_mode() { "host".into() } else { slot.to_string() }
+        if self.is_worker_mode() {
+            "host".into()
+        } else if slot == STANDBY_SLOT {
+            "standby".into()
+        } else {
+            slot.to_string()
+        }
     }
 
     /// `worker` in events: the slot in process mode; in worker mode 0 is the
@@ -394,6 +440,8 @@ impl Supervisor {
             slot.token += 1;
             self.spawn_current(id);
         }
+        // Standbys follow once the workers listen (`fill_pool` waits for them).
+        self.fill_pool();
     }
 
     /// Spawn the serving instance of a slot. On spawn failure the slot goes
@@ -427,7 +475,7 @@ impl Supervisor {
     }
 
     fn spawn_instance(&mut self, slot_id: usize, role: Role) -> std::io::Result<u64> {
-        if self.slots.get(&slot_id).is_none_or(|s| s.removing) {
+        if role != Role::Standby && self.slots.get(&slot_id).is_none_or(|s| s.removing) {
             return Err(std::io::Error::other(format!("worker {slot_id} no longer exists (scaled down)")));
         }
         let inst_id = self.next_inst;
@@ -439,13 +487,20 @@ impl Supervisor {
         self.insts.insert(inst_id, inst);
         if self.is_worker_mode() {
             info!("host starting", pid = pid, workers = self.count, role = role_name(role));
+        } else if role == Role::Standby {
+            info!("standby starting", pid = pid);
         } else {
             info!("worker starting", worker = slot_id, pid = pid, role = role_name(role));
         }
         self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || {
             (role != Role::Current).then(|| format!("role={}", role_name(role)))
         });
-        self.watch_readiness(inst_id, pid, slot_id);
+        if role == Role::Standby {
+            // Ready = initialized (`standby_ready`); it never listens before promotion.
+            self.send_later(self.cfg.ready_timeout(), Event::ReadyTimeout { inst: inst_id });
+        } else {
+            self.watch_readiness(inst_id, pid, slot_id);
+        }
         Ok(inst_id)
     }
 
@@ -475,9 +530,23 @@ impl Supervisor {
             add("WARDEN_REUSE_PORT", "1".into());
         }
         if let Some(p) = a.port {
-            add("PORT", networking::worker_port(p, self.cfg.workers.port_strategy, slot_id).to_string());
+            // Standbys (slot 0) need a shared port (config validation).
+            add("PORT", networking::worker_port(p, self.cfg.workers.port_strategy, slot_id.max(1)).to_string());
         }
         let (program, args) = match self.cfg.workers.mode {
+            Mode::Process if slot_id == STANDBY_SLOT => {
+                // The shim defers its listen until promoted; it then takes the
+                // slot's worker id and instance number.
+                add("WARDEN_WORKER_ID", "0".into());
+                add("WARDEN_STANDBY", "1".into());
+                add("WARDEN_STANDBY_DIR", self.runtime_dir.display().to_string());
+                if !a.instance_var.is_empty() {
+                    // Past the workers' numbers: code that runs only on
+                    // instance 0 (cron) does not run in a standby.
+                    add(&a.instance_var, self.count.to_string());
+                }
+                (a.command.clone(), with_preload(&a.command, &a.args, self.shim_path.as_deref()))
+            }
             Mode::Process => {
                 add("WARDEN_WORKER_ID", slot_id.to_string());
                 if !a.instance_var.is_empty() {
@@ -580,15 +649,40 @@ impl Supervisor {
             Event::Ready { inst } => self.mark_ready(inst),
             Event::ReadyTimeout { inst } => {
                 let timeout = self.cfg.workers.ready_timeout;
+                let promote_timeout = standby::PROMOTE_TIMEOUT.min(self.cfg.ready_timeout());
                 let label = self.insts.get(&inst).map(|i| self.label(i.slot));
                 if let Some(i) = self.insts.get_mut(&inst) {
-                    if i.ready_at.is_none() && !i.stopping {
-                        error!(
-                            "worker not ready in time; killing",
-                            worker = label.unwrap_or_default(),
-                            pid = i.handle.pid,
-                            ready_timeout_s = timeout,
-                        );
+                    // A standby is ready once initialized; a promoted one has
+                    // `promote_timeout` to listen (the spawn-time timer is stale).
+                    let late = match (&i.standby, i.promoted_at) {
+                        (Some(st), _) => st.ready_at.is_none(),
+                        (None, Some(p)) => i.ready_at.is_none() && p.elapsed() >= promote_timeout,
+                        (None, None) => i.ready_at.is_none(),
+                    };
+                    if late && !i.stopping {
+                        if i.standby.is_some() {
+                            error!(
+                                "standby not initialized in time; killing",
+                                pid = i.handle.pid,
+                                ready_timeout_s = timeout,
+                                hint = "a standby is ready when the app calls Bun.serve or listen() on app.port (the shim holds that call back); raise workers.ready_timeout if startup is slow",
+                            );
+                        } else if i.promoted_at.is_some() {
+                            error!(
+                                "promoted standby did not listen in time; killing",
+                                worker = label.unwrap_or_default(),
+                                pid = i.handle.pid,
+                                timeout_ms = promote_timeout.as_millis(),
+                                hint = "the slot restarts the normal way; if this repeats, set [workers] standby = 0 and report it",
+                            );
+                        } else {
+                            error!(
+                                "worker not ready in time; killing",
+                                worker = label.unwrap_or_default(),
+                                pid = i.handle.pid,
+                                ready_timeout_s = timeout,
+                            );
+                        }
                         i.timed_out = true;
                         i.handle.signal(libc::SIGKILL);
                     }
@@ -612,6 +706,10 @@ impl Supervisor {
             Event::Snapshot(reply) => {
                 let _ = reply.send(self.status());
             }
+            Event::StandbyDue { token } => self.on_standby_due(token),
+            Event::StandbyGateDue { inst } => self.standby_gates(inst),
+            Event::StandbyChecked { inst, result } => self.on_standby_checked(inst, result),
+            Event::StandbyVerified { inst, result } => self.on_standby_verified(inst, result),
         }
     }
 
@@ -627,8 +725,11 @@ impl Supervisor {
         let expected = self.expected_listeners();
         let (port, strategy) = (self.cfg.app.port, self.cfg.workers.port_strategy);
         let Some(inst) = self.insts.get_mut(&inst_id) else { return };
-        let expected_port = port.map(|p| networking::worker_port(p, strategy, inst.slot));
-        let worker = msg.worker.unwrap_or(if worker_mode { 0 } else { inst.slot });
+        let expected_port = port.map(|p| networking::worker_port(p, strategy, inst.slot.max(1)));
+        // Process mode: one worker per process, keyed by its slot now (a
+        // promoted standby's last pre-promotion heartbeat may arrive after it
+        // changed slots, still saying worker 0).
+        let worker = if worker_mode { msg.worker.unwrap_or(0) } else { inst.slot };
         match msg.ev.as_str() {
             "heartbeat" => {
                 inst.heartbeats.insert(worker, Instant::now());
@@ -639,6 +740,13 @@ impl Supervisor {
                     debug!("ignoring listener on another port", port = msg.port.unwrap_or(0));
                     return;
                 }
+                if inst.role == Role::Standby {
+                    // Its listen should have been held back: it takes traffic.
+                    let pid = inst.handle.pid;
+                    self.disable_pool(format!("standby pid {pid} reported listening before its promotion"));
+                    return;
+                }
+                let promoted = inst.promoted_at.is_some();
                 if let Some(sock) = &msg.socket {
                     inst.sockets.insert(worker, PathBuf::from(sock));
                 }
@@ -658,10 +766,13 @@ impl Supervisor {
                     inst.listening.insert(msg.port.unwrap_or(0));
                     true
                 };
-                if ready && !self.cfg.workers.wait_ready {
+                // A promoted standby was initialized before: listening is all
+                // it has left to do, even with wait_ready.
+                if ready && (!self.cfg.workers.wait_ready || promoted) {
                     self.mark_ready(inst_id);
                 }
             }
+            "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
             "ready" => {
                 if self.cfg.workers.wait_ready {
                     debug!("app reported ready", worker = worker, pid = inst.handle.pid);
@@ -700,7 +811,8 @@ impl Supervisor {
     fn mark_ready(&mut self, inst_id: u64) {
         let lifetime = self.cfg.limits.max_lifetime;
         let Some(inst) = self.insts.get_mut(&inst_id) else { return };
-        if inst.ready_at.is_some() || inst.stopping {
+        // A standby is ready once initialized (`standby_ready`), not here.
+        if inst.ready_at.is_some() || inst.stopping || inst.role == Role::Standby {
             return;
         }
         let now = Instant::now();
@@ -710,6 +822,8 @@ impl Supervisor {
                 Some(crate::restart::later(now, upkeep::jittered(Duration::from_secs(lifetime), inst_id)));
         }
         let ms = inst.started.elapsed().as_millis();
+        // Promoted standby: from the promotion to listening.
+        let promote_ms = inst.promoted_at.map(|p| format!("{:.1}", p.elapsed().as_secs_f64() * 1000.0));
         let (slot_id, role, pid) = (inst.slot, inst.role, inst.handle.pid);
         match role {
             Role::Current => {
@@ -718,21 +832,38 @@ impl Supervisor {
                 }
                 if self.is_worker_mode() {
                     info!("host ready", pid = pid, workers = self.count, startup_ms = ms);
+                } else if let Some(pms) = &promote_ms {
+                    info!("worker promoted from standby", worker = slot_id, pid = pid, promote_ms = pms);
                 } else {
                     info!("worker ready", worker = slot_id, pid = pid, startup_ms = ms);
                 }
-                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || Some(format!("startup_ms={ms}")));
-            }
-            Role::Replacement => {
-                info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
-                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || {
-                    Some(format!("startup_ms={ms} role=replacement"))
+                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
+                    Some(pms) => Some(format!("promoted from standby promote_ms={pms}")),
+                    None => Some(format!("startup_ms={ms}")),
                 });
             }
-            Role::Retiring => {}
+            Role::Replacement => {
+                if let Some(pms) = &promote_ms {
+                    info!(
+                        "standby promoted as the replacement; verifying it",
+                        worker = self.label(slot_id),
+                        pid = pid,
+                        promote_ms = pms
+                    );
+                } else {
+                    info!("replacement listening", worker = self.label(slot_id), pid = pid, startup_ms = ms);
+                }
+                self.emit_worker(slot_id, WorkerEvent::Ready, Some(pid), || match &promote_ms {
+                    Some(pms) => Some(format!("promoted from standby promote_ms={pms} role=replacement")),
+                    None => Some(format!("startup_ms={ms} role=replacement")),
+                });
+            }
+            Role::Retiring | Role::Standby => {}
         }
         self.rollout_on_ready(inst_id);
         self.check_all_ready();
+        // A worker listens: start the standbys that waited for it.
+        self.fill_pool();
     }
 
     fn check_all_ready(&mut self) {
@@ -749,6 +880,9 @@ impl Supervisor {
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
+        if inst.role == Role::Standby || inst.promoted_at.is_some() {
+            self.remove_stand_ins(inst_id);
+        }
         let why = describe_exit(code, signal);
         let slot_id = inst.slot;
         let label = self.label(slot_id);
@@ -764,7 +898,9 @@ impl Supervisor {
             why.clone()
         };
 
-        if inst.restart_on_exit && is_current && !self.shutting_down && !self.stopped {
+        if inst.role == Role::Standby {
+            self.on_standby_exit(&inst, why, reason.clone());
+        } else if inst.restart_on_exit && is_current && !self.shutting_down && !self.stopped {
             // A bad release, not a crash of this slot: restart right away on the
             // restored config, without counting it towards the restart limit.
             warn!("worker that failed its rollout gates stopped; restarting", worker = label, pid = inst.handle.pid);
@@ -979,6 +1115,10 @@ impl Supervisor {
             return;
         }
         s.restarts += 1;
+        // A hot standby takes the slot in milliseconds; else a cold start.
+        if self.promote_standby(slot_id, Role::Current).is_some() {
+            return;
+        }
         self.spawn_current(slot_id);
     }
 
@@ -1121,6 +1261,9 @@ impl Supervisor {
         let worker_mode = self.is_worker_mode();
         let Some(inst) = self.insts.get_mut(&inst_id) else { return };
         inst.health_inflight = false;
+        if inst.role == Role::Standby {
+            return self.on_standby_health(inst_id, result);
+        }
         if inst.stopping || inst.role != Role::Current {
             return;
         }
@@ -1405,6 +1548,9 @@ impl Supervisor {
                 retried.push((*id, s.token));
             }
         }
+        if worker.is_none() {
+            self.standby_reset();
+        }
         info!("counters reset on request", workers = ids.len(), failed_retried = retried.len());
         for (id, token) in &retried {
             self.emit_worker(*id, WorkerEvent::Restarting, None, || Some("FAILED; reset on request".into()));
@@ -1621,6 +1767,8 @@ impl Supervisor {
                     healthy,
                 });
             }
+            // Hot standbys: after the workers, `id` 0.
+            self.standby_rows(&mut workers, &sample);
         }
         let me = std::process::id();
         let started = self.started;
@@ -1719,6 +1867,7 @@ fn role_name(r: Role) -> &'static str {
         Role::Current => "current",
         Role::Replacement => "replacement",
         Role::Retiring => "retiring",
+        Role::Standby => "standby",
     }
 }
 
