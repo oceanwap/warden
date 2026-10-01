@@ -2,6 +2,10 @@
 name = "warden"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/oceanwap/warden"
+# Released as binaries on GitHub, not on crates.io.
+publish = false
 description = "A small, boring supervisor for Bun/Node HTTP workers: SO_REUSEPORT, graceful drain, rolling reload."
 rust-version = "1.85"
 

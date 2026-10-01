@@ -1,0 +1,22 @@
+Third-party software in Warden
+
+This program is distributed under the MIT License or the Apache License 2.0,
+at your option (LICENSE-MIT, LICENSE-APACHE). It includes the third-party
+crates below, under the licenses that follow, with their notices.
+
+Licenses used:
+{{#each overview}}
+  {{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}}
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} ({{{crate.repository}}}){{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

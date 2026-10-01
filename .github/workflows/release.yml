@@ -3,7 +3,10 @@
 #   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI: warden-gui, warden,
 #                                            README.md, README-GUI.md, contrib/ (.tar.gz on
 #                                            Linux, a zipped Warden.app on macOS)
-# plus install.sh and SHA256SUMS covering every file.
+# plus install.sh and SHA256SUMS covering every file. Every archive carries
+# LICENSE-MIT, LICENSE-APACHE and the third-party notices (cargo-about,
+# about.toml): THIRD-PARTY-LICENSES.txt, and THIRD-PARTY-LICENSES-GUI.txt in
+# the GUI bundles.
 #
 # A tag v<version> (matching Cargo.toml) publishes a GitHub Release. Pushes to
 # ci-portability and manual runs are dry runs: everything is built, packaged,
@@ -32,6 +35,7 @@ env:
   GLIBC: "2.28"
   ZIG_VERSION: "0.14.1"
   CARGO_ZIGBUILD_VERSION: "0.23.4"
+  CARGO_ABOUT_VERSION: "0.9.2"
 
 jobs:
   meta:
@@ -64,8 +68,39 @@ jobs:
         if: hashFiles('gui/Cargo.toml') != ''
         run: echo "present=true" >> "$GITHUB_OUTPUT"
 
-  cli:
+  # The third-party notices, once for all platforms (about.toml lists the
+  # targets). Fails if a dependency uses a license not accepted there.
+  licenses:
     needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache: false
+          rustflags: ""
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version "$CARGO_ABOUT_VERSION"
+      - name: Generate THIRD-PARTY-LICENSES*.txt
+        run: |
+          mkdir -p notices
+          cargo about generate --locked --fail -m Cargo.toml about.hbs -o notices/THIRD-PARTY-LICENSES.txt
+          if [ "${{ needs.meta.outputs.gui }}" = true ]; then
+            cargo about generate --locked --fail -m gui/Cargo.toml about.hbs -o notices/THIRD-PARTY-LICENSES-GUI.txt
+          fi
+          head -20 notices/*.txt
+          wc -l notices/*.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses
+          path: notices/*
+          if-no-files-found: error
+          retention-days: 14
+
+  cli:
+    needs: [meta, licenses]
     name: cli ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -125,10 +160,14 @@ jobs:
           got=$($run --version)
           echo "$got"
           [ "$got" = "warden $VERSION" ] || { echo "::error::$BIN --version says '$got', expected 'warden $VERSION'"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: notices
       - name: Package
         run: |
           mkdir -p "dist/$NAME/contrib"
-          cp "$BIN" README.md "dist/$NAME/"
+          cp "$BIN" README.md LICENSE-MIT LICENSE-APACHE notices/THIRD-PARTY-LICENSES.txt "dist/$NAME/"
           cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf "dist/$NAME/contrib/"
           # No AppleDouble (._*) files from macOS tar.
           COPYFILE_DISABLE=1 tar -C dist -czf "$NAME.tar.gz" "$NAME"
@@ -143,7 +182,7 @@ jobs:
   # The GUI and the CLI in one download (skipped if gui/ is ever removed);
   # the binary name is read from gui/Cargo.toml.
   gui:
-    needs: [meta, cli]
+    needs: [meta, licenses, cli]
     if: needs.meta.outputs.gui == 'true'
     name: gui ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -175,6 +214,10 @@ jobs:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
       - name: The CLI from the cli job
         run: tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version || true
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: notices
       # No build dependencies: iced (tiny-skia renderer) links only glibc and
       # libgcc; winit and softbuffer load X11, Wayland and xkbcommon at run
       # time (README.md, Install, lists what a desktop needs).
@@ -218,6 +261,7 @@ jobs:
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/$bin" "$CLI/warden" "$CLI/README.md" "dist/$NAME/"
           cp gui/README.md "dist/$NAME/README-GUI.md"
+          cp LICENSE-MIT LICENSE-APACHE "$CLI/THIRD-PARTY-LICENSES.txt" notices/THIRD-PARTY-LICENSES-GUI.txt "dist/$NAME/"
           cp -R "$CLI/contrib" "dist/$NAME/"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
@@ -232,6 +276,7 @@ jobs:
           cp "$CLI/warden" "$app/Contents/MacOS/warden"
           cp -R "$CLI/contrib" "$CLI/README.md" "$app/Contents/Resources/"
           cp gui/README.md "$app/Contents/Resources/README-GUI.md"
+          cp LICENSE-MIT LICENSE-APACHE "$CLI/THIRD-PARTY-LICENSES.txt" notices/THIRD-PARTY-LICENSES-GUI.txt "$app/Contents/Resources/"
           cat > "$app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -251,7 +296,11 @@ jobs:
           </plist>
           EOF
           plutil -lint "$app/Contents/Info.plist"
-          # TODO(signing): unsigned for now, so Gatekeeper warns on first open.
+          # Ad-hoc signature: a consistent bundle (Apple silicon runs only
+          # signed code; the linker signs the binaries, not the bundle).
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # TODO(signing): not notarized yet, so Gatekeeper refuses the first open.
           # Needs the owner's Apple Developer ID (repository secrets): import
           # the certificate into a temporary keychain, then
           #   codesign --force --deep --options runtime --timestamp --sign "Developer ID Application: <name> (<team>)" "$app"

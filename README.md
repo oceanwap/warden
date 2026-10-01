@@ -53,7 +53,11 @@ has two products for Linux (x86_64, arm64) and macOS (arm64, x86_64):
   `libwayland-cursor`, on X11 `libX11`, `libX11-xcb`, `libXcursor`, `libXi`
   and `libxkbcommon-x11`. It draws on the CPU
   (tiny-skia): no GPU, Vulkan or OpenGL driver is needed. macOS: the app
-  is not signed yet, so open it with right-click → Open the first time.
+  is not notarized by Apple yet, so the first open is refused ("Apple could
+  not verify…"); then System Settings → Privacy & Security → Open Anyway
+  (macOS 15 dropped the right-click → Open shortcut), or
+  `xattr -dr com.apple.quarantine /Applications/Warden.app`. The CLI
+  installed by `install.sh` is not affected.
 
 `install.sh` installs the CLI: it picks the archive for your OS and CPU,
 checks it against the release's `SHA256SUMS`, and puts `warden` in
@@ -579,3 +583,12 @@ Limitations:
   `warden_log_lines_dropped_total` in the metrics). With
   `[logging] max_lines_per_sec = 0` Warden keeps every line by slowing a
   flooding app down instead (for at most a second per read).
+
+## License
+
+Warden is open source, under the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option: use it, change it and
+ship it, commercially too. Contributions are accepted under the same terms.
+Release archives list the licenses of the third-party crates compiled in
+(`THIRD-PARTY-LICENSES.txt`; `about.toml` keeps that list to permissive
+licenses).
