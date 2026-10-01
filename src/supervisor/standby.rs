@@ -671,10 +671,13 @@ mod tests {
     /// `listening`; standbys `standby_ready`, then wait for the promote line
     /// and report `listening`. Knobs: FAKE_STANDBY_EXIT (standbys exit 4),
     /// FAKE_STANDBY_LISTENS (standbys listen at once, as an app the shim
-    /// can't hold back would), FAKE_WORKER_EXIT (new workers exit 5).
+    /// can't hold back would), FAKE_STANDBY_DEAF (standbys ignore SIGTERM:
+    /// only the end of fd 3 ends their read, like a Node standby's
+    /// thread-pool read), FAKE_WORKER_EXIT (new workers exit 5).
     const FAKE: &str = r#"
 if [ "$WARDEN_STANDBY" = 1 ]; then
   [ -n "$FAKE_STANDBY_EXIT" ] && exit 4
+  [ -n "$FAKE_STANDBY_DEAF" ] && trap '' TERM
   if [ -z "$FAKE_STANDBY_LISTENS" ]; then
     echo '{"ev":"standby_ready","port":1}' >&3
     read -r line <&3 || exit 0
@@ -881,6 +884,26 @@ exec sleep 60
             assert_eq!(disabled.len(), 1);
             assert_eq!(disabled[0].state, "STOPPED");
             assert!(disabled[0].last_exit.as_deref().unwrap_or("").contains("before its promotion"), "{disabled:?}");
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// Stopping a standby ends its pending read of fd 3 (EOF), so a reader
+    /// its stop signal can't interrupt never holds it until the grace
+    /// period's SIGKILL (30 s here).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_standby_is_not_held_by_its_pending_read() {
+        local(async {
+            let mut r = Rig::new("deaf", "[shutdown]\ngrace_period = 30\n");
+            r.sup.cfg.app.env.insert("FAKE_STANDBY_DEAF".into(), "1".into());
+            r.sup.start_all();
+            r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
+            let standby = available(&r.sup)[0];
+            let t0 = Instant::now();
+            r.sup.stop_instance(standby);
+            r.until("the standby exited", |s| !s.insts.contains_key(&standby)).await;
+            assert!(t0.elapsed() < Duration::from_secs(2), "took {:?}", t0.elapsed());
             r.shutdown().await;
         })
         .await;

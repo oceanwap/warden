@@ -1221,6 +1221,11 @@ impl Supervisor {
         }
         i.stopping = true;
         i.handle.signal_group(stop_signal);
+        if i.role == Role::Standby {
+            // Never promoted now: end the shim's pending read of commands
+            // (EOF), so nothing it runs on can hold up the exit.
+            i.handle.close_input();
+        }
         let wid = if worker_mode { 0 } else { i.slot };
         emit(&self.cfg.app.name, wid, WorkerEvent::Stopping, Some(i.handle.pid), || {
             Some(format!("{} grace_s={}", crate::signals::name(stop_signal), grace.as_secs()))

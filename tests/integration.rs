@@ -5388,3 +5388,72 @@ fn standby_zero_changes_nothing() {
     assert_eq!(s["workers"].as_array().unwrap().len(), 1);
     assert_eq!(s["workers"][0]["restarts"], 1);
 }
+
+/// Wait until `pid` is gone; returns how long that took from `t0`.
+fn gone_within(pid: u64, t0: Instant, limit: Duration, what: &str, w: &Warden) -> Duration {
+    while alive(pid) {
+        assert!(t0.elapsed() < limit, "{what}: pid {pid} still running after {limit:?}\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    t0.elapsed()
+}
+
+/// A standby never holds up a stop, on Node and Bun: its shim reads
+/// Warden's commands without blocking its exit (a Node standby's read of
+/// fd 3 sat on a thread Node joins at exit, so every stop waited for the
+/// grace period's SIGKILL), and Warden ends that read when it stops one.
+/// The standby's own stop signal (fd 3 still open), `warden stop` and
+/// `warden kill` each take well under the 20 s grace period.
+#[test]
+fn a_standby_never_holds_up_a_stop() {
+    if !have_bun() || !have_node() {
+        return;
+    }
+    for (name, app) in [
+        ("sbstop-node", format!("command = \"node\"\nargs = [\"{}\"]", fixture("node_app.mjs"))),
+        ("sbstop-bun", format!("args = [\"{}\"]", fixture("app.ts"))),
+    ] {
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\n{app}\nport = {port}\n[workers]\ncount = 1\nstandby = 1\n\
+             [restart]\nbackoff_initial = 50\n[shutdown]\ngrace_period = 20\ndrain_ms = 100\n"
+        );
+        let mut w = Warden::start(name, port, &cfg);
+        let limit = Duration::from_secs(2);
+        let up = |w: &Warden| w.wait_for("a worker and a standby", T, |s| ready(1)(s) && ready_standby(s).is_some());
+
+        // Its own SIGTERM, from outside Warden: the shim drains and exits.
+        let standby = ready_standby(&up(&w)).unwrap();
+        let t0 = Instant::now();
+        unsafe { libc::kill(standby as i32, libc::SIGTERM) };
+        let took = gone_within(standby, t0, limit, &format!("{name}: SIGTERM to the standby"), &w);
+        eprintln!("{name}: a standby's own SIGTERM: gone after {}", ms(took));
+
+        // `warden stop`: the workers and the standby.
+        let s = w.wait_for("a new standby", T, |s| ready_standby(s).is_some_and(|p| p != standby) && ready(1)(s));
+        let (worker, standby) = (s["workers"][0]["pid"].as_u64().unwrap(), ready_standby(&s).unwrap());
+        let t0 = Instant::now();
+        let (code, out) = w.cli(&["stop"]);
+        assert_eq!(code, 0, "{out}");
+        gone_within(worker, t0, limit, &format!("{name}: warden stop (worker)"), &w);
+        let took = gone_within(standby, t0, limit, &format!("{name}: warden stop (standby)"), &w);
+        eprintln!("{name}: warden stop: the standby was gone after {}", ms(took));
+
+        // `warden kill`: the supervisor exits once its workers and standby have.
+        let (code, out) = w.cli(&["start", name]);
+        assert_eq!(code, 0, "{out}");
+        let standby = ready_standby(&up(&w)).unwrap();
+        let t0 = Instant::now();
+        let (code, out) = w.cli(&["kill", "--yes"]);
+        assert_eq!(code, 0, "{out}");
+        while w.child.try_wait().unwrap().is_none() {
+            assert!(t0.elapsed() < limit, "{name}: warden kill took over {limit:?}\n{}", w.log());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("{name}: warden kill: Warden exited after {}", ms(t0.elapsed()));
+        assert!(!alive(standby), "{name}: the standby outlived Warden");
+        let log = w.log();
+        assert!(!log.contains("did not exit within grace period"), "{name}:\n{log}");
+        assert!(log.contains("standby stopped"), "{name}:\n{log}");
+    }
+}

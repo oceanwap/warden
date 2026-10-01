@@ -88,6 +88,10 @@ let appUsesNodeHttp = false;
 // deferred until promoted. See the "standby" section.
 const standby = env.WARDEN_STANDBY === "1" && !inWorker && ipcFd != null && appPort != null;
 let promoted = false;
+// A standby's reader of Warden's commands (Node: a net.Socket owning fd 3),
+// and whether fd 3 is still open (that socket closes it when it ends).
+let ipcReader = null;
+let ipcOpen = true;
 
 function report(msg) {
   msg.worker = workerId;
@@ -97,7 +101,7 @@ function report(msg) {
     } catch {}
     return;
   }
-  if (ipcFd == null) return;
+  if (ipcFd == null || !ipcOpen) return;
   try {
     fs.writeSync(ipcFd, JSON.stringify(msg) + "\n");
   } catch {}
@@ -527,6 +531,7 @@ function warmNodeListen(args) {
 function promote(msg) {
   if (promoted) return;
   promoted = true;
+  stopReadingWardenCommands();
   if (Number.isInteger(msg.worker) && msg.worker > 0) {
     workerId = msg.worker;
     env.WARDEN_WORKER_ID = String(msg.worker);
@@ -545,33 +550,71 @@ function promote(msg) {
   process.emit("warden:promote", { worker: workerId });
 }
 
-// Commands from Warden on fd 3 (a socket). Reads run on the runtime's
-// thread pool, so the event loop never waits; the pending read also keeps a
-// Node standby alive while nothing listens. No reads after promotion.
+// Commands from Warden on fd 3 (a socket), read without the event loop
+// waiting. The pending read keeps a standby alive while nothing listens.
+// No commands after promotion.
+// - Node: through its event loop (a net.Socket on fd 3). Not fs.read: that
+//   blocks a thread-pool thread in read(2), and Node joins those threads when
+//   it exits, so a standby's process.exit() (its drain on SIGTERM) waited
+//   until Warden's SIGKILL. The socket owns fd 3 from then on and closes it
+//   when it ends (Warden shut down or closed its end): `ipcOpen` turns false
+//   first, so reports never go to a reused fd 3.
+// - Bun: fs.read (its net.Socket can't take an fd), which doesn't hold up
+//   its exit.
+// Warden also shuts down its end when it stops a standby: a pending read
+// gets EOF whatever it runs on.
 function readWardenCommands() {
-  const buf = Buffer.alloc(4096);
   let acc = "";
+  const take = (text) => {
+    if (promoted) return;
+    acc += text;
+    for (let i = acc.indexOf("\n"); i >= 0; i = acc.indexOf("\n")) {
+      const line = acc.slice(0, i);
+      acc = acc.slice(i + 1);
+      let msg = null;
+      try {
+        msg = JSON.parse(line);
+      } catch {}
+      if (msg && msg.cmd === "promote") promote(msg);
+    }
+    if (acc.length > 65536) acc = "";
+  };
+  if (!isBun) {
+    try {
+      const net = require("node:net");
+      const sock = new net.Socket({ fd: ipcFd, readable: true, writable: false });
+      // Every way it closes fd 3 (end, error, destroy) goes through destroy().
+      const destroy = sock.destroy;
+      sock.destroy = function (...a) {
+        ipcOpen = false;
+        return destroy.apply(this, a);
+      };
+      sock.setEncoding("utf8");
+      sock.on("data", take);
+      sock.on("error", () => {});
+      ipcReader = sock;
+      return;
+    } catch {} // not a socket Node can watch: read it the Bun way
+  }
+  const buf = Buffer.alloc(4096);
   const next = () =>
     fs.read(ipcFd, buf, 0, buf.length, null, (err, n) => {
       if (err) {
         if (err.code === "EAGAIN" || err.code === "EINTR") setTimeout(next, 10);
         return; // fd 3 is gone: nothing can promote this worker
       }
-      if (!n) return; // Warden closed its end (it is exiting)
-      acc += buf.toString("utf8", 0, n);
-      for (let i = acc.indexOf("\n"); i >= 0; i = acc.indexOf("\n")) {
-        const line = acc.slice(0, i);
-        acc = acc.slice(i + 1);
-        let msg = null;
-        try {
-          msg = JSON.parse(line);
-        } catch {}
-        if (msg && msg.cmd === "promote") promote(msg);
-      }
-      if (acc.length > 65536) acc = "";
+      if (!n) return; // Warden shut down its end (stopping this standby, or exiting)
+      take(buf.toString("utf8", 0, n));
       if (!promoted) next();
     });
   next();
+}
+
+// No more commands: the reader no longer keeps the process alive (a
+// promoted worker lives as long as its servers; a draining standby exits
+// once its drain and the app's handlers are done).
+function stopReadingWardenCommands() {
+  if (ipcReader) ipcReader.unref();
 }
 
 if (standby) readWardenCommands();
@@ -1083,6 +1126,7 @@ async function drain() {
   if (drainStarted) return;
   drainStarted = true;
   draining = true;
+  stopReadingWardenCommands();
   report({ ev: "draining" });
   await markNodeResponsesClose();
   for (const s of servers) stopAccepting(s);
