@@ -1742,6 +1742,7 @@ impl Supervisor {
             "runtime_dir": self.runtime_dir.display().to_string(),
             "log_file": crate::logging::file_path().map(|p| p.display().to_string()),
             "unit": systemd::own_unit(),
+            "pid": std::process::id(),
             "shim": self.shim_path.as_ref().map(|p| p.display().to_string()),
             "workers_running": self.count,
         })
