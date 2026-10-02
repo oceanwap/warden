@@ -33,6 +33,7 @@ fn f(level: Level, check: &str, detail: impl Into<String>, fix: Option<&str>) ->
 pub async fn run(args: &Args) -> i32 {
     let mut out = Vec::new();
     out.extend(kernel());
+    out.extend(platform_check());
     out.push(runtime("bun", &["--version"], None));
     out.push(runtime("node", &["--version"], Some((22, 12))));
     out.push(file_limit());
@@ -225,6 +226,70 @@ pub fn check_private_dir(dir: &Path) -> Result<bool, String> {
         ));
     }
     Ok(true)
+}
+
+/// Asks the OS adapter about this very process and says what it could not
+/// read: a CPU or memory column that would stay empty, a readiness check that
+/// would fall back to a connect probe. Run live (a listener is bound for the
+/// ports question), so it finds a broken adapter the unit tests of another
+/// OS version would not.
+fn platform_check() -> Vec<Finding> {
+    let p = crate::platform::current();
+    let name = p.name();
+    if name == "other" {
+        return Vec::new(); // `kernel` already says there is no adapter
+    }
+    let (me, caps) = (std::process::id(), p.capabilities());
+    let mut missing: Vec<&str> = Vec::new();
+    if caps.proc_stats && p.proc_stats(me).is_none_or(|s| s.rss_bytes == 0) {
+        missing.push("memory and CPU");
+    }
+    if caps.proc_owner && p.proc_owner(me) != Some(crate::sys::euid()) {
+        missing.push("the process owner");
+    }
+    if caps.proc_environ {
+        let path = std::env::var_os("PATH");
+        let seen = p.proc_environ(me).and_then(|e| e.into_iter().find(|(k, _)| k == "PATH").map(|(_, v)| v));
+        if path.is_some() && seen != path {
+            missing.push("a process's environment");
+        }
+    }
+    if caps.listening_ports {
+        // A port of our own, bound for the question, and gone after it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let port = listener.as_ref().and_then(|l| l.local_addr().ok()).map(|a| a.port());
+        if let Some(port) = port {
+            if !p.listening_ports(me).is_some_and(|ports| ports.contains(&port)) {
+                missing.push("listening ports");
+            }
+        }
+    }
+    if caps.host_stats && p.host_snapshot().is_none() {
+        missing.push("the host's CPU, memory and load");
+    }
+    if p.boot_id().is_none() {
+        missing.push("the boot id");
+    }
+    if missing.is_empty() {
+        vec![f(
+            Level::Ok,
+            "platform",
+            format!(
+                "{name} adapter reads memory, CPU, owner, environment, listening ports, host numbers and the boot id"
+            ),
+            None,
+        )]
+    } else {
+        vec![f(
+            Level::Warn,
+            "platform",
+            format!(
+                "the {name} adapter could not read {}: the matching columns stay empty and readiness falls back to a connect probe",
+                missing.join(", ")
+            ),
+            Some("report it with `warden doctor --json` and your OS version"),
+        )]
+    }
 }
 
 /// What a non-Linux adapter cannot do, as findings: built from the adapter's
@@ -422,6 +487,14 @@ mod tests {
             v[0].detail
         );
         assert!(v[0].detail.contains("connect probe") && v[0].detail.contains("host events"), "{}", v[0].detail);
+    }
+
+    #[test]
+    fn the_adapter_of_this_os_reads_what_it_claims() {
+        let v = platform_check();
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].level, Level::Ok, "{}", v[0].detail);
+        assert_eq!(v[0].check, "platform");
     }
 
     #[test]

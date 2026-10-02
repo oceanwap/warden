@@ -875,6 +875,9 @@ cargo xtask bench           # benchmarks (see above); `cargo xtask bench --help`
 cargo xtask chaos           # chaos soak: a fleet under load, random faults, invariants checked (docs/chaos.md)
 cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
 cargo dist-macos            # the macOS release archives, built on this Mac (see Releasing below)
+scripts/mac-check.sh        # on a Mac: builds, runs the platform tests and drives a real supervisor and
+                            # wardend (CPU, memory, user, ports, environment, host events); the report
+                            # is target/mac-check/report.txt
 ```
 
 The workspace: `warden` (this directory), `protocol/` (the wire types, serde
