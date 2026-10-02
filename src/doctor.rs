@@ -82,21 +82,9 @@ pub fn render(findings: &[Finding], fmt: &Fmt) -> String {
 
 fn kernel() -> Vec<Finding> {
     let mut v = Vec::new();
-    if !cfg!(target_os = "linux") {
-        v.push(f(
-            Level::Warn,
-            "kernel",
-            "not Linux: fine for development, but SO_REUSEPORT does not balance connections across workers \
-             (use count = 1), no parent-death signal (workers outlive a SIGKILLed supervisor), \
-             no /proc readiness (CPU and memory come from libproc)",
-            Some("run production on Linux"),
-        ));
-        v.push(f(
-            Level::Info,
-            "openat2",
-            "not Linux: unavailable; `warden serve` checks paths with realpath instead (slower, same safety)",
-            None,
-        ));
+    let platform = crate::platform::current();
+    if platform.name() != "linux" {
+        v.extend(platform_findings(platform.name(), platform.capabilities()));
         return v;
     }
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string();
@@ -239,11 +227,59 @@ pub fn check_private_dir(dir: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// What a non-Linux adapter cannot do, as findings: built from the adapter's
+/// own capabilities, so the text cannot disagree with the code.
+fn platform_findings(os: &str, c: crate::platform::Capabilities) -> Vec<Finding> {
+    let name = match os {
+        "macos" => "macOS",
+        _ => "an OS Warden has no adapter for",
+    };
+    let mut gaps = Vec::new();
+    if !c.reuseport_balances {
+        gaps.push("SO_REUSEPORT does not balance connections across workers (use count = 1)");
+    }
+    if !c.parent_death_signal {
+        gaps.push("a worker is not stopped when its supervisor is killed");
+    }
+    if !c.oom_attribution {
+        gaps.push("an out-of-memory kill is not recognised as one");
+    }
+    let mut blind = Vec::new();
+    if !c.proc_stats {
+        blind.push("CPU and memory");
+    }
+    if !c.proc_owner {
+        blind.push("the process owner");
+    }
+    if !c.listening_ports {
+        blind.push("listening ports (readiness is a connect probe)");
+    }
+    if !c.proc_environ {
+        blind.push("a process's environment (a restarted supervisor gets wardend's own)");
+    }
+    if !c.host_stats {
+        blind.push("host events");
+    }
+    let mut detail = format!("{name}: fine for development, but {}", gaps.join(", "));
+    if !blind.is_empty() {
+        detail += &format!("; and it cannot read {}", blind.join(", "));
+    }
+    vec![
+        f(Level::Warn, "kernel", detail, Some("run production on Linux")),
+        f(
+            Level::Info,
+            "openat2",
+            format!("{name}: unavailable; `warden serve` checks paths with realpath instead (slower, same safety)"),
+            None,
+        ),
+    ]
+}
+
 fn pid_one() -> Option<Finding> {
     // A container whose PID 1 is Warden itself: nothing reaps orphaned
     // grandchildren (a `bun run` wrapper's children), so zombies pile up.
-    let comm = std::fs::read_to_string("/proc/1/comm").ok()?;
-    (comm.trim() == "warden").then(|| {
+    let comm = crate::platform::proc_name(1)?;
+    (comm == "warden").then(|| {
         f(
             Level::Fail,
             "pid 1",
@@ -330,16 +366,10 @@ fn boot() -> Option<Finding> {
 
 fn pm2() -> Option<Finding> {
     // A PM2 daemon still running after a migration runs the same apps twice.
-    let rd = std::fs::read_dir("/proc").ok()?;
-    let daemons = rd
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
-        .filter(|e| {
-            std::fs::read(e.path().join("cmdline")).is_ok_and(|c| {
-                let c = String::from_utf8_lossy(&c);
-                c.starts_with("PM2 v") && c.contains("God Daemon")
-            })
-        })
+    // It sets its process title: "PM2 v5.4.2: God Daemon (/home/me/.pm2)".
+    let daemons = crate::platform::command_lines()
+        .iter()
+        .filter(|(_, line)| line.starts_with("PM2 v") && line.contains("God Daemon"))
         .count();
     (daemons > 0).then(|| {
         f(
@@ -354,6 +384,45 @@ fn pm2() -> Option<Finding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_adapter_lacks_is_what_the_finding_says() {
+        use crate::platform::Capabilities;
+        let mac = Capabilities {
+            proc_stats: true,
+            proc_owner: true,
+            listening_ports: true,
+            proc_environ: true,
+            host_stats: true,
+            reuseport_balances: false,
+            parent_death_signal: false,
+            oom_attribution: false,
+        };
+        let v = platform_findings("macos", mac);
+        assert_eq!(v[0].level, Level::Warn);
+        assert!(
+            v[0].detail.starts_with("macOS: fine for development, but SO_REUSEPORT does not balance"),
+            "{}",
+            v[0].detail
+        );
+        assert!(!v[0].detail.contains("cannot read"), "macOS reads everything: {}", v[0].detail);
+        assert_eq!(v[0].fix.as_deref(), Some("run production on Linux"));
+        let none = Capabilities {
+            proc_stats: false,
+            proc_owner: false,
+            listening_ports: false,
+            proc_environ: false,
+            host_stats: false,
+            ..mac
+        };
+        let v = platform_findings("other", none);
+        assert!(
+            v[0].detail.contains("no adapter") && v[0].detail.contains("it cannot read CPU and memory"),
+            "{}",
+            v[0].detail
+        );
+        assert!(v[0].detail.contains("connect probe") && v[0].detail.contains("host events"), "{}", v[0].detail);
+    }
 
     #[test]
     fn versions() {

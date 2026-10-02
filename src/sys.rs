@@ -22,6 +22,9 @@
 //! memcheck: its `sys::` tests, steps and flags in docs/review-process.md
 //! ("Valgrind for the `unsafe` code").
 
+#[cfg(target_os = "macos")]
+pub mod darwin;
+
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -132,6 +135,30 @@ pub fn clock_ticks() -> u64 {
     })
 }
 
+/// This host's name (gethostname), when it has one.
+pub fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a valid byte array of buf.len() bytes, which
+    // gethostname writes a NUL-terminated name into (truncated if longer).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let name = buf.split(|b| *b == 0).next().unwrap_or(&[]);
+    let name = String::from_utf8_lossy(name).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The 1, 5 and 15 minute load averages.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // Linux reads /proc/loadavg
+pub fn loadavg() -> Option<[f64; 3]> {
+    let mut v = [0f64; 3];
+    // SAFETY: `v` is a valid array of 3 doubles, which getloadavg fills
+    // with up to 3 samples (it returns how many it got, -1 on error).
+    let n = unsafe { libc::getloadavg(v.as_mut_ptr(), 3) };
+    (n == 3).then_some(v)
+}
+
 /// CLOCK_MONOTONIC in microseconds (what systemd's `MONOTONIC_USEC` wants).
 pub fn monotonic_usec() -> u64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -234,6 +261,39 @@ pub fn localtime(secs: i64) -> Option<libc::tm> {
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() { None } else { Some(tm) }
+    }
+}
+
+/// The login name of a user id (getpwuid_r), or `None` when there is no such
+/// user (or the lookup fails: a user database that is down).
+pub fn user_name(uid: u32) -> Option<String> {
+    // The buffer holds the strings the passwd entry points to; grow it when
+    // getpwuid_r says it is too small (ERANGE), within a bound.
+    let mut buf = vec![0u8; 1024];
+    loop {
+        // SAFETY: all-zero is a valid `passwd` (integers and null pointers);
+        // getpwuid_r writes only into `pwd` and `buf`, both owned here, up
+        // to buf.len() bytes, and is thread-safe (unlike getpwuid). On
+        // success (`found` non-null) `pw_name` points to a NUL-terminated
+        // string inside `buf`, which outlives the read below.
+        let (rc, found, name) = unsafe {
+            let mut pwd: libc::passwd = std::mem::zeroed();
+            let mut found: *mut libc::passwd = std::ptr::null_mut();
+            let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr().cast::<libc::c_char>(), buf.len(), &mut found);
+            let name = if rc == 0 && !found.is_null() && !pwd.pw_name.is_null() {
+                Some(std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            (rc, found, name)
+        };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            let bigger = buf.len() * 4;
+            buf.resize(bigger, 0);
+            continue;
+        }
+        let _ = found;
+        return name.filter(|n| !n.is_empty());
     }
 }
 
@@ -776,6 +836,20 @@ mod tests {
         let f = std::fs::File::open("/dev/null").unwrap();
         assert!(!isatty(f.as_raw_fd()));
         assert!(!isatty(-1) && !isatty(987_654));
+    }
+
+    #[test]
+    fn user_names_come_from_the_user_database() {
+        assert_eq!(user_name(0).as_deref(), Some("root"));
+        assert_eq!(user_name(0x7fff_fff0), None, "no such user");
+    }
+
+    #[test]
+    fn hostname_and_load_average() {
+        let name = hostname().expect("every host has a name");
+        assert!(!name.contains('\0') && !name.trim().is_empty(), "{name:?}");
+        let load = loadavg().expect("getloadavg");
+        assert!(load.iter().all(|l| l.is_finite() && *l >= 0.0), "{load:?}");
     }
 
     #[test]

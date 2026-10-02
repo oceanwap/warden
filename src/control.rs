@@ -665,6 +665,7 @@ mod tests {
             standbys: vec![],
             draining: vec![],
             start_failed: None,
+            user: None,
         }
     }
 

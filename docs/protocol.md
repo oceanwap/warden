@@ -144,6 +144,12 @@ crash's reason (`exit code 1`, `not ready in time`). It stays while the
 workers are stopped after it (`stopped` true: the app is `errored`) and is
 cleared by the next start. `warden start` fails fast on it.
 
+`status.user` (a string, absent from an older Warden): the user the app's
+processes run as: the owner of a running worker (read from the OS), else the
+supervisor's own user. Warden never switches user, so it is the user that ran
+`warden start`, or the unit's `User=`. A number when the user database has no
+such user.
+
 `status.workers[].loop_delay` (`{"p50_ms","p99_ms","max_ms"}`, absent
 without one) is the worker's event-loop delay over its last heartbeat
 interval (about a second), from Warden's shim; in worker mode each

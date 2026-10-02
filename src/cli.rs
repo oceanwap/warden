@@ -787,6 +787,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
                 Cell::plain(w.restarts.to_string()),
                 Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                 Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
+                Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
                 Cell::plain(loop_p99(w)),
                 health_cell(w.healthy),
                 Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
@@ -794,7 +795,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
         })
         .collect();
     boxed(
-        Some(&["worker", "status", "pid", "uptime", "↺", "cpu", "mem", "loop p99", "health", "last exit"]),
+        Some(&["worker", "status", "pid", "uptime", "↺", "cpu", "mem", "user", "loop p99", "health", "last exit"]),
         &rows,
         fmt,
         None,
@@ -818,6 +819,9 @@ pub fn render_status_with(s: &Status, table_only: bool, id: Option<u32>, fmt: &F
         kv(&mut rows, "id", id.to_string());
     }
     kv(&mut rows, "namespace", s.namespace.clone());
+    if let Some(user) = &s.user {
+        kv(&mut rows, "user", user.clone());
+    }
     kv(&mut rows, "mode", s.mode.clone());
     kv(&mut rows, "workers", format!("{} configured, {} ready", s.workers_configured, s.workers_ready));
     if !s.standbys.is_empty() {
@@ -995,6 +999,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                         Cell::plain(w.restarts.to_string()),
                         Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                         Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
+                        Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
                         Cell::plain(loop_p99(w)),
                         health_cell(w.healthy),
                         Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
@@ -1019,7 +1024,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 let mut row = lead(true, &app.namespace);
                 row.push(Cell::plain("-"));
                 row.push(state_cell(what));
-                row.extend((0..8).map(|_| Cell::plain("-")));
+                row.extend((0..9).map(|_| Cell::plain("-")));
                 rows.push(row);
                 if what == "offline" {
                     offline.push(app);
@@ -1055,6 +1060,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
             "↺",
             "cpu",
             "mem",
+            "user",
             "loop p99",
             "health",
             "last exit",
@@ -1091,6 +1097,9 @@ pub fn render_describe(s: &Status, info: &serde_json::Value, id: Option<u32>, fm
         kv(&mut head, "id", id.to_string());
     }
     kv(&mut head, "namespace", s.namespace.clone());
+    if let Some(user) = &s.user {
+        kv(&mut head, "user", user.clone());
+    }
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut row = |k: &str, v: String| kv(&mut rows, k, v);
     row(
@@ -1672,6 +1681,36 @@ mod tests {
         let mixed = render_list_with(&[off("a", Some(4)), off("b", None)], &Fmt::PLAIN);
         assert!(mixed.contains("│ -  │ b ") && mixed.contains("2 offline: `warden start a,b` starts them"), "{mixed}");
         assert!(render_list_with(&[], &Fmt::PLAIN).starts_with("no apps yet"));
+    }
+
+    /// The `user` column shows who the app runs as; `-` when unknown
+    /// (an older Warden sends none, an app that is not running has no process).
+    #[test]
+    fn the_user_shows_in_the_list_the_workers_table_and_the_boxes() {
+        let mut s: Status = serde_json::from_value(serde_json::json!({
+            "app": "api", "mode": "process", "pid": 7, "uptime_secs": 9, "workers_configured": 1, "workers_ready": 1,
+            "healthy": null, "supervisor_rss_bytes": null, "host": null, "reloading": false, "shutting_down": false,
+            "workers": [], "user": "deploy"
+        }))
+        .unwrap();
+        s.workers = vec![row(1, "RUNNING", 101)];
+        let list = render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt::PLAIN);
+        // The cells of one box line, empty ones included (the namespace is empty here).
+        let cells = |line: &str| -> Vec<String> {
+            let mut v: Vec<String> = line.split('│').map(|c| c.trim().to_string()).collect();
+            v.remove(0);
+            v.pop();
+            v
+        };
+        let at = cells(list.lines().nth(1).unwrap()).iter().position(|c| c == "user").expect("a user column");
+        assert_eq!(cells(list.lines().nth(3).unwrap())[at], "deploy", "{list}");
+        assert!(render_status(&s, true).contains("deploy"), "the workers table");
+        assert!(render_status(&s, false).contains("│ user      │ deploy"), "the status box");
+        // An older Warden's status has no user: a dash, no `user` row.
+        s.user = None;
+        let list = render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt::PLAIN);
+        assert_eq!(cells(list.lines().nth(3).unwrap())[at], "-", "{list}");
+        assert!(!render_status(&s, false).contains("│ user      │"));
     }
 
     #[test]

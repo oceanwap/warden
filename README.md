@@ -838,10 +838,16 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
   - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
   - `warden serve` checks static paths with realpath instead of `openat2`
     (same confinement, slower).
-  - No `/proc`: the CPU and RSS columns and metrics are empty, wardend
-    sends no `host` events, and it restarts a supervisor with its own
-    environment (the launchd job's `PATH`) instead of the one it was started
-    with.
+  - No out-of-memory attribution: a worker the kernel killed for memory
+    shows as `killed by SIGKILL`, not as an OOM kill (macOS has no cgroup
+    events to read).
+  - CPU, memory, the user, listening ports, a process's environment and
+    the host's numbers come from macOS's own interfaces (libproc, `sysctl`
+    and Mach calls) through a small adapter per OS (`src/platform/`), so
+    the CPU and mem columns, readiness by port, wardend's `host` events and
+    its restart of a supervisor with the environment it was started with
+    all work as on Linux. `warden doctor` says what the OS you are on
+    cannot do.
 - **Windows**: not supported, and not planned for 0.1. Warden is built on
   Unix sockets, signals, process groups and `SO_REUSEPORT`, none of which
   Windows has in the same form. **WSL2 works as Linux** (it is a real Linux
@@ -875,16 +881,24 @@ The workspace: `warden` (this directory), `protocol/` (the wire types, serde
 only, shared by `warden` and the GUI), `gui/` (`warden-gui`) and `xtask/`.
 Plain `cargo build` and `cargo test` here mean `warden` only.
 
-All `unsafe` code is in [`src/sys.rs`](src/sys.rs) (`protocol/` and `gui/`
-have none: `#![forbid(unsafe_code)]`): system calls the standard
-library doesn't expose, and the few that measurably pay on a hot path (the
-static server and log capture), each with a SAFETY note and tests. The rest
-of the crate is `#![deny(unsafe_code)]`.
+All `unsafe` code is in [`src/sys.rs`](src/sys.rs) and its macOS half
+[`src/sys/darwin.rs`](src/sys/darwin.rs) (`protocol/` and `gui/` have none:
+`#![forbid(unsafe_code)]`): system calls the standard library doesn't expose,
+and the few that measurably pay on a hot path (the static server and log
+capture), each with a SAFETY note and tests. The rest of the crate is
+`#![deny(unsafe_code)]`.
+
+What differs per OS (reading a process's memory, owner, ports and
+environment, the host's load, the boot id) sits behind one trait with an
+implementation per OS in [`src/platform/`](src/platform/): `linux.rs` reads
+`/proc`, `macos.rs` calls libproc and `sysctl`, `other.rs` answers nothing.
+The adapter is chosen when Warden is built; the same contract tests run
+against the real OS on Linux (CI) and on a Mac.
 
 Layout: `src/supervisor.rs` (event loop), `src/supervisor/rollout.rs` (gates,
 canary, rollback), `src/supervisor/upkeep.rs` (watchdog, recycling),
-`src/process.rs` (spawning, fd-3 IPC), `shim/` (embedded JS), `tests/`,
-`bench/`, `research/`.
+`src/process.rs` (spawning, fd-3 IPC), `src/platform/` (the per-OS adapters),
+`shim/` (embedded JS), `tests/`, `bench/`, `research/`.
 
 Limitations:
 

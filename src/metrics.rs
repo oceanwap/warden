@@ -1,42 +1,9 @@
-//! Process metrics from /proc and the optional Prometheus endpoint.
+//! Process metrics (read through `platform`) and the optional Prometheus endpoint.
 
 use crate::control::Status;
 use std::fmt::Write as _;
 
-#[derive(Debug, Clone, Copy)]
-pub struct ProcStats {
-    pub rss_bytes: u64,
-    /// utime + stime in seconds.
-    pub cpu_seconds: f64,
-}
-
-/// RSS and CPU time of `pid`. Linux only.
-pub fn proc_stats(pid: u32) -> Option<ProcStats> {
-    #[cfg(target_os = "linux")]
-    {
-        let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
-        let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let ticks = parse_stat_cpu_ticks(&stat)?;
-        let (page, hz) = (crate::sys::page_size(), crate::sys::clock_ticks());
-        Some(ProcStats { rss_bytes: resident * page, cpu_seconds: ticks as f64 / hz as f64 })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-/// utime + stime (clock ticks) from the contents of /proc/<pid>/stat.
-/// The command name may contain spaces and parens, so split after the last ')'.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `proc_stats`, Linux only
-pub fn parse_stat_cpu_ticks(stat: &str) -> Option<u64> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    // f[0] is field 3 (state); utime is field 14, stime field 15.
-    Some(f.get(11)?.parse::<u64>().ok()? + f.get(12)?.parse::<u64>().ok()?)
-}
+pub use crate::platform::{ProcStats, proc_stats};
 
 pub fn render_prometheus(s: &Status) -> String {
     let mut o = String::with_capacity(2048);
@@ -247,19 +214,6 @@ mod tests {
     use crate::control::WorkerStatus;
 
     #[test]
-    fn stat_parsing_handles_spaces_in_comm() {
-        let stat = "1234 (my (weird) app) S 1 1234 1234 0 -1 4194304 100 0 0 0 250 50 0 0 20 0 5 0 100 1000 200";
-        assert_eq!(parse_stat_cpu_ticks(stat), Some(300));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn reads_self() {
-        let s = proc_stats(std::process::id()).unwrap();
-        assert!(s.rss_bytes > 0);
-    }
-
-    #[test]
     fn prometheus_text() {
         let st = Status {
             app: "api".into(),
@@ -302,6 +256,7 @@ mod tests {
             standbys: vec![],
             draining: vec![],
             start_failed: None,
+            user: None,
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));

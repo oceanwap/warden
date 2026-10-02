@@ -38,6 +38,17 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   the terminal width is known.
 - [`docs/windows.md`](docs/windows.md): why Warden does not run natively on
   Windows, how to use it under WSL2, and the plan for a native build.
+- Platform adapters (`src/platform/`): one trait for what Warden asks the OS
+  (a process's memory, CPU, owner, ports, environment and working directory,
+  every process's command line, the host's load, the boot id), with a Linux
+  (`/proc`), a macOS (libproc, `sysctl`, Mach) and an "other Unix" (answers
+  nothing) implementation, chosen at build time and checked by one set of
+  contract tests. On macOS the CPU and mem columns, `warden list`'s ports
+  check, wardend's `host` events, PM2 daemon detection and restarting a
+  supervisor with its original environment now work (they were empty).
+- A `user` column in `warden list` and the workers table, and a `user` row in
+  `status` and `describe`: who the app's processes run as (`Status.user`,
+  [`docs/protocol.md`](docs/protocol.md)).
 - `pm2-migrate` leaves out environment names an env file cannot hold (PM2
   records one named after the app) and lists them in `MIGRATION.md`, instead
   of writing an env file Warden refuses to read.

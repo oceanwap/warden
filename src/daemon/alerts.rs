@@ -792,15 +792,7 @@ fn clock(at_ms: u64) -> String {
 
 /// This host's name, for the alert's text.
 pub(crate) fn hostname() -> String {
-    #[cfg(target_os = "linux")]
-    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
-    #[cfg(not(target_os = "linux"))]
-    let name = std::process::Command::new("/bin/hostname")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
-    name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).unwrap_or_else(|| "this host".into())
+    crate::sys::hostname().unwrap_or_else(|| "this host".into())
 }
 
 #[cfg(test)]

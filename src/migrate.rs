@@ -125,17 +125,10 @@ fn pm2(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// The environment of a process (the PM2 daemon), from /proc.
+/// The environment of a process (the PM2 daemon), through the OS adapter.
 fn environ_of(pid: u32) -> Option<BTreeMap<String, String>> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    Some(
-        raw.split(|b| *b == 0)
-            .filter_map(|kv| {
-                let kv = String::from_utf8_lossy(kv);
-                kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect(),
-    )
+    let env = crate::platform::proc_environ(pid)?;
+    Some(env.into_iter().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect())
 }
 
 fn daemon_env() -> Option<BTreeMap<String, String>> {
@@ -534,32 +527,9 @@ fn detect_port(a: &Pm2App) -> Option<u16> {
     (ports.len() == 1).then(|| ports[0])
 }
 
-/// TCP ports a process listens on (its socket inodes against /proc/net/tcp*).
+/// TCP ports a process listens on, through the OS adapter (none when it cannot say).
 fn listening_ports(pid: u32) -> Vec<u16> {
-    let inodes: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter_map(|e| std::fs::read_link(e.path()).ok())
-                .filter_map(|l| {
-                    let l = l.to_string_lossy().to_string();
-                    l.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']')).map(String::from)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(table) else { continue };
-        for line in text.lines().skip(1) {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() > 9 && f[3] == "0A" && inodes.iter().any(|i| i == f[9]) {
-                if let Some(p) = f[1].rsplit(':').next().and_then(|h| u16::from_str_radix(h, 16).ok()) {
-                    out.push(p);
-                }
-            }
-        }
-    }
-    out
+    crate::platform::listening_ports(pid).unwrap_or_default()
 }
 
 // ------------------------------------------------------------ generating

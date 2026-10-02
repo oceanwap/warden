@@ -20,6 +20,7 @@ mod logview;
 mod metrics;
 mod migrate;
 mod networking;
+mod platform;
 mod process;
 mod restart;
 mod schedule;

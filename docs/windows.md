@@ -38,17 +38,19 @@ source files use Unix-only std or tokio APIs (`std::os::unix`,
 | Process groups, parent-death signal | `process.rs`, `sys::child_*` | **Job objects**: stronger than Linux's pdeathsig (`KILL_ON_JOB_CLOSE` kills the whole tree when Warden dies) |
 | `socketpair` on fd 3 for the worker's IPC (`WARDEN_IPC_FD`) | `process.rs`, the shim | Inheritable handles, or a named pipe whose name goes in the environment |
 | `flock` (ids, state files), `rename` over an open file | `ids.rs`, `sys::try_lock_exclusive`, `logging.rs` | `LockFileEx`. Open files cannot be renamed or deleted unless opened with `FILE_SHARE_DELETE`: log rotation needs care |
-| `/proc`: RSS, CPU, listeners, cgroups, environ, boot id | `metrics.rs`, `networking.rs`, `process/exit.rs`, `migrate.rs`, `daemon/host.rs` | `GetProcessMemoryInfo`, `GetProcessTimes`, `GetExtendedTcpTable`, performance counters. The same `ProcStats` shape fits |
+| `/proc`: RSS, CPU, owner, listeners, environ, boot id | already behind the `Platform` trait in `src/platform/` (Linux and macOS adapters); cgroups and OOM events stay in `process/exit.rs` | A `platform/windows.rs` adapter: `GetProcessMemoryInfo`, `GetProcessTimes`, `GetExtendedTcpTable`, performance counters. The same `ProcStats` shape fits |
 | `sh -c` for shell-style `command`s, `/bin/sh` in alert commands | `fleet.rs`, `daemon/` | `cmd.exe /C`, or require an explicit program and argv on Windows |
 | systemd and launchd for `warden startup` | `startup.rs`, `systemd.rs` | A Windows Service (the `windows-service` crate) or a Task Scheduler entry |
 | XDG and `/run`, `/var`, `/etc`, `/tmp` paths | `config.rs`, `fleet.rs`, `protocol/src/paths.rs` | `%LOCALAPPDATA%`, `%ProgramData%`, `%TEMP%` |
 | `sendfile`, `openat2`, `memfd`, `splice`, `pidfd`, `TCP_DEFER_ACCEPT` | `sys.rs` | Not needed: each already has a portable fallback (written for macOS), selected at compile time. `TransmitFile` could replace `sendfile` later |
 | The JS shim: Unix-socket health servers, `process.send`, signal handlers | `shim/warden-shim.mjs` | Named pipes in Node; to verify for Bun (see Spikes) |
 
-What helps: **all `unsafe` and every syscall already sit in `src/sys.rs`** behind
-safe functions (38 of them), and the macOS port forced the non-Linux fallbacks
-to exist and be tested. A Windows layer is a second implementation of that same
-seam, not a rewrite of the supervisor.
+What helps: **all `unsafe` and every syscall already sit in `src/sys.rs`** (and
+`src/sys/darwin.rs`) behind safe functions, **what differs per OS is behind the
+`Platform` trait** (`src/platform/`, one adapter per OS, one set of contract
+tests), and the macOS port forced the non-Linux fallbacks to exist and be
+tested. A Windows layer is a third implementation of those same seams, not a
+rewrite of the supervisor.
 
 ## The hard part: sharing a port
 

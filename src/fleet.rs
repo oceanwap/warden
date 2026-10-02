@@ -1768,23 +1768,15 @@ pub(crate) struct Origin {
 }
 
 impl Origin {
-    /// Read from /proc: what `pid` was started with (same user, or root).
+    /// What `pid` was started with (same user, or root), from the OS adapter
+    /// (`/proc` on Linux, `sysctl` on macOS): `None` when it cannot say.
     pub(crate) fn of(pid: u32) -> Option<Origin> {
-        use std::os::unix::ffi::OsStrExt;
-        let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-        let env: Vec<_> = raw
-            .split(|b| *b == 0)
-            .filter_map(|kv| {
-                let i = kv.iter().position(|b| *b == b'=')?;
-                let (k, v) = (std::ffi::OsStr::from_bytes(&kv[..i]), std::ffi::OsStr::from_bytes(&kv[i + 1..]));
-                Some((k.to_os_string(), v.to_os_string()))
-            })
-            .collect();
+        let env = crate::platform::proc_environ(pid)?;
         // A zombie shows an empty environment: better ours than none.
         if env.is_empty() {
             return None;
         }
-        Some(Origin { env, cwd: std::fs::read_link(format!("/proc/{pid}/cwd")).ok() })
+        Some(Origin { env, cwd: crate::platform::proc_cwd(pid) })
     }
 }
 
@@ -2545,14 +2537,18 @@ mod tests {
         assert!(standby("backend:standby").unwrap_err().contains("needs an app"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    #[cfg(target_os = "linux")] // /proc
-    fn origin_is_read_from_proc() {
+    fn origin_is_read_through_the_platform_adapter() {
+        if !crate::platform::current().capabilities().proc_environ {
+            assert!(Origin::of(std::process::id()).is_none());
+            return;
+        }
         let me = Origin::of(std::process::id()).expect("our own environment");
         let path = me.env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone());
         assert_eq!(path, std::env::var_os("PATH"));
-        assert_eq!(me.cwd, std::env::current_dir().ok());
+        // macOS reports the canonical path (/private/var), the test's own cwd may be a symlink.
+        let want = std::env::current_dir().ok().and_then(|d| std::fs::canonicalize(d).ok());
+        assert_eq!(me.cwd.and_then(|d| std::fs::canonicalize(d).ok()), want);
         assert_eq!(Origin::of(u32::MAX / 2), None, "no such process");
     }
 

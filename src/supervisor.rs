@@ -2191,6 +2191,9 @@ impl Supervisor {
         let me = std::process::id();
         let started = self.started;
         let sup = sample(me, &mut self.supervisor_cpu_prev, started);
+        // Who the app runs as: a running worker's owner (the OS says), else our own user.
+        let owner = workers.iter().find_map(|w| w.pid).and_then(crate::platform::proc_owner);
+        let user = crate::platform::user_name(owner.unwrap_or_else(crate::sys::euid));
         let rollout = self.rollout_status();
         Status {
             app: self.cfg.app.name.clone(),
@@ -2227,6 +2230,7 @@ impl Supervisor {
             standbys,
             draining,
             start_failed: self.start_failed(),
+            user: Some(user),
         }
     }
 }

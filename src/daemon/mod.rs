@@ -902,18 +902,11 @@ impl Daemon {
     }
 }
 
-/// Identifies this boot: the kernel's boot id on Linux, the boot time
-/// elsewhere. None if unknown (then every start resurrects, as before).
+/// Identifies this boot (the kernel's boot id on Linux, the boot time on
+/// macOS), through the OS adapter. None if unknown (then every start
+/// resurrects, as before).
 fn boot_id() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
+    crate::platform::boot_id()
 }
 
 fn already_resurrected(boot: Option<&str>, marker: Option<&str>) -> bool {
@@ -1456,11 +1449,17 @@ mod tests {
         assert!(!already_resurrected(Some(""), Some("")));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn boot_id_is_stable_within_a_boot() {
-        let a = super::boot_id().expect("Linux has a boot id");
-        assert_eq!(a.len(), 36, "{a}");
+        if crate::platform::current().name() == "other" {
+            assert_eq!(super::boot_id(), None);
+            return;
+        }
+        let a = super::boot_id().expect("Linux and macOS have a boot id");
+        assert!(!a.is_empty());
+        if cfg!(target_os = "linux") {
+            assert_eq!(a.len(), 36, "{a}");
+        }
         assert_eq!(super::boot_id().as_deref(), Some(a.as_str()));
     }
 }

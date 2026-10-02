@@ -195,6 +195,12 @@ pub struct Status {
     /// after it (`warden list` shows them `errored`); a start clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_failed: Option<String>,
+    /// The user the app's processes run as: the owner of a running worker,
+    /// else the supervisor's own user (Warden never switches user). A name,
+    /// or the number when the user database has no such user. Absent from
+    /// an older Warden and when the OS cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
