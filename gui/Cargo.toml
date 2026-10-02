@@ -24,8 +24,9 @@ wgpu = ["iced/wgpu"]
 warden-protocol = { path = "../protocol" }
 # canvas: the history charts. tiny-skia draws the paths itself: the default
 # build adds only lyon_path (lyon's tessellator comes with `--features wgpu`).
-iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "x11", "wayland", "tokio", "crisp", "canvas"] }
+iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "x11", "wayland", "tokio", "crisp", "canvas", "advanced"] }
 tokio = { version = "1.53.1", features = ["net", "io-util", "time", "process", "sync", "rt", "fs", "macros"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # The user ids that pick the runtime directory, without `unsafe` (already in
 # iced's tree on Linux).

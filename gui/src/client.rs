@@ -65,6 +65,19 @@ pub fn local_socket() -> PathBuf {
     warden_protocol::paths::wardend_socket(&warden_protocol::paths::runtime_dir(euid, uid))
 }
 
+/// The wardend to connect to on this machine when none was named: the one
+/// of this user if its socket is there, else the system's (a wardend run as
+/// root, `sudo warden startup`), else this user's, which is where `Start
+/// wardend` will put it.
+pub fn auto_local_socket() -> PathBuf {
+    let own = local_socket();
+    if own.exists() {
+        return own;
+    }
+    let system = warden_protocol::paths::root_wardend_socket();
+    if system.exists() { system } else { own }
+}
+
 /// The `subscribe` request's options.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FeedOptions {

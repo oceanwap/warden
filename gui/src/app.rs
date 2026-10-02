@@ -5,6 +5,7 @@
 use crate::client::{self, Endpoint, FeedMsg, FeedOptions};
 use crate::commands::{self, AddApp, Added, Host, Output};
 use crate::history::{AppChart, HostSpark, Load, Range};
+use crate::hosts::{self, Machine, Saved};
 use crate::logs::{self, LogPane, Scroll};
 use crate::model::Model;
 use crate::ssh;
@@ -28,8 +29,18 @@ pub struct Target {
 }
 
 impl Target {
+    /// This machine's wardend: `socket`, else the one that is running (see
+    /// [`client::auto_local_socket`]).
     pub fn local(socket: Option<PathBuf>) -> Target {
-        Target { endpoint: Endpoint::Socket(socket.unwrap_or_else(client::local_socket)), host: Host::Local }
+        Target { endpoint: Endpoint::Socket(socket.unwrap_or_else(client::auto_local_socket)), host: Host::Local }
+    }
+
+    /// The name this machine goes by in the connection menu.
+    pub fn machine_name(&self) -> String {
+        match &self.endpoint {
+            Endpoint::Socket(_) => "This machine".into(),
+            Endpoint::Ssh(t) => t.dest.clone(),
+        }
     }
 
     pub fn ssh(dest: &str, remote_socket: &str, remote_warden: &str) -> Result<Target, String> {
@@ -66,6 +77,10 @@ pub enum Tab {
     /// Charts of the last hours (`history` from wardend, then live).
     History,
 }
+
+/// The window as it opens (until the first resize says otherwise), and the least it can be.
+pub const WINDOW: iced::Size = iced::Size::new(1280.0, 820.0);
+pub const WINDOW_MIN: iced::Size = iced::Size::new(900.0, 560.0);
 
 /// An action on an app (`DaemonRequest::App`, or wardend's `start`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,16 +159,24 @@ pub struct Toast {
     pub text: String,
 }
 
-/// The connection form.
+/// The form of one SSH machine: adding it, or editing a saved one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnForm {
-    pub ssh: bool,
-    /// Empty: wardend's default socket on this machine.
-    pub socket: String,
+pub struct MachineForm {
+    /// The `dest` of the machine being edited; `None` when adding one.
+    pub editing: Option<String>,
     pub dest: String,
     pub remote_socket: String,
     pub remote_warden: String,
     pub error: Option<String>,
+}
+
+/// A dropdown that is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// The app's Restart button.
+    Restart,
+    /// The connection button: This machine and the SSH machines.
+    Machines,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +213,8 @@ pub struct Editor {
 
 pub enum Modal {
     None,
-    Connection(ConnForm),
+    /// Add or edit an SSH machine.
+    Machine(MachineForm),
     Add(AddForm),
     Editor(Editor),
 }
@@ -240,6 +264,18 @@ pub struct Gui {
     pub chart: Option<AppChart>,
     /// The header's host sparklines (the last hour).
     pub host_spark: HostSpark,
+    /// The open dropdown, if any.
+    pub menu: Option<MenuKind>,
+    /// What the app list is filtered by.
+    pub filter: String,
+    /// The SSH machines of the connection menu, and the file they are kept in.
+    pub saved: Saved,
+    pub saved_path: Option<PathBuf>,
+    /// The local socket was not named (no `--socket`): look again where wardend runs
+    /// when it is not found.
+    pub auto_local: bool,
+    /// The window's size: the top bar and the worker table fit themselves to it.
+    pub window: iced::Size,
 }
 
 #[derive(Debug, Clone)]
@@ -273,13 +309,25 @@ pub enum Message {
     },
     StartWardend,
     WardendStarted(Result<Output, String>),
-    OpenConnection,
-    ConnSsh(bool),
-    ConnSocket(String),
-    ConnDest(String),
-    ConnRemoteSocket(String),
-    ConnRemoteWarden(String),
-    ApplyConnection,
+    /// Open a dropdown, or close it when it is the one that is open.
+    ToggleMenu(MenuKind),
+    CloseMenu,
+    /// Connect to this machine's wardend.
+    UseThisMachine,
+    /// Connect to a saved SSH machine (by its `dest`).
+    UseMachine(String),
+    AddMachine,
+    EditMachine(String),
+    ForgetMachine(String),
+    MachineDest(String),
+    MachineSocket(String),
+    MachineWarden(String),
+    SaveMachine,
+    AppFilter(String),
+    /// Put this on the clipboard (a URL or a socket path).
+    Copy(String),
+    /// The window was resized.
+    Resized(iced::Size),
     CloseModal,
     OpenAdd,
     AddWhat(String),
@@ -327,6 +375,11 @@ impl Gui {
             Err(e) => (Target::local(opts.socket.clone()), Some(e)),
         };
         let mut g = Gui::with_target(target);
+        g.auto_local = opts.ssh.is_none() && opts.socket.is_none();
+        g.saved_path = hosts::path();
+        if let Some(p) = &g.saved_path {
+            g.saved = hosts::load(p);
+        }
         let task = match error {
             Some(e) => g.toast(false, format!("--ssh: {e}; connecting to this machine instead")),
             None => Task::none(),
@@ -358,6 +411,12 @@ impl Gui {
             range: Range::Hour,
             chart: None,
             host_spark: HostSpark::default(),
+            menu: None,
+            filter: String::new(),
+            saved: Saved::default(),
+            saved_path: None,
+            auto_local: false,
+            window: WINDOW,
         }
     }
 
@@ -462,7 +521,10 @@ impl Gui {
         match message {
             Message::Feed(m) => self.on_feed(m),
             Message::LogFeed(m) => self.on_log_feed(m),
-            Message::Select(name) => self.select(name),
+            Message::Select(name) => {
+                self.menu = None;
+                self.select(name)
+            }
             Message::Tab(tab) => {
                 if self.tab == tab {
                     return Task::none();
@@ -511,6 +573,7 @@ impl Gui {
                 Task::none()
             }
             Message::Act(app, act) => {
+                self.menu = None;
                 if act.destructive() {
                     self.confirm = Some(Pending { app, act });
                     return Task::none();
@@ -577,47 +640,108 @@ impl Gui {
                     Err(e) => self.toast(false, format!("starting wardend failed: {e}")),
                 }
             }
-            Message::OpenConnection => {
-                let (ssh, socket, dest, remote_socket, remote_warden) = match (&self.target.endpoint, &self.target.host)
-                {
-                    (Endpoint::Ssh(t), Host::Ssh { warden, .. }) => {
-                        (true, String::new(), t.dest.clone(), t.remote_socket.clone(), warden.clone())
-                    }
-                    (Endpoint::Socket(p), _) => {
-                        let s = if *p == client::local_socket() { String::new() } else { p.display().to_string() };
-                        (false, s, String::new(), ssh::default_remote_socket(), "warden".into())
-                    }
-                    (Endpoint::Ssh(t), Host::Local) => {
-                        (true, String::new(), t.dest.clone(), t.remote_socket.clone(), "warden".into())
-                    }
-                };
-                self.modal =
-                    Modal::Connection(ConnForm { ssh, socket, dest, remote_socket, remote_warden, error: None });
+            Message::ToggleMenu(kind) => {
+                self.menu = if self.menu == Some(kind) { None } else { Some(kind) };
                 Task::none()
             }
-            Message::ConnSsh(b) => self.with_conn_form(|f| f.ssh = b),
-            Message::ConnSocket(s) => self.with_conn_form(|f| f.socket = s),
-            Message::ConnDest(s) => self.with_conn_form(|f| f.dest = s),
-            Message::ConnRemoteSocket(s) => self.with_conn_form(|f| f.remote_socket = s),
-            Message::ConnRemoteWarden(s) => self.with_conn_form(|f| f.remote_warden = s),
-            Message::ApplyConnection => {
-                let Modal::Connection(f) = &mut self.modal else { return Task::none() };
-                let target = if f.ssh {
-                    Target::ssh(f.dest.trim(), f.remote_socket.trim(), &f.remote_warden)
-                } else if f.socket.trim().is_empty() {
-                    Ok(Target::local(None))
-                } else {
-                    ssh::validate_socket_path(f.socket.trim(), "wardend")
-                        .map(|_| Target::local(Some(f.socket.trim().into())))
+            Message::CloseMenu => {
+                self.menu = None;
+                Task::none()
+            }
+            Message::UseThisMachine => {
+                self.menu = None;
+                self.auto_local = true;
+                self.switch_target(Target::local(None));
+                Task::none()
+            }
+            Message::UseMachine(dest) => {
+                self.menu = None;
+                let target = match self.saved.get(&dest) {
+                    Some(m) => Target::ssh(&m.dest, &m.remote_socket, &m.remote_warden),
+                    None => Err(format!("{dest} is not in the list of machines")),
                 };
                 match target {
                     Ok(t) => {
-                        self.modal = Modal::None;
+                        self.auto_local = false;
                         self.switch_target(t);
+                        Task::none()
                     }
-                    Err(e) => f.error = Some(e),
+                    Err(e) => self.toast(false, format!("cannot connect to {dest}: {e}")),
+                }
+            }
+            Message::AddMachine => {
+                self.menu = None;
+                self.modal = Modal::Machine(MachineForm {
+                    editing: None,
+                    dest: String::new(),
+                    remote_socket: ssh::default_remote_socket(),
+                    remote_warden: "warden".into(),
+                    error: None,
+                });
+                Task::none()
+            }
+            Message::EditMachine(dest) => {
+                self.menu = None;
+                if let Some(m) = self.saved.get(&dest) {
+                    self.modal = Modal::Machine(MachineForm {
+                        editing: Some(m.dest.clone()),
+                        dest: m.dest.clone(),
+                        remote_socket: m.remote_socket.clone(),
+                        remote_warden: m.remote_warden.clone(),
+                        error: None,
+                    });
                 }
                 Task::none()
+            }
+            Message::ForgetMachine(dest) => {
+                self.menu = None;
+                self.saved.forget(&dest);
+                let saved = self.persist();
+                Task::batch([saved, self.toast(true, format!("{dest} removed from the list of machines"))])
+            }
+            Message::MachineDest(s) => self.with_machine_form(|f| f.dest = s),
+            Message::MachineSocket(s) => self.with_machine_form(|f| f.remote_socket = s),
+            Message::MachineWarden(s) => self.with_machine_form(|f| f.remote_warden = s),
+            Message::SaveMachine => {
+                let Modal::Machine(f) = &mut self.modal else { return Task::none() };
+                let target = Target::ssh(f.dest.trim(), f.remote_socket.trim(), &f.remote_warden);
+                match target {
+                    Ok(t) => {
+                        let Host::Ssh { dest, warden } = &t.host else { return Task::none() };
+                        let Endpoint::Ssh(e) = &t.endpoint else { return Task::none() };
+                        let machine = Machine {
+                            dest: dest.clone(),
+                            remote_socket: e.remote_socket.clone(),
+                            remote_warden: warden.clone(),
+                        };
+                        // Editing under another name: the old entry goes.
+                        if let Some(old) = f.editing.clone().filter(|o| *o != machine.dest) {
+                            self.saved.forget(&old);
+                        }
+                        self.saved.remember(machine);
+                        self.modal = Modal::None;
+                        self.auto_local = false;
+                        let saved = self.persist();
+                        self.switch_target(t);
+                        saved
+                    }
+                    Err(e) => {
+                        f.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::Resized(size) => {
+                self.window = size;
+                Task::none()
+            }
+            Message::AppFilter(f) => {
+                self.filter = f;
+                Task::none()
+            }
+            Message::Copy(text) => {
+                let note = self.toast(true, format!("Copied {text}"));
+                Task::batch([iced::clipboard::write(text), note])
             }
             Message::CloseModal => {
                 // A running command keeps its dialog until it ends.
@@ -629,6 +753,7 @@ impl Gui {
                 Task::none()
             }
             Message::OpenAdd => {
+                self.menu = None;
                 self.modal = Modal::Add(AddForm { form: AddApp::default(), status: AddStatus::Editing });
                 Task::none()
             }
@@ -751,12 +876,21 @@ impl Gui {
         Task::none()
     }
 
-    fn with_conn_form(&mut self, f: impl FnOnce(&mut ConnForm)) -> Task<Message> {
-        if let Modal::Connection(c) = &mut self.modal {
-            f(c);
-            c.error = None;
+    fn with_machine_form(&mut self, f: impl FnOnce(&mut MachineForm)) -> Task<Message> {
+        if let Modal::Machine(m) = &mut self.modal {
+            f(m);
+            m.error = None;
         }
         Task::none()
+    }
+
+    /// Write the list of machines; a failure is told, the list stays in memory.
+    fn persist(&mut self) -> Task<Message> {
+        let Some(path) = self.saved_path.clone() else { return Task::none() };
+        match hosts::save(&path, &self.saved) {
+            Ok(()) => Task::none(),
+            Err(e) => self.toast(false, format!("could not save the list of machines in {}: {e}", path.display())),
+        }
     }
 
     fn with_add(&mut self, f: impl FnOnce(&mut AddApp)) -> Task<Message> {
@@ -777,7 +911,16 @@ impl Gui {
             self.generation += 1;
             return;
         }
-        *self = Gui { toasts: std::mem::take(&mut self.toasts), next_toast: self.next_toast, ..Gui::with_target(t) };
+        *self = Gui {
+            toasts: std::mem::take(&mut self.toasts),
+            next_toast: self.next_toast,
+            saved: std::mem::take(&mut self.saved),
+            saved_path: self.saved_path.take(),
+            filter: std::mem::take(&mut self.filter),
+            auto_local: self.auto_local,
+            window: self.window,
+            ..Gui::with_target(t)
+        };
     }
 
     fn act(&mut self, app: String, act: Act) -> Task<Message> {
@@ -856,6 +999,15 @@ impl Gui {
                 self.conn = Conn::Down { error, not_running, retry_in, attempt };
                 self.socket = None;
                 self.model.disconnected();
+                // wardend may run as another user (a system wardend, `sudo warden startup`)
+                // than the socket first guessed: look again, and connect there at once.
+                if not_running && self.auto_local {
+                    let found = Endpoint::Socket(client::auto_local_socket());
+                    if found != self.target.endpoint {
+                        self.target.endpoint = found;
+                        self.generation += 1;
+                    }
+                }
                 Task::none()
             }
         }
@@ -938,7 +1090,8 @@ impl Gui {
             .map(Message::LogFeed),
             _ => Subscription::none(),
         };
-        Subscription::batch([main, logs])
+        let size = iced::window::resize_events().map(|(_, size)| Message::Resized(size));
+        Subscription::batch([main, logs, size])
     }
 }
 
@@ -1207,25 +1360,116 @@ mod tests {
     }
 
     #[test]
-    fn connection_form_validates_and_switches() {
+    fn machine_form_validates_saves_and_connects() {
+        let dir = std::env::temp_dir().join(format!("wg-app-machines-{}", std::process::id()));
+        let file = dir.join("gui.json");
         let mut g = connected();
-        let _ = g.update(Message::OpenConnection);
-        let _ = g.update(Message::ConnSsh(true));
-        let _ = g.update(Message::ConnDest("-oProxyCommand=x".into()));
-        let _ = g.update(Message::ApplyConnection);
+        g.saved_path = Some(file.clone());
+        let _ = g.update(Message::AddMachine);
+        let _ = g.update(Message::MachineDest("-oProxyCommand=x".into()));
+        let _ = g.update(Message::SaveMachine);
         match &g.modal {
-            Modal::Connection(f) => assert!(f.error.as_deref().is_some_and(|e| e.contains("option"))),
+            Modal::Machine(f) => assert!(f.error.as_deref().is_some_and(|e| e.contains("option"))),
             _ => panic!("the form stays open with the error"),
         }
-        let _ = g.update(Message::ConnDest("deploy@web-1".into()));
-        let _ = g.update(Message::ApplyConnection);
+        assert!(g.saved.machines.is_empty(), "a refused machine is not kept");
+        let _ = g.update(Message::MachineDest("deploy@web-1".into()));
+        let _ = g.update(Message::SaveMachine);
         assert!(matches!(g.modal, Modal::None));
         assert_eq!(g.target.host, Host::Ssh { dest: "deploy@web-1".into(), warden: "warden".into() });
         assert!(g.model.apps.is_empty() && g.selected.is_none(), "nothing of the old host remains");
         assert_eq!(g.title(), "Warden: deploy@web-1");
+        assert_eq!(g.saved.machines.len(), 1, "saved, and the list survives the switch");
+        assert_eq!(hosts::load(&file), g.saved, "and written to disk");
         let before = g.generation;
         g.switch_target(g.target.clone());
         assert_eq!(g.generation, before + 1, "the same target again: reconnect now");
+        // Back to this machine, and to the saved one from the menu.
+        let _ = g.update(Message::UseThisMachine);
+        assert_eq!(g.title(), "Warden");
+        assert_eq!(g.saved.machines.len(), 1, "going home keeps the list");
+        let _ = g.update(Message::UseMachine("deploy@web-1".into()));
+        assert_eq!(g.title(), "Warden: deploy@web-1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn machines_are_edited_renamed_and_forgotten() {
+        let dir = std::env::temp_dir().join(format!("wg-app-edit-{}", std::process::id()));
+        let file = dir.join("gui.json");
+        let mut g = connected();
+        g.saved_path = Some(file.clone());
+        for dest in ["a@one", "b@two"] {
+            let _ = g.update(Message::AddMachine);
+            let _ = g.update(Message::MachineDest(dest.into()));
+            let _ = g.update(Message::SaveMachine);
+        }
+        assert_eq!(g.saved.machines.len(), 2);
+        // Editing opens the form filled in; a new name replaces the old entry.
+        let _ = g.update(Message::EditMachine("a@one".into()));
+        match &g.modal {
+            Modal::Machine(f) => assert_eq!((f.editing.as_deref(), f.dest.as_str()), (Some("a@one"), "a@one")),
+            _ => panic!("the machine form"),
+        }
+        let _ = g.update(Message::MachineDest("a@uno".into()));
+        let _ = g.update(Message::SaveMachine);
+        let names: Vec<_> = g.saved.machines.iter().map(|m| m.dest.as_str()).collect();
+        assert_eq!(names, ["b@two", "a@uno"], "renamed, not duplicated");
+        // Forgetting drops it from the list and the file; connecting to it then fails with a toast.
+        let _ = g.update(Message::ForgetMachine("b@two".into()));
+        assert_eq!(hosts::load(&file).machines.len(), 1);
+        let toasts = g.toasts.len();
+        let _ = g.update(Message::UseMachine("b@two".into()));
+        assert_eq!(g.toasts.len(), toasts + 1);
+        assert!(g.toasts.last().is_some_and(|t| !t.ok && t.text.contains("b@two")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_window_size_survives_a_machine_switch() {
+        let mut g = connected();
+        assert_eq!(g.window, WINDOW);
+        let _ = g.update(Message::Resized(iced::Size::new(1000.0, 600.0)));
+        let _ = g.update(Message::UseThisMachine);
+        let _ = g.update(Message::AddMachine);
+        let _ = g.update(Message::MachineDest("deploy@web-1".into()));
+        let _ = g.update(Message::SaveMachine);
+        assert_eq!(g.window, iced::Size::new(1000.0, 600.0), "the window is the same after the switch");
+    }
+
+    #[test]
+    fn a_dropdown_opens_closes_and_closes_on_a_choice() {
+        let mut g = connected();
+        let _ = g.update(Message::ToggleMenu(MenuKind::Restart));
+        assert_eq!(g.menu, Some(MenuKind::Restart));
+        let _ = g.update(Message::ToggleMenu(MenuKind::Machines));
+        assert_eq!(g.menu, Some(MenuKind::Machines), "opening another replaces the first");
+        let _ = g.update(Message::ToggleMenu(MenuKind::Machines));
+        assert_eq!(g.menu, None, "the same button again closes it");
+        let _ = g.update(Message::ToggleMenu(MenuKind::Restart));
+        let _ = g.update(Message::CloseMenu);
+        assert_eq!(g.menu, None);
+        let _ = g.update(Message::ToggleMenu(MenuKind::Restart));
+        let _ = g.update(Message::Select("web".into()));
+        assert_eq!(g.menu, None, "choosing an app closes the menu");
+        let _ = g.update(Message::ToggleMenu(MenuKind::Restart));
+        let _ = g.update(Message::Act("web".into(), Act::RollingRestart));
+        assert_eq!(g.menu, None, "and so does an action");
+        let _ = g.update(Message::ToggleMenu(MenuKind::Machines));
+        let _ = g.update(Message::OpenAdd);
+        assert_eq!(g.menu, None);
+    }
+
+    #[test]
+    fn the_app_filter_is_kept_across_a_machine_switch() {
+        let mut g = connected();
+        let _ = g.update(Message::AppFilter("we".into()));
+        assert_eq!(g.filter, "we");
+        let _ = g.update(Message::MachineDest("deploy@web-1".into())); // no form open: nothing happens
+        let _ = g.update(Message::AddMachine);
+        let _ = g.update(Message::MachineDest("deploy@web-1".into()));
+        let _ = g.update(Message::SaveMachine);
+        assert_eq!(g.filter, "we", "the filter box belongs to the window, not to a machine");
     }
 
     #[test]

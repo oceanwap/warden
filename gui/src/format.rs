@@ -161,6 +161,79 @@ pub fn event_line(ev: &Event, now_ms: u64) -> Option<String> {
     })
 }
 
+/// How an event line reads, for its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Info,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// A feed line taken apart: its clock (`12:00:01`) and its text, without the
+/// app's name when `app` is the one the list is of (`warden events` prints
+/// it because it mixes apps; one app's list does not need it on every line).
+pub fn split_event<'a>(line: &'a str, app: &str) -> (Option<&'a str>, &'a str) {
+    let (time, rest) = match line.split_once(' ') {
+        Some((t, r)) if t.len() == 8 && t.as_bytes().get(2) == Some(&b':') && t.as_bytes().get(5) == Some(&b':') => {
+            (Some(t), r)
+        }
+        _ => (None, line),
+    };
+    let rest = match rest.strip_prefix(app) {
+        Some(r) if !app.is_empty() && r.starts_with(' ') => r.trim_start(),
+        _ => rest,
+    };
+    (time, rest)
+}
+
+/// What an event line is about, by its words: a crash is bad, a restart or a
+/// stop is a warning, a ready worker is good.
+pub fn severity(text: &str) -> Severity {
+    let mut worst = Severity::Info;
+    for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let s = match word.to_ascii_lowercase().as_str() {
+            "crashed" | "failed" | "unreachable" | "died" | "killed" | "oom" | "gave_up" => Severity::Bad,
+            "restarting" | "starting" | "stopped" | "stopping" | "exiting" | "skipped" | "draining" | "lagged" => {
+                Severity::Warn
+            }
+            "ready" | "running" | "done" | "connected" => Severity::Good,
+            _ => Severity::Info,
+        };
+        worst = match (worst, s) {
+            (Severity::Bad, _) | (_, Severity::Bad) => Severity::Bad,
+            (Severity::Warn, _) | (_, Severity::Warn) => Severity::Warn,
+            (Severity::Good, _) | (_, Severity::Good) => Severity::Good,
+            _ => Severity::Info,
+        };
+    }
+    // "gave up" is two words in `warden events`.
+    if text.contains("gave up") { Severity::Bad } else { worst }
+}
+
+/// What a worker listens on, for a table cell: `3000, 9229, +1 socket`
+/// (a port on `0.0.0.0` and `::` is one).
+pub fn ports_cell(listening: &[warden_protocol::control::Listener]) -> String {
+    use warden_protocol::control::Listener;
+    let mut ports: Vec<u16> = listening
+        .iter()
+        .filter_map(|l| match l {
+            Listener::Tcp { port, .. } => Some(*port),
+            _ => None,
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    let sockets = listening.iter().filter(|l| matches!(l, Listener::Unix { .. })).count();
+    let mut parts: Vec<String> = ports.iter().map(u16::to_string).collect();
+    match sockets {
+        0 => {}
+        1 => parts.push("+1 socket".into()),
+        n => parts.push(format!("+{n} sockets")),
+    }
+    if parts.is_empty() { "-".into() } else { parts.join(", ") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +243,44 @@ mod tests {
     /// The clock part is local time: compare what follows it.
     fn after_clock(s: &str) -> &str {
         &s[9..]
+    }
+
+    #[test]
+    fn a_feed_line_loses_its_clock_and_its_own_app_name() {
+        assert_eq!(
+            split_event("12:00:01 api worker 2 crashed pid=4230", "api"),
+            (Some("12:00:01"), "worker 2 crashed pid=4230")
+        );
+        // Another app's name stays (the host feed mixes apps); a name that merely starts the same does too.
+        assert_eq!(split_event("12:00:01 web worker 1 ready", "api").1, "web worker 1 ready");
+        assert_eq!(split_event("12:00:01 api2 worker 1 ready", "api").1, "api2 worker 1 ready");
+        assert_eq!(split_event("no clock here", "api"), (None, "no clock here"));
+        assert_eq!(split_event("12:00:01", "api"), (None, "12:00:01"));
+        assert_eq!(split_event("12:00:01 api", "api").1, "api");
+    }
+
+    #[test]
+    fn severity_by_the_words_of_the_line() {
+        assert_eq!(severity("worker 2 crashed pid=4230 exit code 3"), Severity::Bad);
+        assert_eq!(severity("supervisor gave up died 10 times in 10 minutes"), Severity::Bad);
+        assert_eq!(severity("reload FAILED: new worker exited"), Severity::Bad);
+        assert_eq!(severity("worker 2 restarting in_ms=0"), Severity::Warn);
+        assert_eq!(severity("3/4 workers ready (3 RUNNING, 1 STARTING)"), Severity::Warn);
+        assert_eq!(severity("worker 2 ready pid=4262 startup_ms=31"), Severity::Good);
+        assert_eq!(severity("running (supervised by wardend, pid 4208)"), Severity::Good);
+        assert_eq!(severity("reload 2/4: replacing worker 3"), Severity::Info);
+        assert_eq!(severity(""), Severity::Info);
+    }
+
+    #[test]
+    fn what_a_worker_listens_on_in_a_cell() {
+        use warden_protocol::control::Listener;
+        let tcp = |addr: &str, port| Listener::Tcp { addr: addr.into(), port };
+        assert_eq!(ports_cell(&[]), "-");
+        assert_eq!(ports_cell(&[tcp("0.0.0.0", 3000), tcp("::", 3000), tcp("127.0.0.1", 9229)]), "3000, 9229");
+        let sock = |p: &str| Listener::Unix { path: p.into() };
+        assert_eq!(ports_cell(&[sock("/tmp/a.sock")]), "+1 socket");
+        assert_eq!(ports_cell(&[tcp("::", 80), sock("/a"), sock("/b")]), "80, +2 sockets");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 
 use crate::format;
 use crate::ring::Ring;
-use std::collections::BTreeMap;
-use warden_protocol::control::{RolloutOutcome, RolloutStatus, Status};
+use std::collections::{BTreeMap, BTreeSet};
+use warden_protocol::control::{Listener, RolloutOutcome, RolloutStatus, Status};
 use warden_protocol::events::{AppEntry, AppState, Event};
 
 /// Event lines kept per app, and for the whole host.
@@ -98,6 +98,65 @@ impl App {
         total
     }
 
+    /// Restarts since the supervisor started, of the workers and of the supervisor.
+    pub fn restarts(&self) -> u64 {
+        let workers: u64 = self.status.as_ref().map_or(0, |s| s.workers.iter().map(|w| w.restarts).sum());
+        workers + u64::from(self.entry.supervisor_restarts)
+    }
+
+    /// The ports and Unix sockets the workers listen on, each once: a port
+    /// open on `0.0.0.0` and on `::` is one, and workers that share it (the
+    /// same port with `SO_REUSEPORT`) are one.
+    pub fn ports(&self) -> Vec<PortChip> {
+        let Some(s) = &self.status else { return Vec::new() };
+        let mut tcp: BTreeMap<u16, Reach> = BTreeMap::new();
+        let mut unix: BTreeSet<&str> = BTreeSet::new();
+        for l in s.workers.iter().flat_map(|w| &w.listening) {
+            match l {
+                Listener::Tcp { addr, port } => {
+                    let r = Reach::of(addr);
+                    let e = tcp.entry(*port).or_insert_with(|| r.clone());
+                    // The widest way in wins: every interface, then one address, then this machine.
+                    if r.rank() > e.rank() {
+                        *e = r;
+                    }
+                }
+                Listener::Unix { path } => {
+                    unix.insert(path);
+                }
+                Listener::Other => {}
+            }
+        }
+        let mut chips: Vec<PortChip> = tcp
+            .into_iter()
+            .map(|(port, reach)| PortChip {
+                label: port.to_string(),
+                scope: reach.words(),
+                copy: reach.url(port),
+                unix: false,
+            })
+            .collect();
+        chips.extend(unix.into_iter().map(|path| PortChip {
+            label: path.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or(path).to_string(),
+            scope: format!("unix socket {path}"),
+            copy: path.to_string(),
+            unix: true,
+        }));
+        chips
+    }
+
+    /// The list's short form: `:3000 :9229`, `:3000 +2`.
+    pub fn ports_short(&self) -> Option<String> {
+        let chips = self.ports();
+        let shown: Vec<String> =
+            chips.iter().take(2).map(|c| if c.unix { "socket".to_string() } else { format!(":{}", c.label) }).collect();
+        match (shown.is_empty(), chips.len().saturating_sub(2)) {
+            (true, _) => None,
+            (false, 0) => Some(shown.join(" ")),
+            (false, n) => Some(format!("{} +{n}", shown.join(" "))),
+        }
+    }
+
     /// The state people read: wardend's, refined by the status.
     pub fn state_label(&self) -> String {
         match (&self.entry.state, &self.status) {
@@ -128,6 +187,60 @@ impl App {
     fn line(&mut self, text: String, global: &mut Ring<String>) {
         global.push(text.clone());
         self.feed.push(text);
+    }
+}
+
+/// A listening port or Unix socket as the window shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortChip {
+    /// `3000`, or a socket's file name.
+    pub label: String,
+    /// `all interfaces`, `localhost only`, `10.0.0.5 only`, `unix socket /tmp/a.sock`.
+    pub scope: String,
+    /// What a click copies: a URL to try (TCP) or the socket's path.
+    pub copy: String,
+    pub unix: bool,
+}
+
+/// How far a TCP listener reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    Local,
+    Addr(String),
+    All,
+}
+
+impl Reach {
+    fn of(addr: &str) -> Reach {
+        match addr {
+            "0.0.0.0" | "::" => Reach::All,
+            a if a.starts_with("127.") || a == "::1" => Reach::Local,
+            a => Reach::Addr(a.to_string()),
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            Reach::Local => 0,
+            Reach::Addr(_) => 1,
+            Reach::All => 2,
+        }
+    }
+
+    fn words(&self) -> String {
+        match self {
+            Reach::All => "all interfaces".into(),
+            Reach::Local => "localhost only".into(),
+            Reach::Addr(a) => format!("{a} only"),
+        }
+    }
+
+    fn url(&self, port: u16) -> String {
+        match self {
+            Reach::All | Reach::Local => format!("http://localhost:{port}"),
+            Reach::Addr(a) if a.contains(':') => format!("http://[{a}]:{port}"),
+            Reach::Addr(a) => format!("http://{a}:{port}"),
+        }
     }
 }
 

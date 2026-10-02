@@ -9,9 +9,10 @@ use iced_test::Simulator;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
-use warden_gui::app::{Act, Gui, Message, Tab, Target};
+use warden_gui::app::{Act, Gui, MenuKind, Message, Tab, Target};
 use warden_gui::client::{Batch, FeedMsg};
 use warden_gui::history::Range;
+use warden_gui::hosts::Machine;
 use warden_gui::protocol::events::{AppHistory, Event, HostHistory, ResourceHistory};
 
 const SIZE: (f32, f32) = (1280.0, 820.0);
@@ -32,12 +33,22 @@ fn worker(
     })
 }
 
+/// `w` listening on these sockets (`status.workers[].listening`).
+fn listening(mut w: serde_json::Value, on: serde_json::Value) -> serde_json::Value {
+    w["listening"] = on;
+    w
+}
+
+fn tcp(addr: &str, port: u16) -> serde_json::Value {
+    json!({"kind": "tcp", "addr": addr, "port": port})
+}
+
 fn status(app: &str, workers: Vec<serde_json::Value>, ready: u64, rollout: serde_json::Value) -> serde_json::Value {
     json!({
         "app": app, "namespace": "default", "mode": "process", "config_path": format!("/etc/warden/{app}.toml"),
         "launched": "background", "version": "0.1.0", "pid": 4208, "uptime_secs": 86_400 + 3_723,
         "workers_configured": workers.len(), "workers_ready": ready, "healthy": true,
-        "supervisor_rss_bytes": 4u64 << 20, "host": null, "reloading": !rollout.is_null(), "shutting_down": false,
+        "supervisor_rss_bytes": 4u64 << 20, "host": null, "reloading": !rollout.is_null(), "shutting_down": false, "user": "deploy",
         "rollout": rollout,
         "last_rollout": {"seq": 2, "kind": "reload", "ok": true, "message": "4 workers replaced", "duration_secs": 6.2},
         "workers": workers,
@@ -51,10 +62,13 @@ fn fake_stream() -> Vec<Event> {
     let api = status(
         "api",
         vec![
-            worker(1, "RUNNING", Some(4230), 41, 1.2, 0, None),
-            worker(2, "RUNNING", Some(4262), 40, 0.8, 1, Some("exit code 3")),
+            listening(worker(1, "RUNNING", Some(4230), 41, 1.2, 0, None), json!([tcp("0.0.0.0", 3000)])),
+            listening(worker(2, "RUNNING", Some(4262), 40, 0.8, 1, Some("exit code 3")), json!([tcp("0.0.0.0", 3000)])),
             worker(3, "STARTING", Some(4270), 22, 9.5, 0, None),
-            worker(4, "RUNNING", Some(4241), 42, 1.1, 0, None),
+            listening(
+                worker(4, "RUNNING", Some(4241), 42, 1.1, 0, None),
+                json!([tcp("0.0.0.0", 3000), tcp("127.0.0.1", 9229)]),
+            ),
         ],
         3,
         rollout.clone(),
@@ -62,7 +76,10 @@ fn fake_stream() -> Vec<Event> {
     let web = status(
         "web",
         vec![
-            worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None),
+            listening(
+                worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None),
+                json!([tcp("127.0.0.1", 8080), {"kind": "unix", "path": "/run/web/web.sock"}]),
+            ),
             worker(2, "FAILED", None, 0, 0.0, 10, Some("signal 9 (SIGKILL)")),
         ],
         1,
@@ -184,7 +201,7 @@ fn snapshot_dir() -> PathBuf {
 
 /// Render, save as `<name>-tiny-skia.png`, and check it is not blank.
 fn save(ui: &mut Simulator<'_, Message>, name: &str) {
-    save_with(ui, name, &Theme::Dark);
+    save_with(ui, name, &warden_gui::look::theme(false));
 }
 
 fn save_with(ui: &mut Simulator<'_, Message>, name: &str, theme: &Theme) {
@@ -212,8 +229,8 @@ fn main_screen_with_fake_data() {
     for t in [
         "wardend 0.1.0 · pid 4211",
         "CPU 23.4%",
-        "· Mem 3.10 GB / 7.66 GB",
-        "· Load 0.52 0.40 0.31",
+        "Mem 3.10 GB / 7.66 GB",
+        "Load 0.52 0.40 0.31",
         "api",
         "jobs",
         "gave up",
@@ -222,21 +239,26 @@ fn main_screen_with_fake_data() {
         "reload 2/4: replacing worker 3 (4s)",
         "STARTING",
         "exit code 3",
-        "Reload",
-        "Hard restart",
-        "4 workers",
+        "Restart",
+        "Stop",
         "Edit config",
+        "3 / 4",
+        "as deploy",
+        "3000",
+        "9229",
+        "Listening",
     ] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the main screen");
     }
     save(&mut ui, "main-screen");
+    save_with(&mut ui, "main-screen-light", &warden_gui::look::theme(true));
 
-    // Clicking Reload asks nothing and sends the request; Stop asks first.
-    let _ = ui.click("Reload").expect("a Reload button");
+    // Clicking Restart is the safe reload and asks nothing; Stop asks first.
+    let _ = ui.click("Restart").expect("a Restart button");
     let _ = ui.click("Stop").expect("a Stop button");
     let _ = ui.click("jobs").expect("the jobs row");
     let msgs: Vec<Message> = ui.into_messages().collect();
-    assert!(matches!(&msgs[0], Message::Act(app, Act::Reload) if app == "api"), "{msgs:?}");
+    assert!(matches!(&msgs[0], Message::Act(app, Act::SafeReload) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[1], Message::Act(app, Act::Stop) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
 }
@@ -265,7 +287,8 @@ fn an_app_that_gave_up_shows_its_problem_and_start() {
     let mut g = connected();
     let _ = g.update(Message::Select("jobs".into()));
     let mut ui = sim(&g);
-    assert!(ui.find("No workers to show: the supervisor is not running (or wardend does not watch it yet).").is_ok());
+    assert!(ui.find("Stopped trying").is_ok(), "the idle card says why");
+    assert!(ui.find("Restart").is_err(), "only Start applies to an app that is not running");
     assert!(ui.find("api jobs supervisor gave up pid=6001 died 10 times in 10 minutes").is_err(), "lines have a clock");
     let _ = ui.click("Start").expect("Start is offered");
     let msgs: Vec<Message> = ui.into_messages().collect();
@@ -329,7 +352,8 @@ fn history_tab_last_hour_with_a_crosshair() {
         range: Range::Hour,
         result: Ok(fake_history("api", Range::Hour)),
     });
-    let mut ui = sim(&g);
+    // Tall enough for all four charts.
+    let mut ui = Simulator::with_size(warden_gui::settings(), (1280.0, 1100.0), warden_gui::view::view(&g));
     for t in [
         "CPU",
         "% of one core",
@@ -366,7 +390,7 @@ fn history_tab_last_day_light() {
     let mut ui = sim(&g);
     assert!(ui.find("4 min per point · from wardend, then live").is_ok());
     assert!(ui.find("10 in 24 h").is_ok());
-    save_with(&mut ui, "history-24h-light", &Theme::Light);
+    save_with(&mut ui, "history-24h-light", &warden_gui::look::theme(true));
 }
 
 #[test]
@@ -429,10 +453,95 @@ fn dialogs_add_app_edit_config_and_connection() {
     save(&mut ui, "edit-config");
 
     let mut g = connected();
-    let _ = g.update(Message::OpenConnection);
-    let _ = g.update(Message::ConnSsh(true));
-    let _ = g.update(Message::ConnDest("deploy@web-1".into()));
+    let _ = g.update(Message::AddMachine);
+    let _ = g.update(Message::MachineDest("deploy@web-1".into()));
     let mut ui = sim(&g);
-    assert!(ui.find("Connect to").is_ok() && ui.find("SSH target").is_ok());
-    save(&mut ui, "connection");
+    assert!(ui.find("Add SSH machine").is_ok() && ui.find("deploy@web-1").is_ok());
+    save(&mut ui, "machine");
+}
+
+/// The Restart dropdown: the safe reload is the button, the others are in the menu.
+#[test]
+fn restart_menu_lists_the_other_restarts() {
+    let mut g = connected();
+    let _ = g.update(Message::ToggleMenu(MenuKind::Restart));
+    let mut ui = sim(&g);
+    for t in ["Safe reload", "Reload", "Rolling restart", "Hard restart"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in the Restart menu");
+    }
+    save(&mut ui, "restart-menu");
+    let _ = ui.click("Rolling restart").expect("a menu entry");
+    let msgs: Vec<Message> = ui.into_messages().collect();
+    assert!(matches!(&msgs[..], [Message::Act(app, Act::RollingRestart)] if app == "api"), "{msgs:?}");
+}
+
+/// The Connection dropdown: this machine, the saved SSH machines, and a way to add one.
+#[test]
+fn connection_menu_lists_this_machine_and_the_saved_ones() {
+    let mut g = connected();
+    for dest in ["deploy@web-1", "deploy@web-2"] {
+        g.saved.remember(Machine {
+            dest: dest.into(),
+            remote_socket: "/run/warden/wardend.sock".into(),
+            remote_warden: "warden".into(),
+        });
+    }
+    let _ = g.update(Message::ToggleMenu(MenuKind::Machines));
+    let mut ui = sim(&g);
+    for t in ["This machine", "deploy@web-1", "deploy@web-2", "Add SSH machine"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in the Connection menu");
+    }
+    save(&mut ui, "connection-menu");
+    let _ = ui.click("deploy@web-2").expect("a saved machine");
+    let msgs: Vec<Message> = ui.into_messages().collect();
+    assert!(matches!(&msgs[..], [Message::UseMachine(d)] if d == "deploy@web-2"), "{msgs:?}");
+}
+
+/// A column nobody fills in (loop delay without the shim, health without a check, last
+/// exit before any exit) is left out; it is there as soon as one worker has a value.
+#[test]
+fn worker_table_leaves_out_columns_nothing_fills_in() {
+    let mut g = connected();
+    let w = |last_exit: Option<&str>, healthy: bool| {
+        let mut w = worker(1, "RUNNING", Some(5101), 64, 3.0, 0, last_exit);
+        w["healthy"] = json!(if healthy { Some(true) } else { None::<bool> });
+        w
+    };
+    let only = status("web", vec![w(None, false)], 1, json!(null));
+    let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": only})).unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    for t in ["Worker", "State", "PID", "Ports", "Uptime", "Restarts", "CPU", "RSS"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is always there");
+    }
+    for t in ["Loop p99", "Health", "Last exit"] {
+        assert!(ui.find(t).is_err(), "{t:?} has nothing to show");
+    }
+    drop(ui);
+    let mut busy = w(Some("signal 9 (SIGKILL)"), true);
+    busy["loop_delay"] = json!({"p50_ms": 1.0, "p99_ms": 4.5, "max_ms": 9.0});
+    let all = status("web", vec![busy], 1, json!(null));
+    let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": all})).unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+    let mut ui = sim(&g);
+    for t in ["Loop p99", "Health", "Last exit", "signal 9 (SIGKILL)"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is missing");
+    }
+    save(&mut ui, "workers-all-columns");
+}
+
+/// A window too narrow for the table: the card scrolls sideways instead of cutting columns.
+#[test]
+fn narrow_window_still_draws_the_table() {
+    let mut g = connected();
+    let _ = g.update(Message::Resized(iced::Size::new(900.0, 700.0)));
+    let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, 700.0), warden_gui::view::view(&g));
+    for t in ["Worker", "State", "RSS", "RUNNING", "Connected", "Add app", "CPU 23.4%"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not on the narrow screen");
+    }
+    for t in ["Load 0.52 0.40 0.31", "wardend 0.1.0 · pid 4211"] {
+        assert!(ui.find(t).is_err(), "{t:?} is dropped from the top bar when there is no room");
+    }
+    save(&mut ui, "main-screen-narrow");
 }
