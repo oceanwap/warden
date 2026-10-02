@@ -111,9 +111,14 @@ impl Dir {
     }
 
     fn warden_in(&self, cwd: &Path, args: &[&str]) -> Out {
+        self.warden_env(cwd, args, &[])
+    }
+
+    fn warden_env(&self, cwd: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Out {
         let home = self.path("whome");
         let out = Command::new(BIN)
             .args(args)
+            .envs(extra.iter().copied())
             .env("WARDEN_HOME", &home)
             .env("WARDEN_RUNTIME_DIR", home.join("run"))
             .env_remove("WARDEN_CONFIG")
@@ -624,4 +629,495 @@ fn a_cutover_starts_wardens_copy_next_to_a_running_wattpm_and_never_stops_it() {
     let ps = Command::new(bench_modules().join(".bin/wattpm")).arg("ps").current_dir(d.path("shop")).output().unwrap();
     assert!(String::from_utf8_lossy(&ps.stdout).contains("shop"), "{}", String::from_utf8_lossy(&ps.stdout));
     drop(watt);
+}
+
+// ------------------------------------------------------------------ secrets in a command
+
+const TOKEN: &str = "s3cr3t-value-123";
+
+/// Every file under `dir` (not its env files): what a reader of the output directory can see.
+fn files_but_env(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut v = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_file() && p.extension().is_none_or(|x| x != "env") {
+            v.push((p.clone(), std::fs::read_to_string(&p).unwrap()));
+        }
+    }
+    v
+}
+
+/// A project whose applications put `{API_TOKEN}` (from `.env`) in a shell command, a plain command,
+/// and in `arguments`, `execArgv` and `nodeOptions`.
+fn secret_project(d: &Dir) -> PathBuf {
+    d.json("p/package.json", json!({"name": "vault", "private": true, "type": "module"}));
+    d.write("p/.env", &format!("API_TOKEN={TOKEN}\n"));
+    for id in ["chain", "plain", "flags"] {
+        d.app(&format!("p/{id}"), "index.js", "");
+    }
+    d.json(
+        "p/chain/watt.json",
+        json!({"$schema": NODE, "application": {"commands": {"production": "npm run build && node index.js --token={API_TOKEN}"}}}),
+    );
+    d.json(
+        "p/plain/watt.json",
+        json!({"$schema": NODE, "application": {"commands": {"production": "node index.js --token={API_TOKEN}"}}}),
+    );
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "chain", "server": {"port": 4300},
+               "applications": [
+                   {"id": "chain", "path": "./chain"},
+                   {"id": "plain", "path": "./plain", "env": {"PORT": "4301"}},
+                   {"id": "flags", "path": "./flags", "env": {"PORT": "4302"},
+                    "execArgv": ["--title={API_TOKEN}"], "nodeOptions": "--require={API_TOKEN}",
+                    "arguments": ["--token={API_TOKEN}"]}]}),
+    );
+    d.path("p")
+}
+
+#[test]
+fn a_secret_in_a_command_reaches_only_the_env_file_and_a_private_config() {
+    let d = Dir::new("secret");
+    let root = secret_project(&d);
+    let out_dir = d.path("out");
+    let r = d.warden(&["migrate-wattpm", root.to_str().unwrap(), "--out", out_dir.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.all());
+
+    // A shell command reads the value from the env file: its config has none, and is an ordinary file.
+    let chain = toml(&out_dir.join("chain.toml"));
+    assert_eq!(chain["app"]["command"].as_str(), Some("sh"));
+    assert_eq!(chain["app"]["args"][1].as_str(), Some("npm run build && node index.js --token=\"${API_TOKEN}\""));
+    assert_eq!(mode(&out_dir.join("chain.toml")), 0o644);
+    assert!(std::fs::read_to_string(out_dir.join("chain.env")).unwrap().contains(&format!("API_TOKEN={TOKEN}")));
+    // The other forms have no way to read it: the value is in the config, which is as private as the env file.
+    for id in ["plain", "flags"] {
+        let text = std::fs::read_to_string(out_dir.join(format!("{id}.toml"))).unwrap();
+        assert!(text.contains(TOKEN), "{id}.toml needs the value:\n{text}");
+        assert_eq!(mode(&out_dir.join(format!("{id}.toml"))), 0o600, "{id}.toml holds a secret");
+        assert_eq!(mode(&out_dir.join(format!("{id}.env"))), 0o600);
+        d.check(&out_dir.join(format!("{id}.toml")));
+    }
+    d.check(&out_dir.join("chain.toml"));
+
+    // Nothing else holds it: not the report, not the screen.
+    for (path, text) in files_but_env(&out_dir) {
+        let private = mode(&path) == 0o600;
+        assert!(private || !text.contains(TOKEN), "{} is world-readable and has the secret:\n{text}", path.display());
+    }
+    let report = std::fs::read_to_string(out_dir.join("MIGRATION-wattpm.md")).unwrap();
+    assert_eq!(mode(&out_dir.join("MIGRATION-wattpm.md")), 0o644);
+    assert!(!report.contains(TOKEN) && report.contains("***"), "{report}");
+    assert!(!r.all().contains(TOKEN), "the output has the secret:\n{}", r.all());
+
+    // --dry-run prints the same without the value.
+    let dry = d.warden(&["migrate-wattpm", root.to_str().unwrap(), "--dry-run"]);
+    assert_eq!(dry.code, 0, "{}", dry.all());
+    assert!(!dry.all().contains(TOKEN), "a dry run printed the secret:\n{}", dry.all());
+    assert!(dry.stdout.contains("--token=***") && dry.stdout.contains("${API_TOKEN}"), "{}", dry.stdout);
+}
+
+#[test]
+fn an_invalid_config_is_reported_without_its_text() {
+    let d = Dir::new("invalid");
+    d.json("p/package.json", json!({"name": "vault", "type": "module"}));
+    d.write("p/.env", &format!("API_TOKEN={TOKEN}\n"));
+    d.app("p/web", "index.js", "");
+    d.json(
+        "p/web/watt.json",
+        json!({"$schema": NODE, "application": {"commands": {"production": "node index.js --token={API_TOKEN}"}}}),
+    );
+    // Four workers with consecutive ports from 65535 do not fit: the generated config is refused.
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "web", "workers": 4,
+               "server": {"port": 65535, "portAssignment": "perWorkerIncrement"},
+               "applications": [{"id": "web", "path": "./web"}]}),
+    );
+    let out_dir = d.path("out");
+    let r = d.warden(&["migrate-wattpm", d.path("p").to_str().unwrap(), "--out", out_dir.to_str().unwrap()]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.stderr.contains("generated config is invalid") && r.stderr.contains("65535"), "{}", r.stderr);
+    for out in [r.all(), std::fs::read_to_string(out_dir.join("MIGRATION-wattpm.md")).unwrap()] {
+        assert!(!out.contains(TOKEN), "{out}");
+        assert!(
+            !out.contains("working_directory") && !out.contains("args = ["),
+            "the config text is in the output:\n{out}"
+        );
+    }
+    assert!(!out_dir.join("web.toml").exists());
+}
+
+#[test]
+fn a_line_break_in_a_command_cannot_change_the_config() {
+    let d = Dir::new("lf");
+    d.json("p/package.json", json!({"name": "lf", "type": "module"}));
+    d.app("p/web", "index.js", "");
+    for (name, command) in [
+        ("chained", "npm run build &&\nnode server.js"),
+        ("inject", "node server.js;\n[limits]\nmax_memory = 1\n# done"),
+    ] {
+        d.json("p/web/watt.json", json!({"$schema": NODE, "application": {"commands": {"production": command}}}));
+        d.json(
+            "p/watt.json",
+            json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "./web"}]}),
+        );
+        let out_dir = d.path(&format!("out-{name}"));
+        let r = d.warden(&["migrate-wattpm", d.path("p").to_str().unwrap(), "--out", out_dir.to_str().unwrap()]);
+        assert_eq!(r.code, 0, "{name}: {}", r.all());
+        let cfg = out_dir.join("web.toml");
+        d.check(&cfg);
+        let t = toml(&cfg);
+        assert!(
+            t.get("limits").is_none(),
+            "{name}: the command wrote a table:\n{}",
+            std::fs::read_to_string(&cfg).unwrap()
+        );
+        assert!(t["app"]["args"][1].as_str().unwrap().contains('\n'), "{name}: the command is kept as it was");
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.lines().next().unwrap().starts_with("# Written by `warden migrate-wattpm`"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with('#')).count(), 1, "{name}: one comment line\n{text}");
+    }
+}
+
+// ------------------------------------------------------------------ what is written, and where
+
+#[test]
+fn an_existing_env_file_is_kept_unless_overwrite_is_given() {
+    let d = Dir::new("envkeep");
+    d.json("p/package.json", json!({"name": "keep", "type": "module"}));
+    d.app("p/web", "index.js", "");
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "./web"}]}),
+    );
+    let out_dir = d.path("out");
+    d.write("out/web.env", "KEEP=me\n");
+    let project = d.path("p");
+    let args = ["migrate-wattpm", project.to_str().unwrap(), "--out", out_dir.to_str().unwrap()];
+    // No web.toml yet, but the env file is somebody's: the app is left alone, and the exit code says so.
+    let r = d.warden(&args);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.stderr.contains("web.env exists") && r.stderr.contains("--overwrite"), "{}", r.stderr);
+    assert_eq!(std::fs::read_to_string(out_dir.join("web.env")).unwrap(), "KEEP=me\n");
+    assert!(!out_dir.join("web.toml").exists(), "a config without its env file is not written");
+    // --overwrite replaces both, and the env file is private.
+    let r = d.warden(&[args[0], args[1], args[2], args[3], "--overwrite"]);
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(std::fs::read_to_string(out_dir.join("web.env")).unwrap().contains("NODE_ENV=production"));
+    assert_eq!(mode(&out_dir.join("web.env")), 0o600);
+    d.check(&out_dir.join("web.toml"));
+}
+
+#[test]
+fn a_symbolic_link_is_never_written_through() {
+    use std::os::unix::fs::symlink;
+    let d = Dir::new("link");
+    d.json("p/package.json", json!({"name": "ln", "type": "module"}));
+    d.app("p/web", "index.js", "");
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "./web"}]}),
+    );
+    let out_dir = d.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let victim = d.write("victim.txt", "somebody else's file\n");
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let still = |what: &str| {
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "somebody else's file\n",
+            "{what}: the file behind the link changed"
+        );
+        assert_eq!(mode(&victim), 0o644, "{what}: the file behind the link was chmod-ed");
+    };
+    let project = d.path("p");
+    for overwrite in [false, true] {
+        let mut args = vec!["migrate-wattpm", project.to_str().unwrap(), "--out", out_dir.to_str().unwrap()];
+        if overwrite {
+            args.push("--overwrite");
+        }
+        // An env file that is a link to a file, and a config that is a link to nothing.
+        let (env_link, toml_link) = (out_dir.join("web.env"), out_dir.join("web.toml"));
+        let _ = std::fs::remove_file(&env_link);
+        let _ = std::fs::remove_file(&toml_link);
+        symlink(&victim, &env_link).unwrap();
+        let r = d.warden(&args);
+        assert_eq!(r.code, 1, "{overwrite}: {}", r.all());
+        assert!(r.stderr.contains("symbolic link") && r.stderr.contains("web.env"), "{}", r.stderr);
+        still("env link");
+        assert!(std::fs::symlink_metadata(&env_link).unwrap().file_type().is_symlink());
+        assert!(!toml_link.exists(), "nothing is written for an app whose files cannot be");
+        std::fs::remove_file(&env_link).unwrap();
+        let nowhere = d.path("nowhere.toml");
+        symlink(&nowhere, &toml_link).unwrap();
+        let r = d.warden(&args);
+        assert_eq!(r.code, 1, "{overwrite}: {}", r.all());
+        assert!(r.stderr.contains("symbolic link") && r.stderr.contains("web.toml"), "{}", r.stderr);
+        assert!(!nowhere.exists(), "a dangling link was written through");
+        assert!(!out_dir.join("web.env").exists(), "the env file is not written when the config cannot be");
+    }
+}
+
+#[test]
+fn pm2_migrate_never_writes_through_a_symbolic_link_either() {
+    use std::os::unix::fs::symlink;
+    let d = Dir::new("pm2link");
+    d.write("srv/api.js", "");
+    d.json(
+        "pm2/dump.pm2",
+        json!([{"name": "api", "pm_exec_path": d.path("srv/api.js"), "pm_cwd": d.path("srv"), "exec_mode": "fork_mode",
+                "env": {"NODE_ENV": "production", "DB_URL": "postgres://x"}}]),
+    );
+    let out_dir = d.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let victim = d.write("victim.txt", "somebody else's file\n");
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    symlink(&victim, out_dir.join("api.env")).unwrap();
+    symlink(d.path("nowhere.toml"), out_dir.join("api.toml")).unwrap();
+    let pm2_home = d.path("pm2");
+    let r = d.warden_env(
+        &d.root,
+        &["pm2-migrate", "--from", "dump", "--out", out_dir.to_str().unwrap(), "--overwrite"],
+        &[("PM2_HOME", pm2_home.as_os_str())],
+    );
+    assert_ne!(r.code, 0, "{}", r.all());
+    assert!(r.all().contains("symbolic link"), "{}", r.all());
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "somebody else's file\n");
+    assert_eq!(mode(&victim), 0o644, "the file behind the link was chmod-ed");
+    assert!(!d.path("nowhere.toml").exists(), "a dangling link was written through");
+}
+
+#[test]
+fn a_variable_that_is_not_utf8_does_not_crash_either_migration() {
+    use std::os::unix::ffi::OsStrExt;
+    let d = Dir::new("utf8");
+    d.json("p/package.json", json!({"name": "u", "type": "module"}));
+    d.app("p/web", "index.js", "");
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "./web"}]}),
+    );
+    let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe broken");
+    let r = d.warden_env(&d.root, &["migrate-wattpm", d.path("p").to_str().unwrap(), "--dry-run"], &[("BAD_VAR", bad)]);
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(r.stdout.contains("name = \"web\""), "{}", r.stdout);
+
+    d.write("srv/api.js", "");
+    d.json(
+        "pm2/dump.pm2",
+        json!([{"name": "api", "pm_exec_path": d.path("srv/api.js"), "pm_cwd": d.path("srv"), "exec_mode": "fork_mode",
+                "env": {"NODE_ENV": "production"}}]),
+    );
+    let pm2_home = d.path("pm2");
+    let r = d.warden_env(
+        &d.root,
+        &["pm2-migrate", "--from", "dump", "--dry-run"],
+        &[("PM2_HOME", pm2_home.as_os_str()), ("BAD_VAR", bad)],
+    );
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(r.stdout.contains("name = \"api\""), "{}", r.stdout);
+}
+
+#[test]
+fn a_name_that_is_a_directory_is_renamed_and_warden_refuses_it() {
+    let d = Dir::new("dots");
+    d.json("p/package.json", json!({"name": "dots", "type": "module"}));
+    d.app("p/web", "index.js", "");
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "..", "applications": [{"id": "..", "path": "./web"}]}),
+    );
+    let out_dir = d.path("out");
+    let r = d.warden(&["migrate-wattpm", d.path("p").to_str().unwrap(), "--out", out_dir.to_str().unwrap()]);
+    assert_eq!(r.code, 0, "{}", r.all());
+    assert!(
+        out_dir.join("app-dotdot.toml").is_file(),
+        "{}\n{:?}",
+        r.all(),
+        std::fs::read_dir(&out_dir).unwrap().flatten().collect::<Vec<_>>()
+    );
+    assert!(!out_dir.join("...toml").exists() && !out_dir.join("..toml").exists());
+    d.check(&out_dir.join("app-dotdot.toml"));
+    assert_eq!(toml(&out_dir.join("app-dotdot.toml"))["app"]["name"].as_str(), Some("app-dotdot"));
+    let report = std::fs::read_to_string(out_dir.join("MIGRATION-wattpm.md")).unwrap();
+    assert!(report.contains("names a directory"), "{report}");
+
+    // A config that names itself that is refused by `warden check`.
+    for name in [".", ".."] {
+        let cfg = d.write("bad.toml", &format!("[app]\nname = {name:?}\ncommand = \"sleep\"\nargs = [\"1\"]\n"));
+        let r = d.warden(&["check", "-c", cfg.to_str().unwrap()]);
+        assert_ne!(r.code, 0, "{name}: {}", r.all());
+        assert!(r.all().contains("only dots"), "{name}: {}", r.all());
+    }
+}
+
+// ------------------------------------------------------------------ cutover
+
+/// A server on `PORT` that answers its own name.
+fn named_server(name: &str) -> String {
+    format!(
+        "import http from 'node:http';\n\
+         http.createServer((q, r) => r.end('{name}')).listen(Number(process.env.PORT), '127.0.0.1');\n"
+    )
+}
+
+/// Three applications: the entry point `web`, an internal `api`, and `ok`; each is given its port.
+fn three(d: &Dir, web: u16, api: u16, ok: u16) -> PathBuf {
+    d.json("p/package.json", json!({"name": "trio", "private": true, "type": "module"}));
+    for id in ["web", "api", "ok"] {
+        d.app(&format!("p/{id}"), "index.mjs", &named_server(id));
+    }
+    d.json(
+        "p/watt.json",
+        json!({"$schema": RUNTIME, "entrypoint": "web", "server": {"hostname": "127.0.0.1", "port": web},
+               "applications": [{"id": "web", "path": "./web"},
+                                {"id": "api", "path": "./api", "env": {"PORT": api.to_string()}},
+                                {"id": "ok", "path": "./ok", "env": {"PORT": ok.to_string()}}]}),
+    );
+    d.path("p")
+}
+
+fn running(d: &Dir) -> Vec<String> {
+    let list = d.warden(&["list", "--json"]);
+    let rows: Value = serde_json::from_str(&list.stdout).unwrap_or(Value::Null);
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        // `status` is null for an app whose supervisor does not answer.
+        .filter(|a| !a["status"].is_null())
+        .filter_map(|a| a["app"].as_str().map(String::from))
+        .collect()
+}
+
+#[test]
+fn a_cutover_does_not_start_two_programs_on_one_port() {
+    if !have_node() {
+        eprintln!("skipping: needs node");
+        return;
+    }
+    let d = Dir::new("clash");
+    let (shared, ok) = (free_port(), free_port());
+    // `web` is on `server.port`, `api` on the same port from its own env.
+    let root = three(&d, shared, shared, ok);
+    let out_dir = d.path("out");
+    let r = d.warden(&[
+        "migrate-wattpm",
+        root.to_str().unwrap(),
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--cutover",
+        "overlap",
+    ]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(
+        r.stderr.contains("web: not started")
+            && r.stderr.contains("api: not started")
+            && r.stderr.contains(&format!("port {shared}")),
+        "{}",
+        r.stderr
+    );
+    assert_eq!(get(shared, "/"), None, "something was started on the shared port");
+    // The one that has a port of its own is not held back.
+    wait_for("`ok` to serve", 20, || get(ok, "/").is_some());
+    assert_eq!(get(ok, "/").as_deref(), Some("ok"));
+    let names = running(&d);
+    assert!(
+        names.contains(&"ok".to_string()) && !names.contains(&"web".to_string()) && !names.contains(&"api".to_string()),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn a_cutover_port_that_is_an_internal_applications_own_is_a_conflict_too() {
+    if !have_node() {
+        eprintln!("skipping: needs node");
+        return;
+    }
+    let d = Dir::new("newport");
+    let (web, api, ok) = (free_port(), free_port(), free_port());
+    let root = three(&d, web, api, ok);
+    let out_dir = d.path("out");
+    // The new port of the entry point is the one `api` listens on.
+    let r = d.warden(&[
+        "migrate-wattpm",
+        root.to_str().unwrap(),
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--cutover",
+        &format!("new-port:{api}"),
+    ]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.stderr.contains("web: not started") && r.stderr.contains("api: not started"), "{}", r.stderr);
+    assert!(r.stderr.contains("new-port"), "it says what to change: {}", r.stderr);
+    assert_eq!(get(api, "/"), None);
+    wait_for("`ok` to serve", 20, || get(ok, "/").is_some());
+}
+
+#[test]
+fn a_cutover_that_fails_stops_what_it_started_and_says_so() {
+    if !have_node() {
+        eprintln!("skipping: needs node");
+        return;
+    }
+    let d = Dir::new("failcut");
+    let (web, api, ok) = (free_port(), free_port(), free_port());
+    let root = three(&d, web, api, ok);
+    // `ok` crashes at start.
+    d.write("p/ok/index.mjs", "process.exit(1);\n");
+    let out_dir = d.path("out");
+    let new_web = free_port();
+    let r = d.warden(&[
+        "migrate-wattpm",
+        root.to_str().unwrap(),
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--cutover",
+        &format!("new-port:{new_web}"),
+    ]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.stderr.contains("ok: Warden's workers did not come up"), "{}", r.stderr);
+    // What is left running is said, and it is nothing: web and api were stopped again.
+    assert!(
+        r.stderr.contains("Stopped web, api") && r.stderr.contains("nothing of this run is left running"),
+        "{}",
+        r.stderr
+    );
+    assert!(!r.stdout.contains("Warden serves"), "{}", r.stdout);
+    wait_for("web and api to be stopped", 20, || running(&d).is_empty());
+    assert!(get(new_web, "/").is_none() && get(api, "/").is_none());
+    // The configs stay, and the failing one is named in what to do next.
+    assert!(out_dir.join("web.toml").is_file() && out_dir.join("ok.toml").is_file());
+    assert!(r.stderr.contains("warden start"), "{}", r.stderr);
+}
+
+#[test]
+fn a_cutover_of_apps_that_run_already_says_they_keep_their_previous_config() {
+    if !have_node() {
+        eprintln!("skipping: needs node");
+        return;
+    }
+    let d = Dir::new("again");
+    let (web, api, ok) = (free_port(), free_port(), free_port());
+    let root = three(&d, web, api, ok);
+    let out_dir = d.path("out");
+    let args = ["migrate-wattpm", root.to_str().unwrap(), "--out", out_dir.to_str().unwrap(), "--cutover", "overlap"];
+    let r = d.warden(&args);
+    assert_eq!(r.code, 0, "{}", r.all());
+    wait_for("web", 20, || get(web, "/").is_some());
+    assert!(r.stdout.contains("Warden serves 3 app(s)") && r.stdout.contains("warden stop web api ok"), "{}", r.stdout);
+
+    let r = d.warden(&[args[0], args[1], args[2], args[3], args[4], args[5], "--overwrite"]);
+    assert_eq!(r.code, 0, "{}", r.all());
+    for name in ["web", "api", "ok"] {
+        assert!(
+            r.stdout.contains(&format!("{name}: already running with its previous config"))
+                && r.stdout.contains(&format!("warden reload {name}")),
+            "{}",
+            r.stdout
+        );
+    }
+    assert!(!r.stdout.contains("starting next to Watt"), "nothing was started again:\n{}", r.stdout);
+    assert!(!r.stdout.contains("Warden serves"), "{}", r.stdout);
+    assert_eq!(get(web, "/").as_deref(), Some("web"));
 }

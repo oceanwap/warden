@@ -7562,6 +7562,10 @@ fn a_killed_supervisors_workers_are_stopped_when_the_app_starts_again() {
     let start = ["start", "/bin/sh", "--name", "orphan", "--interpreter", "none", "-i", "2", "--", "-c", &cmd];
     let (code, out) = f.cli_env(&start, &env);
     assert_eq!(code, 0, "{out}");
+    assert!(
+        !out.contains("waiting for the previous supervisor's workers"),
+        "nothing to sweep, nothing to wait for: {out}"
+    );
     f.wait("two workers", |f| f.pids("orphan").len() == 2);
     let old = f.pids("orphan");
     let sup = supervisor_pid(&f, "orphan");
@@ -7692,4 +7696,146 @@ fn records_of_processes_that_are_not_orphans_are_left_alone() {
         let _ = c.kill();
         let _ = c.wait();
     }
+}
+
+// ----------------------------------------------- the sweep while the supervisor runs
+
+/// Two workers that ignore SIGTERM (so the sweep takes `grace_period` to end),
+/// whose supervisor was killed with SIGKILL. Then the app's config says
+/// `ready_timeout` and `grace_period`, and the workers it will start next obey
+/// SIGTERM. Returns the old workers' pids and the dead supervisor's.
+fn app_with_stubborn_orphans(f: &Fleet, name: &str, tag: &str, ready_timeout: u64, grace: u64) -> (Vec<u64>, u64) {
+    let hook = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let cmd = format!("trap '' TERM; exec sleep {tag}");
+    let start = ["start", "/bin/sh", "--name", name, "--interpreter", "none", "-i", "2", "--", "-c", &cmd];
+    let (code, out) = f.cli_env(&start, &hook);
+    assert_eq!(code, 0, "{out}");
+    f.wait("two workers", |f| f.pids(name).len() == 2);
+    let old = f.pids(name);
+    let sup = supervisor_pid(f, name);
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    wait_until("the supervisor to be gone", || !running(sup));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(old.iter().all(|p| running(*p)), "the workers outlive the killed supervisor: {old:?}");
+    // The next supervisor reads the config afresh: its workers obey SIGTERM.
+    let path = f.home.join(format!("{name}.toml"));
+    let cfg = std::fs::read_to_string(&path).unwrap();
+    let (was, now) = ("[workers]\ncount = 2\n", format!("[workers]\ncount = 2\nready_timeout = {ready_timeout}\n"));
+    assert!(cfg.contains(was) && cfg.contains("trap '' TERM; "), "{cfg}");
+    let cfg = cfg.replace(was, &now).replace("trap '' TERM; ", "");
+    std::fs::write(&path, format!("{cfg}\n[shutdown]\ngrace_period = {grace}\n")).unwrap();
+    (old, sup)
+}
+
+/// `warden start <name>` in the background, its output in a file.
+fn start_in_the_background(f: &Fleet, name: &str) -> (Child, PathBuf) {
+    let out = f.home.join(format!("start-{name}.out"));
+    let file = std::fs::File::create(&out).unwrap();
+    let child = Command::new(BIN)
+        .args(["start", name])
+        .env("WARDEN_HOME", &f.home)
+        .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
+        .env_remove("WARDEN_CONFIG")
+        .env("WARDEN_NO_DAEMON", "1")
+        .env("WARDEN_TEST_MACOS_ORPHANS", "1")
+        .current_dir(&f.home)
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    (child, out)
+}
+
+/// While a supervisor stops the workers a killed one left behind (up to
+/// `grace_period` + 3 s when they ignore the stop signal) it answers: `status`
+/// says what it waits for, and a SIGTERM ends it at once, without starting a
+/// worker only to stop it (it used to handle nothing until the sweep ended,
+/// then start workers, and only then see the SIGTERM).
+#[test]
+fn a_supervisor_told_to_stop_during_the_sweep_stops_at_once_and_starts_no_worker() {
+    let tag = sleep_tag(2);
+    let _sleepers = Sleepers(tag.clone());
+    let f = Fleet::new("sweep-term");
+    let (old, dead) = app_with_stubborn_orphans(&f, "slow", &tag, 30, 12);
+    let (mut cli, out) = start_in_the_background(&f, "slow");
+
+    f.wait("the sweep to show in status", |f| f.app("slow")["status"]["rollout"]["kind"] == "sweep");
+    let status = f.app("slow")["status"].clone();
+    let sweep = &status["rollout"];
+    assert_eq!((sweep["done"].as_u64(), sweep["total"].as_u64()), (Some(0), Some(2)), "{status:#}");
+    let phase = sweep["phase"].as_str().unwrap();
+    assert!(phase.contains("waiting for the previous supervisor's workers to stop (up to 15 s)"), "{phase}");
+    assert_eq!(status["workers"].as_array().map(Vec::len), Some(0), "no worker started: {status:#}");
+    // `warden status` and `warden list` show it, instead of an app that does not answer.
+    let text = f.ok(&["status", "slow"]);
+    assert!(text.contains("sweep 0/2") && text.contains("waiting for the previous supervisor's workers"), "{text}");
+    let text = f.ok(&["list"]);
+    assert!(text.contains("sweep 0/2") && text.contains("waiting for the previous supervisor's workers"), "{text}");
+    // Requests that would start or change workers wait for it; the CLI says so.
+    let (code, text) = f.cli(&["reload", "slow"]);
+    assert_ne!(code, 0, "{text}");
+    assert!(text.contains("try again then"), "{text}");
+    // `warden start` printed what it waits for.
+    wait_until("the CLI to say what it waits for", || {
+        std::fs::read_to_string(&out).is_ok_and(|t| t.contains("waiting for the previous supervisor's workers"))
+    });
+    assert!(old.iter().all(|p| running(*p)), "SIGTERM is ignored by them: still there");
+
+    let sup = supervisor_pid(&f, "slow");
+    assert_ne!(sup, dead);
+    let t0 = Instant::now();
+    unsafe { libc::kill(sup as i32, libc::SIGTERM) };
+    wait_until("the supervisor to stop", || !running(sup));
+    let took = t0.elapsed();
+    assert!(took < Duration::from_secs(3), "stopped in {took:?}, not after the sweep (12 s)");
+    // The log has the killed supervisor's lines first: this one's start at its own `starting application`.
+    let log = std::fs::read_to_string(f.home.join("state/logs/slow.log")).unwrap();
+    let log = &log[log.rfind("starting application").expect("this supervisor's start")..];
+    assert!(log.contains("shutting down reason=SIGTERM workers=0"), "{log}");
+    assert!(log.contains("stopped while waiting for the previous supervisor's workers to stop"), "{log}");
+    assert!(!log.contains("worker starting") && !log.contains("standby starting"), "no worker was started:\n{log}");
+    assert!(!log.contains("event loop was blocked"), "the loop was never blocked:\n{log}");
+    every_warning_has_a_hint(log);
+    // The records stay, for the next start to finish what this one did not.
+    assert!(f.home.join(format!("state/orphans/slow.{dead}.json")).exists());
+    // The CLI that waited says why it stops waiting.
+    let t1 = Instant::now();
+    let status = loop {
+        if let Some(st) = cli.try_wait().unwrap() {
+            break st;
+        }
+        assert!(t1.elapsed() < Duration::from_secs(5), "warden start did not give up");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(status.code(), Some(1), "{text}");
+    assert!(text.contains("the supervisor stopped while it was waiting"), "{text}");
+}
+
+/// `warden start` waits for a sweep longer than its own bound for the first
+/// worker (`ready_timeout` + 15 s): the wait begins when the sweep is over.
+/// It reported "not answering" and exited 1 while the app came up fine
+/// right after.
+#[test]
+fn warden_start_waits_for_a_sweep_that_outlasts_ready_timeout() {
+    let tag = sleep_tag(3);
+    let _sleepers = Sleepers(tag.clone());
+    let f = Fleet::new("sweep-wait");
+    // ready_wait = 2 + 15 = 17 s; the old workers die of SIGKILL at 18 s.
+    let (old, dead) = app_with_stubborn_orphans(&f, "slowboot", &tag, 2, 18);
+    let t0 = Instant::now();
+    let (code, out) = f.cli_env(&["start", "slowboot"], &[("WARDEN_TEST_MACOS_ORPHANS", "1")]);
+    let took = t0.elapsed();
+    assert_eq!(code, 0, "{out}");
+    assert!(took > Duration::from_secs(17), "the sweep outlasted the 17 s bound: {took:?}");
+    assert!(out.contains("waiting for the previous supervisor's workers to stop"), "{out}");
+    assert!(out.contains("slowboot: online (2/2 workers ready)"), "{out}");
+    let now = f.pids("slowboot");
+    assert!(now.len() == 2 && now.iter().all(|p| !old.contains(p)), "{old:?} -> {now:?}");
+    assert!(old.iter().all(|p| !running(*p)), "the old workers are gone");
+    let log = std::fs::read_to_string(f.home.join("state/logs/slowboot.log")).unwrap();
+    assert!(log.contains("did not exit within the grace period; sent SIGKILL"), "{log}");
+    assert!(log.contains("stopped workers left behind by a previous supervisor"), "{log}");
+    every_warning_has_a_hint(&log);
+    assert!(!f.home.join(format!("state/orphans/slowboot.{dead}.json")).exists());
 }

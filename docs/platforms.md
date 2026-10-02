@@ -87,8 +87,22 @@ parent-death signal, only the cure for its absence, and it has limits:
   then the orphans keep serving, holding the port and their memory. With
   wardend that is seconds (it restarts a dead supervisor); without it, until
   you `warden start` the app or kill them by hand (`warden doctor` names them).
-- A supervisor whose orphans ignore the stop signal does not answer commands
-  until they are gone: at most `shutdown.grace_period` plus 3 s. It logs first.
+- The sweep takes as long as the orphans take to stop: at most
+  `shutdown.grace_period` plus 3 s when they ignore the stop signal. The new
+  supervisor does not wait in silence, and starts no worker until it is over
+  (the old ones hold the port):
+  - `warden status` and `warden list` show it as a rollout of its own kind,
+    `sweep 1/2: waiting for the previous supervisor's workers to stop (up to
+    33 s)`, with how many are gone; the app is not "unreachable".
+  - `warden start` prints the same line and waits for the sweep before it
+    starts counting `ready_timeout` for the first worker, so a long grace
+    period does not make it report a failed start.
+  - SIGTERM, SIGINT and `warden shutdown` end the supervisor at once, without
+    starting a worker; what the sweep did not reach is found again by the next
+    start (the records stay until their workers are gone). `warden stop` and
+    `warden start` are remembered for when the sweep ends. `reload`,
+    `restart`, `scale`, `reset` and SIGHUP are refused until then, with a
+    message saying so.
 - Processes a worker started that outlived it are stopped with its group while
   the worker is still running at the next start. If the worker itself exited
   before that, its group is not touched: the number of an empty group may

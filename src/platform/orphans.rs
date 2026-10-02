@@ -55,6 +55,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The format of the record; a record of a later one is left alone.
@@ -68,6 +70,36 @@ const KILL_WAIT: Duration = Duration::from_secs(3);
 
 /// A temporary file of a write that never finished is removed after this.
 const TMP_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// A record is a few hundred bytes (a pid, a start time and a label per
+/// worker); a file bigger than this is not one, and is not read.
+const MAX_RECORD: u64 = 1 << 20;
+
+/// `Status.rollout.kind` while a supervisor waits for a killed one's workers
+/// to stop: `warden status` and `warden list` show it like a rollout in
+/// progress, and `warden start` waits for it to end.
+pub const SWEEP_KIND: &str = "sweep";
+
+/// The longest a sweep takes: the stop signal, `grace` for the workers to
+/// obey it, SIGKILL, and a wait for them to be gone.
+pub fn longest(grace: Duration) -> Duration {
+    grace + KILL_WAIT
+}
+
+/// How far a sweep has got, shared with the supervisor that runs it so that
+/// `status` can say.
+#[derive(Debug, Default)]
+pub struct Progress {
+    total: AtomicUsize,
+    done: AtomicUsize,
+}
+
+impl Progress {
+    /// `(done, total)`: the workers found, and how many of them are gone.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed))
+    }
+}
 
 /// A process of Warden's: the supervisor, or a worker (`label`: `1`, `s1`,
 /// `host`, as in the logs).
@@ -345,10 +377,20 @@ impl<'a> Stopper<'a> {
         out
     }
 
-    /// Wait for the end, looking every `POLL`.
-    pub async fn finish(mut self) -> Outcome {
+    /// `(done, total)`: how many orphans are no longer running.
+    fn counts(&self) -> (usize, usize) {
+        (self.targets.iter().filter(|(_, fate)| *fate != Fate::Running).count(), self.targets.len())
+    }
+
+    /// Wait for the end, looking every `POLL`, and telling `progress` how many
+    /// are gone as they go.
+    pub async fn finish(mut self, progress: &Progress) -> Outcome {
         loop {
-            if let Some(out) = self.poll(Instant::now()) {
+            let out = self.poll(Instant::now());
+            let (done, total) = self.counts();
+            progress.total.store(total, Ordering::Relaxed);
+            progress.done.store(done, Ordering::Relaxed);
+            if let Some(out) = out {
                 return out;
             }
             tokio::time::sleep(POLL).await;
@@ -425,14 +467,37 @@ pub fn read_all(dir: &Path, app: Option<&str>) -> Vec<Found> {
         if app.is_some_and(|a| a != file_app) {
             continue;
         }
-        let record = match std::fs::read_to_string(&path) {
+        let record = match read_record(&path) {
             Ok(text) => parse(&text, file_app),
-            Err(e) => Err(Unusable::Garbled(e.to_string())),
+            Err(why) => Err(Unusable::Garbled(why)),
         };
         found.push(Found { path, record });
     }
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+/// The text of a record file, if it can be one: a regular file (a link, or a
+/// pipe that would block the read, is not) of at most `MAX_RECORD` bytes, read
+/// no further than that.
+fn read_record(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("it is not a regular file".into());
+    }
+    if meta.len() > MAX_RECORD {
+        return Err(format!("it is {} bytes: a record is a few hundred", meta.len()));
+    }
+    let mut text = String::new();
+    // The file may have grown since: never read more than the limit.
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_RECORD + 1).read_to_string(&mut text))
+        .map_err(|e| e.to_string())?;
+    if text.len() as u64 > MAX_RECORD {
+        return Err(format!("it is over {MAX_RECORD} bytes: a record is a few hundred"));
+    }
+    Ok(text)
 }
 
 /// `<app>.<pid>.tmp<pid>` older than `TMP_MAX_AGE`: a write cut short.
@@ -505,6 +570,21 @@ impl Registry {
         Registry { file, rec, known: HashMap::new(), failing: false }
     }
 
+    /// A registry of this process for another module's tests: its record is
+    /// `<dir>/<app>.<this pid>.json`.
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &Path, app: &str) -> Registry {
+        let me = std::process::id();
+        let start = super::proc_identity(me).map_or(0, |id| id.start);
+        Registry::new(dir, app, Member { pid: me, start, label: String::new() }, super::boot_id())
+    }
+
+    /// The workers the record names now: `(pid, label)`, for tests.
+    #[cfg(test)]
+    pub(crate) fn workers(&self) -> Vec<(u32, String)> {
+        self.rec.workers.iter().map(|m| (m.pid, m.label.clone())).collect()
+    }
+
     /// The supervisor's workers are these (`pid`, label): write the record if
     /// they are not what it says. A process that cannot be read (it has
     /// already exited) is left out: it cannot be told from another later.
@@ -563,6 +643,9 @@ pub struct Settings<'a> {
     pub grace: Duration,
     /// Where the records are (`dir(state_dir)`).
     pub dir: PathBuf,
+    /// Told how many workers were found and how many are gone: what
+    /// `status` shows while the sweep runs.
+    pub progress: Arc<Progress>,
 }
 
 /// On this OS, does a supervisor keep and sweep records? macOS: yes.
@@ -570,7 +653,7 @@ pub struct Settings<'a> {
 /// be told to behave like macOS (`WARDEN_TEST_MACOS_ORPHANS=1`: workers
 /// outlive their supervisor, and the sweep is on), which is how Linux tests
 /// run the whole thing against real processes.
-fn enabled() -> bool {
+pub fn enabled() -> bool {
     if super::current().capabilities().orphan_sweep {
         return true;
     }
@@ -685,7 +768,7 @@ pub async fn sweep(s: &Settings<'_>, procs: &dyn Procs, boot: Option<&str>, me: 
                     signal, so its workers kept running; `warden stop` or SIGTERM ends a supervisor and its workers \
                     together",
         );
-        let outcome = Stopper::new(procs, orphans, s.stop_signal, s.grace, Instant::now()).finish().await;
+        let outcome = Stopper::new(procs, orphans, s.stop_signal, s.grace, Instant::now()).finish(&s.progress).await;
         if !outcome.killed.is_empty() {
             crate::warn!(
                 "workers left behind by a previous supervisor did not exit within the grace period; sent SIGKILL",
@@ -953,6 +1036,31 @@ mod tests {
     }
 
     #[test]
+    fn the_stopper_counts_how_many_are_gone_as_they_go() {
+        let fake = Fake::default();
+        fake.add(101, id(1001, 1, 101), OnTerm::Exits);
+        fake.add(102, id(1002, 1, 102), OnTerm::Ignores);
+        let t0 = Instant::now();
+        let grace = Duration::from_secs(5);
+        let mut s = Stopper::new(&fake, vec![orphan(101, 1001), orphan(102, 1002)], TERM, grace, t0);
+        assert_eq!(s.counts(), (0, 2), "both were told to stop; none has looked gone yet");
+        assert!(s.poll(t0 + POLL).is_none());
+        assert_eq!(s.counts(), (1, 2), "one obeyed, one did not");
+        assert!(s.poll(t0 + grace + POLL).is_none() || !fake.alive(102));
+        assert!(s.poll(t0 + grace + 2 * POLL).is_some());
+        assert_eq!(s.counts(), (2, 2));
+        // The shared progress a supervisor reads for `status` ends the same way.
+        let fake = Fake::default();
+        fake.add(101, id(1001, 1, 101), OnTerm::Exits);
+        let progress = Progress::default();
+        assert_eq!(progress.counts(), (0, 0));
+        let s = Stopper::new(&fake, vec![orphan(101, 1001)], TERM, grace, Instant::now());
+        let out = rt().block_on(s.finish(&progress));
+        assert_eq!(out.stopped.len(), 1);
+        assert_eq!(progress.counts(), (1, 1));
+    }
+
+    #[test]
     fn the_configured_stop_signal_is_the_one_sent() {
         let fake = Fake::default();
         fake.add(101, id(1001, 1, 101), OnTerm::Ignores);
@@ -1151,6 +1259,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_file_too_big_to_be_a_record_is_garbage_and_is_not_read() {
+        let dir = scratch("bounded");
+        // A record is a few hundred bytes. 300 MB (sparse here: it costs no disk) was read whole,
+        // 322 MB of memory, before it was found to be nothing.
+        let big = dir.join(file_name("api", 100));
+        std::fs::File::create(&big).unwrap().set_len(300 << 20).unwrap();
+        let why = read_record(&big).unwrap_err();
+        assert!(why.contains("bytes"), "{why}");
+        let found = read_all(&dir, Some("api"));
+        assert_eq!(found.len(), 1);
+        assert!(matches!(&found[0].record, Err(Unusable::Garbled(w)) if w.contains("bytes")), "{found:?}");
+        // The limit is on the size: a file of exactly `MAX_RECORD` bytes is read (and is no record),
+        // and one a byte over is not.
+        let edge = dir.join(file_name("api", 101));
+        std::fs::File::create(&edge).unwrap().set_len(MAX_RECORD).unwrap();
+        assert_eq!(read_record(&edge).map(|t| t.len() as u64), Ok(MAX_RECORD));
+        std::fs::File::create(&edge).unwrap().set_len(MAX_RECORD + 1).unwrap();
+        assert!(read_record(&edge).is_err());
+        // A real record is far below it, whatever the number of workers a supervisor has.
+        let workers: Vec<Member> = (0..1000).map(|i| m(200 + i, 5000 + u64::from(i))).collect();
+        let rec = record(m(100, 1000), workers);
+        let path = dir.join(file_name("api", 102));
+        write_atomic(&path, &rec).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < MAX_RECORD / 4, "1000 workers fit a quarter of it");
+        assert_eq!(parse(&read_record(&path).unwrap(), "api").unwrap(), rec);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_or_a_pipe_in_the_record_directory_is_garbage_and_never_read() {
+        let dir = scratch("special");
+        // A link to something endless, and a pipe nobody writes to (a read of it would block for good).
+        std::os::unix::fs::symlink("/dev/zero", dir.join(file_name("api", 100))).unwrap();
+        let fifo = dir.join(file_name("api", 101));
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let t0 = Instant::now();
+        let found = read_all(&dir, Some("api"));
+        assert!(t0.elapsed() < Duration::from_secs(5), "returned at once");
+        assert_eq!(found.len(), 2);
+        for f in &found {
+            assert!(matches!(&f.record, Err(Unusable::Garbled(w)) if w.contains("regular file")), "{f:?}");
+        }
+        // The sweep removes them like any other garbage (the link, not what it points at).
+        rt().block_on(sweep(&settings(&dir, Duration::from_millis(100)), &Fake::default(), None, 900));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(Path::new("/dev/zero").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ------------------------------------------------------------ the registry
 
     #[test]
@@ -1232,7 +1390,7 @@ mod tests {
     }
 
     fn settings(dir: &Path, grace: Duration) -> Settings<'_> {
-        Settings { app: "api", stop_signal: TERM, grace, dir: dir.to_path_buf() }
+        Settings { app: "api", stop_signal: TERM, grace, dir: dir.to_path_buf(), progress: Arc::default() }
     }
 
     /// A record of this boot (the real one: the sweep ignores any other).

@@ -141,6 +141,20 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   `~/.local/bin` with a PATH hint), and can remove the link; on Linux it links
   into `~/.local/bin`.
 - CI runs `tests/static_perf.rs` (with strace on Linux).
+- macOS: the supervisor that stops a killed supervisor's workers keeps answering
+  while it does (`status` shows `sweep`), obeys SIGTERM at once without starting
+  workers, and `warden start` waits for the sweep instead of reporting a failed
+  start. Oversized or non-regular files in the record directory are not read.
+- GUI: a damaged `gui.json` is kept as `gui.json.bad` instead of overwritten;
+  "Restart everything" shows which `warden` runs and aims it at the connected
+  wardend, runs up to 15 minutes and offers `warden resurrect` if it fails;
+  Cancel on the administrator prompt installs nothing; text contrast is 4.5:1 in
+  every look; the machines menu scrolls; replies from before a host switch are
+  dropped; the tunnel's ssh ends with the window on Linux.
+- `migrate-wattpm` and `pm2-migrate` never write through a symlink, keep an
+  existing env file unless `--overwrite`, and keep secrets out of reports, dry
+  runs and error text (a `{SECRET}` in a shell command is read from the 0600
+  env file; in other commands the config is written 0600).
 
 ### Changed
 

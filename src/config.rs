@@ -825,6 +825,11 @@ impl Config {
         if a.name.is_empty() || !a.name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) {
             return Err("app.name must be non-empty and contain only [A-Za-z0-9._-]".into());
         }
+        // `.` and `..` name directories: the config would be `..toml` and the control socket
+        // `<runtime dir>/../control.sock`.
+        if a.name.chars().all(|c| c == '.') {
+            return Err("app.name cannot be only dots (`.` and `..` are directories)".into());
+        }
         if a.command.is_empty() {
             return Err("app.command must not be empty".into());
         }

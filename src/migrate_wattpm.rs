@@ -20,13 +20,18 @@
 use crate::cli::{Args, Command, StartOpts};
 use crate::config::Config;
 use crate::fleet::{self, Launch};
-use crate::migrate::{Cutover, env_quote, parse_cutover, toml_str, warden_start, warden_stop, write_file};
+use crate::migrate::{Cutover, env_quote, parse_cutover, toml_str, warden_start, warden_stop};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The report's name. `pm2-migrate` writes MIGRATION.md into the same directory.
 const REPORT: &str = "MIGRATION-wattpm.md";
+
+/// Warden's limit for a number of seconds (`grace_period`, `ready_timeout`): one hour.
+const MAX_SECONDS_MS: u64 = 3_600_000;
+/// The longest restart delay whose `backoff_max` (16 times it) stays under Warden's one-hour limit.
+const MAX_RESTART_DELAY_MS: u64 = MAX_SECONDS_MS / 16;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Opts {
@@ -364,6 +369,59 @@ struct Placeholders {
     from_process: BTreeSet<String>,
     /// Names with no value anywhere: Watt substitutes an empty string.
     unset: BTreeSet<String>,
+    /// Every string that had a value substituted into it, by the string it became.
+    strings: BTreeMap<String, Subst>,
+}
+
+/// A config string with a value from the environment or a `.env` file in it. Warden has no
+/// placeholders, so the value would land in the config as plain text; this remembers what went in,
+/// so that it is never printed, and what the string was, so that a shell command can read the value
+/// from the env file instead.
+#[derive(Debug, Clone, Default)]
+struct Subst {
+    /// The string as the config has it, placeholders and all.
+    template: String,
+    /// Every value that went into it (nested ones included) that could be a secret.
+    values: Vec<String>,
+    /// The placeholders of the template itself, in order.
+    first: Vec<Filled>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Filled {
+    name: String,
+    /// What Watt puts in its place.
+    value: String,
+    /// Could be a secret: it came from the environment or a `.env` file and is not a port-like number.
+    secret: bool,
+}
+
+/// A value worth hiding: not empty, and not a number as short as a port or a count.
+fn is_secret_value(v: &str) -> bool {
+    let short_number = v.len() <= 5 && v.bytes().all(|b| b.is_ascii_digit());
+    !v.is_empty() && !short_number
+}
+
+/// `text` with every one of `secrets` (as written, and as a TOML or JSON string would escape it)
+/// replaced by `***`.
+fn mask(text: &str, secrets: &BTreeSet<String>) -> String {
+    let mut forms: Vec<String> = Vec::new();
+    for v in secrets.iter().filter(|v| !v.is_empty()) {
+        forms.push(v.clone());
+        let quoted = toml_str(v);
+        forms.push(quoted[1..quoted.len() - 1].to_string());
+    }
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    let mut out = text.to_string();
+    for f in forms.iter().filter(|f| !f.is_empty()) {
+        out = out.replace(f.as_str(), "***");
+    }
+    out
+}
+
+fn holds_secret(text: &str, secrets: &BTreeSet<String>) -> bool {
+    mask(text, secrets) != text
 }
 
 /// The `.env` Watt would read: the given one, else the nearest `.env` from `root` upwards.
@@ -390,7 +448,7 @@ fn load_vars(root: &Path, explicit: Option<&Path>) -> Result<Vars, String> {
         v.map = parse_dotenv(&text);
     }
     let file_keys: BTreeSet<String> = v.map.keys().cloned().collect();
-    for (k, val) in std::env::vars() {
+    for (k, val) in crate::migrate::env_utf8() {
         v.map.insert(k, val);
     }
     v.file_only = file_keys.into_iter().filter(|k| std::env::var_os(k).is_none()).collect();
@@ -494,16 +552,21 @@ fn find_template(s: &str) -> Option<(usize, usize, &str)> {
     None
 }
 
-fn replace_str(s: &str, vars: &Vars, ph: &mut Placeholders) -> String {
+/// Watt's substitution: the first placeholder is replaced, the result is scanned again (a value
+/// that holds a placeholder is replaced too; a loop stops after 32 rounds). `values` collects what
+/// came from the environment or a `.env` file.
+fn expand(s: &str, vars: &Vars, ph: &mut Placeholders, values: &mut Vec<String>) -> String {
     let mut s = s.to_string();
-    // A value that holds a placeholder is replaced again; a loop (A={A}) stops.
     for _ in 0..32 {
         let Some((start, end, name)) = find_template(&s) else { break };
         let name = name.to_string();
         let value = match vars.map.get(&name) {
             Some(v) => {
-                if name != "PLT_ROOT" && !vars.file_only.contains(&name) {
-                    ph.from_process.insert(name.clone());
+                if name != "PLT_ROOT" {
+                    if !vars.file_only.contains(&name) {
+                        ph.from_process.insert(name.clone());
+                    }
+                    values.push(v.clone());
                 }
                 v.clone()
             }
@@ -515,6 +578,27 @@ fn replace_str(s: &str, vars: &Vars, ph: &mut Placeholders) -> String {
         s.replace_range(start..end, &value);
     }
     s
+}
+
+fn replace_str(s: &str, vars: &Vars, ph: &mut Placeholders) -> String {
+    let mut values = Vec::new();
+    let out = expand(s, vars, ph, &mut values);
+    values.retain(|v| is_secret_value(v));
+    if !values.is_empty() {
+        values.sort();
+        values.dedup();
+        // The placeholders of the string itself, each as Watt fills it in.
+        let mut first = Vec::new();
+        let mut rest = s;
+        while let Some((start, end, name)) = find_template(rest) {
+            let value = expand(&rest[start..end], vars, &mut Placeholders::default(), &mut Vec::new());
+            let secret = name != "PLT_ROOT" && vars.map.contains_key(name) && is_secret_value(&value);
+            first.push(Filled { name: name.to_string(), value, secret });
+            rest = &rest[end..];
+        }
+        ph.strings.insert(out.clone(), Subst { template: s.to_string(), values, first });
+    }
+    out
 }
 
 /// Every string value in a config, like Watt's `replaceEnv` (keys are left as they are).
@@ -557,6 +641,8 @@ struct Project {
     entries: Vec<Entry>,
     /// What the project's `.env` file holds.
     dotenv: BTreeMap<String, String>,
+    /// What `{NAME}` placeholders see (the `.env` file, then the environment of this command).
+    vars: Vars,
     entrypoint: Option<String>,
     notes: Vec<Note>,
     placeholders: Placeholders,
@@ -703,6 +789,7 @@ fn load_project(o: &Opts) -> Result<Project, String> {
         runtime: Value::Null,
         entries: Vec::new(),
         dotenv,
+        vars: vars.clone(),
         entrypoint: None,
         notes,
         placeholders: Placeholders::default(),
@@ -855,6 +942,8 @@ enum Run {
     Script(PathBuf),
     /// A command line: the application's `commands.production`, or `--command`.
     Command(String),
+    /// A shell command that reads values of the env file as `$NAME` (the config holds no secret).
+    Shell(String),
 }
 
 #[derive(Debug, Default)]
@@ -887,9 +976,39 @@ struct WattApp {
     skip: Option<String>,
     /// The Warden app name, once generated.
     name: String,
+    /// Values from the environment or a `.env` file that went into the command line or into text of
+    /// the report: never printed, and the config that holds them is private.
+    secrets: BTreeSet<String>,
+    /// The placeholders those values filled.
+    secret_names: BTreeSet<String>,
+    /// How `application.commands.production` was written, when a placeholder was in it.
+    cmd_sub: Option<Subst>,
+    /// The other applications of this run that listen on the same port.
+    port_clash: Vec<String>,
 }
 
 impl WattApp {
+    /// A config string is about to reach the command line or the report: if a value went into it,
+    /// remember not to print that value.
+    fn taint(&mut self, ph: &Placeholders, s: &str) {
+        if let Some(sub) = ph.strings.get(s) {
+            self.secrets.extend(sub.values.iter().cloned());
+            self.secret_names.extend(sub.first.iter().filter(|f| f.secret).map(|f| f.name.clone()));
+        }
+    }
+
+    fn taint_all(&mut self, ph: &Placeholders, list: &[String]) {
+        for s in list {
+            self.taint(ph, s);
+        }
+    }
+
+    /// `text` for the screen or the report: without the values from the environment that this
+    /// application's command line and settings hold.
+    fn hide(&self, text: &str) -> String {
+        mask(text, &self.secrets)
+    }
+
     fn map(&mut self, field: &str, to: impl Into<String>) {
         self.mapped.push((field.into(), to.into()));
     }
@@ -1123,7 +1242,10 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
         if p.single {
             // The project's config is the application's config.
             match read_config(path) {
-                Ok(c) => cfg = c,
+                Ok(mut c) => {
+                    replace_env(&mut c, &p.vars, ph);
+                    cfg = c;
+                }
                 Err(err) => a.skip = Some(err),
             }
         } else {
@@ -1150,7 +1272,12 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
         return a;
     }
     let Some(dir) = a.dir.clone() else {
-        a.skip = Some(match e.raw.get("url").and_then(jstr) {
+        let url = e.raw.get("url").and_then(jstr).map(String::from);
+        if let Some(u) = &url {
+            // A token may be part of it (`https://{TOKEN}@host/repo.git`).
+            a.taint(ph, u);
+        }
+        a.skip = Some(match url {
             Some(u) => format!(
                 "it is external ({u}) and has not been resolved: run Watt's `resolve` on the project, then migrate \
                  again (its code is expected in {}/external/{}/)",
@@ -1183,6 +1310,10 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
                 for item in list {
                     if let Some(id) = item.get("id").and_then(jstr) {
                         let prefix = item.get("proxy").and_then(|x| x.get("prefix")).and_then(jstr);
+                        a.taint(ph, id);
+                        if let Some(pre) = prefix {
+                            a.taint(ph, pre);
+                        }
                         listed.push(match prefix {
                             Some(pre) => format!("{id} ({pre})"),
                             None => id.to_string(),
@@ -1210,11 +1341,16 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
             a.run = Some(Run::Command(c));
         }
         (None, Some(c)) => {
+            // Whether a value from the environment is in it is dealt with once the environment is known.
+            a.cmd_sub = ph.strings.get(&c).cloned();
             a.map("application.commands.production", format!("runs `{c}`"));
             a.run = Some(Run::Command(c));
         }
         (None, None) if module == "@platformatic/node" => match node_entry(&dir, &cfg) {
             Ok(f) => {
+                if let Some(m) = cfg.get("node").and_then(|n| n.get("main")).and_then(jstr) {
+                    a.taint(ph, m);
+                }
                 a.map("entry", format!("node {}", f.display()));
                 if std::fs::metadata(&f).is_ok_and(|m| m.len() < 2 << 20) {
                     if let Ok(text) = std::fs::read_to_string(&f) {
@@ -1244,6 +1380,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
     }
     let scripted = matches!(a.run, Some(Run::Script(_)));
     if let Some(b) = capp.get("commands").and_then(|c| c.get("build")).and_then(jstr) {
+        a.taint(ph, b);
         a.note(
             "application.commands.build",
             Kind::Check,
@@ -1253,6 +1390,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
         );
     }
     if let Some(base) = capp.get("basePath").and_then(jstr) {
+        a.taint(ph, base);
         a.note(
             "application.basePath",
             Kind::Unsupported,
@@ -1309,8 +1447,15 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
 
     // Stop, restart, start timeouts.
     if let Some(ms) = rcfg("gracefulShutdown").and_then(|g| g.get("application")).and_then(jnum) {
-        a.grace_ms = ms.max(1);
+        a.grace_ms = ms.clamp(1, MAX_SECONDS_MS);
         a.map("gracefulShutdown.application", format!("[shutdown] grace_period = {}", a.grace_ms.div_ceil(1000)));
+        if ms > MAX_SECONDS_MS {
+            a.note(
+                "gracefulShutdown.application",
+                Kind::Approximated,
+                format!("{ms} ms is more than Warden accepts: grace_period is at most 3600 s"),
+            );
+        }
     } else {
         a.map("gracefulShutdown.application", "[shutdown] grace_period = 10 (Watt's default)");
     }
@@ -1326,16 +1471,23 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
                     a.autorestart = false;
                     a.map("restartOnError", "[restart] enabled = false");
                 }
-                Some(ms) if ms >= 10 => {
+                Some(wanted) if wanted >= 10 => {
+                    // backoff_max is 16 times the delay (at least 10 s) and may not pass an hour.
+                    let ms = wanted.min(MAX_RESTART_DELAY_MS);
                     a.restart_delay_ms = Some(ms);
                     a.map("restartOnError", format!("[restart] backoff_initial = {ms}"));
                     a.note(
                         "restartOnError",
                         Kind::Approximated,
                         format!(
-                            "Watt waits {ms} ms before every restart; Warden restarts at once after the first crash and \
-                             doubles the delay from {ms} ms per crash in a row (up to {} ms)",
-                            (ms * 16).max(10_000)
+                            "Watt waits {wanted} ms before every restart; Warden restarts at once after the first crash \
+                             and doubles the delay from {ms} ms per crash in a row (up to {} ms){}",
+                            ms.saturating_mul(16).max(10_000),
+                            if wanted > ms {
+                                format!(". {wanted} ms is more than Warden accepts (backoff_max is at most 3600000 ms), so {ms} ms is used")
+                            } else {
+                                String::new()
+                            }
                         ),
                     );
                 }
@@ -1355,8 +1507,18 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
     );
     if let Some(ms) = rcfg("startTimeout").and_then(jnum) {
         if ms > 0 {
-            a.ready_ms = Some(ms);
-            a.map("startTimeout", format!("[workers] ready_timeout = {}", ms.div_ceil(1000).max(1)));
+            a.ready_ms = Some(ms.min(MAX_SECONDS_MS));
+            a.map(
+                "startTimeout",
+                format!("[workers] ready_timeout = {}", ms.min(MAX_SECONDS_MS).div_ceil(1000).max(1)),
+            );
+            if ms > MAX_SECONDS_MS {
+                a.note(
+                    "startTimeout",
+                    Kind::Approximated,
+                    format!("{ms} ms is more than Warden accepts: ready_timeout is at most 3600 s"),
+                );
+            }
         } else {
             a.note(
                 "startTimeout",
@@ -1412,12 +1574,16 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
 
     // Flags for the node process (only when Warden runs `node <file>`).
     let mut node_flags = Vec::new();
-    node_flags.extend(jstrings(ecfg("execArgv")));
+    let exec_argv = jstrings(ecfg("execArgv"));
+    a.taint_all(ph, &exec_argv);
+    node_flags.extend(exec_argv);
     if let Some(n) = ecfg("nodeOptions").and_then(jstr) {
+        a.taint(ph, n);
         node_flags.extend(n.split_whitespace().map(String::from));
     }
     let mut preload = jstrings(rcfg("preload"));
     preload.extend(jstrings(ecfg("preload")));
+    a.taint_all(ph, &preload);
     for f in &preload {
         node_flags.push("--import".into());
         node_flags.push(app_dir(&p.root, f).display().to_string());
@@ -1448,6 +1614,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
     }
     if let Some(args) = ecfg("arguments") {
         let args = jstrings(Some(args));
+        a.taint_all(ph, &args);
         if scripted {
             a.script_args = args.clone();
             a.map("arguments", format!("arguments after the script: {}", args.join(" ")));
@@ -1483,6 +1650,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
 
     // Keys with nothing to map.
     if let Some(d) = ecfg("dependencies").filter(|d| d.as_array().is_some_and(|d| !d.is_empty())) {
+        a.taint_all(ph, &jstrings(Some(d)));
         a.note(
             "dependencies",
             Kind::Unsupported,
@@ -1523,6 +1691,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
 
     // Environment, then the port.
     collect_env(p, e, &dir, &mut a);
+    shellify(&mut a, &dir, &p.root);
     // The listen port: the entry point's is `server.port`; an application's own PORT is its own.
     let server = rcfg("server");
     let from_env = a.env.get("PORT").and_then(|v| v.parse::<u16>().ok()).filter(|p| *p > 0);
@@ -1563,6 +1732,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
         if let Some(h) =
             server.and_then(|s| s.get("hostname")).and_then(jstr).filter(|h| !matches!(*h, "0.0.0.0" | "::" | "[::]"))
         {
+            a.taint(ph, h);
             a.note(
                 "server.hostname",
                 Kind::Check,
@@ -1599,7 +1769,7 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
                 _ => false,
             }
         }
-        None => false,
+        Some(Run::Shell(_)) | None => false,
     };
     if a.count > 1 && a.port.is_some() && !shim && !a.offset_ports {
         a.note(
@@ -1615,6 +1785,98 @@ fn convert(p: &Project, e: &Entry, o: &Opts, inherit: &Workers, ph: &mut Placeho
         a.count = 1;
     }
     a
+}
+
+/// How far into a shell command text is: not in quotes, in single quotes, or in double quotes.
+#[derive(Clone, Copy, PartialEq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+}
+
+/// The quoting state after `text`, which starts in `from`.
+fn quote_after(mut q: Quote, text: &str) -> Quote {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        q = match (q, c) {
+            (Quote::None, '\\') | (Quote::Double, '\\') => {
+                chars.next();
+                q
+            }
+            (Quote::None, '\'') => Quote::Single,
+            (Quote::None, '"') => Quote::Double,
+            (Quote::Single, '\'') | (Quote::Double, '"') => Quote::None,
+            _ => q,
+        };
+    }
+    q
+}
+
+/// A command with `{NAME}` placeholders as shell text: a value that could be a secret becomes a
+/// reference to the variable `NAME` (quoted for where it stands), every other placeholder its value.
+fn shell_text(sub: &Subst) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = sub.template.as_str();
+    let mut q = Quote::None;
+    let mut fills = sub.first.iter();
+    while let Some((start, end, _)) = find_template(rest) {
+        let lit = &rest[..start];
+        out += lit;
+        q = quote_after(q, lit);
+        let f = fills.next()?;
+        if f.secret {
+            out += &match q {
+                Quote::None => format!("\"${{{}}}\"", f.name),
+                Quote::Double => format!("${{{}}}", f.name),
+                // Leave the single quotes for the reference and go back into them.
+                Quote::Single => format!("'\"${{{}}}\"'", f.name),
+            };
+        } else {
+            out += &f.value;
+            q = quote_after(q, &f.value);
+        }
+        rest = &rest[end..];
+    }
+    out += rest;
+    Some(out)
+}
+
+/// The command of an application has a value from the environment or a `.env` file in it. Warden has
+/// no placeholders, so the value would land in the config as plain text. A shell command is written
+/// to read it from the env file (mode 0600) instead; any other command keeps the value, and the
+/// config that holds it is private and never printed.
+fn shellify(a: &mut WattApp, dir: &Path, root: &Path) {
+    let Some(Run::Command(c)) = a.run.clone() else { return };
+    let Some(sub) = a.cmd_sub.take() else { return };
+    a.secrets.extend(sub.values.iter().cloned());
+    let secret: Vec<&Filled> = sub.first.iter().filter(|f| f.secret).collect();
+    let names: Vec<String> = secret.iter().map(|f| f.name.clone()).collect();
+    a.secret_names.extend(names.iter().cloned());
+    let is_shell = matches!(launch_for_command(&c, dir, root, a.prefer_local).0, Launch::Shell(_));
+    // The variable must hold exactly the value Watt put there: not be set to another one.
+    let usable = secret
+        .iter()
+        .all(|f| crate::config::valid_env_name(&f.name) && a.env.get(&f.name).is_none_or(|v| *v == f.value));
+    let text = if is_shell && usable { shell_text(&sub) } else { None };
+    let Some(text) = text else { return };
+    for f in secret {
+        a.env.entry(f.name.clone()).or_insert_with(|| f.value.clone());
+    }
+    for m in a.mapped.iter_mut().filter(|m| m.0 == "application.commands.production") {
+        m.1 = format!("runs `{text}` through `sh -c`");
+    }
+    a.note(
+        "application.commands.production",
+        Kind::Approximated,
+        format!(
+            "Watt fills {} in when it reads the config; Warden has no placeholders, so the command reads \
+             {} from the environment and the value is in the app's env file (mode 0600), not in the config",
+            names.iter().map(|n| format!("`{{{n}}}`")).collect::<Vec<_>>().join(", "),
+            names.iter().map(|n| format!("`${n}`")).collect::<Vec<_>>().join(", "),
+        ),
+    );
+    a.run = Some(Run::Shell(text));
 }
 
 /// The environment of an application, in Watt's order: the runtime's `.env`, then the application's
@@ -1803,12 +2065,57 @@ fn rcfg<'a>(r: &'a Value, k: &str) -> Option<&'a Value> {
 
 // ---------------------------------------------------------------------- generating
 
+/// `s` as one line of a comment: no line break and no other control character.
+fn one_line(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+/// A name that Warden cannot use because it is a directory (`.`, `..`), as it ends up after cleaning;
+/// what to call the app instead.
+fn directory_name(wanted: &str) -> Option<String> {
+    let cleaned: String =
+        wanted.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '-' }).collect();
+    let cleaned = cleaned.trim_matches('-');
+    (!cleaned.is_empty() && cleaned.chars().all(|c| c == '.')).then(|| match cleaned.len() {
+        1 => "app-dot".to_string(),
+        2 => "app-dotdot".to_string(),
+        n => format!("app-dots{n}"),
+    })
+}
+
+/// What `Config::parse` said, without the lines of the config it quotes (a TOML syntax error shows the
+/// line, and the line may hold a value from the environment) and with every known secret hidden.
+fn describe_invalid(error: &str, secrets: &BTreeSet<String>) -> String {
+    let kept: Vec<&str> = error
+        .lines()
+        .filter(|l| {
+            let rest = l.trim_start().trim_start_matches(|c: char| c.is_ascii_digit());
+            !(rest.starts_with('|') || rest.starts_with(" |"))
+        })
+        .collect();
+    mask(&kept.join("\n"), secrets)
+}
+
 /// The Warden config (TOML) and env file for one application; `name` is filled in.
 fn generate(a: &mut WattApp, p: &Project, o: &Opts, namespace: Option<&str>) -> Result<(String, String), String> {
     let Some(run) = a.run.clone() else { return Err("nothing to run".into()) };
     let dir = a.dir.clone().ok_or("no directory")?;
+    let wanted = format!("{}{}", o.prefix.as_deref().map(|p| format!("{p}-")).unwrap_or_default(), a.id);
+    let wanted = match directory_name(&wanted) {
+        Some(new) => {
+            a.note(
+                "name",
+                Kind::Approximated,
+                format!(
+                    "{wanted:?} names a directory, which Warden does not accept as an app name: the app is {new:?}"
+                ),
+            );
+            new
+        }
+        None => wanted,
+    };
     let mut so = StartOpts {
-        name: Some(format!("{}{}", o.prefix.as_deref().map(|p| format!("{p}-")).unwrap_or_default(), a.id)),
+        name: Some(wanted),
         instances: Some(a.count.to_string()),
         port: a.port,
         namespace: namespace.map(String::from),
@@ -1838,20 +2145,23 @@ fn generate(a: &mut WattApp, p: &Project, o: &Opts, namespace: Option<&str>) -> 
             so.script_args = args;
             l
         }
+        Run::Shell(c) => Launch::Shell(c.clone()),
     };
     let (name, text) = fleet::quick_config(&launch, &so)?;
     a.name = name.clone();
     let env_file = format!("{name}.env");
-    let mut out = String::new();
-    for line in text.lines() {
-        if line.starts_with("# Written by") {
-            out += &format!(
-                "# Written by `warden migrate-wattpm` from the Watt application {:?} of {}. Every setting: warden.example.toml\n",
-                a.id,
-                p.config_path.display()
-            );
-            continue;
-        }
+    // The header is written here, from the application and the project: the one `warden start` writes
+    // names the command, which may be anything.
+    let mut out = format!(
+        "# Written by `warden migrate-wattpm` from the Watt application {:?} of {}. Every setting: warden.example.toml\n",
+        a.id,
+        one_line(&p.config_path.display().to_string())
+    );
+    let body = match text.split_once('\n') {
+        Some((first, rest)) if first.starts_with("# Written by") => rest,
+        _ => text.as_str(),
+    };
+    for line in body.lines() {
         out += line;
         out += "\n";
         if line.starts_with("working_directory = ") && !a.env.is_empty() {
@@ -1861,7 +2171,27 @@ fn generate(a: &mut WattApp, p: &Project, o: &Opts, namespace: Option<&str>) -> 
             out += "port_strategy = \"offset\"\n";
         }
     }
-    Config::parse(&out).map_err(|e| format!("the generated config is invalid: {e}\n{out}"))?;
+    // Never the config itself: it may hold a value from the environment.
+    Config::parse(&out)
+        .map_err(|e| format!("the generated config is invalid: {}", describe_invalid(&e, &a.secrets)))?;
+    if holds_secret(&out, &a.secrets) {
+        let names: Vec<String> = a.secret_names.iter().map(|n| format!("`{{{n}}}`")).collect();
+        a.note(
+            "placeholders",
+            Kind::Check,
+            format!(
+                "{} filled in from the environment or a `.env` file, and the value is part of the command line in the \
+                 config (Warden has no placeholders). The config is written with mode 0600; the value is shown as *** \
+                 here and in --dry-run. If the program can read it from its environment, take it off the command \
+                 line: the env file already holds the variables of your `.env`",
+                if names.is_empty() {
+                    "A placeholder was".to_string()
+                } else {
+                    format!("{} {}", names.join(", "), if names.len() == 1 { "was" } else { "were" })
+                }
+            ),
+        );
+    }
     let mut env = String::from("# Environment for this app (secrets live here, not in the config). Mode 0600.\n");
     for (k, v) in a.env.iter().filter(|(k, _)| crate::config::valid_env_name(k)) {
         env += &format!("{k}={}\n", env_quote(v));
@@ -1902,11 +2232,11 @@ fn report(p: &Project, apps: &[WattApp], extra: &[Note]) -> String {
     r += "\n";
     for a in apps {
         if let Some(why) = &a.skip {
-            r += &format!("## {} (not converted)\n\n- Why: {why}\n\n", a.id);
+            r += &a.hide(&format!("## {} (not converted)\n\n- Why: {why}\n\n", a.id));
             continue;
         }
-        r += &format!("## {} → {}\n\n", a.id, a.name);
-        r += &format!(
+        let mut sec = format!("## {} → {}\n\n", a.id, a.name);
+        sec += &format!(
             "- Role: {}\n",
             if a.entrypoint {
                 "the entry point: Watt serves it on the runtime's public port".to_string()
@@ -1914,26 +2244,26 @@ fn report(p: &Project, apps: &[WattApp], extra: &[Note]) -> String {
                 "internal: Watt reaches it only inside the runtime, as `http://<id>.plt.local`".to_string()
             }
         );
-        r += &format!("- Type: {} ({})\n", type_label(&a.module), a.module);
-        r += &format!(
+        sec += &format!("- Type: {} ({})\n", type_label(&a.module), a.module);
+        sec += &format!(
             "- Mode: processes ({} instance{}; {}, and Warden's worker mode is Bun only)\n",
             a.count,
             if a.count == 1 { "" } else { "s" },
-            if matches!(a.run, Some(Run::Command(_))) {
+            if matches!(a.run, Some(Run::Command(_) | Run::Shell(_))) {
                 "Watt ran the command as a child process of the runtime"
             } else {
                 "Watt ran them as worker threads of one process"
             }
         );
         if let Some(d) = &a.dir {
-            r += &format!("- Directory: {} (Watt does not change into it; Warden does)\n", d.display());
+            sec += &format!("- Directory: {} (Watt does not change into it; Warden does)\n", d.display());
         }
         for (field, to) in &a.mapped {
-            r += &format!("- {field}: mapped: {to}\n");
+            sec += &format!("- {field}: mapped: {to}\n");
         }
         if !a.env.is_empty() {
             let names: Vec<&str> = a.env.keys().map(String::as_str).collect();
-            r += &format!(
+            sec += &format!(
                 "- Environment kept ({}): {} (values in {}.env, mode 0600)\n",
                 names.len(),
                 names.join(", "),
@@ -1941,23 +2271,24 @@ fn report(p: &Project, apps: &[WattApp], extra: &[Note]) -> String {
             );
         }
         if !a.dropped_env.is_empty() {
-            r += &format!(
+            sec += &format!(
                 "- Environment left out ({}): {}. PORT in a shared `.env` or `env` is the entry point's; this application would bind it too\n",
                 a.dropped_env.len(),
                 a.dropped_env.join(", ")
             );
         }
         if !a.bad_env.is_empty() {
-            r += &format!(
+            sec += &format!(
                 "- Environment not carried over ({}): {} are not valid variable names (letters, digits and _, not starting with a digit), so an env file cannot hold them\n",
                 a.bad_env.len(),
                 a.bad_env.join(", ")
             );
         }
         for n in &a.notes {
-            r += &format!("- {}: {}: {}\n", n.field, n.kind.label(), n.text);
+            sec += &format!("- {}: {}: {}\n", n.field, n.kind.label(), n.text);
         }
-        r += "\n";
+        sec += "\n";
+        r += &a.hide(&sec);
     }
     r += "## The runtime\n\n";
     let mut general = vec![
@@ -2115,6 +2446,7 @@ fn convert_all(o: &Opts) -> Result<Converted, String> {
         let Some(pt) = a.port else { continue };
         let others: Vec<&str> =
             ported.iter().filter(|(id, q)| *q == pt && *id != a.id).map(|(id, _)| id.as_str()).collect();
+        a.port_clash = others.iter().map(|id| id.to_string()).collect();
         if !others.is_empty() {
             a.note(
                 "port",
@@ -2130,21 +2462,51 @@ fn convert_all(o: &Opts) -> Result<Converted, String> {
     Ok((p, apps, texts))
 }
 
+/// Why `path` may not be written: a link (writing through it would change the file it points to) or,
+/// without `--overwrite`, anything that is there already.
+fn blocked(path: &Path, overwrite: bool) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => Some(format!(
+            "{} is a symbolic link: not writing through it (remove it, or point --out at a real directory)",
+            path.display()
+        )),
+        Ok(_) if !overwrite => Some(format!("{} exists; left as it is (--overwrite replaces it)", path.display())),
+        _ => None,
+    }
+}
+
+/// An application that was written, for the cutover.
+struct Written {
+    id: String,
+    name: String,
+    cfg: PathBuf,
+    port: Option<u16>,
+    /// The other applications of this run on the same port.
+    clash: Vec<String>,
+}
+
 async fn run_inner(args: &Args, o: &Opts) -> Result<i32, String> {
     let (p, mut apps, texts) = convert_all(o)?;
     let out_dir = o.out.clone().unwrap_or_else(fleet::config_dir);
     let mut code = 0;
-    let mut written: Vec<(String, PathBuf)> = Vec::new();
+    let mut written: Vec<Written> = Vec::new();
     for (a, text) in apps.iter_mut().zip(texts) {
         let Some((toml, env)) = text else {
-            eprintln!("warden: {}: not converted: {}", a.id, a.skip.as_deref().unwrap_or("?"));
+            eprintln!("warden: {}: not converted: {}", a.id, a.hide(a.skip.as_deref().unwrap_or("?")));
             code = 1;
             continue;
         };
         let cfg_path = out_dir.join(format!("{}.toml", a.name));
         let env_name = format!("{}.env", a.name);
+        // A command line that holds a value from the environment: the config is as private as the env file.
+        let private = holds_secret(&toml, &a.secrets);
         if o.dry_run {
-            println!("# ---- {}\n{toml}", cfg_path.display());
+            println!(
+                "# ---- {}{}\n{}",
+                cfg_path.display(),
+                if private { " (the value is shown as ***; the file is written with mode 0600)" } else { "" },
+                a.hide(&toml)
+            );
             if !a.env.is_empty() {
                 println!(
                     "# ---- {} (values not shown)\n{}",
@@ -2154,23 +2516,48 @@ async fn run_inner(args: &Args, o: &Opts) -> Result<i32, String> {
             }
             continue;
         }
-        if cfg_path.exists() && !o.overwrite {
-            eprintln!("warden: {}: {} exists; left as it is (--overwrite replaces it)", a.id, cfg_path.display());
-            a.skip = Some(format!("{} exists and --overwrite was not given", cfg_path.display()));
+        // Nothing is written through a link, and nothing that is there is replaced without --overwrite
+        // (the env file may hold what the app needs and nothing else has).
+        let targets = [Some(cfg_path.clone()), Some(out_dir.join(&env_name)).filter(|_| !a.env.is_empty())];
+        if let Some(why) = targets.iter().flatten().find_map(|t| blocked(t, o.overwrite)) {
+            eprintln!("warden: {}: {why}", a.id);
+            a.skip = Some(why);
             code = 1;
             continue;
         }
-        if !a.env.is_empty() {
-            write_file(&out_dir.join(&env_name), &env, 0o600)?;
+        let write = |path: &Path, text: &str, mode: u32| {
+            if o.overwrite {
+                crate::migrate::write_file(path, text, mode)
+            } else {
+                crate::migrate::write_new_file(path, text, mode)
+            }
+        };
+        let done = (|| {
+            if !a.env.is_empty() {
+                write(&out_dir.join(&env_name), &env, 0o600)?;
+            }
+            write(&cfg_path, &toml, if private { 0o600 } else { 0o644 })
+        })();
+        if let Err(e) = done {
+            eprintln!("warden: {}: {}", a.id, a.hide(&e));
+            a.skip = Some(e);
+            code = 1;
+            continue;
         }
-        write_file(&cfg_path, &toml, 0o644)?;
         println!(
-            "{}: wrote {}{}",
+            "{}: wrote {}{}{}",
             a.id,
             cfg_path.display(),
-            if a.env.is_empty() { String::new() } else { format!(" and {env_name}") }
+            if a.env.is_empty() { String::new() } else { format!(" and {env_name}") },
+            if private { " (mode 0600: it holds a value from the environment)" } else { "" }
         );
-        written.push((a.name.clone(), cfg_path));
+        written.push(Written {
+            id: a.id.clone(),
+            name: a.name.clone(),
+            cfg: cfg_path,
+            port: a.port,
+            clash: a.port_clash.clone(),
+        });
     }
     let md = report(&p, &apps, &project_notes(&p));
     if o.dry_run {
@@ -2178,7 +2565,7 @@ async fn run_inner(args: &Args, o: &Opts) -> Result<i32, String> {
         return Ok(code);
     }
     let report_path = out_dir.join(REPORT);
-    write_file(&report_path, &md, 0o644)?;
+    crate::migrate::write_file(&report_path, &md, 0o644)?;
     println!("report: {}", report_path.display());
     if let Some(mode) = o.cutover {
         if cutover(args, &written, mode, &p).await != 0 {
@@ -2188,32 +2575,97 @@ async fn run_inner(args: &Args, o: &Opts) -> Result<i32, String> {
     Ok(code)
 }
 
-/// Start Warden's copy next to the running runtime. Watt is never stopped here.
-async fn cutover(args: &Args, written: &[(String, PathBuf)], mode: Cutover, p: &Project) -> i32 {
+/// How to name an application to `warden start`: by name in the config directory, else by its file.
+fn start_handle(w: &Written) -> String {
+    if w.cfg.parent() == Some(fleet::config_dir().as_path()) { w.name.clone() } else { w.cfg.display().to_string() }
+}
+
+/// Start Warden's copy next to the running runtime. Watt is never stopped here, and neither is
+/// anything this run did not start.
+async fn cutover(args: &Args, written: &[Written], mode: Cutover, p: &Project) -> i32 {
     let mut code = 0;
-    for (name, cfg) in written {
-        println!(
-            "{name}: starting next to Watt ({})",
-            match mode {
-                Cutover::NewPort(port) => format!("new-port:{port}"),
-                _ => "overlap".to_string(),
-            }
+    let how = match mode {
+        Cutover::NewPort(port) => format!("new-port:{port}"),
+        _ => "overlap".to_string(),
+    };
+    // Two programs on one port would both start (Warden shares a port) and the kernel would split the
+    // requests between them: none of them is started.
+    let (clashing, todo): (Vec<&Written>, Vec<&Written>) = written.iter().partition(|w| !w.clash.is_empty());
+    for w in &clashing {
+        eprintln!(
+            "warden: {}: not started: port {} is also the port of {}, and two different programs on one port would \
+             split the requests between them. Give each its own port (`port` in the config{}), then `warden start {}`",
+            w.id,
+            w.port.map(|p| p.to_string()).unwrap_or_default(),
+            w.clash.join(", "),
+            if matches!(mode, Cutover::NewPort(_)) { ", or another --cutover new-port" } else { "" },
+            start_handle(w),
         );
-        if warden_start(args, cfg).await != 0 {
-            warden_stop(args, name).await;
-            eprintln!(
-                "warden: {name}: Warden's workers did not come up; stopped them. Watt was not touched, nothing changed"
-            );
-            code = 1;
-        }
+        code = 1;
     }
-    if code == 0 && !written.is_empty() {
+    let mut started: Vec<&Written> = Vec::new();
+    let mut running = 0;
+    let mut failed: Option<&Written> = None;
+    for w in &todo {
+        let app = fleet::app_from_config(&w.cfg);
+        if app.socket.exists() && fleet::status_of(&app).await.is_ok() {
+            // Its supervisor keeps the config it started with, whatever was written to the file since.
+            println!(
+                "{}: already running with its previous config; not started again. `warden reload {}` applies {}",
+                w.name,
+                w.name,
+                w.cfg.display()
+            );
+            running += 1;
+            continue;
+        }
+        println!("{}: starting next to Watt ({how})", w.name);
+        if warden_start(args, &w.cfg).await != 0 {
+            warden_stop(args, &w.name).await;
+            failed = Some(w);
+            break;
+        }
+        started.push(w);
+    }
+    if let Some(bad) = failed {
+        // All or nothing: what this run started next to Watt is stopped again.
+        for w in started.iter().rev() {
+            warden_stop(args, &w.name).await;
+        }
+        let names: Vec<&str> = started.iter().map(|w| w.name.as_str()).collect();
+        eprintln!(
+            "warden: {}: Warden's workers did not come up; stopped them. {}Watt was not touched. Fix it (the configs \
+             are written), then `warden start {}`",
+            bad.name,
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Stopped {} too, which this run had started: nothing of this run is left running. ",
+                    names.join(", ")
+                )
+            },
+            start_handle(bad),
+        );
+        return 1;
+    }
+    if !started.is_empty() {
         println!(
-            "Warden serves {} app(s) next to the running Watt runtime; wattpm was not touched. When they answer \
-             as they should, switch your proxy if the port changed and stop Watt yourself: `wattpm stop {}` stops \
-             every application of the runtime. Applications without a port run twice until then.",
-            written.len(),
+            "Warden serves {} app(s) next to the running Watt runtime ({}); wattpm was not touched. `warden stop {}` \
+             stops them. When they answer as they should, switch your proxy if the port changed and stop Watt \
+             yourself: `wattpm stop {}` stops every application of the runtime. Applications without a port run \
+             twice until then.",
+            started.len(),
+            started.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(", "),
+            started.iter().map(|w| w.name.as_str()).collect::<Vec<_>>().join(" "),
             p.name
+        );
+    }
+    if !clashing.is_empty() {
+        eprintln!(
+            "warden: not started: {} (the reason is above){}",
+            clashing.iter().map(|w| w.id.as_str()).collect::<Vec<_>>().join(", "),
+            if started.is_empty() && running == 0 { String::new() } else { "; the others were started".to_string() }
         );
     }
     code
@@ -3098,5 +3550,253 @@ mod tests {
             let parsed = crate::config::parse_env_file(&env).unwrap();
             assert_eq!(parsed["DB_URL"], "postgres://u:p w@h/db");
         }
+    }
+
+    const TOKEN: &str = "s3cr3t-value-123";
+
+    /// A project with one entry point, `web`, whose own watt.json is `app_cfg`, and a `.env`.
+    fn project_with(t: &Tmp, dotenv: &str, app_cfg: Value) {
+        node_app(t, "web", "server.js");
+        t.write(".env", dotenv);
+        t.json("web/watt.json", app_cfg);
+        t.json(
+            "watt.json",
+            json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "web"}]}),
+        );
+    }
+
+    fn production(cmd: &str) -> Value {
+        json!({"$schema": NODE, "application": {"commands": {"production": cmd}}})
+    }
+
+    #[test]
+    fn a_secret_in_a_shell_command_is_read_from_the_env_file_not_written_into_the_config() {
+        let t = Tmp::new("shellsecret");
+        project_with(
+            &t,
+            &format!("API_TOKEN={TOKEN}\nWHO=world\nPORT=4821\n"),
+            production(
+                "npm run build && node server.js --token={API_TOKEN} --who='{WHO}' --label=\"{API_TOKEN}\" --port={PORT}",
+            ),
+        );
+        let (p, apps, texts) = convert_ok(&t);
+        let (toml, env) = texts[0].clone().unwrap();
+        assert!(!toml.contains(TOKEN) && !toml.contains("world"), "the config holds a value:\n{toml}");
+        let c = Config::parse(&toml).unwrap();
+        assert_eq!((c.app.command.as_str(), c.app.args[0].as_str()), ("sh", "-c"));
+        // Each reference is quoted for where it stands; a value that is not a secret (a port) is inline.
+        assert_eq!(
+            c.app.args[1],
+            "npm run build && node server.js --token=\"${API_TOKEN}\" --who=''\"${WHO}\"'' --label=\"${API_TOKEN}\" --port=4821"
+        );
+        let parsed = crate::config::parse_env_file(&env).unwrap();
+        assert_eq!((parsed["API_TOKEN"].as_str(), parsed["WHO"].as_str()), (TOKEN, "world"));
+        assert!(!holds_secret(&toml, &apps[0].secrets), "the config needs no mode 0600: it holds nothing secret");
+        let md = report(&p, &apps, &[]);
+        assert!(!md.contains(TOKEN), "{md}");
+        assert!(md.contains("${API_TOKEN}") && md.contains("mode 0600"), "{md}");
+        assert!(has_note(&apps[0], "application.commands.production", Kind::Approximated));
+    }
+
+    #[test]
+    fn the_shell_text_of_a_command_does_what_watts_substituted_command_does() {
+        // The command with the value pasted in (what Watt runs) and the one that reads it from the
+        // environment (what Warden runs) print the same.
+        let template = "printf '[%s]' a{T}b '{T}' \"{T}\" {T} \"x'{T}'y\" '\"{T}\"'; echo";
+        let value = "s3cr3t-value-123";
+        let vars = Vars { map: [("T".to_string(), value.to_string())].into(), file_only: ["T".to_string()].into() };
+        let mut ph = Placeholders::default();
+        let pasted = replace_str(template, &vars, &mut ph);
+        let sub = ph.strings.get(&pasted).unwrap();
+        let reading = shell_text(sub).unwrap();
+        assert!(!reading.contains(value), "{reading}");
+        let run = |cmd: &str| {
+            let o = std::process::Command::new("sh").arg("-c").arg(cmd).env("T", value).output().unwrap();
+            assert!(o.status.success(), "{cmd}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        assert_eq!(run(&reading), run(&pasted), "{reading}");
+        // One word, whatever the value holds: the shell does not split or expand it.
+        let odd = "a b $HOME `id` 'q' \"d\"";
+        let o = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                shell_text(&Subst {
+                    template: "printf '<%s>' {T}".into(),
+                    first: vec![Filled { name: "T".into(), value: odd.into(), secret: true }],
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .env("T", odd)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout), format!("<{odd}>"));
+    }
+
+    #[test]
+    fn a_secret_in_a_program_command_is_masked_everywhere_and_the_config_is_private() {
+        let t = Tmp::new("progsecret");
+        project_with(&t, &format!("API_TOKEN={TOKEN}\n"), production("node server.js --token={API_TOKEN}"));
+        let (p, apps, texts) = convert_ok(&t);
+        let a = &apps[0];
+        let (toml, _) = texts[0].clone().unwrap();
+        // The program needs the value, so the config has it; the rest of Warden must not show it.
+        assert!(toml.contains(TOKEN) && holds_secret(&toml, &a.secrets), "{toml}");
+        assert!(!a.hide(&toml).contains(TOKEN) && a.hide(&toml).contains("--token=***"), "{}", a.hide(&toml));
+        let md = report(&p, &apps, &[]);
+        assert!(!md.contains(TOKEN) && md.contains("--token=***"), "{md}");
+        assert!(md.contains("0600") && md.contains("{API_TOKEN}"), "the report says what happened:\n{md}");
+        assert!(has_note(a, "placeholders", Kind::Check));
+    }
+
+    #[test]
+    fn a_secret_in_arguments_and_exec_argv_is_masked_too() {
+        let t = Tmp::new("flagsecret");
+        node_app(&t, "web", "index.js");
+        t.write(".env", &format!("API_TOKEN={TOKEN}\n"));
+        t.json(
+            "watt.json",
+            json!({"$schema": RUNTIME, "entrypoint": "web",
+                   "applications": [{"id": "web", "path": "web", "execArgv": ["--title={API_TOKEN}"],
+                                     "nodeOptions": "--require={API_TOKEN}", "arguments": ["--token={API_TOKEN}"]}]}),
+        );
+        let (p, apps, texts) = convert_ok(&t);
+        let (toml, _) = texts[0].clone().unwrap();
+        assert!(toml.contains("--title=s3cr3t") && toml.contains("--token=s3cr3t"), "{toml}");
+        assert!(holds_secret(&toml, &apps[0].secrets));
+        let md = report(&p, &apps, &[]);
+        assert!(!md.contains(TOKEN) && md.contains("--token=***") && md.contains("--title=***"), "{md}");
+    }
+
+    #[test]
+    fn a_config_that_fails_validation_is_described_without_its_text() {
+        // A TOML error quotes the line it found; the message must not.
+        let line = format!("[app]\nname = 'a' = '{TOKEN}'\n");
+        let e = Config::parse(&line).unwrap_err();
+        assert!(e.contains(TOKEN), "the premise: {e}");
+        let shown = describe_invalid(&e, &BTreeSet::new());
+        assert!(!shown.contains(TOKEN) && shown.contains("line 2"), "{shown}");
+        // A value the message names is masked.
+        let secrets: BTreeSet<String> = [TOKEN.to_string()].into();
+        assert_eq!(
+            describe_invalid(&format!("invalid type: string \"{TOKEN}\""), &secrets),
+            "invalid type: string \"***\""
+        );
+    }
+
+    #[test]
+    fn a_failing_validation_prints_the_reason_and_not_the_config() {
+        // `perWorkerIncrement` from the last port: the workers' ports do not fit.
+        let t = Tmp::new("invalid");
+        node_app(&t, "web", "index.js");
+        t.write(".env", &format!("API_TOKEN={TOKEN}\n"));
+        t.json("web/watt.json", production("node server.js --token={API_TOKEN}"));
+        t.json(
+            "watt.json",
+            json!({"$schema": RUNTIME, "entrypoint": "web", "workers": 4,
+                   "server": {"port": 65535, "portAssignment": "perWorkerIncrement"},
+                   "applications": [{"id": "web", "path": "web"}]}),
+        );
+        let (p, apps, texts) = convert_ok(&t);
+        assert!(texts[0].is_none());
+        let why = apps[0].skip.clone().unwrap();
+        assert!(why.contains("the generated config is invalid") && why.contains("65535"), "{why}");
+        assert!(!why.contains(TOKEN) && !why.contains("[app]") && !why.contains("args ="), "{why}");
+        assert!(!report(&p, &apps, &[]).contains(TOKEN));
+    }
+
+    #[test]
+    fn a_line_break_in_a_command_stays_out_of_the_header_comment() {
+        let t = Tmp::new("newline");
+        node_app(&t, "web", "index.js");
+        for (name, command) in [
+            ("a", "npm run build &&\nnode server.js"),
+            ("b", "node server.js;\n[limits]\nmax_memory = 1\n# done"),
+            ("c", "node server.js;\r[limits]\rmax_memory = 1"),
+        ] {
+            t.json(
+                "watt.json",
+                json!({"$schema": RUNTIME, "entrypoint": "web", "applications": [{"id": "web", "path": "web"}]}),
+            );
+            let mut o = opts(&t);
+            o.commands = vec![("web".into(), command.into())];
+            let (_, apps, texts) = convert_all(&o).unwrap();
+            let (toml, _) = texts[0].clone().unwrap_or_else(|| panic!("{name}: {:?}", apps[0].skip));
+            let c = Config::parse(&toml).unwrap_or_else(|e| panic!("{name}: {e}\n{toml}"));
+            assert_eq!(c.limits.max_memory, 0, "{name}: the command wrote a [limits] table:\n{toml}");
+            let table: toml::Table = toml.parse().unwrap_or_else(|e| panic!("{name}: {e}\n{toml}"));
+            assert!(table.get("limits").is_none(), "{name}:\n{toml}");
+            assert!(c.app.args.iter().any(|a| a.contains("node server.js")), "{name}: {:?}", c.app.args);
+            let head: Vec<&str> = toml.lines().take(3).collect();
+            assert!(
+                head[0].starts_with("# Written by `warden migrate-wattpm`") && head[1].is_empty() && head[2] == "[app]",
+                "{name}: {head:?}"
+            );
+        }
+        // `warden start` writes the same header: its own is one line, too.
+        for cmd in ["npm run build &&\nnode server.js", "node server.js;\n[limits]\nmax_memory = 1\n# done"] {
+            let (_, text) = fleet::quick_config(&Launch::Shell(cmd.into()), &StartOpts::default()).unwrap();
+            let table: toml::Table = text.parse().unwrap_or_else(|e| panic!("{e}\n{text}"));
+            assert!(table.get("limits").is_none(), "{text}");
+            assert_eq!(Config::parse(&text).unwrap().limits.max_memory, 0, "{text}");
+            assert!(text.lines().next().unwrap().starts_with("# Written by `warden start"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_huge_restart_delay_is_clamped_not_a_panic() {
+        let t = Tmp::new("huge");
+        node_app(&t, "web", "index.js");
+        for (ms, initial) in [(18_446_744_073_709_551_615u64, 225_000u64), (3_600_001, 225_000), (60_000, 60_000)] {
+            t.json(
+                "watt.json",
+                json!({"$schema": RUNTIME, "entrypoint": "web",
+                       "applications": [{"id": "web", "path": "web", "restartOnError": ms}]}),
+            );
+            let (_, apps, texts) = convert_ok(&t);
+            let (toml, _) = texts[0].clone().unwrap_or_else(|| panic!("{ms}: {:?}", apps[0].skip));
+            let c = Config::parse(&toml).unwrap_or_else(|e| panic!("{ms}: {e}\n{toml}"));
+            assert_eq!(c.restart.backoff_initial, initial, "{ms}");
+            assert!(c.restart.backoff_max <= 3_600_000 && c.restart.backoff_max >= c.restart.backoff_initial);
+            let noted = has_note(&apps[0], "restartOnError", Kind::Approximated);
+            assert!(noted, "{ms}");
+            let text = &apps[0].notes.iter().find(|n| n.field == "restartOnError").unwrap().text;
+            assert_eq!(text.contains("more than Warden accepts"), ms > initial, "{ms}: {text}");
+        }
+        // The same for the stop and start timeouts.
+        t.json(
+            "watt.json",
+            json!({"$schema": RUNTIME, "entrypoint": "web", "startTimeout": u64::MAX, "gracefulShutdown": {"application": u64::MAX},
+                   "applications": [{"id": "web", "path": "web"}]}),
+        );
+        let (_, _, texts) = convert_ok(&t);
+        let c = Config::parse(&texts[0].clone().unwrap().0).unwrap();
+        assert_eq!((c.shutdown.grace_period, c.workers.ready_timeout), (3600, 3600));
+    }
+
+    #[test]
+    fn a_name_that_is_a_directory_gets_another_name() {
+        let t = Tmp::new("dots");
+        for (id, name) in [(".", "app-dot"), ("..", "app-dotdot"), ("...", "app-dots3"), (" .. ", "app-dotdot")] {
+            node_app(&t, "web", "index.js");
+            t.json(
+                "watt.json",
+                json!({"$schema": RUNTIME, "entrypoint": id, "applications": [{"id": id, "path": "web"}]}),
+            );
+            let (_, apps, texts) = convert_ok(&t);
+            let (toml, _) = texts[0].clone().unwrap_or_else(|| panic!("{id:?}: {:?}", apps[0].skip));
+            assert_eq!(Config::parse(&toml).unwrap().app.name, name, "{id:?}");
+            assert_eq!(apps[0].name, name);
+            assert!(has_note(&apps[0], "name", Kind::Approximated), "{id:?}");
+        }
+        // Warden itself refuses them.
+        for bad in [".", "..", "..."] {
+            let text = format!("[app]\nname = {bad:?}\ncommand = \"x\"\n");
+            let e = Config::parse(&text).unwrap_err();
+            assert!(e.contains("only dots"), "{bad}: {e}");
+        }
+        assert!(Config::parse("[app]\nname = \"a.b\"\ncommand = \"x\"\n").is_ok());
+        assert!(Config::parse("[app]\nname = \".hidden\"\ncommand = \"x\"\n").is_ok());
     }
 }

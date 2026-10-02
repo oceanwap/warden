@@ -211,36 +211,68 @@ default: `$WARDEN_HOME`, `/etc/warden` for root, else `~/.config/warden`; `--out
 chooses another):
 
 - `<name>.toml`, the Warden config. It is checked with the same parser `warden
-  check` uses before it is written.
+  check` uses before it is written. The header comment is written by this
+  command, not copied from a command line, so a command with a line break cannot
+  leave it.
 - `<name>.env`, mode 0600, the application's environment in Watt's order: the
   runtime's `.env`, the application's own `.env` or `envfile`, the runtime's
   `env`, the application's `env`. `NODE_ENV=production` is added when none is
-  set, as `wattpm start` does. Values go only here; they are never in a config,
-  in the report or in a dry run (which lists the names). The shared `PORT` is
-  left out of internal applications.
+  set, as `wattpm start` does. The shared `PORT` is left out of internal
+  applications. A value from the environment or a `.env` file reaches the env
+  file and, in one case, the config; it is in no other output (see below).
 - `MIGRATION-wattpm.md`, once per run, replaced each time (not `MIGRATION.md`,
   which `pm2-migrate` writes in the same directory). A table of the
   applications, then for each one every setting as **mapped**, **approximated**
   (with the difference), **unsupported** (with the reason) or **check**, then
   what applies to the whole runtime.
 
+Each file is written to a temporary file in the same directory and renamed, so
+a reader never sees half a file. Without `--overwrite` the names are created
+exclusively, so a file that appears meanwhile is not lost.
+
 | Watt | Warden |
 |---|---|
-| Application `id` | `[app] name` (`--prefix p` gives `p-<id>`; characters a name cannot hold are replaced) |
+| Application `id` | `[app] name` (`--prefix p` gives `p-<id>`; characters a name cannot hold are replaced; `.` and `..`, which name directories, become `app-dot` and `app-dotdot`, with a note) |
 | `path` | `working_directory` |
 | Node.js entry: `node.main`, `package.json` `main` and `exports`, then `index`, `main`, `app`, `application`, `server`, `start`, `bundle`, `run`, `entrypoint` with `.js`, `.mjs`, `.cjs` | `command = "node"`, the file in `args` |
-| `application.commands.production`, or `--command <id>=<line>` | The program and its arguments (split as Watt splits them); `node_modules/.bin` is searched as Watt does; a line with `&&`, `\|\|` or `;` runs through a shell |
+| `application.commands.production`, or `--command <id>=<line>` | The program and its arguments (split as Watt splits them); `node_modules/.bin` is searched as Watt does; a line with `&&`, `\|\|` or `;` runs through `sh -c` (a `{NAME}` in it becomes `"${NAME}"`, read from the env file) |
 | `workers` (a number or `{static, ...}`, inherited from the runtime) | `[workers] count` |
 | `server.port` on the entry point | `[app] port` |
 | `server.portAssignment: perWorkerIncrement` | `port_strategy = "offset"` |
 | `gracefulShutdown.application` (default 10 s) | `[shutdown] grace_period` |
-| `restartOnError` on an application | `[restart] enabled = false`, or `backoff_initial` |
-| `startTimeout` | `[workers] ready_timeout` |
+| `restartOnError` on an application | `[restart] enabled = false`, or `backoff_initial` (at most 225 s: Warden's `backoff_max` is 16 times it and may not pass an hour; a longer delay is capped, with a note) |
+| `startTimeout` | `[workers] ready_timeout` (at most an hour, as is `grace_period`) |
 | `health.maxHeapTotal` | `node --max-old-space-size` (Watt's total minus its young generation) |
 | `execArgv`, `nodeOptions`, `preload`, `sourceMaps` | node flags, for a `node <file>` application |
 | `arguments` | arguments after the script |
 | `watch` | `[watch] enabled` |
 | `enabled: false` for production | The application is left out |
+
+#### Secrets
+
+Watt fills `{NAME}` placeholders in when it reads the config; Warden has no
+placeholders, so the value of a `{NAME}` in a command line lands in the config
+as text. Here is exactly what is guaranteed. A value from the environment of the
+command, or from a `.env` file, appears:
+
+- in the env file (mode 0600), always;
+- in the config only where the program has to be given it on its command line:
+  `application.commands.production`, `arguments`, `execArgv`, `nodeOptions`,
+  `preload` and `node.main`. When the command is a shell command (it chains with
+  `&&`, `||` or `;`), the config holds no value at all: it reads `"${NAME}"`,
+  quoted for where it stands, and the env file supplies the variable. Every other
+  form needs the value itself in `args`; that config is written with mode 0600
+  instead of 0644, and the run says so;
+- nowhere else. The report, `--dry-run`, the messages on stdout and stderr and
+  the errors show it as `***`; an error about an invalid config shows the
+  validation message and its line number, never the config text.
+
+A value counts as a secret when it came from the environment or a `.env` file
+and is not a number of five digits or fewer (a port, a count). It is hidden
+wherever the same text appears in that application's section of the report, so a
+plain word such as `info` can be hidden too. A value written literally in a
+config file (`"env": {"TOKEN": "..."}`) is not a placeholder value and is not
+hidden, but it goes to the env file and not to the config.
 
 Warden's restart policy differs from Watt's, which restarts a crashed worker
 for ever: Warden marks a worker failed after `max_restarts` crashes in
@@ -288,12 +320,12 @@ Two warnings worth knowing before you start:
 | `--prefix <p>` | Put `<p>-` in front of every app name |
 | `--command <id>=<line>` | The command to run for an application (repeatable) |
 | `--dry-run` | Print every config, the env variable names and the report; write nothing |
-| `--overwrite` | Replace configs that exist. Without it an existing `<name>.toml` is kept, that application is reported and the exit code is 1 |
+| `--overwrite` | Replace files that exist. Without it an existing `<name>.toml` or `<name>.env` is kept (the env file may hold what the app needs and nothing else has), that application is reported and the exit code is 1. A symbolic link at either path is never written through, with or without it: that application is reported and the exit code is 1 |
 | `--cutover overlap\|new-port:<port>` | Start Warden's copy next to the running Watt; see below |
 
 Exit code: 0 when every application was converted (and started, with
-`--cutover`); 1 when one was not, a file was kept, or the project could not be
-read; 2 for a bad command line.
+`--cutover`); 1 when one was not, a file was kept, an app was not started, or
+the project could not be read; 2 for a bad command line.
 
 ### Cutover
 
@@ -305,8 +337,23 @@ read; 2 for a bad command line.
 - `new-port:<port>`: the entry point's `port` is `<port>` and the rest keep
   theirs. Switch your proxy when you are satisfied.
 
-If Warden's workers do not come up, it stops them and says so; Watt was never
-touched. When you are satisfied, stop Watt yourself with `wattpm stop <project>`
+What it does when it cannot start everything:
+
+- Two apps on one port are not started. If the entry point's `server.port` (or
+  the `new-port` you gave) is also an internal application's own `PORT`, Warden
+  would start both and the kernel would split the requests between two different
+  programs. Neither is started, the reason is printed on stderr before anything
+  starts, and the exit code is 1. The other apps start.
+- An app that runs already is not started again: `<name>: already running with
+  its previous config`. Its supervisor keeps the config it started with, so after
+  `--overwrite` it needs `warden reload <name>` to take the new file.
+- If an app's workers do not come up, the apps this run had started are stopped
+  too, and the message names them: nothing of the run is left running. Watt was
+  never touched, and neither was any process this run did not start. The configs
+  stay; fix the app and `warden start` it.
+- When every app is up it says which, and `warden stop <names>` stops them.
+
+When you are satisfied, stop Watt yourself with `wattpm stop <project>`
 and run `warden save` and `sudo warden startup`.
 
 `pm2-migrate` can stop PM2's copy of an app and put it back if Warden's fails

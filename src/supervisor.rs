@@ -175,6 +175,21 @@ pub struct Supervisor {
     /// this supervisor's record of its workers, which the next supervisor of
     /// the app reads to stop the ones left running (`platform::orphans`).
     orphans: Option<crate::platform::orphans::Registry>,
+    /// The sweep of a killed supervisor's workers, while it runs: no worker is
+    /// started here until it ends (they hold the port), and what `status`
+    /// says meanwhile (`sweep_status`).
+    sweep: Option<Sweeping>,
+}
+
+/// The sweep of a killed supervisor's workers, run by `run_local`'s loop.
+type Sweep<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Option<crate::platform::orphans::Registry>> + 'a>>;
+
+/// A sweep of the previous supervisor's workers in progress (`platform::orphans`).
+struct Sweeping {
+    started: Instant,
+    progress: std::sync::Arc<crate::platform::orphans::Progress>,
+    /// The most it takes: `shutdown.grace_period` and the wait after SIGKILL.
+    longest: Duration,
 }
 
 /// How many times each worker has to crash before one is ready for the app
@@ -322,27 +337,46 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     }
     // Workers a killed supervisor of this app left running are stopped before
     // new ones start (macOS: no parent-death signal); then this one's workers
-    // are recorded as they start.
+    // are recorded as they start. On macOS the sweep runs in this loop, so
+    // that signals and control requests are served meanwhile (it can take
+    // `grace_period` and a few seconds when a worker ignores the stop signal),
+    // and the workers start once it is over.
     let app = sup.cfg.app.name.clone();
-    sup.orphans = crate::platform::orphans::start(crate::platform::orphans::Settings {
+    let progress = std::sync::Arc::new(crate::platform::orphans::Progress::default());
+    let settings = crate::platform::orphans::Settings {
         app: &app,
         stop_signal: sup.cfg.stop_signal(),
         grace: sup.cfg.grace_period(),
         dir: crate::platform::orphans::dir(&crate::fleet::state_dir()),
-    })
-    .await;
-    sup.schedule_next();
-    if saved.as_ref().is_some_and(|s| s.stopped) {
-        info!("workers stay stopped, as saved by `warden save`", hint = "`warden start <app>` starts them");
-        sup.stopped = true;
-        sup.announced_ready = true;
-        systemd::notify("READY=1\nSTATUS=workers stopped (saved state)");
+        progress: progress.clone(),
+    };
+    let saved_stopped = saved.as_ref().is_some_and(|s| s.stopped);
+    let mut sweeping: Option<Sweep<'_>> = None;
+    if crate::platform::orphans::enabled() {
+        let longest = crate::platform::orphans::longest(settings.grace);
+        let mut sweep: Sweep<'_> = Box::pin(crate::platform::orphans::start(settings));
+        // Nothing to stop (the usual case) ends at the first look: workers start
+        // as ever, and no sweep is ever shown. Otherwise the loop carries on with it.
+        match tokio::time::timeout(Duration::ZERO, &mut sweep).await {
+            Ok(registry) => {
+                sup.orphans = registry;
+                sup.start_workers(saved_stopped);
+            }
+            Err(_) => {
+                sup.sweep = Some(Sweeping { started: Instant::now(), progress, longest });
+                sweeping = Some(sweep);
+            }
+        }
     } else {
-        sup.start_all();
+        sup.start_workers(saved_stopped);
     }
 
     loop {
         tokio::select! {
+            reg = async { sweeping.as_mut().expect("the precondition says it is there").await }, if sweeping.is_some() => {
+                sweeping = None;
+                sup.sweep_over(reg, saved_stopped);
+            }
             Some(ev) = rx.recv() => sup.on_event(ev),
             Some(pe) = proc_rx.recv() => sup.on_proc(pe),
             Some(s) = sig_rx.recv() => sup.on_signal(s),
@@ -355,6 +389,13 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         if sup.shutting_down && sup.insts.is_empty() {
             break;
         }
+    }
+    if sweeping.is_some() {
+        // Told to stop before the sweep ended: nothing was started. What it
+        // did not reach is found, by the records, at the next start.
+        info!(
+            "stopped while waiting for the previous supervisor's workers to stop; the next start of the app stops what is left"
+        );
     }
     // Every worker has exited: nothing for a next supervisor to sweep.
     if let Some(o) = sup.orphans.as_mut() {
@@ -507,6 +548,7 @@ impl Supervisor {
             oom: process::exit::OomTracker::new(),
             start_attempt: None,
             orphans: None,
+            sweep: None,
             cfg,
             cfg_path,
         }
@@ -526,6 +568,82 @@ impl Supervisor {
         let workers: Vec<(u32, String)> = self.insts.values().map(|i| (i.handle.pid, self.inst_label(i))).collect();
         if let Some(o) = self.orphans.as_mut() {
             o.note(&workers);
+        }
+    }
+
+    /// The first start: the schedule, and the workers, unless `warden save`
+    /// recorded them stopped, or a `warden stop` came while the previous
+    /// supervisor's workers were being stopped.
+    fn start_workers(&mut self, saved_stopped: bool) {
+        self.schedule_next();
+        if saved_stopped || self.stopped {
+            if saved_stopped {
+                info!("workers stay stopped, as saved by `warden save`", hint = "`warden start <app>` starts them");
+            } else {
+                info!(
+                    "workers stay stopped, as asked while the previous supervisor's workers were being stopped",
+                    hint = "`warden start <app>` starts them"
+                );
+            }
+            self.stopped = true;
+            if !self.announced_ready {
+                self.announced_ready = true;
+                systemd::notify("READY=1\nSTATUS=workers stopped (saved state)");
+            }
+        } else {
+            self.start_all();
+        }
+    }
+
+    /// The sweep of the previous supervisor's workers has ended: record this
+    /// one's from now on, and start them (not when a stop is under way).
+    fn sweep_over(&mut self, registry: Option<crate::platform::orphans::Registry>, saved_stopped: bool) {
+        self.orphans = registry;
+        self.sweep = None;
+        if self.shutting_down {
+            return;
+        }
+        self.start_workers(saved_stopped);
+    }
+
+    /// What a status says while the sweep runs: a rollout of its own kind, so
+    /// that `warden status`, `warden list`, the GUI and `warden start` show
+    /// and wait for it like any other (`done`: workers gone, of `total`).
+    fn sweep_status(&self) -> Option<control::RolloutStatus> {
+        let s = self.sweep.as_ref()?;
+        let (done, total) = s.progress.counts();
+        Some(control::RolloutStatus {
+            seq: 0,
+            kind: crate::platform::orphans::SWEEP_KIND.into(),
+            phase: format!("waiting for the previous supervisor's workers to stop (up to {} s)", s.longest.as_secs()),
+            done,
+            total,
+            elapsed_secs: s.started.elapsed().as_secs(),
+        })
+    }
+
+    /// What a request gets while the sweep runs, `None` to carry on as usual:
+    /// no worker runs yet, and none may start until the old ones are gone, so
+    /// what would start or change workers waits (`start` and `stop` are
+    /// remembered for when the sweep ends).
+    fn request_during_sweep(&mut self, req: &Request) -> Option<Response> {
+        let longest = self.sweep.as_ref()?.longest.as_secs();
+        match req {
+            Request::Status | Request::Config { .. } | Request::Shutdown => None,
+            Request::Logs { .. } | Request::LogLevel { .. } | Request::Flush | Request::Subscribe { .. } => None,
+            Request::Start if self.shutting_down => None,
+            Request::Stop if self.shutting_down => None,
+            Request::Start => {
+                self.stopped = false;
+                Some(Response::ok("starting workers once the previous supervisor's workers have stopped"))
+            }
+            Request::Stop => {
+                self.stopped = true;
+                Some(Response::ok("workers stay stopped once the previous supervisor's workers have stopped"))
+            }
+            _ => Some(Response::err(format!(
+                "still stopping the workers a killed supervisor of this app left behind (up to {longest} s); try again then"
+            ))),
         }
     }
 
@@ -972,6 +1090,15 @@ impl Supervisor {
             }
             Event::AppHealth(r) => self.on_app_health(r),
             Event::WorkerHealth { inst, result } => self.on_worker_health(inst, result),
+            Event::Tick if self.sweep.is_some() => {
+                // No worker runs yet, and none may start (a standby would): only
+                // systemd's watchdog is fed, and the tick's clock kept, so the
+                // first real tick does not report a blocked loop.
+                self.last_tick = Instant::now();
+                if self.watchdog_enabled {
+                    systemd::notify("WATCHDOG=1");
+                }
+            }
             Event::Tick => {
                 self.on_tick();
                 // `[watch]` changed by a reload, workers stopped or started again.
@@ -1669,7 +1796,11 @@ impl Supervisor {
             Sig::Hup => {
                 let r = self.request_reload(false);
                 if !r.ok {
-                    warn!("SIGHUP ignored", reason = r.message.unwrap_or_default());
+                    warn!(
+                        "SIGHUP ignored",
+                        reason = r.message.unwrap_or_default(),
+                        hint = "SIGHUP reloads the workers once they run and nothing else is under way; `warden reload <app>` says why when it cannot",
+                    );
                 }
             }
             Sig::Usr1 | Sig::Usr2 => {
@@ -2150,6 +2281,11 @@ impl Supervisor {
         if self.shutting_down {
             return Response::err("shutting down");
         }
+        if self.sweep.is_some() {
+            return Response::err(
+                "still stopping the workers a killed supervisor of this app left behind; try again then",
+            );
+        }
         if self.stopped {
             return Response::err("workers are stopped; use `warden restart`");
         }
@@ -2164,6 +2300,9 @@ impl Supervisor {
     }
 
     fn on_request(&mut self, req: Request) -> Response {
+        if let Some(r) = self.request_during_sweep(&req) {
+            return r;
+        }
         match req {
             Request::Status => Response { status: Some(self.status()), ..Response::ok("") },
             Request::Start => {
@@ -2591,7 +2730,7 @@ impl Supervisor {
         // Who the app runs as: a running worker's owner (the OS says), else our own user.
         let owner = workers.iter().find_map(|w| w.pid).and_then(crate::platform::proc_owner);
         let user = crate::platform::user_name(owner.unwrap_or_else(crate::sys::euid));
-        let rollout = self.rollout_status();
+        let rollout = self.rollout_status().or_else(|| self.sweep_status());
         Status {
             app: self.cfg.app.name.clone(),
             namespace: self.cfg.app.namespace.clone().unwrap_or_else(|| "default".into()),
@@ -3364,6 +3503,126 @@ exec sleep 60
             assert!(r.sup.watch_retry.is_none() && r.sup.watch_pending.is_none(), "gave up");
             std::fs::rename(&moved, &dir).unwrap();
             finish(r, dir).await;
+        })
+        .await;
+    }
+}
+
+/// While the workers a killed supervisor left behind are being stopped
+/// (`platform::orphans`, macOS) the supervisor answers, obeys a stop, and
+/// starts nothing, not even a standby on a tick: the old workers hold the port.
+#[cfg(test)]
+mod sweep_tests {
+    use super::rig::{Rig, local};
+    use super::*;
+
+    /// A worker that listens at once and stays up.
+    const APP: &str = "echo '{\"ev\":\"listening\",\"port\":1}' >&3\nexec sleep 60\n";
+
+    fn sweeping(r: &mut Rig) {
+        r.sup.sweep =
+            Some(Sweeping { started: Instant::now(), progress: Default::default(), longest: Duration::from_secs(33) });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_says_what_it_waits_for_and_a_tick_starts_nothing() {
+        local(async {
+            // A standby would start on any tick (nothing is Starting); the sweep forbids it.
+            let mut r = Rig::new("sweep-status", "[workers]\ncount = 2\nstandby = 1\n", APP);
+            sweeping(&mut r);
+            let st = r.sup.status();
+            let ro = st.rollout.expect("the sweep shows as a rollout of its own kind");
+            assert_eq!(ro.kind, "sweep");
+            assert!(ro.phase.contains("waiting for the previous supervisor's workers") && ro.phase.contains("33 s"));
+            assert_eq!((ro.done, ro.total, ro.seq), (0, 0, 0));
+            assert!(st.reloading && st.workers.is_empty() && !st.stopped && !st.shutting_down);
+            r.sup.on_event(Event::Tick);
+            assert!(r.sup.insts.is_empty(), "no standby, no worker, during the sweep");
+            // The same tick starts one without it: the guard is what held it back.
+            r.sup.sweep = None;
+            r.sup.on_event(Event::Tick);
+            assert_eq!(r.sup.insts.len(), 1, "a standby starts on a tick when nothing sweeps");
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_would_start_or_change_workers_waits_and_the_rest_is_served() {
+        local(async {
+            let mut r = Rig::new("sweep-requests", "[workers]\ncount = 2\n", APP);
+            sweeping(&mut r);
+            for req in [
+                Request::Reload { safe: false },
+                Request::Reload { safe: true },
+                Request::Restart { worker: None, hard: false },
+                Request::Restart { worker: None, hard: true },
+                Request::Restart { worker: Some(1), hard: false },
+                Request::Scale { count: 4 },
+                Request::Reset { worker: None },
+            ] {
+                let resp = r.sup.on_request(req);
+                assert!(!resp.ok, "refused while sweeping");
+                assert!(resp.message.unwrap_or_default().contains("try again then"));
+            }
+            assert!(r.sup.on_request(Request::Status).status.is_some(), "status is answered");
+            // SIGHUP is a reload too.
+            assert!(!r.sup.request_reload(false).ok);
+            assert!(r.sup.insts.is_empty() && r.sup.slots.is_empty(), "nothing started");
+            assert_eq!(r.sup.count, 2, "and nothing scaled");
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_or_a_stop_is_remembered_for_when_the_sweep_ends() {
+        local(async {
+            // `stop` while sweeping: the workers stay stopped afterwards.
+            let mut r = Rig::new("sweep-stop", "[workers]\ncount = 2\n", APP);
+            sweeping(&mut r);
+            assert!(r.sup.on_request(Request::Stop).ok);
+            assert!(r.sup.stopped);
+            r.sup.sweep_over(None, false);
+            assert!(r.sup.sweep.is_none() && r.sup.stopped && r.sup.insts.is_empty(), "no worker starts");
+            assert_eq!(r.sup.status().rollout.map(|x| x.kind), None, "and the sweep is not shown any more");
+            r.shutdown().await;
+
+            // `start` after it: they start when it ends.
+            let mut r = Rig::new("sweep-start", "[workers]\ncount = 2\n", APP);
+            sweeping(&mut r);
+            assert!(r.sup.on_request(Request::Stop).ok);
+            assert!(r.sup.on_request(Request::Start).ok);
+            assert!(!r.sup.stopped);
+            assert!(r.sup.insts.is_empty(), "not before the old workers are gone");
+            r.sup.sweep_over(None, false);
+            r.until("both workers running", |s| s.insts.len() == 2).await;
+            r.shutdown().await;
+
+            // `warden save` recorded it stopped: it stays so.
+            let mut r = Rig::new("sweep-saved", "[workers]\ncount = 2\n", APP);
+            sweeping(&mut r);
+            r.sup.sweep_over(None, true);
+            assert!(r.sup.stopped && r.sup.insts.is_empty());
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_shutdown_during_the_sweep_ends_the_supervisor_without_starting_a_worker() {
+        local(async {
+            let mut r = Rig::new("sweep-shutdown", "[workers]\ncount = 2\n", APP);
+            sweeping(&mut r);
+            assert!(r.sup.on_request(Request::Shutdown).ok);
+            assert!(r.sup.shutting_down && r.sup.insts.is_empty(), "nothing to wait for: the loop ends");
+            // The sweep may still finish in the same turn: it starts nothing.
+            r.sup.sweep_over(None, false);
+            assert!(r.sup.insts.is_empty() && r.sup.slots.is_empty());
+            // `start` and `stop` are not remembered during a shutdown.
+            sweeping(&mut r);
+            assert!(r.sup.on_request(Request::Start).message.unwrap_or_default().contains("shutting down"));
+            r.shutdown().await;
         })
         .await;
     }

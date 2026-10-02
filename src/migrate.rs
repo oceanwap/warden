@@ -131,6 +131,16 @@ fn pm2(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// This process's environment, without the variables whose name or value is not UTF-8
+/// (`std::env::vars` panics on those).
+pub(crate) fn env_utf8() -> BTreeMap<String, String> {
+    utf8_pairs(std::env::vars_os())
+}
+
+fn utf8_pairs(pairs: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> BTreeMap<String, String> {
+    pairs.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect()
+}
+
 /// The environment of a process (the PM2 daemon), through the OS adapter.
 fn environ_of(pid: u32) -> Option<BTreeMap<String, String>> {
     let env = crate::platform::proc_environ(pid)?;
@@ -155,7 +165,7 @@ pub fn load(o: &MigrateOpts) -> Result<(Vec<Pm2App>, String), String> {
             let list: Vec<Value> =
                 serde_json::from_str(text.trim()).map_err(|e| format!("`pm2 jlist` did not print JSON: {e}"))?;
             // Inherited = equal to the daemon's own environment.
-            let base = daemon_env().unwrap_or_else(|| std::env::vars().collect());
+            let base = daemon_env().unwrap_or_else(env_utf8);
             let entries: Vec<(Value, Option<u32>)> = list
                 .into_iter()
                 .map(|p| {
@@ -169,7 +179,7 @@ pub fn load(o: &MigrateOpts) -> Result<(Vec<Pm2App>, String), String> {
             let path = pm2_home().join("dump.pm2");
             let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let list: Vec<Value> = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            let base: BTreeMap<String, String> = std::env::vars().collect();
+            let base: BTreeMap<String, String> = env_utf8();
             (
                 group(list.into_iter().map(|v| (v, None)).collect(), Some(&base)),
                 format!("{} (`pm2 save`)", path.display()),
@@ -744,7 +754,11 @@ pub fn generate(a: &Pm2App, worker_mode: bool, env_file: &str) -> Result<(String
         // Worker mode runs the entry in Bun Workers under a bun host.
         out = out.replace("command = \"node\"\n", "command = \"bun\"\n");
     }
-    Config::parse(&out).map_err(|e| format!("app {:?}: the generated config is invalid: {e}\n{out}", a.name))?;
+    // The error names the problem and its line, not the config: pm2's `args` and `env`
+    // can hold secrets, and this text goes to the terminal and into reports.
+    Config::parse(&out).map_err(|e| {
+        format!("app {:?}: the generated config is invalid: {}", a.name, without_source_lines(&e.to_string()))
+    })?;
     let mut env = String::from("# Environment for this app (secrets live here, not in the config). Mode 0600.\n");
     // The sources keep invalid names out (`bad_env`); an env file that Warden
     // itself refuses to read would stop the app from starting.
@@ -752,6 +766,19 @@ pub fn generate(a: &Pm2App, worker_mode: bool, env_file: &str) -> Result<(String
         env += &format!("{k}={}\n", env_quote(v));
     }
     Ok((out, env))
+}
+
+/// A TOML error without the lines of the document it quotes (`3 | args = [...]`): the message
+/// and the line number say what is wrong, and the quoted text may hold a secret.
+fn without_source_lines(error: &str) -> String {
+    error
+        .lines()
+        .filter(|l| {
+            let rest = l.trim_start().trim_start_matches(|c: char| c.is_ascii_digit());
+            !(rest.starts_with('|') || rest.starts_with(" |"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) fn toml_str(s: &str) -> String {
@@ -890,23 +917,65 @@ fn ask_mode(a: &Pm2App, o: &MigrateOpts) -> Result<bool, String> {
     Ok(answer.trim() == "2")
 }
 
+/// Write `text` to `path` with `mode`, replacing what is there. A symbolic link at `path` is
+/// refused (writing through it would change, and chmod, the file it points to). The text goes to a
+/// new file in the same directory first and is renamed over `path`, so a reader never sees half a
+/// file, and a hard link at `path` is replaced, never written through.
 pub(crate) fn write_file(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    write_to(path, text, mode, true)
+}
+
+/// Like `write_file`, but a file (or link) that is at `path` already is an error, never replaced:
+/// the check and the creation are one step, so a file that appears meanwhile is not lost either.
+pub(crate) fn write_new_file(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+    write_to(path, text, mode, false)
+}
+
+fn write_to(path: &Path, text: &str, mode: u32, replace: bool) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
     }
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)
-        .map_err(|e| format!("writing {}: {e}", path.display()))?;
-    f.write_all(text.as_bytes()).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    // An existing file keeps its old mode with create(); make it right.
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a symbolic link: not writing through it (remove it, or point --out at a real directory)",
+            path.display()
+        ));
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // create_new (O_EXCL) never follows a link and never reuses a file that is already there.
+    let (tmp, mut f) = (0..100)
+        .find_map(|i| {
+            let tmp = dir.join(format!(".{name}.{}.{i}.tmp", std::process::id()));
+            let f = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp).ok()?;
+            Some((tmp, f))
+        })
+        .ok_or_else(|| format!("writing {}: cannot create a temporary file in {}", path.display(), dir.display()))?;
+    let done = f
+        .write_all(text.as_bytes())
+        // The umask may have taken bits away at creation: make the mode what was asked.
+        .and_then(|_| std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode)))
+        .and_then(|_| f.sync_all())
+        .and_then(|_| {
+            if replace {
+                std::fs::rename(&tmp, path)
+            } else {
+                // link(2) fails when `path` exists, whatever it is, and does not follow a link there.
+                std::fs::hard_link(&tmp, path)
+            }
+        });
+    if !replace || done.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    match done {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("{} exists; not replaced", path.display()))
+        }
+        Err(e) => Err(format!("writing {}: {e}", path.display())),
+        Ok(()) => Ok(()),
+    }
 }
 
 pub async fn run(args: &Args, o: &MigrateOpts) -> i32 {
@@ -1113,6 +1182,14 @@ async fn finalize(args: &Args, o: &MigrateOpts) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_toml_error_is_shown_without_the_lines_of_the_document_it_quotes() {
+        let error = "TOML parse error at line 2, column 6\n  |\n2 | args = [\"--token=s3cr3t\"\n  |      ^\nexpected `,` or `]`";
+        let shown = without_source_lines(error);
+        assert!(!shown.contains("s3cr3t"), "{shown}");
+        assert!(shown.contains("line 2, column 6") && shown.contains("expected"), "{shown}");
+    }
     use serde_json::json;
 
     /// PM2 records an env entry named after the app (`my-app`): not a valid
@@ -1339,5 +1416,69 @@ mod tests {
         assert_eq!(parse_cutover("new-port:4200"), Ok(Cutover::NewPort(4200)));
         assert!(parse_cutover("new-port:0").is_err());
         assert!(parse_cutover("fast").is_err());
+    }
+    /// A scratch directory under the system's temp dir, removed by the caller.
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wm-wf-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_file_replaces_a_file_and_sets_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("replace");
+        let f = d.join("a.env");
+        std::fs::write(&f, "old").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_file(&f, "new", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        write_file(&f, "again", 0o644).unwrap();
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o644);
+        // No temporary file is left behind, and a missing directory is created.
+        write_file(&d.join("sub/dir/b.toml"), "x", 0o644).unwrap();
+        let names: Vec<String> =
+            std::fs::read_dir(&d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_file_never_follows_a_symbolic_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("link");
+        // A link to a file somebody else owns: it is neither written nor chmod-ed.
+        let victim = d.join("victim.txt");
+        std::fs::write(&victim, "precious").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&victim, d.join("web.env")).unwrap();
+        let e = write_file(&d.join("web.env"), "SECRET=1", 0o600).unwrap_err();
+        assert!(e.contains("symbolic link"), "{e}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777, 0o644);
+        // A dangling link is refused too (it would create the file it points to).
+        std::os::unix::fs::symlink(d.join("nowhere/created.toml"), d.join("web.toml")).unwrap();
+        assert!(write_file(&d.join("web.toml"), "x", 0o644).is_err());
+        assert!(!d.join("nowhere").exists());
+        // A hard link is replaced, not written through.
+        let hard = d.join("hard.env");
+        std::fs::hard_link(&victim, &hard).unwrap();
+        write_file(&hard, "SECRET=1", 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(&hard).unwrap(), "SECRET=1");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_non_utf8_environment_variable_is_skipped_not_fatal() {
+        use std::os::unix::ffi::OsStrExt;
+        let os = |b: &[u8]| std::ffi::OsStr::from_bytes(b).to_os_string();
+        let kept = utf8_pairs(
+            vec![(os(b"GOOD"), os(b"1")), (os(b"BAD"), os(&[0xff, 0xfe])), (os(&[0xff]), os(b"v"))].into_iter(),
+        );
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["GOOD"]);
+        let _ = env_utf8();
     }
 }

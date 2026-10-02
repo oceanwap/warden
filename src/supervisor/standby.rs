@@ -659,6 +659,8 @@ impl Supervisor {
                 s.state = State::Starting;
             }
         }
+        // The record of the workers (macOS) names it by its slot now.
+        self.note_workers();
         self.emit_worker(slot_id, WorkerEvent::Starting, Some(pid), || Some(format!("promoted from standby {was}")));
         self.send_later(PROMOTE_TIMEOUT.min(self.cfg.ready_timeout()), Event::ReadyTimeout { inst: id });
         // Its successor starts once it listens (`mark_ready` → `fill_pool`).
@@ -839,6 +841,36 @@ exec sleep 60
             r.until("a fresh standby", |s| available(s).len() == 1).await;
             assert_ne!(available(&r.sup)[0], standby);
             r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// The record of the workers a killed supervisor would leave (macOS,
+    /// `platform::orphans`) names a promoted standby by its slot, as the logs do.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_promoted_standby_is_recorded_as_the_slots_worker() {
+        local(async {
+            let dir = std::env::temp_dir().join(format!("warden-promote-record-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut r = rig("record", "");
+            r.sup.orphans = Some(crate::platform::orphans::Registry::for_test(&dir, "pool-record"));
+            r.sup.start_all();
+            r.until("worker and standby ready", |s| running(s) && available(s).len() == 1).await;
+            let (worker, standby) = (r.sup.slots[&1].current.unwrap(), available(&r.sup)[0]);
+            let recorded = |s: &Supervisor, id: u64| {
+                let pid = s.insts[&id].handle.pid;
+                s.orphans.as_ref().unwrap().workers().into_iter().find(|(p, _)| *p == pid).map(|(_, l)| l)
+            };
+            assert_eq!(recorded(&r.sup, worker).as_deref(), Some("1"));
+            assert_eq!(recorded(&r.sup, standby).as_deref(), Some("s1"));
+
+            // Looked at in the event that promoted it: no worker started or exited since to rewrite the record.
+            r.kill(worker);
+            r.until("standby promoted", |s| s.slots[&1].current == Some(standby)).await;
+            assert_eq!(recorded(&r.sup, standby).as_deref(), Some("1"), "worker 1 now, not s1");
+            r.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
         })
         .await;
     }

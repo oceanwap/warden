@@ -1680,6 +1680,16 @@ fn ready_wait(app: &App) -> Duration {
     Duration::from_secs(ready.saturating_add(15))
 }
 
+/// How long `wait_ready` lets a supervisor spend stopping the workers a killed
+/// one left behind (macOS, `platform::orphans`) before it counts it as stuck:
+/// what the supervisor itself allows (`shutdown.grace_period` and a wait after
+/// SIGKILL), and some seconds more. No worker of the app starts meanwhile, so
+/// the wait for the first one does not run during it.
+fn sweep_wait(app: &App) -> Duration {
+    let grace = app.config.as_ref().and_then(|p| Config::load(p).ok()).map_or(30, |c| c.shutdown.grace_period);
+    crate::platform::orphans::longest(Duration::from_secs(grace)) + Duration::from_secs(10)
+}
+
 /// Wait until every worker is ready (or the app is stopped), then print one
 /// line. Fails fast when the supervisor says every worker crashed before
 /// one was ready (`Status.start_failed`): reports why, with the app's last
@@ -1690,11 +1700,27 @@ async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
     let bound = ready_wait(app);
     let mut deadline = Instant::now() + bound;
     let mut first_ready = false;
+    let mut sweeping_since: Option<Instant> = None;
     let mut last = None;
     while Instant::now() < deadline {
         if let Ok(st) = status_of(app).await {
             if let Some(reason) = st.start_failed.clone() {
                 return failed_start(app, &st, &reason, on_fail).await;
+            }
+            // The supervisor is stopping the workers a killed one left behind:
+            // nothing of the app has started, so nothing is slow yet. Say so,
+            // and start counting when it is over (bounded by `sweep_wait`).
+            if let Some(r) = st.rollout.as_ref().filter(|r| r.kind == crate::platform::orphans::SWEEP_KIND) {
+                let since = *sweeping_since.get_or_insert_with(|| {
+                    println!("{}: {}", app.name, r.phase);
+                    Instant::now()
+                });
+                if since.elapsed() < sweep_wait(app) {
+                    deadline = Instant::now() + bound;
+                    last = Some(st);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             }
             if st.stopped || (st.workers_ready >= st.workers_configured && st.workers_configured > 0) {
                 println!(
@@ -1716,6 +1742,15 @@ async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
                 deadline = Instant::now() + bound;
             }
             last = Some(st);
+        } else if sweeping_since.is_some() && !reachable(app) {
+            // It stopped (a `warden stop` or SIGTERM) while it waited for the old
+            // workers: there is nothing to wait for any more.
+            eprintln!(
+                "warden: {}: the supervisor stopped while it was waiting for the previous supervisor's workers to \
+                 stop, and started none; `warden start {}` tries again ({log})",
+                app.name, app.name
+            );
+            return 1;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -2057,6 +2092,16 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
         Launch::Program(p) => p.clone(),
         Launch::Shell(c) => format!("\"{c}\""),
     };
+    // A comment ends at the line break: a command with one (`a &&\nb`) must not leave the comment.
+    let shown: String = shown
+        .chars()
+        .map(|c| match c {
+            '\r' => "\\r".to_string(),
+            '\n' => "\\n".to_string(),
+            c if c.is_control() && c != '\t' => " ".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
     t += &format!("# Written by `warden start {shown}`. Every setting: warden.example.toml\n\n[app]\n");
     t += &format!("name = {}\n", toml_str(&name));
     if let Some(ns) = &o.namespace {
@@ -2091,7 +2136,7 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
     }
     if let Some(ms) = o.restart_delay_ms {
         restart += &format!("backoff_initial = {}\n", ms.max(1));
-        restart += &format!("backoff_max = {}\n", (ms.max(1) * 16).max(10_000));
+        restart += &format!("backoff_max = {}\n", ms.max(1).saturating_mul(16).max(10_000));
     }
     if let Some(n) = o.max_restarts {
         restart += &format!("max_restarts = {n}\n");

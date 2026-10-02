@@ -29,8 +29,9 @@ only, shared by `warden` and the GUI), `gui/` (`warden-gui`) and `xtask/`.
 Plain `cargo build` and `cargo test` here mean `warden` only.
 
 All `unsafe` code of the program is in [`src/sys.rs`](../src/sys.rs) and its
-macOS half [`src/sys/darwin.rs`](../src/sys/darwin.rs) (`protocol/` and `gui/`
-have none: `#![forbid(unsafe_code)]`): system calls the standard library
+macOS half [`src/sys/darwin.rs`](../src/sys/darwin.rs) (`protocol/` has none:
+`#![forbid(unsafe_code)]`; `gui/` has one `pre_exec` closure, in
+`gui/src/parent_death.rs`): system calls the standard library
 doesn't expose, the few that measurably pay on a hot path (the static server
 and log capture), and the two `Command::pre_exec` calls, which are behind safe
 wrappers there (`pre_exec_worker`, `pre_exec_new_session`), each with a SAFETY
