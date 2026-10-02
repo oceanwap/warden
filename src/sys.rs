@@ -416,6 +416,93 @@ pub fn sendfile(out: BorrowedFd<'_>, input: BorrowedFd<'_>, offset: &mut i64, co
     Ok(len as usize)
 }
 
+/// How a total reported by `sendfile_head` splits: the bytes of the head
+/// first, then the file's. `None` when `total` is more than was asked for
+/// (a kernel or caller bug: the caller fails the connection rather than
+/// send a wrong body).
+pub fn split_head_body(total: usize, head_left: usize, body_left: u64) -> Option<(usize, u64)> {
+    let head = total.min(head_left);
+    let body = (total - head) as u64;
+    (body <= body_left).then_some((head, body))
+}
+
+/// One system call that sends `head` and then up to `count` bytes of
+/// `input` from `*offset` to the socket `out`: the whole response head and
+/// the start of the body in one go. Returns the bytes sent in all, head
+/// first (`split_head_body` splits it); advances `*offset` by the file
+/// bytes. A partial send is normal (a full socket buffer): the caller
+/// waits for writability and calls again with the rest of the head (empty
+/// once it is out). WouldBlock only when nothing at all could be sent;
+/// Ok(0) is an end of file before `count` (the file shrank) when there
+/// was nothing of the head left to send. `count == 0` sends just the head.
+///
+/// Linux: `send` with MSG_MORE (the head waits for the body and shares its
+/// first packet), then sendfile: two calls, the same as before there was
+/// one function for both systems. Not Linux (macOS): one sendfile(2) with
+/// an `sf_hdtr` header, a single call; its length argument takes the file
+/// bytes wanted and gives back everything sent, header included.
+#[cfg(target_os = "linux")]
+pub fn sendfile_head(
+    out: BorrowedFd<'_>,
+    input: BorrowedFd<'_>,
+    offset: &mut i64,
+    count: usize,
+    head: &[u8],
+) -> io::Result<usize> {
+    let mut sent = 0;
+    if !head.is_empty() {
+        sent = send(out, head, count > 0)?;
+        if sent < head.len() || count == 0 {
+            return Ok(sent);
+        }
+    } else if count == 0 {
+        return Ok(0);
+    }
+    match sendfile(out, input, offset, count) {
+        Ok(n) => Ok(sent + n),
+        // The head is out; the body waits for the next writable event.
+        Err(e) if sent > 0 && e.kind() == io::ErrorKind::WouldBlock => Ok(sent),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sendfile_head(
+    out: BorrowedFd<'_>,
+    input: BorrowedFd<'_>,
+    offset: &mut i64,
+    count: usize,
+    head: &[u8],
+) -> io::Result<usize> {
+    if head.is_empty() {
+        return sendfile(out, input, offset, count);
+    }
+    if count == 0 {
+        // A length of 0 means "to the end of the file" to macOS: send the head alone.
+        return send(out, head, false);
+    }
+    let mut iov = libc::iovec { iov_base: head.as_ptr() as *mut libc::c_void, iov_len: head.len() };
+    let mut hdtr = libc::sf_hdtr { headers: &mut iov, hdr_cnt: 1, trailers: std::ptr::null_mut(), trl_cnt: 0 };
+    let mut len: libc::off_t = count.min(i64::MAX as usize) as libc::off_t;
+    // SAFETY: both descriptors are borrowed, so they stay open for the whole
+    // call; `iov` points at `head`, which outlives the call, and the kernel
+    // only reads it; `hdtr` and `len` are live, exclusively borrowed values
+    // on this stack frame, with one header iovec and no trailer. sendfile
+    // touches no other Rust memory.
+    let rc =
+        unsafe { libc::sendfile(input.as_raw_fd(), out.as_raw_fd(), *offset as libc::off_t, &mut len, &mut hdtr, 0) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        // EAGAIN / EINTR after a partial send: `len` says how far it got.
+        if len <= 0 || !matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
+            return Err(e);
+        }
+    }
+    let total = len.max(0) as usize;
+    *offset += total.saturating_sub(head.len()) as i64;
+    Ok(total)
+}
+
 /// openat2 `resolve` flags, named here so callers compile on every platform
 /// (outside Linux, `openat2` is Unsupported and never reads them).
 #[cfg(target_os = "linux")]
@@ -537,24 +624,67 @@ pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
-/// send(2) on a socket, never raising SIGPIPE. Not Linux: SO_NOSIGPIPE on
-/// the socket instead of MSG_NOSIGNAL (set on every call: the socket may
-/// come from anywhere), and no MSG_MORE, so `more` is ignored (headers may
-/// go out in their own packet). macOS refuses socket options with EINVAL
-/// once the connection is reset; send then reports the real error (EPIPE,
-/// ECONNRESET), and the option set by an earlier call still holds.
+/// send(2) on a socket, never raising SIGPIPE. Not Linux: there is no
+/// MSG_NOSIGNAL; the socket must carry SO_NOSIGPIPE (`set_nosigpipe`, once
+/// per connection: setting it on every send cost a system call each time;
+/// Rust programs also ignore SIGPIPE, so this is belt and braces). There is
+/// no MSG_MORE either, so `more` is ignored (headers may go out in their
+/// own packet; `sendfile_head` sends them with the file instead).
 #[cfg(not(target_os = "linux"))]
 pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
     let _ = more;
-    if let Err(e) = setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1) {
-        if e.raw_os_error() != Some(libc::EINVAL) {
-            return Err(e);
-        }
-    }
     // SAFETY: `buf` is a valid slice for its length and send only reads it;
     // `sock` is borrowed and stays open for the call.
     let n = unsafe { libc::send(sock.as_raw_fd(), buf.as_ptr() as *const libc::c_void, buf.len(), 0) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+/// Make later `send`s and `sendfile`s on this connection fail with EPIPE
+/// instead of raising SIGPIPE. Linux: nothing to do (`send` passes
+/// MSG_NOSIGNAL per call). Not Linux: SO_NOSIGPIPE, once, when the
+/// connection is accepted. macOS refuses socket options with EINVAL once
+/// the connection is already reset: that is not an error here, the next
+/// send reports the real one (EPIPE, ECONNRESET).
+#[cfg(target_os = "linux")]
+pub fn set_nosigpipe(sock: BorrowedFd<'_>) -> io::Result<()> {
+    let _ = sock;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_nosigpipe(sock: BorrowedFd<'_>) -> io::Result<()> {
+    match setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1) {
+        Err(e) if e.raw_os_error() != Some(libc::EINVAL) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// TCP_NODELAY on a TCP socket (a listener too). On Linux a connection
+/// accepted from a listener that has it set starts with it: one system
+/// call at startup instead of one per connection (`NODELAY_INHERITED`).
+pub fn set_tcp_nodelay(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    setsockopt_int(sock, libc::IPPROTO_TCP, libc::TCP_NODELAY, on as libc::c_int)
+}
+
+/// Do accepted connections inherit TCP_NODELAY from their listener? Linux:
+/// yes (tested below). Elsewhere not relied on: callers set it on each
+/// accepted socket.
+pub const NODELAY_INHERITED: bool = cfg!(target_os = "linux");
+
+/// TCP_CORK on or off (Linux): while it is on, the kernel sends only full-size
+/// segments and holds a partial one back; turning it off sends what is held.
+/// For a big body that keeps every segment full and the receiver from being
+/// woken for each piece (nginx's `tcp_nopush`). Elsewhere `Unsupported`:
+/// callers go on without it (macOS has TCP_NOPUSH, not measured here).
+#[cfg(target_os = "linux")]
+pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    setsockopt_int(sock, libc::IPPROTO_TCP, libc::TCP_CORK, on as libc::c_int)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    let _ = (sock, on);
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 fn setsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
@@ -1253,6 +1383,261 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// `sendfile_head` with blocking sockets: all of `head`, then `[off, off+count)`.
+    fn send_head_range(
+        sock: &std::net::TcpStream,
+        file: &std::fs::File,
+        head: &[u8],
+        mut off: i64,
+        count: usize,
+    ) -> io::Result<i64> {
+        use std::os::fd::AsFd;
+        let (mut head_left, mut body_left) = (head, count as u64);
+        while !head_left.is_empty() || body_left > 0 {
+            let n = sendfile_head(sock.as_fd(), file.as_fd(), &mut off, body_left as usize, head_left)?;
+            if n == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let (h, b) = split_head_body(n, head_left.len(), body_left).expect("never more than asked for");
+            head_left = &head_left[h..];
+            body_left -= b;
+        }
+        Ok(off)
+    }
+
+    #[test]
+    fn split_head_body_counts_the_head_first() {
+        assert_eq!(split_head_body(0, 10, 100), Some((0, 0)));
+        assert_eq!(split_head_body(4, 10, 100), Some((4, 0)), "a partial head: no body yet");
+        assert_eq!(split_head_body(10, 10, 100), Some((10, 0)));
+        assert_eq!(split_head_body(11, 10, 100), Some((10, 1)));
+        assert_eq!(split_head_body(110, 10, 100), Some((10, 100)), "everything");
+        assert_eq!(split_head_body(111, 10, 100), None, "more than was asked for");
+        assert_eq!(split_head_body(7, 0, 7), Some((0, 7)), "no head left");
+        assert_eq!(split_head_body(8, 0, 7), None);
+        assert_eq!(split_head_body(0, 0, 0), Some((0, 0)));
+        // Never panics, for any input.
+        for total in [0usize, 1, 99, usize::MAX] {
+            for head in [0usize, 1, 99] {
+                for body in [0u64, 1, 99] {
+                    let _ = split_head_body(total, head, body);
+                }
+            }
+        }
+    }
+
+    /// Head and file bytes arrive exactly, in order, for empty and large
+    /// heads, offsets, and a count of 0 (the head alone).
+    #[test]
+    fn sendfile_head_sends_the_head_then_exact_file_bytes() {
+        let data: Vec<u8> = (0..(3 << 20) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+        let (file, path) = temp_file(&data);
+        for (head_len, off, len) in [
+            (0usize, 0usize, 0usize),
+            (0, 0, 20_000),
+            (253, 0, 0),
+            (253, 0, 1),
+            (253, 17, 48 * 1024),
+            (280, 4096, 100_000),
+            (70_000, 5, 200_000),
+            (300, 0, data.len()),
+            (1, data.len() - 10, 10),
+        ] {
+            let head: Vec<u8> = (0..head_len).map(|i| b'A' + (i % 26) as u8).collect();
+            let (tx, mut rx) = socket_pair();
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::new();
+                rx.read_to_end(&mut got).unwrap();
+                got
+            });
+            let end = send_head_range(&tx, &file, &head, off as i64, len).unwrap();
+            assert_eq!(end, (off + len) as i64, "the offset moves by the file bytes sent, not by the head's");
+            drop(tx);
+            let got = reader.join().unwrap();
+            let mut want = head.clone();
+            want.extend_from_slice(&data[off..off + len]);
+            assert!(got == want, "bytes differ for head {head_len}, offset {off}, length {len}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A reader slower than the sender: the socket fills in the middle of the
+    /// head and in the middle of the body; progress is reported, never lost.
+    #[test]
+    fn sendfile_head_on_a_slow_reader_hits_eagain_and_resumes() {
+        use std::os::fd::AsFd;
+        let data: Vec<u8> = (0..(1 << 20) as u32).map(|i| (i % 253) as u8).collect();
+        let (file, path) = temp_file(&data);
+        let head: Vec<u8> = (0..100_000u32).map(|i| (i % 199) as u8).collect();
+        let (tx, mut rx) = socket_pair();
+        tx.set_nonblocking(true).unwrap();
+        tx.set_nodelay(true).unwrap();
+        let small: libc::c_int = 32 * 1024;
+        for (fd, opt) in [(tx.as_raw_fd(), libc::SO_SNDBUF), (rx.as_raw_fd(), libc::SO_RCVBUF)] {
+            // SAFETY (test): setsockopt with a live c_int and its size.
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, opt, &small as *const _ as *const libc::c_void, 4);
+            }
+        }
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 65536];
+            loop {
+                match rx.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            got
+        });
+        let (mut head_left, mut body_left, mut off) = (&head[..], data.len() as u64, 0i64);
+        let (mut would_block, mut partial_head) = (0, 0);
+        while !head_left.is_empty() || body_left > 0 {
+            match sendfile_head(tx.as_fd(), file.as_fd(), &mut off, body_left as usize, head_left) {
+                Ok(0) => panic!("unexpected EOF"),
+                Ok(n) => {
+                    let (h, b) = split_head_body(n, head_left.len(), body_left).unwrap();
+                    if h > 0 && h < head_left.len() {
+                        partial_head += 1;
+                    }
+                    head_left = &head_left[h..];
+                    body_left -= b;
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    would_block += 1;
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        drop(tx);
+        let got = reader.join().unwrap();
+        assert_eq!(got.len(), head.len() + data.len());
+        assert!(got[..head.len()] == head[..] && got[head.len()..] == data[..], "head then file, in order");
+        assert_eq!(off as usize, data.len(), "the offset followed the file bytes only");
+        assert!(would_block > 0, "the slow reader should have filled the socket buffer");
+        assert!(partial_head > 0, "a 100 KB head does not fit 32 KB buffers in one call");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A file shorter than promised ends the response early: the caller sees
+    /// Ok(0) once the head is out, never a hang or an invented body.
+    #[test]
+    fn sendfile_head_reports_a_truncated_file() {
+        use std::os::fd::AsFd;
+        let (file, path) = temp_file(&[7u8; 1000]);
+        let (tx, _rx) = socket_pair();
+        let mut off = 0i64;
+        let mut total = 0;
+        let mut rounds = 0;
+        // Ask for 5000 bytes of a 1000-byte file, with a 10-byte head.
+        let head = [b'h'; 10];
+        let mut head_left = &head[..];
+        loop {
+            rounds += 1;
+            assert!(rounds < 10, "must terminate");
+            let n = sendfile_head(tx.as_fd(), file.as_fd(), &mut off, 5000, head_left).unwrap();
+            if n == 0 {
+                break;
+            }
+            let (h, b) = split_head_body(n, head_left.len(), 5000).unwrap();
+            head_left = &head_left[h..];
+            total += h + b as usize;
+        }
+        assert_eq!(total, 10 + 1000, "the head and the file's own bytes, then the end");
+        assert_eq!(off, 1000);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Linux: a connection accepted from a listener with TCP_NODELAY set has
+    /// it too, so the server needs no setsockopt per connection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepted_connections_inherit_nodelay_from_the_listener() {
+        use std::os::fd::AsFd;
+        const { assert!(NODELAY_INHERITED) };
+        let accept_one = |nodelay: bool| {
+            let l = listen_tcp("127.0.0.1:0".parse().unwrap(), false, 16).unwrap();
+            if nodelay {
+                set_tcp_nodelay(l.as_fd(), true).unwrap();
+            }
+            let c = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            l.set_nonblocking(false).unwrap();
+            let (s, _) = l.accept().unwrap();
+            drop(c);
+            s.nodelay().unwrap()
+        };
+        assert!(accept_one(true), "inherited from the listener");
+        assert!(!accept_one(false), "off by default: the setting is what makes the difference");
+        // Turning it off again works too.
+        let (tx, _rx) = socket_pair();
+        set_tcp_nodelay(tx.as_fd(), true).unwrap();
+        assert!(tx.nodelay().unwrap());
+        set_tcp_nodelay(tx.as_fd(), false).unwrap();
+        assert!(!tx.nodelay().unwrap());
+        // Not a socket: an error, not a crash.
+        assert!(set_tcp_nodelay(std::fs::File::open("/dev/null").unwrap().as_fd(), true).is_err());
+    }
+
+    /// Linux: a corked socket holds a small write back until the cork is
+    /// taken off, then sends it; refuses what is not a socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_cork_holds_a_partial_segment_until_it_is_released() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut tx = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (mut rx, _) = l.accept().unwrap();
+        tx.set_nodelay(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 16];
+
+        set_tcp_cork(tx.as_fd(), true).unwrap();
+        tx.write_all(b"held back").unwrap();
+        // With the cork on the bytes are not sent (without it, NODELAY puts
+        // them on the wire inside the write call: the loopback delivers them
+        // before it returns). Looking at once leaves no room for the kernel's
+        // own 200 ms release of a cork to have happened.
+        let e = rx.read(&mut buf).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock, "a corked partial segment must wait");
+
+        set_tcp_cork(tx.as_fd(), false).unwrap();
+        let t0 = std::time::Instant::now();
+        let n = loop {
+            match rx.read(&mut buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && t0.elapsed() < std::time::Duration::from_secs(5) => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("the held bytes never arrived: {e}"),
+            }
+        };
+        assert_eq!(&buf[..n], b"held back");
+        // Twice is fine; a file is not a socket.
+        set_tcp_cork(tx.as_fd(), false).unwrap();
+        assert!(set_tcp_cork(std::fs::File::open("/dev/null").unwrap().as_fd(), true).is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tcp_cork_is_unsupported_off_linux() {
+        use std::os::fd::AsFd;
+        let (tx, _rx) = socket_pair();
+        assert_eq!(set_tcp_cork(tx.as_fd(), true).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn set_nosigpipe_accepts_sockets_and_refuses_other_files() {
+        use std::os::fd::AsFd;
+        let (tx, _rx) = socket_pair();
+        set_nosigpipe(tx.as_fd()).unwrap();
+        set_nosigpipe(tx.as_fd()).unwrap(); // twice is fine
+        #[cfg(not(target_os = "linux"))]
+        assert!(set_nosigpipe(std::fs::File::open("/dev/null").unwrap().as_fd()).is_err());
+    }
+
     #[test]
     fn sendfile_reports_truncation_and_peer_resets() {
         use std::os::fd::AsFd;
@@ -1653,6 +2038,8 @@ mod tests {
         // SAFETY (test): signal() with a valid signal and SIG_DFL.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
         let (tx, rx) = socket_pair();
+        // Not Linux: what keeps the probe alive (once per connection, as the server does).
+        set_nosigpipe(tx.as_fd()).unwrap();
         drop(rx);
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut err = None;

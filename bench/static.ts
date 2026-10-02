@@ -7,7 +7,9 @@
 // Markdown table on stdout. See bench/README.md.
 //
 //   bun bench/static.ts [--duration 10] [--connections 64] [--workers 4] [--scenarios warden,nginx,pm2-serve,serve]
-//                       [--rounds 1]
+//                       [--rounds 1] [--no-blocking] [--warden target/release/warden]
+//
+// --warden PATH runs another Warden build (an A/B against an older one: two runs, one binary each).
 //
 // --rounds N runs the scenarios N times, interleaved (A B A B ...), and reports the median of
 // every number: an A/B comparison that a noisy machine moves less. Each load also reports the
@@ -20,13 +22,19 @@
 //   nginx         nginx with N worker processes, sendfile, tcp_nopush, access log off (skipped if not installed)
 //   pm2-serve  PM2's static server (`pm2 serve`), N instances in cluster mode
 //   serve      the `serve` npm package (one process: it has no cluster mode)
+//
+// After the table, a second one (unless --no-blocking): does a big transfer hold up the other
+// requests? One Warden process and one nginx process, a client downloading a 10 MB file back to
+// back, a second client asking for the 1.5 KB page: that page's p50 / p99 latency. (A server
+// that sends a big file in one long system call, without letting the others in between, makes
+// every other request on that process wait for it: milliseconds.)
 
 import { spawn, spawnSync, type Subprocess } from "bun";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
-  BIN, TMP, WARDEN, baseEnv, childrenOf, cpuNs, listenersOnPort, machine, mb, medianOf, oha, parseArgs, pkgVersion,
-  pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor, type LoadResult,
+  BIN, TMP, WARDEN, backgroundLoad, baseEnv, childrenOf, cpuNs, listenersOnPort, machine, mb, medianOf, oha, parseArgs,
+  pkgVersion, pss, rss, saveResults, sleep, sum, table, uniq, version, waitFor, type LoadResult,
   onAppCpus,
 } from "./lib.ts";
 
@@ -47,6 +55,9 @@ export const FILES = {
   "/assets/app.3f9a2c1b.js": 48 * 1024,
   "/media/video.bin": 1024 * 1024,
 };
+/** Also in the site, but in no throughput table: the download of the "blocking" measurement. */
+export const BIG = "/media/big.bin";
+const BIG_BYTES = 10 * 1024 * 1024;
 
 export function makeSite() {
   rmSync(SITE, { recursive: true, force: true });
@@ -62,6 +73,7 @@ export function makeSite() {
     return b;
   };
   for (const [path, size] of Object.entries(FILES)) writeFileSync(join(SITE, path), bytes(size));
+  writeFileSync(join(SITE, BIG), bytes(BIG_BYTES));
 }
 
 // ------------------------------------------------------------------ scenarios
@@ -76,17 +88,18 @@ export interface Running {
 
 /** `cache: false` sets cache_size = 0; `bin`: another warden binary (A/B of
  *  two builds); `staticExtra` / `workersExtra`: more lines for [static] /
- *  [workers]. */
+ *  [workers]; `workers`: instead of --workers. */
 export async function startWarden(
-  opts: { cache?: boolean; bin?: string; staticExtra?: string; workersExtra?: string } = {},
+  opts: { cache?: boolean; bin?: string; staticExtra?: string; workersExtra?: string; workers?: number } = {},
 ): Promise<Running> {
-  const bin = opts.bin ?? WARDEN;
+  const bin = opts.bin ?? (args.warden ? resolve(args.warden) : WARDEN);
+  const workers = opts.workers ?? WORKERS;
   if (!existsSync(bin)) throw new Error(`${bin} does not exist (build first: cargo build --release)`);
   const cfg = join(TMP, "warden-static.toml");
   const log = join(TMP, "warden-static.log");
   writeFileSync(
     cfg,
-    `[app]\nname = "bench-static"\nport = ${PORT}\n[workers]\ncount = ${WORKERS}\n${opts.workersExtra ?? ""}` +
+    `[app]\nname = "bench-static"\nport = ${PORT}\n[workers]\ncount = ${workers}\n${opts.workersExtra ?? ""}` +
       `[static]\nroot = ${JSON.stringify(SITE)}\n${opts.cache === false ? "cache_size = 0\n" : ""}${opts.staticExtra ?? ""}` +
       `[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(join(TMP, "warden-static.sock"))}\n`,
   );
@@ -101,7 +114,7 @@ export async function startWarden(
     managerPids: () => [w.pid],
     ready: async () => {
       // Each worker says when it serves.
-      await waitFor(() => (readFileSync(log, "utf8").match(/ via (epoll|kqueue)/g) ?? []).length >= WORKERS, 10_000);
+      await waitFor(() => (readFileSync(log, "utf8").match(/ via (epoll|kqueue)/g) ?? []).length >= workers, 10_000);
     },
     stop: async () => {
       w.kill("SIGTERM");
@@ -110,7 +123,7 @@ export async function startWarden(
   };
 }
 
-export async function startNginx(): Promise<Running> {
+export async function startNginx(workers = WORKERS): Promise<Running> {
   const nginx = ["/usr/sbin/nginx", "/usr/local/sbin/nginx", "/usr/bin/nginx"].find(existsSync);
   if (!nginx) throw new Error("skip: nginx is not installed");
   const dir = join(TMP, "nginx");
@@ -121,7 +134,7 @@ export async function startNginx(): Promise<Running> {
     conf,
     `daemon off;
 master_process on;
-worker_processes ${WORKERS};
+worker_processes ${workers};
 pid ${dir}/nginx.pid;
 error_log ${dir}/error.log warn;
 events { worker_connections 4096; }
@@ -203,7 +216,7 @@ async function startServe(): Promise<Running> {
 export const starters: Record<string, () => Promise<Running>> = {
   warden: () => startWarden(),
   "warden-nocache": () => startWarden({ cache: false }),
-  nginx: startNginx,
+  nginx: () => startNginx(),
   "pm2-serve": startPm2Serve,
   serve: startServe,
 };
@@ -257,6 +270,34 @@ async function runScenario(name: string) {
     const loaded_mb = mb(sum(run.pids(), rss));
     const loaded_pss_mb = mb(sum(run.pids(), pss));
     return { name, processes: uniq(run.pids()).length, startup_ms, idle_mb, idle_pss_mb, loaded_mb, loaded_pss_mb, manager_mb, loads };
+  } finally {
+    await run.stop();
+    await waitFor(() => listenersOnPort(PORT) === 0, 15_000).catch(() => {});
+  }
+}
+
+// ------------------------------------------------------- blocking by big files
+
+/** One server process; one client downloads `BIG` back to back while a second
+ *  one asks for the small page, one request at a time: the page's latency is
+ *  what a big transfer costs the other requests of that process. */
+async function runBlocking(name: "warden" | "nginx") {
+  if (listenersOnPort(PORT) !== 0) throw new Error(`port ${PORT} busy`);
+  const run = await (name === "warden" ? startWarden({ workers: 1 }) : startNginx(1));
+  try {
+    await waitFor(async () => (await get("/index.html")) !== null, 60_000);
+    await run.ready?.();
+    await sleep(1000);
+    const small = `http://127.0.0.1:${PORT}/index.html`;
+    oha(small, 1, 1); // warm-up
+    const stop = backgroundLoad(`http://127.0.0.1:${PORT}${BIG}`, DURATION + 3, 1);
+    try {
+      await sleep(500);
+      const r = oha(small, DURATION, 1);
+      return { name, ...r };
+    } finally {
+      stop();
+    }
   } finally {
     await run.stop();
     await waitFor(() => listenersOnPort(PORT) === 0, 15_000).catch(() => {});
@@ -323,4 +364,32 @@ async function main() {
     ].join("\n"),
   );
   console.error(`results: ${out}`);
+  if (!process.argv.includes("--no-blocking") && SCENARIOS.some((s) => s === "warden" || s === "nginx")) {
+    const names = (["warden", "nginx"] as const).filter((n) => SCENARIOS.includes(n));
+    const blocked: Record<string, any[]> = {};
+    for (let round = 1; round <= ROUNDS; round++) {
+      for (const n of names) {
+        console.error(`--- ${n}, one process, next to a ${BIG_BYTES >> 20} MB download${ROUNDS > 1 ? ` (round ${round} of ${ROUNDS})` : ""}`);
+        const r = await runBlocking(n);
+        console.error(JSON.stringify(r));
+        (blocked[n] ??= []).push(r);
+      }
+    }
+    const rows = names.map((n) => medianOf(blocked[n]));
+    saveResults("static-blocking", { meta, results: rows, ...(ROUNDS > 1 ? { rounds: blocked } : {}) });
+    console.log(
+      [
+        "",
+        `One process, one client downloading a ${BIG_BYTES >> 20} MB file back to back, a second client asking for the ` +
+          `1.5 KB page one request at a time (${DURATION} s${ROUNDS > 1 ? `, median of ${ROUNDS} interleaved rounds` : ""}): ` +
+          "what a big transfer costs the other requests of that process.",
+        "",
+        table(rows, (r) => r.name, [
+          ["page p50 / p99 (ms)", (r) => `${r.p50_ms} / ${r.p99_ms}`],
+          ["page req/s", (r) => r.rps],
+          ["page errors", (r) => r.errors],
+        ]),
+      ].join("\n"),
+    );
+  }
 }

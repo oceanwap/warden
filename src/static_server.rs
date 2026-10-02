@@ -297,6 +297,12 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     // Wake up for a connection only once its request has arrived. Optional:
     // without it the server is just as correct, a little busier.
     let _ = crate::sys::tcp_defer_accept(std_listener.as_fd(), HEAD_TIMEOUT.as_secs() as i32);
+    // TCP_NODELAY (responses go out at once, never held back for Nagle's
+    // algorithm) once on the listener: Linux hands it to every connection it
+    // accepts, so there is no setsockopt per connection. Where that is not
+    // the rule (or setting it failed) each connection gets it when accepted.
+    let nodelay_inherited =
+        crate::sys::NODELAY_INHERITED && crate::sys::set_tcp_nodelay(std_listener.as_fd(), true).is_ok();
     let mut listener = Listener::new(std_listener)?;
     let worker: u64 = std::env::var("WARDEN_WORKER_ID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
 
@@ -372,11 +378,18 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
                 };
                 let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
                 let site = site.clone();
-                let stream = accepted;
-                let _ = stream.set_nodelay(true);
+                let mut stream = accepted;
+                if !nodelay_inherited {
+                    let _ = stream.set_nodelay(true);
+                }
+                let _ = crate::sys::set_nosigpipe(stream.as_fd());
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let (r, w) = stream.into_split();
+                    // Borrowed halves: dropping them does nothing, and the
+                    // stream's own drop is just close(2). Owned halves shut
+                    // the write side down first, one more system call for
+                    // every connection (the FIN is the same either way).
+                    let (r, w) = stream.split();
                     connection(BufReader::new(r), Conn::Tcp(w), site).await;
                 });
             }
@@ -393,7 +406,8 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
                 };
                 let site = site.clone();
                 tokio::spawn(async move {
-                    let (r, w) = stream.into_split();
+                    let mut stream = stream;
+                    let (r, w) = stream.split();
                     connection(BufReader::new(r), Conn::Unix(w), site).await;
                 });
             }
@@ -461,12 +475,12 @@ impl From<Vec<u8>> for OutBuf {
 
 /// The writing half of a client connection. TCP bodies go out with
 /// sendfile(2); the Unix health socket uses a plain copy.
-enum Conn {
-    Tcp(tokio::net::tcp::OwnedWriteHalf),
-    Unix(tokio::net::unix::OwnedWriteHalf),
+enum Conn<'a> {
+    Tcp(tokio::net::tcp::WriteHalf<'a>),
+    Unix(tokio::net::unix::WriteHalf<'a>),
 }
 
-impl Conn {
+impl Conn<'_> {
     async fn write_all(&mut self, b: impl Into<OutBuf>) -> std::io::Result<()> {
         let b = b.into();
         match self {
@@ -482,57 +496,29 @@ impl Conn {
         }
     }
 
-    async fn shutdown(&mut self) -> std::io::Result<()> {
+    /// The response `head` (possibly empty), then `count` bytes of a cached
+    /// response's memfd from `offset`: on TCP by page reference (sendfile; the
+    /// head goes in the same system call on macOS, and in the same packet on
+    /// Linux); on the Unix health socket a plain copy (a memfd read never
+    /// waits for a disk).
+    async fn send_cached(&mut self, head: &[u8], file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
         match self {
-            Conn::Tcp(w) => w.shutdown().await,
-            Conn::Unix(w) => w.shutdown().await,
-        }
-    }
-
-    /// Response headers that a sendfile body follows: on TCP, MSG_MORE lets
-    /// the kernel put them in the same packet as the first body bytes.
-    async fn write_head_more(&mut self, b: impl Into<OutBuf>) -> std::io::Result<()> {
-        let b = b.into();
-        match self {
-            Conn::Tcp(w) => {
-                let b = b.as_slice();
-                let sock: &tokio::net::TcpStream = w.as_ref();
-                let mut off = 0;
-                while off < b.len() {
-                    sock.writable().await?;
-                    match sock.try_io(tokio::io::Interest::WRITABLE, || crate::sys::send(sock.as_fd(), &b[off..], true))
-                    {
-                        Ok(n) => off += n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(())
-            }
-            Conn::Unix(w) => w.write_all(b.as_slice()).await,
-        }
-    }
-
-    /// Send `count` bytes of a cached response's memfd from `offset`: on TCP
-    /// by page reference (sendfile); on the Unix health socket a plain copy
-    /// (a memfd read never waits for a disk).
-    async fn send_cached(&mut self, file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
-        match self {
-            Conn::Tcp(w) => sendfile_all(w.as_ref(), file, offset, count).await.map(|_| ()),
+            Conn::Tcp(w) => sendfile_all(w.as_ref(), head, file, offset, count).await.map(|_| ()),
             Conn::Unix(w) => {
                 let mut buf = vec![0u8; usize::try_from(count).map_err(std::io::Error::other)?];
                 file.read_exact_at(&mut buf, offset)?;
+                w.write_all(head).await?;
                 w.write_all(&buf).await
             }
         }
     }
 
-    /// Send `count` bytes of `file` from `offset`.
-    async fn send_file(&mut self, file: std::fs::File, offset: u64, count: u64) -> std::io::Result<u64> {
+    /// The response `head`, then `count` bytes of `file` from `offset`.
+    async fn send_file(&mut self, head: &[u8], file: std::fs::File, offset: u64, count: u64) -> std::io::Result<u64> {
         match self {
-            Conn::Tcp(w) => sendfile_all(w.as_ref(), &file, offset, count).await,
+            Conn::Tcp(w) => sendfile_all(w.as_ref(), head, &file, offset, count).await,
             Conn::Unix(w) => {
+                w.write_all(head).await?;
                 let mut f = tokio::fs::File::from_std(file);
                 if offset > 0 {
                     use tokio::io::AsyncSeekExt;
@@ -544,21 +530,58 @@ impl Conn {
     }
 }
 
+/// The most one sendfile(2) call is asked to move. The worker is one thread:
+/// while a call runs nobody else is served, and on a loopback or fast local
+/// link the kernel takes a whole multi-megabyte file in one call (10 MB:
+/// 5 ms, during which every other request on the worker waited). After each
+/// chunk the connection yields, so the others get their turn: a 1 KB request
+/// next to a 10 MB download took 5.4 ms and takes 0.34 ms (docs/benchmarks.md).
+/// Files up to this size still go in one call, as before; a smaller chunk
+/// (256 KB) would shorten the wait further but made files of 0.5 to 1 MB
+/// slower (an extra reader wake-up per chunk). Big files cost the same CPU.
+const SEND_CHUNK: u64 = 1 << 20;
+
+/// Bodies of this size and more go out with TCP_CORK: every segment full, the
+/// reader woken less often. Measured on loopback: a 2 MB file 1.06 ms
+/// uncorked, 0.70 corked; 10 MB 5.5 ms, 3.5. Below it corking costs more than
+/// it saves (a 256 KB file: 41 us of CPU uncorked, 97 corked), and between
+/// 1 and 1.25 MB the two are within the noise of this machine.
+const CORK_MIN: u64 = 5 << 18;
+
+/// TCP_CORK on for the length of a big body; off again, which sends what is
+/// held, however the transfer ends.
+struct Corked<'a>(std::os::fd::BorrowedFd<'a>);
+
+impl Drop for Corked<'_> {
+    fn drop(&mut self) {
+        let _ = crate::sys::set_tcp_cork(self.0, false);
+    }
+}
+
 /// Zero-copy body: the kernel moves file pages to the socket, no userspace
-/// buffer. Loops on partial sends and waits for writability on EAGAIN.
+/// buffer, after the response `head` (empty when it is already part of
+/// what the file holds). In chunks of `SEND_CHUNK`, yielding between them;
+/// loops on partial sends and waits for writability on EAGAIN. Where the
+/// system can, the head and the start of the body are one system call and
+/// one packet (`sys::sendfile_head`).
 async fn sendfile_all(
     sock: &tokio::net::TcpStream,
+    head: &[u8],
     file: &std::fs::File,
     offset: u64,
     count: u64,
 ) -> std::io::Result<u64> {
+    let mut head_left = head;
     let mut off = offset as i64;
     let mut left = count;
-    while left > 0 {
+    let _cork =
+        (count >= CORK_MIN && crate::sys::set_tcp_cork(sock.as_fd(), true).is_ok()).then(|| Corked(sock.as_fd()));
+    while !head_left.is_empty() || left > 0 {
         sock.writable().await?;
-        let chunk = left.min(1 << 30) as usize;
+        let chunk = left.min(SEND_CHUNK) as usize;
+        let asked = head_left.len() + chunk;
         let res = sock.try_io(tokio::io::Interest::WRITABLE, || {
-            crate::sys::sendfile(sock.as_fd(), file.as_fd(), &mut off, chunk)
+            crate::sys::sendfile_head(sock.as_fd(), file.as_fd(), &mut off, chunk, head_left)
         });
         match res {
             // The file shrank under us: the promised Content-Length can't be
@@ -566,8 +589,21 @@ async fn sendfile_all(
             Ok(0) => {
                 return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file truncated while sending"));
             }
-            Ok(n) => left -= (n as u64).min(left),
+            Ok(n) => match crate::sys::split_head_body(n, head_left.len(), left) {
+                Some((h, b)) => {
+                    head_left = &head_left[h..];
+                    left -= b;
+                    // A whole chunk went in and there is more: let the other
+                    // connections run before the next one. (A short send means
+                    // the socket is full; waiting for it does that already.)
+                    if left > 0 && n >= asked {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                None => return Err(std::io::Error::other("sendfile reported more bytes than were asked for")),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
@@ -642,7 +678,7 @@ async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R) -> Result<Opti
 /// drains is answered with `Connection: close`, like the shim does for
 /// Bun and Node apps; a connection still idle when the drain ends closes
 /// as the worker exits.
-async fn connection<R>(mut r: R, mut w: Conn, site: Arc<Site>)
+async fn connection<R>(mut r: R, mut w: Conn<'_>, site: Arc<Site>)
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -655,7 +691,7 @@ where
             Ok(Ok(Some(req))) => req,
             Ok(Ok(None)) | Err(_) => return,
             Ok(Err(code)) => {
-                let _ = respond_error(&mut w, code, false).await;
+                let _ = respond_error(&mut w, code, false, false).await;
                 return;
             }
         };
@@ -674,30 +710,36 @@ where
                 t0.elapsed().as_secs_f64() * 1000.0
             );
         }
+        // Closing: the caller's drop of the connection is close(2), which
+        // sends the FIN after the response bytes (no shutdown(2) first).
         if result.is_err() || !keep || site.draining.load(Ordering::SeqCst) {
-            let _ = w.shutdown().await;
             return;
         }
     }
 }
 
-async fn respond_error(w: &mut Conn, code: u16, keep: bool) -> std::io::Result<(u16, u64)> {
+/// A plain-text error. The head and the body go out in one write (one
+/// packet; two writes were two packets and two system calls), and a HEAD
+/// request gets the head alone, which must not be followed by body bytes.
+async fn respond_error(w: &mut Conn<'_>, code: u16, keep: bool, head_only: bool) -> std::io::Result<(u16, u64)> {
     let body = format!("{code} {}\n", reason(code));
-    let mut head = format!(
+    let mut out = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: {}\r\n",
         reason(code),
         body.len(),
         if keep { "keep-alive" } else { "close" }
     );
     if code == 405 {
-        head += "Allow: GET, HEAD\r\n";
+        out += "Allow: GET, HEAD\r\n";
     }
-    head += "\r\n";
+    out += "\r\n";
     let len = body.len() as u64;
-    w.write_all(head).await?;
-    w.write_all(body).await?;
+    if !head_only {
+        out += &body;
+    }
+    w.write_all(out).await?;
     w.flush().await?;
-    Ok((code, len))
+    Ok((code, if head_only { 0 } else { len }))
 }
 
 fn reason(code: u16) -> &'static str {
@@ -961,26 +1003,29 @@ async fn still_matches(site: &Site, deps: &[Dep]) -> bool {
 async fn handle(
     req: &Request,
     site: &Site,
-    w: &mut Conn,
+    w: &mut Conn<'_>,
     keep: bool,
     cached: &mut &'static str,
 ) -> std::io::Result<(u16, u64)> {
     if req.method != "GET" && req.method != "HEAD" {
-        return respond_error(w, 405, keep).await;
+        return respond_error(w, 405, keep, false).await;
     }
     if let Some(expected) = &site.auth {
         if req.header("authorization") != Some(expected.as_str()) {
             let body = "401 Unauthorized\n";
-            let head = format!(
+            let mut out = format!(
                 "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"warden\"\r\nContent-Type: text/plain\r\n\
                  Content-Length: {}\r\nConnection: {}\r\n\r\n",
                 body.len(),
                 if keep { "keep-alive" } else { "close" }
             );
-            w.write_all(head).await?;
-            w.write_all(body.to_string()).await?;
+            let head_only = req.method == "HEAD";
+            if !head_only {
+                out += body;
+            }
+            w.write_all(out).await?;
             w.flush().await?;
-            return Ok((401, body.len() as u64));
+            return Ok((401, if head_only { 0 } else { body.len() as u64 }));
         }
     }
     let cfg = &site.cfg;
@@ -1063,7 +1108,13 @@ async fn handle(
 }
 
 /// SPA fallback to index.html, then 404.html, then a plain 404.
-async fn not_found_or(w: &mut Conn, site: &Site, req: &Request, code: u16, keep: bool) -> std::io::Result<(u16, u64)> {
+async fn not_found_or(
+    w: &mut Conn<'_>,
+    site: &Site,
+    req: &Request,
+    code: u16,
+    keep: bool,
+) -> std::io::Result<(u16, u64)> {
     if code == 404 {
         let wants_page = req.header("accept").is_none_or(|a| a.contains("text/html") || a.contains("*/*"));
         let last = req.path.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("");
@@ -1080,10 +1131,16 @@ async fn not_found_or(w: &mut Conn, site: &Site, req: &Request, code: u16, keep:
             }
         }
     }
-    respond_error(w, code, keep).await
+    respond_error(w, code, keep, req.method == "HEAD").await
 }
 
-async fn listing(w: &mut Conn, dir: &Path, url_path: &str, head_only: bool, keep: bool) -> std::io::Result<(u16, u64)> {
+async fn listing(
+    w: &mut Conn<'_>,
+    dir: &Path,
+    url_path: &str,
+    head_only: bool,
+    keep: bool,
+) -> std::io::Result<(u16, u64)> {
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
     let mut names: Vec<(bool, String)> = std::fs::read_dir(dir)
         .map(|rd| {
@@ -1103,17 +1160,17 @@ async fn listing(w: &mut Conn, dir: &Path, url_path: &str, head_only: bool, keep
         body += &format!("<li><a href=\"{0}\">{0}</a>", esc(&shown));
     }
     body += "</ul>\n";
-    let head = format!(
+    let mut out = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-cache\r\n\
          Connection: {}\r\n\r\n",
         body.len(),
         if keep { "keep-alive" } else { "close" }
     );
     let len = body.len() as u64;
-    w.write_all(head).await?;
     if !head_only {
-        w.write_all(body).await?;
+        out += &body;
     }
+    w.write_all(out).await?;
     w.flush().await?;
     Ok((200, len))
 }
@@ -1174,6 +1231,21 @@ fn not_modified_head(p: &HeadParts, conn: &str) -> (String, usize) {
     (head, conn_at)
 }
 
+/// Cache-Control of an HTML page (also an index page and the SPA fallback).
+/// By default `no-cache`: the browser asks again on every navigation and
+/// gets a 304 (one round trip per page load, whatever the file size).
+/// `html_max_age` (seconds) lets it reuse the page without asking for that
+/// long; unset or 0 keeps `no-cache`. `private` with Basic auth, so a shared
+/// cache in front never stores a page that needed a password (`public`
+/// would allow it for requests with an Authorization header).
+fn html_cache_control(cfg: &Static) -> String {
+    match cfg.html_max_age {
+        None | Some(0) => "no-cache".to_string(),
+        Some(n) if cfg.basic_auth.is_some() => format!("private, max-age={n}"),
+        Some(n) => format!("public, max-age={n}"),
+    }
+}
+
 /// If-None-Match (wins when present), else If-Modified-Since.
 fn is_not_modified(req: &Request, etag: &str, mtime: u64) -> bool {
     match req.header("if-none-match") {
@@ -1184,19 +1256,18 @@ fn is_not_modified(req: &Request, etag: &str, mtime: u64) -> bool {
 
 /// Answer from a cached entry: 304, HEAD or the full response, the same
 /// bytes the normal path sends. Keep-alive: one send of the stored bytes.
-async fn respond_cached(w: &mut Conn, req: &Request, e: &Arc<Entry>, keep: bool) -> std::io::Result<(u16, u64)> {
+async fn respond_cached(w: &mut Conn<'_>, req: &Request, e: &Arc<Entry>, keep: bool) -> std::io::Result<(u16, u64)> {
     let not_modified = is_not_modified(req, &e.etag, e.mtime);
     if let (Some(mem), false, false) = (&e.file, not_modified, req.method == "HEAD") {
         // The whole response is in a memfd: one sendfile(2), no copy.
         if keep {
-            w.send_cached(&mem.file, 0, (e.head_len as u64) + e.body_len).await?;
+            w.send_cached(&[], &mem.file, 0, (e.head_len as u64) + e.body_len).await?;
         } else {
             let mut head = Vec::with_capacity(e.head_len);
             head.extend_from_slice(&e.resp[..e.conn_at]);
             head.extend_from_slice(b"close");
             head.extend_from_slice(&e.resp[e.conn_at + cache::KEEP_ALIVE.len()..e.head_len]);
-            w.write_head_more(head).await?;
-            w.send_cached(&mem.file, e.head_len as u64, e.body_len).await?;
+            w.send_cached(&head, &mem.file, e.head_len as u64, e.body_len).await?;
         }
         w.flush().await?;
         return Ok((200, e.body_len));
@@ -1227,7 +1298,7 @@ async fn respond_cached(w: &mut Conn, req: &Request, e: &Arc<Entry>, keep: bool)
 /// the cache entry.
 #[allow(clippy::too_many_arguments)]
 async fn send_file(
-    w: &mut Conn,
+    w: &mut Conn<'_>,
     site: &Site,
     req: &Request,
     rel: &str,
@@ -1272,8 +1343,10 @@ async fn send_file(
     let last_modified = http_date(mtime);
 
     let html = matches!(ext.as_str(), "html" | "htm");
-    let cache_control = if html || status != 200 {
+    let cache_control = if status != 200 {
         "no-cache".to_string()
+    } else if html {
+        html_cache_control(cfg)
     } else if fingerprinted(name) {
         "public, max-age=31536000, immutable".to_string()
     } else {
@@ -1370,8 +1443,7 @@ async fn send_file(
         w.flush().await?;
         return Ok((code, count));
     }
-    w.write_head_more(head).await?;
-    let sent = w.send_file(body.file, start, count).await?;
+    let sent = w.send_file(head.as_bytes(), body.file, start, count).await?;
     w.flush().await?;
     Ok((code, sent))
 }
@@ -1664,6 +1736,22 @@ mod tests {
             cache_key("a.css", &cfg, &req(&[]), false)
         );
         assert_ne!(cache_key("a", &cfg, &req(&[]), false), cache_key("a\u{1}", &cfg, &req(&[]), false));
+    }
+
+    #[test]
+    fn html_pages_revalidate_unless_html_max_age_is_set() {
+        let mut cfg: Static = serde_json::from_str(r#"{"root": "/srv"}"#).unwrap();
+        assert_eq!(cfg.html_max_age, None);
+        assert_eq!(html_cache_control(&cfg), "no-cache", "the default: ask again on every page load");
+        cfg.html_max_age = Some(0);
+        assert_eq!(html_cache_control(&cfg), "no-cache", "0 is the same as unset");
+        cfg.html_max_age = Some(60);
+        assert_eq!(html_cache_control(&cfg), "public, max-age=60");
+        cfg.basic_auth = Some("user:pass".into());
+        assert_eq!(html_cache_control(&cfg), "private, max-age=60", "a shared cache must not keep a password page");
+        // Not a knob for the other files: their policy is cache_max_age.
+        cfg.html_max_age = None;
+        assert_eq!(html_cache_control(&cfg), "no-cache");
     }
 
     #[test]

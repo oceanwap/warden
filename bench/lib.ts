@@ -1,6 +1,6 @@
 // Shared helpers for the benchmark scripts (run.ts, static.ts, logs.ts,
 // fleet.ts): /proc sampling, the load generator, run metadata and output.
-import { spawnSync } from "bun";
+import { spawn, spawnSync } from "bun";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -181,6 +181,17 @@ export interface LoadOptions {
   /** A fixed number of requests instead of `seconds` (oha only; wrk runs for `seconds`):
    *  per-request costs then divide by an exact count. */
   requests?: number;
+}
+
+/** A load in the background, its numbers thrown away: `connections` clients
+ *  requesting `url` back to back for `seconds`. Returns what stops it. */
+export function backgroundLoad(url: string, seconds: number, connections: number): () => void {
+  const cmd =
+    LOADGEN === "wrk"
+      ? ["wrk", "-t", "1", "-c", String(connections), "-d", `${seconds}s`, "--timeout", "5s", url]
+      : ["oha", "-z", `${seconds}s`, "-c", String(connections), "--no-tui", "--output-format", "json", url];
+  const p = spawn(onLoadgenCpus(cmd), { stdout: "ignore", stderr: "ignore" });
+  return () => p.kill();
 }
 
 /** A load test against `url` for `seconds` with the configured generator. */
