@@ -285,6 +285,11 @@ pub fn section<'a>(label: &str) -> Text<'a> {
     text(label.to_uppercase()).size(11).font(DISPLAY).style(muted)
 }
 
+/// A section label with an icon before it: `>_ COMMAND LINE TOOL`.
+pub fn section_icon<'a, Message: 'a>(i: Icon, label: &str) -> Element<'a, Message> {
+    row![icon(i).size(13).style(muted), section(label)].spacing(6).align_y(Center).into()
+}
+
 /// The mark of the app: the shield on a rounded square of the accent.
 pub fn brand_mark<'a, Message: 'a>(size: f32) -> Element<'a, Message> {
     container(

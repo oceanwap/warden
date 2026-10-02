@@ -11,6 +11,7 @@
 //!   and backoff, short requests), all off the UI thread;
 //! - `ssh`: the tunnel to a remote wardend, and shell quoting for remote commands;
 //! - `commands`: the `warden` CLI as a subprocess (local, or over SSH);
+//! - `cli_install`: the link that puts `warden` on PATH, from Settings or the first-run banner;
 //! - `model`, `logs`, `history`, `format`, `ring`: state and text, no I/O
 //!   (unit-tested);
 //! - `app`, `view`, `charts`: the iced program (update, subscriptions,
@@ -20,6 +21,7 @@
 
 pub mod app;
 pub mod charts;
+pub mod cli_install;
 pub mod client;
 pub mod commands;
 pub mod dropdown;

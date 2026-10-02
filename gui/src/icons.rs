@@ -54,9 +54,77 @@ pub enum Icon {
     Workers,
     Folder,
     Timer,
+    Sun,
+    Moon,
+    SunMoon,
+    Palette,
+    Monitor,
+    Save,
+    Trash,
 }
 
 impl Icon {
+    /// Every icon, in the order of the list in build.py (a test draws each).
+    pub const ALL: [Icon; 57] = [
+        Icon::ChevronDown,
+        Icon::ChevronRight,
+        Icon::ChevronUp,
+        Icon::Restart,
+        Icon::Reset,
+        Icon::Reload,
+        Icon::Rolling,
+        Icon::SafeReload,
+        Icon::Hard,
+        Icon::Play,
+        Icon::Stop,
+        Icon::Power,
+        Icon::Plus,
+        Icon::Minus,
+        Icon::Settings,
+        Icon::Edit,
+        Icon::Copy,
+        Icon::Check,
+        Icon::Close,
+        Icon::Search,
+        Icon::Server,
+        Icon::Globe,
+        Icon::Plug,
+        Icon::Unplug,
+        Icon::Laptop,
+        Icon::Activity,
+        Icon::Logs,
+        Icon::History,
+        Icon::Cpu,
+        Icon::Memory,
+        Icon::Clock,
+        Icon::Alert,
+        Icon::AlertCircle,
+        Icon::CheckCircle,
+        Icon::Shield,
+        Icon::Terminal,
+        Icon::Link,
+        Icon::ExternalLink,
+        Icon::User,
+        Icon::Network,
+        Icon::Ellipsis,
+        Icon::Pause,
+        Icon::Info,
+        Icon::Loader,
+        Icon::Wifi,
+        Icon::WifiOff,
+        Icon::Boxes,
+        Icon::Workers,
+        Icon::Folder,
+        Icon::Timer,
+        Icon::Sun,
+        Icon::Moon,
+        Icon::SunMoon,
+        Icon::Palette,
+        Icon::Monitor,
+        Icon::Save,
+        Icon::Trash,
+    ];
+
     pub const fn glyph(self) -> char {
         match self {
             Icon::ChevronDown => '\u{e06d}',  // chevron-down
@@ -109,6 +177,13 @@ impl Icon {
             Icon::Workers => '\u{e529}',      // layers
             Icon::Folder => '\u{e0d7}',       // folder
             Icon::Timer => '\u{e1e0}',        // timer
+            Icon::Sun => '\u{e178}',          // sun
+            Icon::Moon => '\u{e11e}',         // moon
+            Icon::SunMoon => '\u{e2b2}',      // sun-moon
+            Icon::Palette => '\u{e1dd}',      // palette
+            Icon::Monitor => '\u{e11d}',      // monitor
+            Icon::Save => '\u{e14d}',         // save
+            Icon::Trash => '\u{e18e}',        // trash-2
         }
     }
 }

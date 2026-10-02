@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Subset the fonts the GUI embeds, and write gui/src/icons.rs.
 
-    pip install fonttools brotli && python3 gui/assets/fonts/build.py [--cache DIR]
+    pip install fonttools brotli && python3 gui/assets/fonts/build.py [--cache DIR] && cargo fmt -p warden-gui
 
 Sources (downloaded once into --cache, default a temp directory):
   Inter 4.1            https://github.com/rsms/inter                 SIL OFL 1.1
@@ -49,6 +49,8 @@ ICONS = [
     ("ExternalLink", "external-link"), ("User", "user"), ("Network", "network"), ("Ellipsis", "ellipsis"),
     ("Pause", "pause"), ("Info", "info"), ("Loader", "loader"), ("Wifi", "wifi"), ("WifiOff", "wifi-off"),
     ("Boxes", "boxes"), ("Workers", "layers"), ("Folder", "folder"), ("Timer", "timer"),
+    ("Sun", "sun"), ("Moon", "moon"), ("SunMoon", "sun-moon"), ("Palette", "palette"), ("Monitor", "monitor"),
+    ("Save", "save"), ("Trash", "trash-2"),
 ]
 
 TEXT_UNICODES = (
@@ -129,6 +131,11 @@ lines += [
     "}",
     "",
     "impl Icon {",
+    "    /// Every icon, in the order of the list in build.py (a test draws each).",
+    f"    pub const ALL: [Icon; {len(ICONS)}] = [",
+    *[f"        Icon::{rust}," for rust, _ in ICONS],
+    "    ];",
+    "",
     "    pub const fn glyph(self) -> char {",
     "        match self {",
     *arms,

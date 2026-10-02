@@ -7,6 +7,15 @@ one ~8 MB binary, no web view, no GPU driver.
 
 ![The main screen, rendered headless by the tests](../docs/gui-main-screen.png)
 
+The app's icon is [`assets/icon/warden.svg`](../assets/icon/warden.svg), a shield
+with a W on a dark rounded square. `assets/icon/build.py` renders it into
+`assets/icon/png/` (16 to 1024 px; the README and the Linux packages), `Warden.icns`
+(macOS: `Warden.app/Contents/Resources`, which is where the Dock and Cmd-Tab take it
+from) and `gui/assets/icon-128.rgba` (the window's icon, embedded). On Linux the menu
+entry is `assets/warden-gui.desktop` (`Icon=warden`), and the window's
+`application_id` is `warden-gui`, so Wayland and X11 match it to that entry and show
+the icon.
+
 ## What it does
 
 - **Connection bar**: wardend's version and pid, the host's CPU, memory and
@@ -59,6 +68,8 @@ one ~8 MB binary, no web view, no GPU driver.
   **Validate** runs `warden check -c` on the text (a temporary file beside the
   config, so relative paths resolve the same) and shows its error; **Save**
   validates, then writes the file (mode and owner kept); **Reload now** follows.
+- **Install command line tool**: links `warden` where Terminal finds it, from
+  Settings or from a one-time banner (see [Command line tool](#command-line-tool)).
 - **Remote host**: see below.
 
 It is a separate process and only a client: closing or killing it touches no
@@ -121,17 +132,77 @@ In every look:
   same place, with or without the bar.
 - Boxes are see-through (a white veil over the page), so the page shows a
   little through cards and tiles.
-- Type: Plus Jakarta Sans for headings and figures, Inter for text,
-  JetBrains Mono for pids, ports and logs, and the Lucide icons, all embedded
-  as subsets (about 310 KB). Their licenses (OFL for the fonts, ISC for the
-  icons) are in `assets/fonts/LICENSES.txt`, shipped as `FONT-LICENSES.txt`
-  in the tarball and the `.app`; `assets/fonts/build.py` rebuilds the subsets.
+- Type: Plus Jakarta Sans for headings and figures, Inter (regular, medium and
+  semibold) for text, JetBrains Mono for pids, ports and logs, and the Lucide
+  icons, all embedded as subsets (about 310 KB; nothing is read from the system,
+  so the window looks the same everywhere, and a script outside Latin falls back
+  to the system's fonts). Their licenses (OFL for the fonts, ISC for the icons)
+  are in `assets/fonts/LICENSES.txt`, shipped as `FONT-LICENSES.txt` in the
+  tarball, the `.app` and the `.deb`/`.rpm` next to the third-party notices of the
+  crates; `assets/fonts/build.py` rebuilds the subsets (and `icons.rs`, which
+  `cargo fmt` then formats) from the list of icons in it.
+  `tests/fonts.rs` draws the same text in each face and fails when two draw alike,
+  so a weight that fell back to another (Medium to Regular, a heading face not
+  found) does not go unnoticed.
+- Icons say what a control does or what a figure is, and are left off where the
+  words are enough: the actions (Start, Restart and its menu, Stop, Reset, scale,
+  reload, per-worker restart, Pause, Clear), the tabs, the stat tiles and the
+  History charts (the same icon for the same figure), the connection and its
+  menu, the folder, ports and sockets, the toasts, the banners and the results in
+  the dialogs (done, failed, warning), the buttons that carry out something
+  (Add, Validate, Save, Save and connect, Install, Uninstall), and the options of
+  Settings (Warden or System colors, Auto, Light and Dark). The state of an app and
+  of a worker stays a dot and its word.
 - The window is laid out for 900 × 560 and up: the stat tiles wrap to two
   rows under 1100 px, the worker table scrolls sideways under about 1240 px,
   and when the window is too short for the events, logs or charts to keep a
   usable height the page scrolls instead of squeezing them.
 
 ![Warden's colors, light](../docs/gui-main-screen-light.png)
+
+## Command line tool
+
+`Warden.app` holds the CLI beside the GUI (`Contents/MacOS/warden`), but Terminal does
+not look there. **Settings → Command line tool → Install command line tool** puts a
+link to it where Terminal does, and a banner under the top bar offers the same once,
+when the window runs from an `.app` bundle and no `warden` is to be found (on PATH, or
+in `/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin` or `~/.cargo/bin`: a window
+opened from Finder has launchd's short PATH). **Not now** is remembered in `gui.json`
+(`cli_banner_dismissed`); installing a `warden` any other way also ends it.
+
+![The first-run banner that offers the command line tool, rendered headless by the tests](../docs/gui-cli-banner.png)
+
+The link goes, in this order:
+
+1. **macOS: `/usr/local/bin/warden`**, made as you when that folder lets you (it is
+   created when it does not exist and its parent lets you);
+2. else the same through the system's administrator prompt (`osascript`:
+   `do shell script … with administrator privileges`): macOS asks for the password
+   itself, and Warden never sees it;
+3. else **`~/.local/bin/warden`**: also when the prompt is cancelled or fails (the
+   toast says why), and the only choice on Linux, where the link points at the `warden`
+   next to `warden-gui`. When that folder is not on PATH, Settings shows the line that
+   puts it there, as `install.sh` does (zsh: `echo 'export PATH="$HOME/.local/bin:$PATH"'
+   >> ~/.zshrc`; bash, fish and others the same way), with a click to copy it. No file
+   of yours is changed.
+
+Settings then says `Installed: /usr/local/bin/warden` (a link to the CLI in the app) and
+offers **Uninstall**. Only links are made and removed, and only ones that point into the
+app (this app's CLI, or a `Warden.app/Contents/MacOS/warden` anywhere):
+
+- a `warden` that is a file, or a link to something else (Homebrew, `install.sh`, a
+  package), is never replaced or deleted: Settings says `` `warden` is installed:
+  <path> `` and offers nothing;
+- a link to a `Warden.app` that was moved or deleted shows as dead, with **Install
+  again** and **Remove the link**;
+- from a disk image (`/Volumes/…`) or from the randomized place macOS runs an app
+  downloaded and opened before it was moved (App Translocation) the window refuses,
+  because a link to such a place would break: it says to drag Warden.app to
+  Applications and open it from there.
+
+It is always about this machine, whichever host the window shows. `cli_install.rs`
+takes every folder as a parameter (so its tests run on temporary ones); the
+administrator prompt is the only part that runs `osascript`.
 
 ## Run it
 
@@ -280,11 +351,25 @@ cargo build --bin warden && cargo test -p warden-gui
   answers) and that every desktop palette is readable, event → state, the bounded buffers, batching and
   backoff, and the command lines for Add app and ssh (quoting included:
   quoted command lines are run through `sh` and must come back unchanged).
+- `src/cli_install.rs` (unit tests, on temporary folders): the link in the system folder
+  with and without the administrator (a folder that says no is simulated: the tests may
+  run as root), the fallback to `~/.local/bin` when the prompt is cancelled or fails, a
+  file or somebody else's link in the way (left alone, no second copy elsewhere), a dead
+  link, uninstalling (only a link of the app's), the first-run banner's conditions, the
+  PATH line for each shell, a disk image or a translocated app refused, and the
+  `osascript` command: the shell quoting and then the AppleScript quoting of a path with
+  a space, a quote and a backslash, and that the shell reads the path back unchanged. The
+  prompt itself only runs on a Mac and is not tested.
+- `tests/fonts.rs`: each face (Inter's three weights, the two heading weights, the mono
+  face) draws differently from the others and from a family that does not exist, and
+  the icon font has its glyphs.
 - `tests/render.rs`: headless rendering with `iced_test` (tiny-skia): the
   main screen with fake wardend data (dark, light and a 900 px window), an
   app that gave up, standbys and draining workers, the worker table's
   columns, the Restart and Connection menus, the logs tab, a confirmation,
-  the Add app, Edit config, machine and Settings dialogs, the main screen in the
+  the Add app, Edit config, machine and Settings dialogs (Settings in each state of
+  the command line tool, and in a window too short for it, where it scrolls and keeps
+  Done in view), the first-run banner (wide and narrow), the main screen in the
   desktop colors of macOS and Ubuntu (light and dark), the "wardend is not
   running" screen, and the History tab (`history-1h` with
   the crosshair over the memory chart, `history-24h-light`, and the error

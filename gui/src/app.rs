@@ -2,6 +2,7 @@
 //! window is drawn by `view`; everything slow (sockets, subprocesses) runs
 //! in tasks and subscriptions on the async executor.
 
+use crate::cli_install;
 use crate::client::{self, Endpoint, FeedMsg, FeedOptions};
 use crate::commands::{self, AddApp, Added, Host, Output};
 use crate::history::{AppChart, HostSpark, Load, Range};
@@ -274,6 +275,9 @@ pub struct Gui {
     pub starting_wardend: bool,
     /// Settings' "Restart everything": asking first, then running `warden update --yes`.
     pub restart_all: RestartAll,
+    /// "Install command line tool": what `warden` is on this machine, and the action in flight
+    /// (the first-run banner and Settings). Always this machine, whatever host the window shows.
+    pub cli: cli_install::State,
     /// Actions in flight, per app (buttons show it).
     pub busy: Vec<(String, Act)>,
     /// The History tab's range (kept across apps).
@@ -336,6 +340,13 @@ pub enum Message {
     CancelRestartAll,
     RestartAll,
     RestartedAll(Result<Output, String>),
+    /// "Install command line tool" (Settings, or the first-run banner), and its undoing.
+    InstallCli,
+    CliInstalled(Result<cli_install::Installed, String>),
+    UninstallCli,
+    CliRemoved(Result<cli_install::Removed, String>),
+    /// "Not now" on the banner: it does not come back.
+    DismissCliBanner,
     /// Open a dropdown, or close it when it is the one that is open.
     ToggleMenu(MenuKind),
     CloseMenu,
@@ -411,6 +422,7 @@ impl Gui {
             Err(e) => (Target::local(opts.socket.clone()), Some(e)),
         };
         let mut g = Gui::with_target(target);
+        g.cli = cli_install::State::detect();
         g.auto_local = opts.ssh.is_none() && opts.socket.is_none();
         g.saved_path = hosts::path();
         if let Some(p) = &g.saved_path {
@@ -450,6 +462,7 @@ impl Gui {
             modal: Modal::None,
             starting_wardend: false,
             restart_all: RestartAll::Idle,
+            cli: cli_install::State::default(),
             busy: Vec::new(),
             range: Range::Hour,
             chart: None,
@@ -767,6 +780,41 @@ impl Gui {
                     Err(e) => self.toast(false, format!("restart failed: {e}")),
                 }
             }
+            Message::InstallCli => {
+                let (Ok(places), cli_install::Work::Idle) = (self.cli.places.clone(), self.cli.work) else {
+                    return Task::none();
+                };
+                self.cli.work = cli_install::Work::Installing;
+                Task::perform(cli_install::install(places), Message::CliInstalled)
+            }
+            Message::CliInstalled(r) => {
+                self.cli.work = cli_install::Work::Idle;
+                self.cli.refresh();
+                match (r, &self.cli.places) {
+                    (Ok(done), Ok(p)) => self.toast(true, done.summary(&p.cli)),
+                    (Ok(done), Err(_)) => self.toast(true, format!("Installed {}.", done.link.display())),
+                    (Err(e), _) => self.toast(false, format!("installing the command line tool failed: {e}")),
+                }
+            }
+            Message::UninstallCli => {
+                let (Ok(places), cli_install::Work::Idle) = (self.cli.places.clone(), self.cli.work) else {
+                    return Task::none();
+                };
+                self.cli.work = cli_install::Work::Removing;
+                Task::perform(cli_install::uninstall(places), Message::CliRemoved)
+            }
+            Message::CliRemoved(r) => {
+                self.cli.work = cli_install::Work::Idle;
+                self.cli.refresh();
+                match r {
+                    Ok(gone) => self.toast(true, format!("Removed {}.", gone.link.display())),
+                    Err(e) => self.toast(false, format!("removing the command line tool failed: {e}")),
+                }
+            }
+            Message::DismissCliBanner => {
+                self.saved.cli_banner_dismissed = true;
+                self.persist()
+            }
             Message::ToggleMenu(kind) => {
                 self.menu = if self.menu == Some(kind) { None } else { Some(kind) };
                 Task::none()
@@ -1043,6 +1091,8 @@ impl Gui {
             next_toast: self.next_toast,
             saved: std::mem::take(&mut self.saved),
             saved_path: self.saved_path.take(),
+            // This machine's, not the host's.
+            cli: self.cli.clone(),
             filter: std::mem::take(&mut self.filter),
             auto_local: self.auto_local,
             window: self.window,
@@ -1548,6 +1598,85 @@ mod tests {
             "{}",
             t.text
         );
+    }
+
+    /// A fake `Warden.app` and the folders of a Linux home, all under one temporary folder.
+    fn cli_places(name: &str) -> (PathBuf, cli_install::Places) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("wg-app-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let macos = root.join("Warden.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        for f in ["warden-gui", "warden"] {
+            std::fs::write(macos.join(f), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(macos.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let home = root.join("home");
+        let places = cli_install::Places {
+            exe: macos.join("warden-gui"),
+            cli: macos.join("warden"),
+            system_dir: None,
+            user_dir: Some(home.join(".local/bin")),
+            search: vec![home.join(".local/bin")],
+            path: vec![],
+            shell: Some("/bin/zsh".into()),
+            home: Some(home),
+            mac: false,
+        };
+        (root, places)
+    }
+
+    #[test]
+    fn the_command_line_tool_is_installed_and_removed_from_the_window() {
+        use cli_install::{State, Status, Work};
+        let (root, places) = cli_places("flow");
+        let file = root.join("config/gui.json");
+        let mut g = connected();
+        g.saved_path = Some(file.clone());
+        // A window that looked at nothing (or cannot link from here) does nothing.
+        let _ = g.update(Message::InstallCli);
+        let _ = g.update(Message::UninstallCli);
+        assert_eq!(g.cli.work, Work::Idle);
+        g.cli = State::of(Ok(places.clone()));
+        assert_eq!(g.cli.status, Status::Missing);
+        assert!(g.cli.banner(g.saved.cli_banner_dismissed), "a bundle, no warden: the banner offers it");
+        // One click starts it; a second while it runs is ignored.
+        let _ = g.update(Message::InstallCli);
+        assert_eq!(g.cli.work, Work::Installing);
+        let _ = g.update(Message::UninstallCli);
+        assert_eq!(g.cli.work, Work::Installing, "one action at a time");
+        // What the task does, on the temporary folders (no administrator: there is no system folder).
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let done = rt.block_on(cli_install::install(places.clone()));
+        let _ = g.update(Message::CliInstalled(done));
+        assert_eq!(g.cli.work, Work::Idle);
+        let link = places.user_dir.clone().unwrap().join("warden");
+        assert!(matches!(&g.cli.status, Status::Linked { link: l, .. } if *l == link), "{:?}", g.cli.status);
+        let t = g.toasts.last().unwrap();
+        assert!(t.ok && t.text.contains("Installed") && t.text.contains(link.to_str().unwrap()), "{}", t.text);
+        assert!(!g.cli.banner(false), "installed: no banner");
+        // The window follows the host it shows, but the tool is this machine's.
+        g.switch_target(Target::ssh("deploy@web-1", "/run/warden/wardend.sock", "warden").unwrap());
+        assert!(matches!(g.cli.status, Status::Linked { .. }));
+        // Remove it again.
+        let _ = g.update(Message::UninstallCli);
+        assert_eq!(g.cli.work, Work::Removing);
+        let gone = rt.block_on(cli_install::uninstall(places.clone()));
+        let _ = g.update(Message::CliRemoved(gone));
+        assert_eq!((g.cli.work, &g.cli.status), (Work::Idle, &Status::Missing));
+        assert!(g.toasts.last().is_some_and(|t| t.ok && t.text.starts_with("Removed")));
+        // Failures are told with what failed.
+        let _ = g.update(Message::CliInstalled(Err("/usr/local/bin/warden is a file, not a link".into())));
+        let t = g.toasts.last().unwrap();
+        assert!(!t.ok && t.text.contains("installing the command line tool failed") && t.text.contains("is a file"));
+        let _ = g.update(Message::CliRemoved(Err("nothing".into())));
+        assert!(g.toasts.last().is_some_and(|t| !t.ok && t.text.contains("removing the command line tool failed")));
+        // "Not now" is kept in gui.json, and a new window starts with it.
+        assert!(!g.saved.cli_banner_dismissed);
+        let _ = g.update(Message::DismissCliBanner);
+        assert!(g.saved.cli_banner_dismissed && !g.cli.banner(g.saved.cli_banner_dismissed));
+        assert!(hosts::load(&file).cli_banner_dismissed);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

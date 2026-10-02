@@ -10,6 +10,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 use warden_gui::app::{Act, Gui, MenuKind, Message, Tab, Target};
+use warden_gui::cli_install::{self, Places, State, Status, Work};
 use warden_gui::client::{Batch, FeedMsg};
 use warden_gui::history::Range;
 use warden_gui::hosts::Machine;
@@ -334,6 +335,10 @@ fn the_charts_follow_the_desktop_accent() {
 fn settings_dialog_offers_colors_and_mode() {
     use warden_gui::system::{Accent, Colors, Flavor, Mode, Source, System, theme};
     let mut g = connected();
+    // As on a Mac with Warden.app in Applications and no `warden` on PATH yet (the banner was
+    // turned away, so the main screen behind the dialog is the usual one).
+    g.cli = State { places: Ok(mac_places()), status: Status::Missing, work: Work::Idle };
+    g.saved.cli_banner_dismissed = true;
     let mut ui = sim(&g);
     let _ = ui.click(warden_gui::icons::Icon::Settings.glyph().to_string().as_str());
     assert!(matches!(messages(ui).as_slice(), [Message::OpenSettings]), "the gear opens Settings");
@@ -342,7 +347,18 @@ fn settings_dialog_offers_colors_and_mode() {
     let mac = System { flavor: Flavor::Mac, dark: Some(true), accent: Accent::Purple };
     let _ = g.update(Message::System(mac));
     let mut ui = sim(&g);
-    for t in ["Settings", "COLORS", "MODE", "System", "Auto", "Light", "Dark", "Done"] {
+    for t in [
+        "Settings",
+        "COLORS",
+        "MODE",
+        "COMMAND LINE TOOL",
+        "Install command line tool",
+        "System",
+        "Auto",
+        "Light",
+        "Dark",
+        "Done",
+    ] {
         assert!(ui.find(t).is_ok(), "{t:?} is not in Settings");
     }
     assert!(ui.find("This desktop: macOS, dark, purple accent.").is_ok());
@@ -724,4 +740,199 @@ fn narrow_window_still_draws_the_table() {
         assert!(ui.find(t).is_err(), "{t:?} is dropped from the top bar when there is no room");
     }
     save(&mut ui, "main-screen-narrow");
+}
+
+/// What a Mac with `Warden.app` in Applications knows about itself, with no file touched: the
+/// folders are only names here.
+fn mac_places() -> Places {
+    Places {
+        exe: "/Applications/Warden.app/Contents/MacOS/warden-gui".into(),
+        cli: "/Applications/Warden.app/Contents/MacOS/warden".into(),
+        system_dir: Some("/usr/local/bin".into()),
+        user_dir: Some("/Users/ana/.local/bin".into()),
+        search: vec!["/usr/local/bin".into(), "/opt/homebrew/bin".into()],
+        path: vec!["/usr/bin".into(), "/bin".into()],
+        shell: Some("/bin/zsh".into()),
+        home: Some("/Users/ana".into()),
+        mac: true,
+    }
+}
+
+fn with_cli(status: Status, work: Work) -> Gui {
+    let mut g = connected();
+    g.cli = State { places: Ok(mac_places()), status, work };
+    g
+}
+
+/// Settings open over the main screen, with the banner turned away (it has the same button).
+fn settings_with(status: Status, work: Work) -> Gui {
+    let mut g = with_cli(status, work);
+    g.saved.cli_banner_dismissed = true;
+    let _ = g.update(Message::OpenSettings);
+    g
+}
+
+/// Settings offers "Install command line tool": what `warden` is here, the action that fits
+/// (install, uninstall, install again), and the line that puts a folder on PATH when it needs one.
+#[test]
+fn settings_installs_and_removes_the_command_line_tool() {
+    // Not there: the explanation, and one button.
+    let g = settings_with(Status::Missing, Work::Idle);
+    let mut ui = sim(&g);
+    assert!(ui.find("COMMAND LINE TOOL").is_ok());
+    assert!(ui.find("Uninstall").is_err());
+    save(&mut ui, "settings-cli");
+    let _ = ui.click("Install command line tool").expect("the install button");
+    let m = messages(ui);
+    assert!(matches!(m.as_slice(), [Message::InstallCli]), "{m:?}");
+
+    // Installed in /usr/local/bin: said, and removable.
+    let link = std::path::PathBuf::from("/usr/local/bin/warden");
+    let target = std::path::PathBuf::from("/Applications/Warden.app/Contents/MacOS/warden");
+    let g = settings_with(Status::Linked { link: link.clone(), target: target.clone() }, Work::Idle);
+    let mut ui = sim(&g);
+    for t in ["Installed: /usr/local/bin/warden", "A link to /Applications/Warden.app/Contents/MacOS/warden."] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in Settings");
+    }
+    assert!(ui.find("Install command line tool").is_err(), "nothing to install");
+    save(&mut ui, "settings-cli-installed");
+    let _ = ui.click("Uninstall").expect("the uninstall button");
+    assert!(matches!(messages(ui).as_slice(), [Message::UninstallCli]));
+
+    // Linked in ~/.local/bin, which a window opened from Finder does not have on its PATH: the line.
+    let mut g = settings_with(
+        Status::Linked { link: "/Users/ana/.local/bin/warden".into(), target: target.clone() },
+        Work::Idle,
+    );
+    let mut ui = sim(&g);
+    let line = "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc";
+    assert!(ui.find(line).is_ok(), "the line to add is shown");
+    assert!(ui.find("If a new Terminal does not find `warden`, put /Users/ana/.local/bin on your PATH (zsh):").is_ok());
+    save(&mut ui, "settings-cli-path");
+    let _ = ui.click(line).expect("the line is a button that copies");
+    assert!(matches!(messages(ui).as_slice(), [Message::Copy(c)] if c == line));
+    // The folder is on PATH: no line.
+    let mut places = mac_places();
+    places.path.push("/Users/ana/.local/bin".into());
+    g.cli.places = Ok(places);
+    let mut ui = sim(&g);
+    assert!(ui.find(line).is_err());
+    drop(ui);
+
+    // The app moved: the link is dead, and can be made again or removed.
+    let g = settings_with(
+        Status::Broken { link, target: "/Users/ana/Downloads/Warden.app/Contents/MacOS/warden".into() },
+        Work::Idle,
+    );
+    let mut ui = sim(&g);
+    assert!(ui.find("Install again").is_ok() && ui.find("Remove the link").is_ok());
+    let _ = ui.click("Install again").expect("install again");
+    let _ = ui.click("Remove the link").expect("remove it");
+    assert!(matches!(messages(ui).as_slice(), [Message::InstallCli, Message::UninstallCli]));
+
+    // Somebody else's warden (Homebrew, a package, install.sh): said, and left alone.
+    let g = settings_with(Status::Present { path: "/opt/homebrew/bin/warden".into() }, Work::Idle);
+    let mut ui = sim(&g);
+    assert!(ui.find("`warden` is installed: /opt/homebrew/bin/warden").is_ok());
+    assert!(ui.find("Install command line tool").is_err() && ui.find("Uninstall").is_err());
+
+    // Working: the button says so and does nothing.
+    let g = settings_with(Status::Missing, Work::Installing);
+    let mut ui = sim(&g);
+    let _ = ui.click("Installing\u{2026}").expect("the busy button is there");
+    assert!(messages(ui).is_empty(), "a button that is busy sends nothing");
+
+    // Not possible from here (the CLI is not beside the window): the reason, no button.
+    let mut g = settings_with(Status::Missing, Work::Idle);
+    g.cli = State::of(Err("There is no `warden` next to this program (/opt/w), so there is nothing to link.".into()));
+    let mut ui = sim(&g);
+    assert!(ui.find("There is no `warden` next to this program (/opt/w), so there is nothing to link.").is_ok());
+    assert!(ui.find("Install command line tool").is_err());
+}
+
+/// The first-run banner: only from an app bundle with no `warden` anywhere, and "Not now" is for good.
+#[test]
+fn first_run_banner_offers_the_command_line_tool_once() {
+    const SENTENCE: &str =
+        "Use Warden from Terminal: install the `warden` command, so `warden list` and `warden start` work there.";
+    let g = with_cli(Status::Missing, Work::Idle);
+    assert!(g.cli.banner(g.saved.cli_banner_dismissed));
+    let mut ui = sim(&g);
+    assert!(ui.find(SENTENCE).is_ok());
+    save(&mut ui, "cli-banner");
+    let _ = ui.click("Install command line tool").expect("the install button");
+    let _ = ui.click("Not now").expect("Not now");
+    assert!(matches!(messages(ui).as_slice(), [Message::InstallCli, Message::DismissCliBanner]));
+
+    // In the narrowest window the sentence wraps and the buttons stay.
+    let mut narrow = with_cli(Status::Missing, Work::Idle);
+    let _ = narrow.update(Message::Resized(iced::Size::new(900.0, 700.0)));
+    let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, 700.0), warden_gui::view::view(&narrow));
+    let install = ui.find("Install command line tool").expect("the button").bounds();
+    let not_now = ui.find("Not now").expect("Not now").bounds();
+    assert!(not_now.x + not_now.width <= 900.0 && install.x + install.width <= not_now.x, "{install:?} {not_now:?}");
+    save(&mut ui, "cli-banner-narrow");
+    drop(ui);
+
+    // Working: the button says so.
+    let g = with_cli(Status::Missing, Work::Installing);
+    let mut ui = sim(&g);
+    let _ = ui.click("Installing\u{2026}").expect("the busy button");
+    assert!(messages(ui).is_empty());
+
+    // Turned away: gone, and it stays gone (it is in gui.json).
+    let mut g = with_cli(Status::Missing, Work::Idle);
+    let dir = std::env::temp_dir().join(format!("wg-render-banner-{}", std::process::id()));
+    g.saved_path = Some(dir.join("gui.json"));
+    let _ = g.update(Message::DismissCliBanner);
+    assert!(sim(&g).find(SENTENCE).is_err());
+    assert!(warden_gui::hosts::load(&dir.join("gui.json")).cli_banner_dismissed);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Not offered: from a plain folder (Linux, a checkout), with a `warden` already, or when it
+    // cannot be done from here; and the main screen of a window that looked at nothing has none.
+    let mut linux = mac_places();
+    linux.exe = "/home/ana/warden-gui-0.1.0-linux-x86_64/warden-gui".into();
+    for g in [
+        {
+            let mut g = connected();
+            g.cli = State { places: Ok(linux), status: Status::Missing, work: Work::Idle };
+            g
+        },
+        with_cli(Status::Present { path: "/opt/homebrew/bin/warden".into() }, Work::Idle),
+        with_cli(Status::Linked { link: "/usr/local/bin/warden".into(), target: "/x/warden".into() }, Work::Idle),
+        {
+            let mut g = connected();
+            g.cli = State::of(Err("no".into()));
+            g
+        },
+        connected(),
+    ] {
+        assert!(sim(&g).find(SENTENCE).is_err());
+    }
+    let _ = cli_install::NAME;
+}
+
+/// Settings fits a short window: its sections scroll, and the heading and Done stay in view.
+#[test]
+fn settings_scrolls_in_a_short_window_and_keeps_done_in_view() {
+    let mut g = connected();
+    g.saved.cli_banner_dismissed = true;
+    let _ = g.update(Message::OpenSettings);
+    // Tall: nothing needs to scroll, so Done sits below the last section.
+    let mut tall = sim(&g);
+    let tall_done = tall.find("Done").expect("Done").bounds();
+    let tall_restart = tall.find("Restart everything\u{2026}").expect("the button").bounds();
+    assert!(tall_done.y > tall_restart.y);
+    drop(tall);
+    for height in [560.0, 640.0] {
+        let _ = g.update(Message::Resized(iced::Size::new(900.0, height)));
+        let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, height), warden_gui::view::view(&g));
+        let done = ui.find("Done").expect("Done").bounds();
+        let head = ui.find("Settings").expect("the heading").bounds();
+        assert!(head.y >= 0.0 && done.y + done.height <= height, "at {height}: Done is at {done:?}, heading {head:?}");
+        if height == 560.0 {
+            save(&mut ui, "settings-short");
+        }
+    }
 }

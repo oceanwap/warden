@@ -8,6 +8,7 @@ use crate::app::{
     Tab,
 };
 use crate::charts::{Chart, Hue, Sparkline, Unit};
+use crate::cli_install::{Status, Work};
 use crate::dropdown::Dropdown;
 use crate::format::{self, Severity};
 use crate::history::{self, Load, Range};
@@ -46,6 +47,12 @@ const FACTS_H: f32 = 18.0;
 /// The folder line under the name.
 const CWD_H: f32 = 20.0;
 const BANNER_H: f32 = 40.0;
+/// The first-run banner under the top bar (its sentence on one line, and a hairline).
+const CLI_BANNER_H: f32 = 52.0;
+/// What Settings' dialog keeps besides its sections: the heading and the button, the gaps and the
+/// padding, and a margin of the window around it. The sections get the rest of the window's height.
+const SETTINGS_FRAME_H: f32 = 190.0;
+const SETTINGS_MIN_H: f32 = 140.0;
 /// The "older supervisor" banner: a sentence and the command under it.
 const OUTDATED_H: f32 = 74.0;
 const IDLE_H: f32 = 92.0;
@@ -60,7 +67,11 @@ const SPARK_W: f32 = 56.0;
 const SPARK_H: f32 = 18.0;
 
 pub fn view(g: &Gui) -> Element<'_, Message> {
-    let main = column![topbar(g), rule::horizontal(1), body(g)].height(Fill);
+    let mut main = column![topbar(g), rule::horizontal(1)].height(Fill);
+    if g.cli.banner(g.saved.cli_banner_dismissed) {
+        main = main.push(cli_banner(g));
+    }
+    let main = main.push(body(g));
     let mut layers: Vec<Element<'_, Message>> = vec![main.into()];
     match &g.modal {
         Modal::None => {}
@@ -665,6 +676,9 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     // What sits above the bottom pane, in pixels (about; the page only needs to know
     // whether the pane keeps a usable height).
     let mut top = TOPBAR_H + PAGE_PAD + HEAD_H + 8.0 + FACTS_H + GAP;
+    if g.cli.banner(g.saved.cli_banner_dismissed) {
+        top += CLI_BANNER_H;
+    }
     if cwd.is_some() {
         top += CWD_H + 8.0;
     }
@@ -1392,45 +1406,84 @@ fn history_content(g: &Gui, row_h: f32) -> Element<'_, Message> {
         }
         _ => "no samples".into(),
     };
-    let card =
-        |title: &'static str, sub: &'static str, summary: String, i: usize, unit: Unit, hue: Hue, look_: Look| {
-            let chart = Chart {
-                series: &s[i],
-                start_s: c.grid.start_s,
-                step_s: c.grid.step_s,
-                end_s: if c.grid.is_empty() { warden_protocol::events::now_ms() / 1000 } else { c.grid.end_s() },
-                span_s: span,
-                unit,
-                hue,
-                bars: look_ == Look::Bars,
-                area: look_ == Look::Area,
-                faded: c.load == Load::Loading,
-            };
-            container(
-                column![
-                    row![text(title).size(14).font(SEMIBOLD), small(sub), space::horizontal(), small(summary)]
-                        .spacing(8)
-                        .align_y(Center),
-                    canvas(chart).width(Fill).height(Fill),
-                ]
-                .spacing(4),
-            )
-            .padding([10, 12])
-            .width(Fill)
-            .height(Fill)
-            .style(look::card)
+    let card = |ic: Icon,
+                title: &'static str,
+                sub: &'static str,
+                summary: String,
+                i: usize,
+                unit: Unit,
+                hue: Hue,
+                look_: Look| {
+        let chart = Chart {
+            series: &s[i],
+            start_s: c.grid.start_s,
+            step_s: c.grid.step_s,
+            end_s: if c.grid.is_empty() { warden_protocol::events::now_ms() / 1000 } else { c.grid.end_s() },
+            span_s: span,
+            unit,
+            hue,
+            bars: look_ == Look::Bars,
+            area: look_ == Look::Area,
+            faded: c.load == Load::Loading,
         };
+        container(
+            column![
+                row![
+                    icon(ic).size(14).style(muted),
+                    text(title).size(14).font(SEMIBOLD),
+                    small(sub),
+                    space::horizontal(),
+                    small(summary)
+                ]
+                .spacing(8)
+                .align_y(Center),
+                canvas(chart).width(Fill).height(Fill),
+            ]
+            .spacing(4),
+        )
+        .padding([10, 12])
+        .width(Fill)
+        .height(Fill)
+        .style(look::card)
+    };
     column![
         bar,
         row![
-            card("CPU", "% of one core", cpu, history::CPU, Unit::Percent, Hue::Blue, Look::Area),
-            card("Memory", "resident, with the supervisor", mem, history::MEM, Unit::Bytes, Hue::Aqua, Look::Area),
+            card(Icon::Cpu, "CPU", "% of one core", cpu, history::CPU, Unit::Percent, Hue::Blue, Look::Area),
+            card(
+                Icon::Memory,
+                "Memory",
+                "resident, with the supervisor",
+                mem,
+                history::MEM,
+                Unit::Bytes,
+                Hue::Aqua,
+                Look::Area
+            ),
         ]
         .spacing(10)
         .height(row_h),
         row![
-            card("Restarts", "per point", restarts, history::RESTARTS, Unit::Count, Hue::Orange, Look::Bars),
-            card("Workers ready", "the fewest per point", ready, history::READY, Unit::Count, Hue::Violet, Look::Line),
+            card(
+                Icon::Restart,
+                "Restarts",
+                "per point",
+                restarts,
+                history::RESTARTS,
+                Unit::Count,
+                Hue::Orange,
+                Look::Bars
+            ),
+            card(
+                Icon::Workers,
+                "Workers ready",
+                "the fewest per point",
+                ready,
+                history::READY,
+                Unit::Count,
+                Hue::Violet,
+                Look::Line
+            ),
         ]
         .spacing(10)
         .height(row_h),
@@ -1440,6 +1493,21 @@ fn history_content(g: &Gui, row_h: f32) -> Element<'_, Message> {
 }
 
 // ----------------------------------------------------------------- dialogs
+
+/// The icon an action has on its button.
+fn act_icon(a: Act) -> Icon {
+    match a {
+        Act::Reload => Icon::Reload,
+        Act::SafeReload => Icon::SafeReload,
+        Act::RollingRestart => Icon::Rolling,
+        Act::HardRestart => Icon::Hard,
+        Act::RestartWorker(_) => Icon::Restart,
+        Act::Scale(_) => Icon::Minus,
+        Act::Stop => Icon::Stop,
+        Act::Start => Icon::Play,
+        Act::Reset => Icon::Reset,
+    }
+}
 
 fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
     column![
@@ -1453,7 +1521,7 @@ fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
                 .padding([6, 14])
                 .style(look::quiet)
                 .on_press(Message::Cancelled),
-            button(text(p.act.label()).size(13).font(MEDIUM))
+            button(labeled(act_icon(p.act), p.act.label()))
                 .padding([6, 14])
                 .style(look::solid(Tone::Bad))
                 .on_press(Message::Confirmed),
@@ -1467,17 +1535,13 @@ fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
 
 /// A row of choices, one lit: the same control as the History ranges.
 fn segmented<'a, T: Copy + PartialEq + 'a>(
-    options: &[(T, &'a str)],
+    options: &[(T, Icon, &'a str)],
     current: T,
     on: fn(T) -> Message,
 ) -> Element<'a, Message> {
     container(
-        Row::with_children(options.iter().map(|&(value, name)| {
-            button(text(name).size(13).font(SEMIBOLD))
-                .style(look::tab(current == value))
-                .padding([5, 16])
-                .on_press(on(value))
-                .into()
+        Row::with_children(options.iter().map(|&(value, i, name)| {
+            button(labeled(i, name)).style(look::tab(current == value)).padding([5, 16]).on_press(on(value)).into()
         }))
         .spacing(2),
     )
@@ -1488,11 +1552,14 @@ fn segmented<'a, T: Copy + PartialEq + 'a>(
 
 fn settings_dialog(g: &Gui) -> Element<'_, Message> {
     use crate::system::{Colors, Mode};
-    column![
-        heading("Settings").size(18),
+    let sections = column![
         column![
-            section("Colors"),
-            segmented(&[(Colors::Warden, "Warden"), (Colors::System, "System")], g.source.colors, Message::SetColors),
+            look::section_icon(Icon::Palette, "Colors"),
+            segmented(
+                &[(Colors::Warden, Icon::Shield, "Warden"), (Colors::System, Icon::Monitor, "System")],
+                g.source.colors,
+                Message::SetColors,
+            ),
             small(
                 "Warden: warm paper, forest green, brick red. System: the desktop's own surfaces, text, accent and \
                  status colors, so the window looks native (macOS, GNOME and Ubuntu).",
@@ -1500,9 +1567,13 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
         ]
         .spacing(8),
         column![
-            section("Mode"),
+            look::section_icon(Icon::SunMoon, "Mode"),
             segmented(
-                &[(Mode::Auto, "Auto"), (Mode::Light, "Light"), (Mode::Dark, "Dark")],
+                &[
+                    (Mode::Auto, Icon::Monitor, "Auto"),
+                    (Mode::Light, Icon::Sun, "Light"),
+                    (Mode::Dark, Icon::Moon, "Dark")
+                ],
                 g.source.mode,
                 Message::SetMode,
             ),
@@ -1511,8 +1582,19 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
             ),
         ]
         .spacing(8),
+        cli_section(g),
         restart_all_section(g),
         small(format!("This desktop: {}.", g.system.describe())),
+    ]
+    .spacing(18)
+    .padding(iced::Padding { right: 14.0, ..iced::Padding::ZERO });
+    // The sections scroll when the window is too short for all of them (the heading, the button
+    // and the dialog's margins stay).
+    let room = (g.window.height - SETTINGS_FRAME_H).max(SETTINGS_MIN_H);
+    column![
+        heading("Settings").size(18),
+        container(scrollable(sections).direction(scrollable::Direction::Vertical(thin())).style(look::scroll))
+            .max_height(room),
         row![
             space::horizontal(),
             button(text("Done").size(13).font(MEDIUM))
@@ -1522,7 +1604,117 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
         ],
     ]
     .spacing(18)
-    .width(440)
+    .width(454)
+    .into()
+}
+
+/// "Install command line tool": what `warden` is on this machine, and the action that links it.
+/// Always this machine's (not the host the window shows).
+fn cli_section(g: &Gui) -> Element<'_, Message> {
+    let mut c = column![look::section_icon(Icon::Terminal, "Command line tool")].spacing(8);
+    let places = match &g.cli.places {
+        Ok(p) => p,
+        Err(why) => return c.push(small(why.as_str())).into(),
+    };
+    let work = g.cli.work;
+    let press = |m: Message| (work == Work::Idle).then_some(m);
+    let install = |label: &'static str| {
+        button(labeled(Icon::Terminal, if work == Work::Installing { "Installing\u{2026}" } else { label }))
+            .padding([6, 14])
+            .style(look::quiet)
+            .on_press_maybe(press(Message::InstallCli))
+    };
+    let uninstall = |label: &'static str| {
+        button(labeled(Icon::Trash, if work == Work::Removing { "Removing\u{2026}" } else { label }))
+            .padding([6, 14])
+            .style(look::quiet)
+            .on_press_maybe(press(Message::UninstallCli))
+    };
+    let said = |i: Icon, tone: Tone, t: String| {
+        row![icon(i).size(15).style(tone.style()), text(t).size(13).width(Fill)].spacing(8).align_y(Center)
+    };
+    match &g.cli.status {
+        Status::Missing => {
+            let wanted =
+                places.first_choice().map_or_else(|| "a folder in your home".into(), |p| p.display().to_string());
+            let admin = if places.system_dir.is_some() {
+                " (it asks for your administrator password if that folder needs it)"
+            } else {
+                ""
+            };
+            c = c.push(small(format!(
+                "Puts `warden` on your PATH, so Terminal can run `warden list`, `warden start` and the rest. It links \
+                 {wanted} to the command inside this app{admin}."
+            )));
+            c = c.push(install("Install command line tool"));
+        }
+        Status::Linked { link, target } => {
+            c = c.push(said(Icon::CheckCircle, Tone::Good, format!("Installed: {}", link.display())));
+            c = c.push(small(format!("A link to {}.", target.display())));
+            if let Some(hint) = places.path_hint(link) {
+                let command = hint.command();
+                c = c.push(small(format!(
+                    "If a new Terminal does not find `warden`, put {} on your PATH ({}):",
+                    link.parent().map_or_else(String::new, |d| d.display().to_string()),
+                    hint.shell
+                )));
+                c = c.push(tip(
+                    button(text(command.clone()).font(MONO).size(11).wrapping(Wrapping::None))
+                        .padding([3, 10])
+                        .style(look::chip)
+                        .on_press(Message::Copy(command)),
+                    "Copy the command",
+                ));
+            }
+            c = c.push(uninstall("Uninstall"));
+        }
+        Status::Broken { link, target } => {
+            c = c.push(said(
+                Icon::Alert,
+                Tone::Warn,
+                format!(
+                    "{} points to {}, which is not there any more (the app moved or was removed).",
+                    link.display(),
+                    target.display()
+                ),
+            ));
+            c = c.push(row![install("Install again"), uninstall("Remove the link")].spacing(8));
+        }
+        Status::Present { path } => {
+            c = c.push(said(Icon::CheckCircle, Tone::Good, format!("`warden` is installed: {}", path.display())));
+            c = c.push(small("It is not a link to this app, so it is left as it is."));
+        }
+    }
+    c.into()
+}
+
+/// The first-run offer, under the top bar: from an app bundle, with no `warden` in Terminal's reach.
+fn cli_banner(g: &Gui) -> Element<'_, Message> {
+    let installing = g.cli.work == Work::Installing;
+    container(
+        container(
+            row![
+                icon(Icon::Terminal).size(16).style(Tone::Accent.style()),
+                text("Use Warden from Terminal: install the `warden` command, so `warden list` and `warden start` work there.")
+                    .size(13)
+                    .width(Fill),
+                button(text(if installing { "Installing\u{2026}" } else { "Install command line tool" }).size(13).font(SEMIBOLD))
+                    .padding([5, 14])
+                    .style(look::solid(Tone::Accent))
+                    .on_press_maybe((g.cli.work == Work::Idle).then_some(Message::InstallCli)),
+                button(text("Not now").size(13).font(MEDIUM))
+                    .padding([5, 14])
+                    .style(look::quiet)
+                    .on_press(Message::DismissCliBanner),
+            ]
+            .spacing(12)
+            .align_y(Center),
+        )
+        .padding([7, 14])
+        .width(Fill)
+        .style(look::banner(Tone::Accent)),
+    )
+    .padding(iced::Padding { top: 10.0, right: 18.0, bottom: 0.0, left: 18.0 })
     .into()
 }
 
@@ -1532,7 +1724,7 @@ fn restart_all_section(g: &Gui) -> Element<'_, Message> {
     use crate::app::RestartAll;
     let where_ = if g.target.host.is_local() { "this machine".to_string() } else { g.target.describe() };
     let mut c = column![
-        section("Restart everything"),
+        look::section_icon(Icon::Restart, "Restart everything"),
         small(format!(
             "Saves what runs on {where_}, stops every app's supervisor and wardend, and starts them again from the \
              installed warden (like `warden update`). Use it after upgrading or rebuilding warden. Apps stop for a \
@@ -1602,7 +1794,14 @@ fn machine_dialog(f: &MachineForm) -> Element<'_, Message> {
     .spacing(12)
     .width(560);
     if let Some(e) = &f.error {
-        c = c.push(text(e.as_str()).size(13).style(Tone::Bad.style()));
+        c = c.push(
+            row![
+                icon(Icon::AlertCircle).size(15).style(Tone::Bad.style()),
+                text(e.as_str()).size(13).style(Tone::Bad.style())
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
     }
     c.push(
         row![
@@ -1611,7 +1810,7 @@ fn machine_dialog(f: &MachineForm) -> Element<'_, Message> {
                 .padding([6, 14])
                 .style(look::quiet)
                 .on_press(Message::CloseModal),
-            button(text("Save and connect").size(13).font(MEDIUM))
+            button(labeled(Icon::Plug, "Save and connect"))
                 .padding([6, 14])
                 .style(look::solid(Tone::Accent))
                 .on_press(Message::SaveMachine),
@@ -1661,7 +1860,16 @@ fn add_dialog<'a>(g: &'a Gui, a: &'a crate::app::AddForm) -> Element<'a, Message
     match &a.status {
         AddStatus::Editing => {}
         AddStatus::Running => c = c.push(small("Running… (`warden start` waits until the app is up)")),
-        AddStatus::Done(Err(e)) => c = c.push(text(e.as_str()).size(13).style(Tone::Bad.style())),
+        AddStatus::Done(Err(e)) => {
+            c = c.push(
+                row![
+                    icon(Icon::AlertCircle).size(15).style(Tone::Bad.style()),
+                    text(e.as_str()).size(13).style(Tone::Bad.style())
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+        }
         AddStatus::Done(Ok(added)) => {
             let out = &added.output;
             let mut log = out.text();
@@ -1669,12 +1877,14 @@ fn add_dialog<'a>(g: &'a Gui, a: &'a crate::app::AddForm) -> Element<'a, Message
                 log.push('\n');
                 log.push_str(n);
             }
+            let tone = if out.ok { Tone::Good } else { Tone::Bad };
             c = c.push(
-                text(if out.ok { "Done:" } else { "warden start failed:" }.to_string()).size(13).style(if out.ok {
-                    Tone::Good.style()
-                } else {
-                    Tone::Bad.style()
-                }),
+                row![
+                    icon(if out.ok { Icon::CheckCircle } else { Icon::AlertCircle }).size(15).style(tone.style()),
+                    text(if out.ok { "Done:" } else { "warden start failed:" }).size(13).style(tone.style()),
+                ]
+                .spacing(8)
+                .align_y(Center),
             );
             c = c.push(
                 container(scrollable(text(log).font(MONO).size(SMALL)).height(Length::Shrink).style(look::scroll))
@@ -1692,7 +1902,7 @@ fn add_dialog<'a>(g: &'a Gui, a: &'a crate::app::AddForm) -> Element<'a, Message
                 .padding([6, 14])
                 .style(look::quiet)
                 .on_press_maybe((!running).then_some(Message::CloseModal)),
-            button(text(if running { "Adding…" } else { "Add" }).size(13).font(MEDIUM))
+            button(labeled(Icon::Plus, if running { "Adding…" } else { "Add" }))
                 .padding([6, 14])
                 .style(look::solid(Tone::Accent))
                 .on_press_maybe((!running).then_some(Message::SubmitAdd)),
@@ -1719,12 +1929,25 @@ fn editor_dialog(e: &Editor) -> Element<'_, Message> {
     .width(860)
     .height(620);
     match &e.result {
-        Some(Ok(m)) => c = c.push(text(format!("✓ {m}")).size(13).style(Tone::Good.style())),
+        Some(Ok(m)) => {
+            c = c.push(
+                row![
+                    icon(Icon::CheckCircle).size(15).style(Tone::Good.style()),
+                    text(m.as_str()).size(13).style(Tone::Good.style())
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+        }
         Some(Err(m)) => {
             c = c.push(
-                container(scrollable(text(m.as_str()).size(13).style(Tone::Bad.style())).style(look::scroll))
-                    .max_height(120)
-                    .width(Fill),
+                row![
+                    icon(Icon::AlertCircle).size(15).style(Tone::Bad.style()),
+                    container(scrollable(text(m.as_str()).size(13).style(Tone::Bad.style())).style(look::scroll))
+                        .max_height(120)
+                        .width(Fill),
+                ]
+                .spacing(8),
             )
         }
         None => {}
@@ -1736,11 +1959,11 @@ fn editor_dialog(e: &Editor) -> Element<'_, Message> {
             .padding([6, 14])
             .style(look::quiet)
             .on_press_maybe((e.status != EditorStatus::Saving).then_some(Message::CloseModal)),
-        button(text("Validate").size(13).font(MEDIUM))
+        button(labeled(Icon::CheckCircle, "Validate"))
             .padding([6, 14])
             .style(look::quiet)
             .on_press_maybe(ready.then_some(Message::Validate)),
-        button(text("Save").size(13).font(MEDIUM))
+        button(labeled(Icon::Save, "Save"))
             .padding([6, 14])
             .style(look::solid(Tone::Accent))
             .on_press_maybe((ready && e.dirty).then_some(Message::Save)),

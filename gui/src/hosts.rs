@@ -1,5 +1,6 @@
-//! The remote machines the window knows (the connection menu) and the Settings
-//! choice of colors, kept in
+//! The remote machines the window knows (the connection menu), the Settings
+//! choice of colors, and whether the "install the command line tool" banner was
+//! turned away, kept in
 //! `~/.config/warden/gui.json` so they are there next time. This machine is
 //! never listed: it needs no configuration, and the window always starts on it.
 //!
@@ -26,6 +27,9 @@ pub struct Saved {
     /// The Settings choice of colors and mode.
     #[serde(default)]
     pub appearance: crate::system::Source,
+    /// "Not now" on the first-run banner that offers the command line tool: it stays away.
+    #[serde(default)]
+    pub cli_banner_dismissed: bool,
 }
 
 impl Saved {
@@ -113,6 +117,20 @@ mod tests {
         std::fs::write(&file, "{ not json").unwrap();
         assert_eq!(load(&file), Saved::default());
         assert_eq!(load(&dir.join("missing.json")), Saved::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_banner_turned_away_is_remembered_and_an_older_file_has_it_not_turned_away() {
+        let dir = std::env::temp_dir().join(format!("wg-hosts-banner-{}", std::process::id()));
+        let file = dir.join("gui.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, r#"{"machines":[]}"#).unwrap();
+        assert!(!load(&file).cli_banner_dismissed, "a file from before the banner existed");
+        let mut s = load(&file);
+        s.cli_banner_dismissed = true;
+        save(&file, &s).unwrap();
+        assert!(load(&file).cli_banner_dismissed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
