@@ -5,14 +5,18 @@
 //! Where the link goes, in order:
 //! 1. `/usr/local/bin/warden` (macOS), made as the user when that folder lets them;
 //! 2. the same through the system's administrator prompt (`osascript`: `do shell script ... with
-//!    administrator privileges`) when it does not;
-//! 3. `~/.local/bin/warden`, with the line that puts that folder on PATH (always on Linux, and on a
-//!    Mac when the prompt is cancelled or fails).
+//!    administrator privileges`) when it does not. Closing that prompt means stop: nothing is
+//!    installed, and "Install for this user only" is the way to the next choice;
+//! 3. `~/.local/bin/warden`, with the line that puts that folder on PATH (always on Linux, when
+//!    asked for ("for this user only") on a Mac, and on a Mac when the prompt fails, as opposed to
+//!    being closed).
 //!
-//! Only links are made and removed, and only ones that point into the app: a `warden` that is a
-//! file, or a link to something else (Homebrew, install.sh, a package), is never replaced or
-//! deleted. Every folder is a field of [`Places`], so the tests run on temporary ones; only
-//! [`Osascript`] (the prompt) is macOS's, and the tests check the command it runs, not the prompt.
+//! Only links are made and removed, and only ones that point into an app of Warden's (this one, or
+//! another copy: `Warden 2.app`, an unpacked download beside its `warden-gui`) or that point
+//! nowhere: a `warden` that is a file, or a link to something else (Homebrew, install.sh, a
+//! package), is never replaced or deleted. Every folder is a field of [`Places`], so the tests run
+//! on temporary ones; only [`Osascript`] (the prompt) is macOS's, and the tests check the command
+//! it runs, not the prompt.
 
 use crate::commands;
 use crate::ssh::shell_quote;
@@ -61,10 +65,7 @@ impl Places {
         let user_dir = home.as_ref().map(|h| h.join(".local").join("bin"));
         // A window opened from Finder or a menu has launchd's short PATH: look in the usual places too.
         let mut search = path.clone();
-        let mut usual = vec![PathBuf::from(SYSTEM_DIR), PathBuf::from("/opt/homebrew/bin")];
-        usual.extend(user_dir.clone());
-        usual.extend(home.as_ref().map(|h| h.join(".cargo").join("bin")));
-        for d in usual {
+        for d in usual_dirs(home.as_deref()) {
             if !search.contains(&d) {
                 search.push(d);
             }
@@ -110,12 +111,40 @@ impl Places {
         self.system_dir.as_ref().or(self.user_dir.as_ref()).map(|d| d.join(NAME))
     }
 
-    /// The line that puts `dir` on PATH, when `dir` is `user_dir` and PATH does not have it.
+    /// The line that puts `dir` on PATH, when `dir` is `user_dir`, this window's PATH does not have
+    /// it, and the shell's startup files do not already add it (a window opened from Finder never
+    /// has `~/.local/bin` on its PATH, whatever the person's Terminal does).
     pub fn path_hint(&self, link: &Path) -> Option<Hint> {
         let dir = link.parent()?;
-        (self.user_dir.as_deref() == Some(dir) && !self.path.iter().any(|d| d == dir))
-            .then(|| Hint::new(dir, self.home.as_deref(), self.shell.as_deref(), self.mac))
+        if self.user_dir.as_deref() != Some(dir) || self.path.iter().any(|d| d == dir) {
+            return None;
+        }
+        let hint = Hint::new(dir, self.home.as_deref(), self.shell.as_deref(), self.mac);
+        (!self.startup_files_add(&hint, dir)).then_some(hint)
     }
+
+    /// One of the shell's startup files already has a line that adds `dir` to PATH (it is looked for
+    /// by its name under the home folder, `.local/bin`, on a line that is not a comment).
+    fn startup_files_add(&self, hint: &Hint, dir: &Path) -> bool {
+        let Some(home) = &self.home else { return false };
+        let needle = match dir.strip_prefix(home) {
+            Ok(rest) => rest.to_string_lossy().into_owned(),
+            Err(_) => dir.to_string_lossy().into_owned(),
+        };
+        hint.startup_files().iter().any(|f| {
+            std::fs::read_to_string(home.join(f))
+                .is_ok_and(|text| text.lines().any(|l| !l.trim_start().starts_with('#') && l.contains(&needle)))
+        })
+    }
+}
+
+/// The bin folders where `warden` usually is, besides PATH (a window opened from Finder or a menu
+/// has launchd's short PATH): the system's, Homebrew's, `~/.local/bin` and `~/.cargo/bin`.
+pub fn usual_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut usual = vec![PathBuf::from(SYSTEM_DIR), PathBuf::from("/opt/homebrew/bin")];
+    usual.extend(home.map(|h| h.join(".local").join("bin")));
+    usual.extend(home.map(|h| h.join(".cargo").join("bin")));
+    usual
 }
 
 /// `X.app/Contents/MacOS/<program>`.
@@ -129,21 +158,34 @@ pub fn in_bundle(exe: &Path) -> bool {
 
 /// macOS runs an app opened from a downloaded disk image, or from Downloads before it was moved,
 /// from a place that goes away (a volume that is ejected, a randomized "App Translocation" folder):
-/// a link to the CLI there would be dead the next time. Err says what to do.
+/// a link to the CLI there would be dead the next time. Err says what to do. A volume that can be
+/// written to (a second drive) is a place to keep an app: only a read-only one is a disk image.
 pub fn stays_put(exe: &Path) -> Result<(), String> {
+    stays_put_with(exe, &read_only_mount)
+}
+
+fn stays_put_with(exe: &Path, read_only: &dyn Fn(&Path) -> bool) -> Result<(), String> {
     if exe.components().any(|c| c.as_os_str() == "AppTranslocation") {
         return Err("Warden runs from a temporary place macOS made for it (it was opened before being moved), and \
                     a link to it would stop working. Move Warden.app to Applications, open it from there, then \
                     install the command line tool."
             .into());
     }
-    if exe.starts_with("/Volumes") {
-        return Err("Warden runs from a disk image or another volume, which may go away, and a link to it would \
-                    stop working. Drag Warden.app to Applications, eject the disk image, open Warden from \
-                    Applications, then install the command line tool."
+    if let Ok(rest) = exe.strip_prefix("/Volumes")
+        && let Some(volume) = rest.components().next()
+        && read_only(&Path::new("/Volumes").join(volume.as_os_str()))
+    {
+        return Err("Warden runs from a read-only disk (a disk image, most likely), which goes away when it is \
+                    ejected, and a link to it would stop working. Drag Warden.app to Applications, eject the disk \
+                    image, open Warden from Applications, then install the command line tool."
             .into());
     }
     Ok(())
+}
+
+/// The file system holding `dir` is mounted read-only.
+fn read_only_mount(dir: &Path) -> bool {
+    rustix::fs::statvfs(dir).is_ok_and(|s| s.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY))
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -158,32 +200,48 @@ fn is_executable(p: &Path) -> bool {
 pub enum Status {
     /// Not in a place Terminal looks, and not linked by this window.
     Missing,
-    /// A link of this app's: `link` points at `target`, which is there.
+    /// A link into an app of Warden's: `link` points at `target`, which is there (this app's CLI,
+    /// or another copy's: see [`Status::of_another_copy`]).
     Linked { link: PathBuf, target: PathBuf },
-    /// A link that points into an app, to a CLI that is not there any more (the app moved).
+    /// A link to nothing: the app it pointed into was moved or removed.
     Broken { link: PathBuf, target: PathBuf },
-    /// A `warden` that is not a link of this app's (a package, install.sh, Homebrew, or a copy):
-    /// it is left alone.
+    /// A `warden` that is not a link into an app of Warden's (a package, install.sh, Homebrew, or a
+    /// copy): it is left alone.
     Present { path: PathBuf },
 }
 
-/// The links this window makes are found by what they point at.
+impl Status {
+    /// A live link that points at another copy of Warden than this app (`Warden 2.app`, an old
+    /// download): "Point it at this app" is the way to this one.
+    pub fn of_another_copy(&self, cli: &Path) -> bool {
+        matches!(self, Status::Linked { target, .. } if target != cli && !same_file(target, cli))
+    }
+}
+
+/// The links this window makes are found by what they point at: this app's CLI, the CLI of any app
+/// bundle (`Warden.app`, `Warden 2.app`: `X.app/Contents/MacOS/warden`), or a `warden` that sits
+/// beside a `warden-gui` (an unpacked download).
 fn points_into_app(target: &Path, cli: &Path) -> bool {
-    target == cli || same_file(target, cli) || in_an_app(target)
+    target == cli || same_file(target, cli) || in_an_app(target) || beside_a_gui(target)
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
     matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
-/// `…/Warden.app/Contents/MacOS/warden`: this app wherever it was, or was before it moved.
+/// `…/<Name>.app/Contents/MacOS/warden`: an app wherever it is, or was before it moved.
 fn in_an_app(target: &Path) -> bool {
     let last: Vec<Component<'_>> = target.components().rev().take(4).collect();
     let [n, macos, contents, app] = last.as_slice() else { return false };
     n.as_os_str() == NAME
         && macos.as_os_str() == "MacOS"
         && contents.as_os_str() == "Contents"
-        && app.as_os_str().to_string_lossy().eq_ignore_ascii_case("Warden.app")
+        && app.as_os_str().to_string_lossy().to_ascii_lowercase().ends_with(".app")
+}
+
+/// A `warden` with a `warden-gui` in its folder: the CLI of an unpacked GUI + CLI download.
+fn beside_a_gui(target: &Path) -> bool {
+    target.file_name().is_some_and(|n| n == NAME) && target.parent().is_some_and(|d| d.join("warden-gui").exists())
 }
 
 /// What is at `link`, when it is a symlink: where it points (relative links resolved).
@@ -203,16 +261,13 @@ pub fn status(p: &Places) -> Status {
     for dir in p.system_dir.iter().chain(p.user_dir.iter()) {
         let link = dir.join(NAME);
         match target_of(&link) {
-            Some(target) if points_into_app(&target, &p.cli) => {
-                if target.exists() {
-                    return Status::Linked { link, target };
-                }
+            // A link to nothing is nobody's: it can be replaced or removed, whatever it was.
+            Some(target) if !target.exists() => {
                 broken.get_or_insert(Status::Broken { link, target });
             }
-            // A live link to something else, or a file: not ours (a dead link to nothing we know
-            // is nobody's).
-            Some(target) if target.exists() => return Status::Present { path: link },
-            Some(_) => {}
+            Some(target) if points_into_app(&target, &p.cli) => return Status::Linked { link, target },
+            // A live link to something else, or a file: not ours.
+            Some(_) => return Status::Present { path: link },
             None if std::fs::symlink_metadata(&link).is_ok() => return Status::Present { path: link },
             None => {}
         }
@@ -258,11 +313,22 @@ impl Hint {
         Hint { shell: shell.to_string(), line, file: file.map(String::from) }
     }
 
-    /// One command that does it: appends the line to the startup file (fish: the command itself).
+    /// One command that does it: appends the line to the startup file unless the file has it
+    /// already (so running it twice adds it once); fish: the command itself, which is idempotent.
     pub fn command(&self) -> String {
         match &self.file {
-            Some(f) => format!("echo '{}' >> {f}", self.line),
+            Some(f) => format!("grep -qsF '{l}' {f} || echo '{l}' >> {f}", l = self.line),
             None => self.line.clone(),
+        }
+    }
+
+    /// The startup files of this shell, under the home folder, where a line may already add the folder.
+    fn startup_files(&self) -> &'static [&'static str] {
+        match self.shell.as_str() {
+            "zsh" => &[".zshrc", ".zshenv", ".zprofile"],
+            "bash" => &[".bashrc", ".bash_profile", ".bash_login", ".profile"],
+            "fish" => &[".config/fish/config.fish"],
+            _ => &[".profile"],
         }
     }
 }
@@ -372,11 +438,20 @@ pub fn cancelled(stderr: &str) -> bool {
     stderr.contains("(-128)") || stderr.to_lowercase().contains("user canceled")
 }
 
-/// What the administrator runs to make the link: the folder, then the link, unless something that
-/// is not a link is in the way (checked again here, as root).
+/// What the administrator runs to make the link: the folder, then the link, but only when nothing
+/// is there, a link to nothing is, or a link into an app of Warden's is (checked again here, as
+/// root, because a person may have made a `warden` of their own while the prompt was open): a file,
+/// or a live link to somebody else's, stays.
 pub fn admin_install_script(dir: &Path, cli: &Path) -> String {
     let (d, l, c) = (q(dir), q(&dir.join(NAME)), q(cli));
-    format!("/bin/mkdir -p {d} && {{ [ ! -e {l} ] || [ -L {l} ]; }} && /bin/ln -sfn {c} {l}")
+    let ours =
+        format!("case \"$(/usr/bin/readlink {l})\" in {c}|*.app/Contents/MacOS/warden) true ;; *) false ;; esac");
+    let in_the_way =
+        shell_quote(&format!("{} is there already, and is not a link to Warden's app", dir.join(NAME).display()));
+    format!(
+        "/bin/mkdir -p {d} && if {{ [ ! -e {l} ] && [ ! -L {l} ]; }} || {{ [ -L {l} ] && {{ [ ! -e {l} ] || {ours}; }}; }}; \
+         then /bin/ln -sfn {c} {l}; else echo {in_the_way} >&2; exit 1; fi"
+    )
 }
 
 /// What the administrator runs to remove a link: only a link.
@@ -419,6 +494,26 @@ impl Installed {
     }
 }
 
+/// What the person asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// The usual place: `/usr/local/bin` (with the administrator prompt if it needs one) on a Mac.
+    Preferred,
+    /// `~/.local/bin`, with no prompt.
+    ThisUserOnly,
+}
+
+/// How an install ended, short of an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Installed(Installed),
+    /// The administrator prompt was closed: that is a "no", and nothing was installed (not even in
+    /// the user's folder: that is its own choice).
+    Cancelled {
+        wanted: PathBuf,
+    },
+}
+
 /// What uninstalling did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removed {
@@ -432,65 +527,96 @@ type Linker<'a> = &'a (dyn Fn(&Path, &Path) -> Result<PathBuf, LinkError> + Sync
 type Remover<'a> = &'a (dyn Fn(&Path) -> std::io::Result<()> + Sync);
 
 /// Link `warden` where Terminal finds it (the order is in the module's documentation).
-pub async fn install(p: Places) -> Result<Installed, String> {
-    install_with(&p, &Osascript).await
+pub async fn install(p: Places, choice: Choice) -> Result<Outcome, String> {
+    install_with(&p, &Osascript, choice).await
 }
 
-pub async fn install_with(p: &Places, admin: &impl Elevate) -> Result<Installed, String> {
-    install_core(p, admin, &link_into).await
+pub async fn install_with(p: &Places, admin: &impl Elevate, choice: Choice) -> Result<Outcome, String> {
+    install_core(p, admin, &link_into, choice).await
 }
 
-async fn install_core(p: &Places, admin: &impl Elevate, link: Linker<'_>) -> Result<Installed, String> {
+async fn install_core(
+    p: &Places,
+    admin: &impl Elevate,
+    link_with: Linker<'_>,
+    choice: Choice,
+) -> Result<Outcome, String> {
     p.usable()?;
-    match status(p) {
+    let st = status(p);
+    match &st {
         Status::Present { path } => {
             return Err(format!(
-                "there is a `warden` at {} already, and it is not a link to this app: it is left alone",
+                "there is a `warden` at {} already, and it is not a link to an app of Warden's: it is left alone",
                 path.display()
             ));
         }
-        Status::Linked { link, .. } => {
-            let hint = p.path_hint(&link);
-            return Ok(Installed { link, admin: false, note: Some("It was installed already.".into()), hint });
+        Status::Linked { link, target } => {
+            if !st.of_another_copy(&p.cli) {
+                let hint = p.path_hint(link);
+                let note = Some("It was installed already.".to_string());
+                return Ok(Outcome::Installed(Installed { link: link.clone(), admin: false, note, hint }));
+            }
+            // A link into another copy of the app: point it at this one, where it is.
+            if choice == Choice::Preferred || link.parent() == p.user_dir.as_deref() {
+                let Some(dir) = link.parent() else { return Err("the link has no folder".into()) };
+                let was = format!("It pointed to {}.", target.display());
+                return place(p, admin, link_with, dir, Some(was)).await;
+            }
         }
         Status::Missing | Status::Broken { .. } => {}
     }
-    let mut note = None;
-    if let Some(dir) = &p.system_dir {
-        let wanted = dir.join(NAME);
-        match link(dir, &p.cli) {
-            Ok(link) => return Ok(Installed { link, admin: false, note: None, hint: None }),
-            Err(LinkError::Other(e)) => return Err(e),
-            Err(LinkError::Denied) => match admin.run(&admin_install_script(dir, &p.cli)).await {
-                Elevated::Done => {
-                    return match status(p) {
-                        Status::Linked { link, .. } => Ok(Installed { link, admin: true, note: None, hint: None }),
-                        _ => Err(format!(
-                            "the administrator step ran, but {} is not a link to this app",
-                            wanted.display()
-                        )),
-                    };
-                }
-                Elevated::Cancelled => {
-                    note =
-                        Some(format!("The administrator prompt was cancelled, so {} was not made.", wanted.display()));
-                }
-                Elevated::Failed(e) => {
-                    note = Some(format!("{} could not be made as the administrator ({e}).", wanted.display()));
-                }
-            },
+    match (choice, &p.system_dir) {
+        (Choice::Preferred, Some(dir)) => place(p, admin, link_with, dir, None).await,
+        _ => {
+            let Some(dir) = &p.user_dir else { return Err("there is no home folder to link in".into()) };
+            place(p, admin, link_with, dir, None).await
         }
     }
-    let Some(dir) = &p.user_dir else {
-        return Err(note.unwrap_or_else(|| "there is no home folder to link in".into()));
+}
+
+/// Make the link in `dir`: as the user, else (a system folder, on a Mac) through the administrator
+/// prompt. A closed prompt is a "no"; a failed one falls back to the user's folder, with the reason.
+async fn place(
+    p: &Places,
+    admin: &impl Elevate,
+    link_with: Linker<'_>,
+    dir: &Path,
+    was: Option<String>,
+) -> Result<Outcome, String> {
+    let wanted = dir.join(NAME);
+    let installed = |link: PathBuf, admin: bool, note: Option<String>| {
+        let hint = p.path_hint(&link);
+        Ok(Outcome::Installed(Installed { link, admin, note, hint }))
     };
-    match link(dir, &p.cli) {
-        Ok(link) => {
-            let hint = p.path_hint(&link);
-            Ok(Installed { link, admin: false, note, hint })
+    let mut note = was;
+    match link_with(dir, &p.cli) {
+        Ok(l) => return installed(l, false, note),
+        Err(LinkError::Other(e)) => return Err(e),
+        Err(LinkError::Denied) if p.user_dir.as_deref() == Some(dir) => {
+            return Err(format!("{} does not let this user make a link", dir.display()));
         }
-        Err(LinkError::Denied) => Err(format!("{} does not let this user make a link", dir.display())),
-        Err(LinkError::Other(e)) => Err(e),
+        Err(LinkError::Denied) => {}
+    }
+    match admin.run(&admin_install_script(dir, &p.cli)).await {
+        Elevated::Done => {
+            let st = status(p);
+            match &st {
+                Status::Linked { link, .. } if !st.of_another_copy(&p.cli) => installed(link.clone(), true, note),
+                _ => Err(format!("the administrator step ran, but {} is not a link to this app", wanted.display())),
+            }
+        }
+        Elevated::Cancelled => Ok(Outcome::Cancelled { wanted }),
+        Elevated::Failed(e) => {
+            // Not "no", but "could not": the user's folder is next.
+            let why = format!("{} could not be made as the administrator ({e}).", wanted.display());
+            note = Some(note.map_or(why.clone(), |n| format!("{n} {why}")));
+            let Some(user) = &p.user_dir else { return Err(why) };
+            match link_with(user, &p.cli) {
+                Ok(l) => installed(l, false, note),
+                Err(LinkError::Denied) => Err(format!("{} does not let this user make a link", user.display())),
+                Err(LinkError::Other(e)) => Err(e),
+            }
+        }
     }
 }
 
@@ -542,12 +668,15 @@ pub struct State {
     pub places: Result<Places, String>,
     pub status: Status,
     pub work: Work,
+    /// The last install was stopped at the administrator prompt: Settings says so, and offers
+    /// "Install for this user only".
+    pub cancelled: bool,
 }
 
 impl Default for State {
     /// Not looked at: no banner, nothing offered.
     fn default() -> State {
-        State { places: Err("not looked at yet".into()), status: Status::Missing, work: Work::Idle }
+        State { places: Err("not looked at yet".into()), status: Status::Missing, work: Work::Idle, cancelled: false }
     }
 }
 
@@ -559,7 +688,7 @@ impl State {
 
     pub fn of(places: Result<Places, String>) -> State {
         let status = places.as_ref().map_or(Status::Missing, status);
-        State { places, status, work: Work::Idle }
+        State { places, status, work: Work::Idle, cancelled: false }
     }
 
     /// Look at the folders again (after an action).
@@ -678,8 +807,21 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
     }
 
+    /// The usual install, expected to end with a link.
     fn install(s: &Sandbox, admin: &Admin) -> Result<Installed, String> {
-        block_on(install_with(&s.places, admin))
+        match block_on(install_with(&s.places, admin, Choice::Preferred))? {
+            Outcome::Installed(i) => Ok(i),
+            Outcome::Cancelled { wanted } => Err(format!("cancelled: {}", wanted.display())),
+        }
+    }
+
+    fn install_as(s: &Sandbox, admin: &Admin, choice: Choice) -> Result<Outcome, String> {
+        block_on(install_with(&s.places, admin, choice))
+    }
+
+    /// `install_core` with the system folder denied, expected to end with a link.
+    fn install_denied(s: &Sandbox, admin: &Admin) -> Result<Outcome, String> {
+        block_on(install_core(&s.places, admin, &deny(s.system()), Choice::Preferred))
     }
 
     fn uninstall(s: &Sandbox, admin: &Admin) -> Result<Removed, String> {
@@ -701,15 +843,37 @@ mod tests {
             "/private/var/folders/x9/abc/T/AppTranslocation/6B1F-42/d/Warden.app/Contents/MacOS/warden-gui",
         ));
         assert!(t.unwrap_err().contains("Move Warden.app to Applications"));
-        let v = stays_put(Path::new("/Volumes/Warden/Warden.app/Contents/MacOS/warden-gui"));
-        assert!(v.unwrap_err().contains("eject the disk image"));
         assert!(stays_put(Path::new("/Applications/Warden.app/Contents/MacOS/warden-gui")).is_ok());
         assert!(stays_put(Path::new("/Users/me/Applications/Warden.app/Contents/MacOS/warden-gui")).is_ok());
         // The same Places refuse to install from such a place.
         let mut s = Sandbox::new("volume");
-        s.places.exe = PathBuf::from("/Volumes/Warden/Warden.app/Contents/MacOS/warden-gui");
-        assert!(install(&s, &Admin::never()).unwrap_err().contains("eject the disk image"));
+        s.places.exe = PathBuf::from(
+            "/private/var/folders/x9/abc/T/AppTranslocation/6B1F-42/d/Warden.app/Contents/MacOS/warden-gui",
+        );
+        assert!(install(&s, &Admin::never()).unwrap_err().contains("Move Warden.app to Applications"));
         assert!(!s.system().exists(), "nothing was made");
+    }
+
+    #[test]
+    fn a_volume_is_refused_only_when_it_is_a_read_only_disk() {
+        let exe = Path::new("/Volumes/Warden/Warden.app/Contents/MacOS/warden-gui");
+        let asked = Mutex::new(vec![]);
+        let read_only = |d: &Path| {
+            asked.lock().unwrap().push(d.to_path_buf());
+            true
+        };
+        let why = stays_put_with(exe, &read_only).unwrap_err();
+        assert!(why.contains("read-only disk") && why.contains("eject the disk image"), "{why}");
+        assert_eq!(*asked.lock().unwrap(), [PathBuf::from("/Volumes/Warden")], "the volume is what is looked at");
+        // A second drive that can be written to is a place to keep an app.
+        assert!(stays_put_with(exe, &|_| false).is_ok());
+        // Other places are not asked about the volume at all.
+        let before = asked.lock().unwrap().len();
+        assert!(stays_put_with(Path::new("/Applications/Warden.app/Contents/MacOS/warden-gui"), &read_only).is_ok());
+        assert_eq!(asked.lock().unwrap().len(), before);
+        // The real check: a folder of this machine is not a read-only mount, and a missing one is not either.
+        assert!(!read_only_mount(&std::env::temp_dir()));
+        assert!(!read_only_mount(Path::new("/no/such/volume")));
     }
 
     #[test]
@@ -764,7 +928,7 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             symlink(&cli, dir.join("warden")).unwrap();
         });
-        let done = block_on(install_core(&s.places, &admin, &deny(s.system()))).unwrap();
+        let Outcome::Installed(done) = install_denied(&s, &admin).unwrap() else { panic!("not installed") };
         assert!(done.admin && done.note.is_none() && done.hint.is_none());
         assert_eq!(done.link, s.system().join("warden"));
         assert_eq!(admin.asked(), vec![admin_install_script(&s.system(), &s.places.cli)]);
@@ -775,32 +939,58 @@ mod tests {
     fn an_administrator_step_that_changed_nothing_is_an_error() {
         let s = Sandbox::new("liar");
         let admin = Admin::new(Elevated::Done, || {});
-        let err = block_on(install_core(&s.places, &admin, &deny(s.system()))).unwrap_err();
+        let err = install_denied(&s, &admin).unwrap_err();
         assert!(err.contains("is not a link to this app"), "{err}");
     }
 
     #[test]
-    fn a_cancelled_or_failed_prompt_falls_back_to_the_users_folder_and_says_why() {
-        for (answer, said) in [
-            (Elevated::Cancelled, "The administrator prompt was cancelled"),
-            (
-                Elevated::Failed("1:2: syntax error".into()),
-                "could not be made as the administrator (1:2: syntax error)",
-            ),
-        ] {
-            let s = Sandbox::new("fallback");
-            let admin = Admin::new(answer, || {});
-            let done = block_on(install_core(&s.places, &admin, &deny(s.system()))).unwrap();
-            assert_eq!(done.link, s.user().join("warden"));
-            assert!(done.note.as_deref().is_some_and(|n| n.contains(said)), "{:?}", done.note);
-            assert_eq!(admin.asked().len(), 1);
-            // A window opened from Finder has no ~/.local/bin on its PATH.
-            let hint = done.hint.clone().expect("the folder is not on PATH");
-            assert_eq!(hint.command(), "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc");
-            let words = done.summary(&s.places.cli);
-            assert!(words.contains(said) && words.contains("Settings has the line"), "{words}");
-            assert!(!s.system().join("warden").exists());
-        }
+    fn a_cancelled_prompt_installs_nothing_and_says_so() {
+        let s = Sandbox::new("cancel");
+        let admin = Admin::new(Elevated::Cancelled, || {});
+        let out = install_denied(&s, &admin).unwrap();
+        assert_eq!(out, Outcome::Cancelled { wanted: s.system().join("warden") });
+        assert_eq!(admin.asked().len(), 1);
+        assert!(!s.system().join("warden").exists(), "no link in the system folder");
+        assert!(!s.user().join("warden").exists(), "and none in the users folder: that is a choice of its own");
+        assert_eq!(status(&s.places), Status::Missing);
+    }
+
+    #[test]
+    fn for_this_user_only_links_in_the_users_folder_with_no_prompt() {
+        let s = Sandbox::new("user-only");
+        let admin = Admin::never();
+        let Outcome::Installed(done) = install_as(&s, &admin, Choice::ThisUserOnly).unwrap() else {
+            panic!("not installed")
+        };
+        assert_eq!(done.link, s.user().join("warden"));
+        assert!(admin.asked().is_empty() && !done.admin && done.note.is_none());
+        assert!(!s.system().exists(), "the system folder is not touched");
+        let hint = done.hint.clone().expect("a Finder-launched window has no ~/.local/bin on its PATH");
+        assert!(hint.command().starts_with("grep -qsF "), "{}", hint.command());
+        // Installing it that way again changes nothing.
+        let Outcome::Installed(again) = install_as(&s, &admin, Choice::ThisUserOnly).unwrap() else { panic!() };
+        assert!(again.note.as_deref().is_some_and(|n| n.contains("already")));
+    }
+
+    #[test]
+    fn a_failed_prompt_falls_back_to_the_users_folder_and_says_why() {
+        let s = Sandbox::new("fallback");
+        let admin = Admin::new(Elevated::Failed("1:2: syntax error".into()), || {});
+        let Outcome::Installed(done) = install_denied(&s, &admin).unwrap() else { panic!("not installed") };
+        let said = "could not be made as the administrator (1:2: syntax error)";
+        assert_eq!(done.link, s.user().join("warden"));
+        assert!(done.note.as_deref().is_some_and(|n| n.contains(said)), "{:?}", done.note);
+        assert_eq!(admin.asked().len(), 1);
+        // A window opened from Finder has no ~/.local/bin on its PATH.
+        let hint = done.hint.clone().expect("the folder is not on PATH");
+        assert_eq!(
+            hint.command(),
+            "grep -qsF 'export PATH=\"$HOME/.local/bin:$PATH\"' ~/.zshrc || \
+             echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc"
+        );
+        let words = done.summary(&s.places.cli);
+        assert!(words.contains(said) && words.contains("Settings has the line"), "{words}");
+        assert!(!s.system().join("warden").exists());
     }
 
     #[test]
@@ -825,7 +1015,7 @@ mod tests {
         assert_eq!(done.link, s.user().join("warden"));
         assert!(admin.asked().is_empty() && !done.admin && done.note.is_none());
         let hint = done.hint.expect("~/.local/bin is not on PATH here");
-        assert_eq!(hint.command(), "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc");
+        assert!(hint.command().ends_with("echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.bashrc"));
         // With the folder on PATH there is nothing to add.
         s.places.path.push(s.user());
         assert!(s.places.path_hint(&s.user().join("warden")).is_none());
@@ -961,13 +1151,91 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_link_to_nothing_of_ours_is_replaced() {
+    fn a_dead_link_is_nobodys_and_is_replaced_or_removed_whatever_it_pointed_at() {
         let s = Sandbox::new("dead");
         std::fs::create_dir_all(s.system()).unwrap();
-        symlink(s.root.join("gone/warden"), s.system().join("warden")).unwrap();
-        assert_eq!(status(&s.places), Status::Missing, "a dead link to nothing we know is nobody's");
+        let gone = s.root.join("gone/warden");
+        symlink(&gone, s.system().join("warden")).unwrap();
+        assert_eq!(status(&s.places), Status::Broken { link: s.system().join("warden"), target: gone });
         let done = install(&s, &Admin::never()).unwrap();
         assert_eq!(std::fs::read_link(done.link).unwrap(), s.places.cli);
+        // A dead link into an app of another name (`Warden 2.app`, deleted) is told as dead, not as missing.
+        let old = s.root.join("Trash/Warden 2.app/Contents/MacOS/warden");
+        std::fs::remove_file(s.system().join("warden")).unwrap();
+        symlink(&old, s.system().join("warden")).unwrap();
+        assert!(matches!(status(&s.places), Status::Broken { target, .. } if target == old));
+        assert_eq!(uninstall(&s, &Admin::never()).unwrap().link, s.system().join("warden"));
+    }
+
+    #[test]
+    fn a_link_into_another_copy_of_the_app_can_be_pointed_at_this_one_or_removed() {
+        for (name, other) in [
+            ("renamed", "Applications/Warden 2.app/Contents/MacOS/warden"),
+            ("download", "Downloads/warden-gui-0.1.0-linux-x86_64/warden"),
+        ] {
+            let s = Sandbox::new(&format!("copy-{name}"));
+            let copy = s.root.join(other);
+            executable(&copy);
+            executable(&copy.with_file_name("warden-gui"));
+            std::fs::create_dir_all(s.system()).unwrap();
+            symlink(&copy, s.system().join("warden")).unwrap();
+            let st = status(&s.places);
+            assert_eq!(st, Status::Linked { link: s.system().join("warden"), target: copy.clone() }, "{name}");
+            assert!(st.of_another_copy(&s.places.cli), "{name}: it is not this app's");
+            // "Point it at this app": the same link, now to this app, with no prompt.
+            let done = install(&s, &Admin::never()).unwrap();
+            assert_eq!(done.link, s.system().join("warden"));
+            assert!(done.note.as_deref().is_some_and(|n| n.contains("It pointed to")), "{:?}", done.note);
+            assert_eq!(std::fs::read_link(&done.link).unwrap(), s.places.cli);
+            assert!(!status(&s.places).of_another_copy(&s.places.cli));
+            // The other copy is left as it was.
+            assert!(copy.exists());
+            // And a link to the other copy can be removed as well.
+            std::fs::remove_file(&done.link).unwrap();
+            symlink(&copy, s.system().join("warden")).unwrap();
+            assert_eq!(uninstall(&s, &Admin::never()).unwrap().link, s.system().join("warden"));
+            assert!(copy.exists(), "only the link is removed");
+        }
+        // A `warden` link to a folder with no `warden-gui` beside it, in no app, is somebody else's.
+        let s = Sandbox::new("copy-foreign");
+        let other = s.root.join("opt/tool/warden");
+        executable(&other);
+        std::fs::create_dir_all(s.system()).unwrap();
+        symlink(&other, s.system().join("warden")).unwrap();
+        assert!(matches!(status(&s.places), Status::Present { .. }));
+    }
+
+    #[test]
+    fn the_path_line_is_not_offered_when_a_startup_file_has_it_and_it_adds_itself_once() {
+        let mut s = Sandbox::new("hint");
+        let home = s.places.home.clone().unwrap();
+        let link = s.user().join("warden");
+        assert!(s.places.path_hint(&link).is_some(), "nothing sets it up yet");
+        // A comment is not a setting.
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshrc"), "# export PATH=\"$HOME/.local/bin:$PATH\"\n").unwrap();
+        assert!(s.places.path_hint(&link).is_some());
+        // A line the person wrote themselves (not this window's) counts all the same.
+        std::fs::write(home.join(".zprofile"), "path+=(~/.local/bin)\n").unwrap();
+        assert!(s.places.path_hint(&link).is_none(), "the startup files already add the folder");
+        // Another shell's files are not looked in.
+        s.places.shell = Some("/usr/bin/bash".into());
+        assert!(s.places.path_hint(&link).is_some());
+        // The command is idempotent: run twice, the line is in the file once.
+        let hint = s.places.path_hint(&link).unwrap();
+        let run = || {
+            let st = std::process::Command::new("/bin/sh")
+                .args(["-c", &hint.command()])
+                .env("HOME", &home)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        };
+        run();
+        run();
+        let file = hint.file.as_deref().and_then(|f| f.strip_prefix("~/")).expect("bash has a startup file");
+        let text = std::fs::read_to_string(home.join(file)).unwrap();
+        assert_eq!(text.matches(".local/bin").count(), 1, "{text}");
     }
 
     #[test]
@@ -1003,7 +1271,11 @@ mod tests {
         let home = Path::new("/Users/me");
         let dir = Path::new("/Users/me/.local/bin");
         let h = |shell: Option<&str>, mac| Hint::new(dir, Some(home), shell, mac);
-        assert_eq!(h(Some("/bin/zsh"), true).command(), "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc");
+        assert_eq!(
+            h(Some("/bin/zsh"), true).command(),
+            "grep -qsF 'export PATH=\"$HOME/.local/bin:$PATH\"' ~/.zshrc || \
+             echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc"
+        );
         assert_eq!(h(Some("/bin/bash"), true).file.as_deref(), Some("~/.bash_profile"));
         assert_eq!(h(Some("/usr/bin/bash"), false).file.as_deref(), Some("~/.bashrc"));
         assert_eq!(h(Some("/usr/bin/fish"), false).command(), "fish_add_path \"$HOME/.local/bin\"");
@@ -1019,11 +1291,8 @@ mod tests {
         let dir = Path::new("/usr/local/bin");
         let cli = Path::new("/Applications/Warden.app/Contents/MacOS/warden");
         let script = admin_install_script(dir, cli);
-        assert_eq!(
-            script,
-            "/bin/mkdir -p /usr/local/bin && { [ ! -e /usr/local/bin/warden ] || [ -L /usr/local/bin/warden ]; } && \
-             /bin/ln -sfn /Applications/Warden.app/Contents/MacOS/warden /usr/local/bin/warden"
-        );
+        assert!(script.starts_with("/bin/mkdir -p /usr/local/bin && if "), "{script}");
+        assert!(script.contains("/bin/ln -sfn /Applications/Warden.app/Contents/MacOS/warden /usr/local/bin/warden;"));
         assert_eq!(
             admin_remove_script(&dir.join("warden")),
             "if [ -L /usr/local/bin/warden ]; then /bin/rm -- /usr/local/bin/warden; fi"
@@ -1033,6 +1302,8 @@ mod tests {
         assert!(args[1].starts_with("do shell script \"/bin/mkdir -p /usr/local/bin"));
         assert!(args[1].ends_with("\" with administrator privileges"));
         assert_eq!(args.len(), 2);
+        // The script has quotes of its own (the `case`): AppleScript sees them escaped.
+        assert!(args[1].contains("readlink /usr/local/bin/warden)\\\" in"), "{}", args[1]);
         // The app's folder may hold a space, a quote and a backslash: shell quoting first (so the
         // shell reads one word), then AppleScript's (so the string reads back as written).
         let odd = Path::new("/Users/o'neil/My Apps/Warden.app/Contents/MacOS/warden");
@@ -1055,21 +1326,72 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&echoed.stdout), odd.to_string_lossy());
     }
 
+    /// Run the install script in a folder of the sandbox, with the commands by their short names
+    /// (`/bin/ln` and the rest are macOS's paths), and say whether it ended well.
+    fn run_install_script(dir: &Path, cli: &Path) -> (bool, String) {
+        let script = admin_install_script(dir, cli)
+            .replace("/bin/mkdir", "mkdir")
+            .replace("/bin/ln", "ln")
+            .replace("/usr/bin/readlink", "readlink");
+        let out = std::process::Command::new("/bin/sh").args(["-c", &script]).output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+
     #[test]
-    fn the_scripts_check_again_as_root_that_only_a_link_is_touched() {
-        // /bin/mkdir and /bin/ln are macOS's: the guards are run as they are, and the removal with `rm`.
+    fn the_install_script_checks_again_as_root_that_only_this_apps_link_or_a_dead_one_is_replaced() {
         let s = Sandbox::new("script");
+        let dir = s.root.join("bin");
+        let link = dir.join("warden");
+        let cli = s.places.cli.clone();
+        // Nothing there (the folder too): it is made.
+        let (ok, err) = run_install_script(&dir, &cli);
+        assert!(ok, "{err}");
+        assert_eq!(std::fs::read_link(&link).unwrap(), cli);
+        // A file in the way: refused, and kept.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, "mine").unwrap();
+        let (ok, err) = run_install_script(&dir, &cli);
+        assert!(!ok && err.contains("is not a link to Warden's app"), "{err}");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "mine");
+        // A live link to somebody else's (Homebrew made it while the prompt was open): kept.
+        std::fs::remove_file(&link).unwrap();
+        let brew = s.root.join("opt/bin/warden");
+        executable(&brew);
+        symlink(&brew, &link).unwrap();
+        let (ok, _) = run_install_script(&dir, &cli);
+        assert!(!ok);
+        assert_eq!(std::fs::read_link(&link).unwrap(), brew, "a live link of somebody else's stays");
+        // A dead link, whatever it was: replaced.
+        std::fs::remove_file(&link).unwrap();
+        symlink(s.root.join("gone/warden"), &link).unwrap();
+        assert!(run_install_script(&dir, &cli).0);
+        assert_eq!(std::fs::read_link(&link).unwrap(), cli);
+        // A link into another copy of the app, and one to this app: replaced (pointed at this one).
+        for other in ["Elsewhere/Warden 2.app/Contents/MacOS/warden", "Applications/Warden.app/Contents/MacOS/warden"] {
+            let target = s.root.join(other);
+            executable(&target);
+            std::fs::remove_file(&link).unwrap();
+            symlink(&target, &link).unwrap();
+            let (ok, err) = run_install_script(&dir, &cli);
+            assert!(ok, "{other}: {err}");
+            assert_eq!(std::fs::read_link(&link).unwrap(), cli, "{other}");
+        }
+        // The path of the CLI itself is accepted even when it is not in an app (an unpacked download).
+        let unpacked = s.root.join("dl/warden");
+        executable(&unpacked);
+        std::fs::remove_file(&link).unwrap();
+        symlink(&unpacked, &link).unwrap();
+        assert!(run_install_script(&dir, &unpacked).0);
+    }
+
+    #[test]
+    fn the_remove_script_removes_only_a_link() {
+        let s = Sandbox::new("rm-script");
         let dir = s.root.join("bin");
         std::fs::create_dir_all(&dir).unwrap();
         let link = dir.join("warden");
         let sh = |script: &str| std::process::Command::new("/bin/sh").args(["-c", script]).status().unwrap();
-        let guard = format!("{{ [ ! -e {l} ] || [ -L {l} ]; }}", l = q(&link));
-        std::fs::write(&link, "mine").unwrap();
-        assert!(!sh(&guard).success(), "a file is in the way");
-        std::fs::remove_file(&link).unwrap();
-        assert!(sh(&guard).success(), "nothing is in the way");
         symlink(s.root.join("nowhere"), &link).unwrap();
-        assert!(sh(&guard).success(), "a dead link may be replaced");
         let rm = admin_remove_script(&link).replace("/bin/rm", "rm");
         assert!(sh(&rm).success());
         assert!(std::fs::symlink_metadata(&link).is_err(), "a link is removed");

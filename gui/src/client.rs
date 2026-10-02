@@ -66,16 +66,38 @@ pub fn local_socket() -> PathBuf {
 }
 
 /// The wardend to connect to on this machine when none was named: the one
-/// of this user if its socket is there, else the system's (a wardend run as
-/// root, `sudo warden startup`), else this user's, which is where `Start
-/// wardend` will put it.
+/// of this user if it answers, else the system's (a wardend run as root,
+/// `sudo warden startup`), else whichever socket is there (to say what is wrong with it), else
+/// this user's, which is where `Start wardend` will put it. A socket file is not
+/// a wardend: one left by a wardend that died would hide a live system one, so each is tried with a
+/// short `connect()`.
 pub fn auto_local_socket() -> PathBuf {
-    let own = local_socket();
-    if own.exists() {
-        return own;
+    choose_socket(&local_socket(), &warden_protocol::paths::root_wardend_socket(), answers)
+}
+
+/// `own` or `system`: the first that `live` says answers, else the first that is there, else `own`.
+fn choose_socket(own: &Path, system: &Path, live: impl Fn(&Path) -> bool) -> PathBuf {
+    for p in [own, system] {
+        if p.exists() && live(p) {
+            return p.to_path_buf();
+        }
     }
-    let system = warden_protocol::paths::root_wardend_socket();
-    if system.exists() { system } else { own }
+    [own, system].into_iter().find(|p| p.exists()).unwrap_or(own).to_path_buf()
+}
+
+/// How long a socket has to accept a connection to count as alive here. A refusal or a missing
+/// file comes at once; only a wardend that is stuck takes this long.
+const PROBE: Duration = Duration::from_millis(300);
+
+/// Whether something accepts on `path`: a `connect()` on a thread of its own, as a listener whose
+/// queue is full would hold this one for good (the thread then ends with the connection).
+fn answers(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(path).is_ok());
+    });
+    rx.recv_timeout(PROBE).unwrap_or(false)
 }
 
 /// The `subscribe` request's options.
@@ -202,21 +224,27 @@ impl Backoff {
     }
 }
 
-/// Why connecting failed, and whether that means wardend is not running.
+/// What a socket's path may be in bytes: `sun_path` less the NUL (108 on Linux, 104 on macOS and the BSDs).
+#[cfg(target_os = "linux")]
+const SOCKET_PATH_MAX: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const SOCKET_PATH_MAX: usize = 103;
+
+/// Why connecting failed, and whether that means wardend is not running. The kind of the error
+/// says (a path a little long for some system still connects on another): only the system's
+/// own "invalid input" on a path over its limit blames the length.
 pub fn connect_error(path: &Path, e: &std::io::Error) -> (String, bool) {
     use std::io::ErrorKind::*;
-    if path.as_os_str().len() > 100 {
-        return (
+    match e.kind() {
+        InvalidInput if path.as_os_str().len() > SOCKET_PATH_MAX => (
             format!(
-                "cannot connect to {}: the path is {} bytes long, and Unix sockets allow about 100. Set \
+                "cannot connect to {}: the path is {} bytes long, and Unix sockets allow {SOCKET_PATH_MAX} here. Set \
                  WARDEN_RUNTIME_DIR to a shorter directory (for wardend and the apps too)",
                 path.display(),
                 path.as_os_str().len()
             ),
             false,
-        );
-    }
-    match e.kind() {
+        ),
         NotFound => (format!("wardend is not running: there is no socket at {}", path.display()), true),
         ConnectionRefused => (
             format!(
@@ -724,9 +752,90 @@ mod tests {
         assert!(connect_error(p, &std::io::Error::from(std::io::ErrorKind::ConnectionRefused)).1);
         let (msg, not_running) = connect_error(p, &std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(!not_running && msg.contains("another user"), "{msg}");
-        let long = PathBuf::from(format!("/tmp/{}/wardend.sock", "x".repeat(100)));
-        let (msg, _) = connect_error(&long, &std::io::Error::from(std::io::ErrorKind::InvalidInput));
-        assert!(msg.contains("WARDEN_RUNTIME_DIR"), "{msg}");
+        let long = PathBuf::from(format!("/tmp/{}/wardend.sock", "x".repeat(SOCKET_PATH_MAX)));
+        let (msg, not_running) = connect_error(&long, &std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        assert!(!not_running && msg.contains("WARDEN_RUNTIME_DIR") && msg.contains("bytes long"), "{msg}");
+    }
+
+    /// A path just over the old guess of 100 bytes and under what the system allows connects fine,
+    /// so a stopped wardend there is "not running", not "the path is too long" (and a path over what
+    /// the system allows is refused by the system itself as invalid input, which is what says so).
+    /// A path of `n` bytes in a folder that is not there.
+    fn near(n: usize) -> PathBuf {
+        let (dir, name) = ("/tmp/", "/w.sock");
+        PathBuf::from(format!("{dir}{}{name}", "d".repeat(n - dir.len() - name.len())))
+    }
+
+    /// The real thing, through `connect`: a stopped wardend on a path that is long but allowed.
+    #[tokio::test]
+    async fn a_stopped_wardend_on_a_long_but_allowed_path_is_not_running() {
+        let p = near(SOCKET_PATH_MAX - 2);
+        let (msg, not_running) = connect(&p).await.expect_err("nothing listens there");
+        assert!(not_running && msg.contains("wardend is not running") && !msg.contains("bytes long"), "{msg}");
+    }
+
+    #[test]
+    fn a_long_path_is_blamed_only_when_the_system_refuses_its_length() {
+        for n in [101, 104.min(SOCKET_PATH_MAX), SOCKET_PATH_MAX] {
+            let p = near(n);
+            assert_eq!(p.as_os_str().len(), n);
+            let (msg, not_running) = connect_error(&p, &std::io::Error::from(std::io::ErrorKind::NotFound));
+            assert!(not_running && msg.contains("not running") && !msg.contains("bytes long"), "{n}: {msg}");
+            let (msg, not_running) = connect_error(&p, &std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            assert!(not_running && !msg.contains("bytes long"), "{n}: {msg}");
+        }
+        // The system's own answer for a path too long for it.
+        let too_long = near(SOCKET_PATH_MAX + 20);
+        let e = std::os::unix::net::UnixStream::connect(&too_long).expect_err("no such socket, and too long a path");
+        let (msg, not_running) = connect_error(&too_long, &e);
+        assert!(!not_running && msg.contains("bytes long") && msg.contains("WARDEN_RUNTIME_DIR"), "{e:?}: {msg}");
+        // A path of 101 bytes is no longer than the system takes: it is only not there.
+        let e = std::os::unix::net::UnixStream::connect(near(101)).expect_err("no such socket");
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A folder for a test's sockets (short names: a socket's path cannot be long), removed when it goes.
+    struct Dir(PathBuf);
+    impl Dir {
+        fn new(name: &str) -> Dir {
+            let d = std::env::temp_dir().join(format!("wg-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Dir(d)
+        }
+        fn sock(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_socket_file_left_by_a_dead_wardend_does_not_hide_a_live_one() {
+        let d = Dir::new("socks");
+        let (own, system) = (d.sock("own.sock"), d.sock("system.sock"));
+        // Neither there: this user's, where Start wardend puts it.
+        assert_eq!(choose_socket(&own, &system, answers), own);
+        // The user's is a file nobody listens on (a wardend that was killed), the system's lives.
+        drop(std::os::unix::net::UnixListener::bind(&own).unwrap());
+        let live = std::os::unix::net::UnixListener::bind(&system).unwrap();
+        assert!(own.exists() && !answers(&own) && answers(&system));
+        assert_eq!(choose_socket(&own, &system, answers), system);
+        // Both live: the user's own.
+        let own_live = {
+            std::fs::remove_file(&own).unwrap();
+            std::os::unix::net::UnixListener::bind(&own).unwrap()
+        };
+        assert_eq!(choose_socket(&own, &system, answers), own);
+        drop(own_live);
+        // Neither answers: the one that is there, the user's first, so the error names it.
+        drop(live);
+        assert_eq!(choose_socket(&own, &system, answers), own);
+        std::fs::remove_file(&own).unwrap();
+        assert_eq!(choose_socket(&own, &system, answers), system, "only the system's file is there");
     }
 
     #[test]

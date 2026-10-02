@@ -32,12 +32,16 @@ use warden_protocol::events::AppState;
 /// Height of one row in the events and logs lists.
 pub const LINE_H: f32 = 19.0;
 const LIST_W: f32 = 320.0;
+/// What an app's row has for its text: the list, less the bar, the dot and the padding.
+const ROW_TEXT_W: f32 = LIST_W - 4.0 - 12.0 - 14.0 - 8.0 - 10.0 - 6.0;
 
 /// A slim round scrollbar, so lists do not look like a file manager.
 fn thin() -> scrollable::Scrollbar {
     scrollable::Scrollbar::new().width(6).scroller_width(6).margin(3)
 }
 const SMALL: f32 = 12.0;
+/// About how wide the `Edit config` button is.
+const EDIT_W: f32 = 132.0;
 // The heights of the detail page's parts, to tell whether the bottom pane still fits.
 const TOPBAR_H: f32 = 55.0;
 const PAGE_PAD: f32 = 18.0;
@@ -154,6 +158,52 @@ fn clip_start(path: &str, max: usize) -> Cow<'_, str> {
     // Start at a whole directory name when there is one to start at.
     let tail = tail.find('/').map_or(tail.as_str(), |i| &tail[i..]);
     Cow::Owned(format!("…{tail}"))
+}
+
+/// What a character takes of its font size (Inter, and JetBrains Mono when `mono`). The letters
+/// are told apart by kind (narrow ones, capitals, wide ones, the double width of CJK and emoji):
+/// close enough to say where a cut goes. A tooltip carries the rest.
+fn em_of(c: char, mono: bool) -> f32 {
+    let wide = matches!(c as u32,
+        0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1FAFF | 0x20000..=0x3FFFD);
+    if mono {
+        return if wide { 1.24 } else { 0.62 };
+    }
+    match c {
+        _ if wide => 1.05,
+        'i' | 'j' | 'l' | 'I' | '.' | ',' | ':' | ';' | '\'' | '|' | '!' | '`' => 0.3,
+        ' ' | 't' | 'f' | 'r' | '(' | ')' | '[' | ']' | '/' | '-' | '"' => 0.4,
+        'W' => 0.95,
+        'm' | 'w' | 'M' => 0.85,
+        'A'..='Z' => 0.68,
+        '0'..='9' => 0.6,
+        _ => 0.56,
+    }
+}
+
+/// About how wide `text` is at `size`, in pixels.
+fn width_of(text: &str, size: f32, mono: bool) -> f32 {
+    text.chars().map(|c| em_of(c, mono)).sum::<f32>() * size
+}
+
+/// `text` cut with `…` to fit `room` pixels, and whether it is cut or close to it (within 15%,
+/// as the estimate can be off): then the whole text belongs in a tooltip.
+fn fit<'a>(text: &'a str, size: f32, mono: bool, room: f32) -> (Cow<'a, str>, bool) {
+    let wide = width_of(text, size, mono);
+    if wide <= room {
+        return (Cow::Borrowed(text), wide > room * 0.85);
+    }
+    let dots = width_of("…", size, mono);
+    let mut used = dots;
+    let cut: String = text
+        .chars()
+        .take_while(|c| {
+            used += em_of(*c, mono) * size;
+            used <= room
+        })
+        .collect();
+    (Cow::Owned(format!("{}…", cut.trim_end())), true)
 }
 
 fn menu_item<'a>(
@@ -290,6 +340,15 @@ fn machines_button(g: &Gui) -> Element<'_, Message> {
     Dropdown::new(main, machines_menu(g), open).on_dismiss(Message::CloseMenu).into()
 }
 
+/// What the menu has besides the machines: its title, the rule, "Add SSH machine", the paddings.
+const MACHINES_MENU_CHROME_H: f32 = 96.0;
+
+/// The height the list of machines may take: the window below the top bar, less the menu's own
+/// parts and a margin to the window's edge.
+pub fn machines_list_room(window_h: f32) -> f32 {
+    (window_h - TOPBAR_H - 4.0 - 8.0 - MACHINES_MENU_CHROME_H).max(72.0)
+}
+
 fn machines_menu(g: &Gui) -> Element<'_, Message> {
     let current_ssh = match &g.target.endpoint {
         crate::client::Endpoint::Ssh(t) => Some(t.dest.as_str()),
@@ -304,7 +363,9 @@ fn machines_menu(g: &Gui) -> Element<'_, Message> {
         .width(20)
         .into()
     };
-    let mut c = column![section("Machine")].spacing(2).padding([4, 6]);
+    // The machines go in a list that scrolls, so that "Add SSH machine" is never below the window's
+    // edge however many machines are saved.
+    let mut c = column![].spacing(2);
     c = c.push(
         button(
             row![
@@ -370,18 +431,24 @@ fn machines_menu(g: &Gui) -> Element<'_, Message> {
             .padding([6, 8]),
         );
     }
-    c = c.push(rule::horizontal(1));
-    c = c.push(
-        button(
-            row![container(icon(Icon::Plus).size(15)).width(20), text("Add SSH machine").size(13).font(MEDIUM)]
-                .spacing(8)
-                .align_y(Center),
-        )
-        .width(Fill)
-        .padding([6, 8])
-        .style(look::ghost)
-        .on_press(Message::AddMachine),
-    );
+    let room = machines_list_room(g.window.height);
+    // Room on the right for the scrollbar, so that it does not cover the Edit and Remove buttons.
+    let list = container(
+        scrollable(container(c).padding(iced::Padding { right: 10.0, ..iced::Padding::ZERO }))
+            .direction(scrollable::Direction::Vertical(thin()))
+            .style(look::scroll),
+    )
+    .max_height(room);
+    let add = button(
+        row![container(icon(Icon::Plus).size(15)).width(20), text("Add SSH machine").size(13).font(MEDIUM)]
+            .spacing(8)
+            .align_y(Center),
+    )
+    .width(Fill)
+    .padding([6, 8])
+    .style(look::ghost)
+    .on_press(Message::AddMachine);
+    let c = column![section("Machine"), list, rule::horizontal(1), add].spacing(2).padding([4, 6]);
     container(c).width(340).padding(4).style(look::menu).into()
 }
 
@@ -554,10 +621,18 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     if a.entry.supervised_by != "wardend" {
         parts.push(a.entry.supervised_by.clone());
     }
-    let mut c = column![
-        row![text(a.name()).size(14).font(DISPLAY_BOLD), space::horizontal(), state_label(a, tone)].align_y(Center)
-    ]
-    .spacing(2);
+    // The state label keeps its place; the name takes what is left, cut with `…` (and whole in a
+    // tooltip) when it is longer. The display face is wider than Inter.
+    let label = a.state_label();
+    let label_w = width_of(&label, SMALL, false) + 24.0;
+    let (name, cut) = fit(a.name(), 14.0 * 1.12, false, ROW_TEXT_W - label_w - 8.0);
+    let name: Element<'a, Message> =
+        container(text(name.into_owned()).size(14).font(DISPLAY_BOLD).wrapping(Wrapping::None))
+            .width(Fill)
+            .clip(true)
+            .into();
+    let name = if cut { tip(name, a.name().to_string()) } else { name };
+    let mut c = column![row![name, state_label(a, tone)].spacing(8).align_y(Center)].spacing(2);
     if !parts.is_empty() {
         c = c.push(small(parts.join(" · ")));
     }
@@ -585,15 +660,28 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
 fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let e = &a.entry;
     let tone = state_tone(a);
-    let mut head =
-        row![heading(a.name()).size(28), badge(a.state_label(), tone), space::horizontal()].spacing(12).align_y(Center);
+    // The name, the state and Edit config always fit: the name is cut to what the row leaves, and
+    // the path of the config is shown only when there is room for it (else it is Edit config's tooltip).
+    let room = (g.window.width - LIST_W - 1.0 - 32.0).max(300.0);
+    let state = a.state_label();
+    let state_w = width_of(&state, 11.0, false) + 26.0;
+    let edit_w = if e.config.is_some() { EDIT_W + 12.0 } else { 0.0 };
+    let (name, name_cut) = fit(a.name(), 28.0 * 1.12, false, room - state_w - edit_w - 24.0);
+    let name_w = width_of(&name, 28.0 * 1.12, false);
+    let name: Element<'a, Message> = heading(name.into_owned()).size(28).wrapping(Wrapping::None).into();
+    let name = if name_cut { tip(name, a.name().to_string()) } else { name };
+    let mut head = row![name, badge(state, tone), space::horizontal()].spacing(12).align_y(Center);
     if let Some(cfg) = &e.config {
-        head = head.push(tip(small(clip(cfg, 52).into_owned()), cfg.clone())).push(
-            button(labeled(Icon::Edit, "Edit config"))
-                .padding([7, 14])
-                .style(look::quiet)
-                .on_press(Message::OpenEditor(e.name.clone())),
-        );
+        let path_room = room - name_w - state_w - edit_w - 3.0 * 12.0;
+        if path_room >= 110.0 {
+            let (shown, _) = fit(cfg, SMALL, false, path_room);
+            head = head.push(tip(small(shown.into_owned()).wrapping(Wrapping::None), cfg.clone()));
+        }
+        let edit = button(labeled(Icon::Edit, "Edit config"))
+            .padding([7, 14])
+            .style(look::quiet)
+            .on_press(Message::OpenEditor(e.name.clone()));
+        head = head.push(if path_room >= 110.0 { edit.into() } else { tip(edit, cfg.clone()) });
     }
     let mut facts = vec![format!("supervised by {}", e.supervised_by)];
     if let Some(p) = e.supervisor_pid {
@@ -1171,6 +1259,23 @@ struct Line<'a> {
     /// A dot before the text (events), colored by what the line is about.
     dot: Option<Tone>,
     mono: bool,
+    /// The tone and the dot are told from the words of the line (events), when it is drawn: most
+    /// lines of a long feed never are.
+    by_words: bool,
+}
+
+impl Line<'_> {
+    /// The tone of the text and the color of the dot.
+    fn look(&self) -> (Tone, Option<Tone>) {
+        if !self.by_words {
+            return (self.tone, self.dot);
+        }
+        let sev = format::severity(self.text);
+        (
+            if matches!(sev, Severity::Bad | Severity::Warn) { severity_tone(sev) } else { Tone::Plain },
+            Some(severity_tone(sev)),
+        )
+    }
 }
 
 /// A list drawn only where it is visible: every row is `LINE_H` tall, the
@@ -1190,26 +1295,25 @@ fn lines<'a>(
             col = col.push(space().height(start as f32 * LINE_H));
         }
         for item in &items[start..end] {
-            let char_w = if item.mono { 7.4 } else { 6.9 };
+            let (tone, dot_tone) = item.look();
             let used =
-                16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if item.dot.is_some() { 16.0 } else { 0.0 };
-            let fit = (((size.width - used - 14.0) / char_w) as usize).max(12);
-            let shown = clip(item.text, fit);
-            let cut = matches!(shown, Cow::Owned(_));
+                16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if dot_tone.is_some() { 16.0 } else { 0.0 };
+            let font = if item.mono { 12.0 } else { 13.0 };
+            let (shown, cut) = fit(item.text, font, item.mono, (size.width - used - 14.0).max(90.0));
             let mut r = Row::new().spacing(8).align_y(Center).height(LINE_H);
             if let Some(t) = item.time {
                 r = r.push(
                     text(t).font(MONO).size(11).style(muted).width(60).line_height(LineHeight::Absolute(LINE_H.into())),
                 );
             }
-            if let Some(d) = item.dot {
+            if let Some(d) = dot_tone {
                 r = r.push(dot(d, 6.0));
             }
             let body = text(shown.into_owned())
                 .size(if item.mono { 12 } else { 13 })
                 .line_height(LineHeight::Absolute(LINE_H.into()))
                 .wrapping(Wrapping::None)
-                .style(item.tone.style());
+                .style(tone.style());
             r = r.push(if item.mono { body.font(MONO) } else { body });
             col = col.push(if cut { tip(r, item.text.to_string()) } else { r.into() });
         }
@@ -1238,14 +1342,7 @@ fn events(a: &App, scroll: Scroll) -> Element<'_, Message> {
         .iter()
         .map(|l| {
             let (time, text) = format::split_event(l, a.name());
-            let sev = format::severity(text);
-            Line {
-                time,
-                text,
-                tone: if matches!(sev, Severity::Bad | Severity::Warn) { severity_tone(sev) } else { Tone::Plain },
-                dot: Some(severity_tone(sev)),
-                mono: false,
-            }
+            Line { time, text, tone: Tone::Plain, dot: None, mono: false, by_words: true }
         })
         .collect();
     lines(items, scroll, FEED_ID, Message::FeedScrolled)
@@ -1316,6 +1413,7 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
                 },
                 dot: None,
                 mono: true,
+                by_words: false,
             })
             .collect();
         lines(items, p.scroll, LOGS_ID, Message::LogsScrolled)
@@ -1608,6 +1706,11 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
     .into()
 }
 
+/// A line of Settings with an icon in a tone: what is installed, what went wrong.
+fn said<'a>(i: Icon, tone: Tone, t: impl Into<String>) -> Element<'a, Message> {
+    row![icon(i).size(15).style(tone.style()), text(t.into()).size(13).width(Fill)].spacing(8).align_y(Center).into()
+}
+
 /// "Install command line tool": what `warden` is on this machine, and the action that links it.
 /// Always this machine's (not the host the window shows).
 fn cli_section(g: &Gui) -> Element<'_, Message> {
@@ -1624,14 +1727,20 @@ fn cli_section(g: &Gui) -> Element<'_, Message> {
             .style(look::quiet)
             .on_press_maybe(press(Message::InstallCli))
     };
+    let install_for_me = |label: &'static str| {
+        tip(
+            button(labeled(Icon::User, label))
+                .padding([6, 14])
+                .style(look::quiet)
+                .on_press_maybe(press(Message::InstallCliForMe)),
+            "A link in your own ~/.local/bin: no password, and only for you",
+        )
+    };
     let uninstall = |label: &'static str| {
         button(labeled(Icon::Trash, if work == Work::Removing { "Removing\u{2026}" } else { label }))
             .padding([6, 14])
             .style(look::quiet)
             .on_press_maybe(press(Message::UninstallCli))
-    };
-    let said = |i: Icon, tone: Tone, t: String| {
-        row![icon(i).size(15).style(tone.style()), text(t).size(13).width(Fill)].spacing(8).align_y(Center)
     };
     match &g.cli.status {
         Status::Missing => {
@@ -1646,27 +1755,52 @@ fn cli_section(g: &Gui) -> Element<'_, Message> {
                 "Puts `warden` on your PATH, so Terminal can run `warden list`, `warden start` and the rest. It links \
                  {wanted} to the command inside this app{admin}."
             )));
-            c = c.push(install("Install command line tool"));
-        }
-        Status::Linked { link, target } => {
-            c = c.push(said(Icon::CheckCircle, Tone::Good, format!("Installed: {}", link.display())));
-            c = c.push(small(format!("A link to {}.", target.display())));
-            if let Some(hint) = places.path_hint(link) {
-                let command = hint.command();
-                c = c.push(small(format!(
-                    "If a new Terminal does not find `warden`, put {} on your PATH ({}):",
-                    link.parent().map_or_else(String::new, |d| d.display().to_string()),
-                    hint.shell
-                )));
-                c = c.push(tip(
-                    button(text(command.clone()).font(MONO).size(11).wrapping(Wrapping::None))
-                        .padding([3, 10])
-                        .style(look::chip)
-                        .on_press(Message::Copy(command)),
-                    "Copy the command",
+            if g.cli.cancelled {
+                c = c.push(said(
+                    Icon::Info,
+                    Tone::Warn,
+                    "The administrator prompt was cancelled, so nothing was installed.",
                 ));
             }
-            c = c.push(uninstall("Uninstall"));
+            // On a Mac the first choice may need the password; the second never does.
+            let mut buttons = row![install("Install command line tool")].spacing(8);
+            if places.system_dir.is_some() && places.user_dir.is_some() {
+                buttons = buttons.push(install_for_me("Install for this user only"));
+            }
+            c = c.push(buttons.wrap().vertical_spacing(8));
+        }
+        Status::Linked { link, target } => {
+            if g.cli.status.of_another_copy(&places.cli) {
+                c = c.push(said(
+                    Icon::Alert,
+                    Tone::Warn,
+                    format!("{} is a link to another copy of Warden: {}", link.display(), target.display()),
+                ));
+                c = c.push(small(format!("This app's command is {}.", places.cli.display())));
+                c = c.push(
+                    row![install("Point it at this app"), uninstall("Uninstall")].spacing(8).wrap().vertical_spacing(8),
+                );
+            } else {
+                c = c.push(said(Icon::CheckCircle, Tone::Good, format!("Installed: {}", link.display())));
+                c = c.push(small(format!("A link to {}.", target.display())));
+                if let Some(hint) = places.path_hint(link) {
+                    let command = hint.command();
+                    c = c.push(small(format!(
+                        "If a new Terminal does not find `warden`, put {} on your PATH ({}):",
+                        link.parent().map_or_else(String::new, |d| d.display().to_string()),
+                        hint.shell
+                    )));
+                    c = c.push(tip(
+                        button(text(command.clone()).font(MONO).size(11))
+                            .width(Fill)
+                            .padding([3, 10])
+                            .style(look::chip)
+                            .on_press(Message::Copy(command)),
+                        "Copy the command (running it twice adds the line once)",
+                    ));
+                }
+                c = c.push(uninstall("Uninstall"));
+            }
         }
         Status::Broken { link, target } => {
             c = c.push(said(
@@ -1678,11 +1812,13 @@ fn cli_section(g: &Gui) -> Element<'_, Message> {
                     target.display()
                 ),
             ));
-            c = c.push(row![install("Install again"), uninstall("Remove the link")].spacing(8));
+            c = c.push(
+                row![install("Install again"), uninstall("Remove the link")].spacing(8).wrap().vertical_spacing(8),
+            );
         }
         Status::Present { path } => {
             c = c.push(said(Icon::CheckCircle, Tone::Good, format!("`warden` is installed: {}", path.display())));
-            c = c.push(small("It is not a link to this app, so it is left as it is."));
+            c = c.push(small("It is not a link to an app of Warden's, so it is left as it is."));
         }
     }
     c.into()
@@ -1732,30 +1868,94 @@ fn restart_all_section(g: &Gui) -> Element<'_, Message> {
         )),
     ]
     .spacing(8);
+    // A restart that did not finish: the apps may be stopped, and here is the way back.
+    if let Some(note) = &g.restart_note {
+        c = c.push(said(Icon::Alert, Tone::Warn, note.as_str()));
+    }
     c = match g.restart_all {
-        RestartAll::Idle => c.push(
-            button(labeled(Icon::Restart, "Restart everything\u{2026}"))
-                .padding([6, 14])
-                .style(look::quiet)
-                .on_press(Message::AskRestartAll),
-        ),
-        RestartAll::Asking => c.push(
-            row![
-                text("Restart every app now?").size(13),
-                space::horizontal(),
-                button(text("Cancel").size(13).font(MEDIUM))
+        RestartAll::Idle => {
+            let mut r = row![
+                button(labeled(Icon::Restart, "Restart everything\u{2026}"))
                     .padding([6, 14])
                     .style(look::quiet)
-                    .on_press(Message::CancelRestartAll),
-                button(text("Restart now").size(13).font(MEDIUM))
-                    .padding([6, 14])
-                    .style(look::solid(Tone::Warn))
-                    .on_press(Message::RestartAll),
+                    .on_press(Message::AskRestartAll)
             ]
-            .spacing(10)
-            .align_y(Center),
-        ),
-        RestartAll::Running => c.push(small("Restarting\u{2026} the window reconnects when wardend is back.")),
+            .spacing(10);
+            if g.restart_note.is_some() {
+                r = r.push(
+                    button(labeled(Icon::Play, "Start the saved apps again"))
+                        .padding([6, 14])
+                        .style(look::solid(Tone::Warn))
+                        .on_press(Message::ResurrectAll),
+                );
+            }
+            c.push(r)
+        }
+        RestartAll::Asking => {
+            let dir = g.wardend_dir();
+            // What would run, and against which wardend: the person is about to stop everything.
+            let who = match &g.restart_who {
+                None => said(Icon::Loader, Tone::Muted, "Looking for the warden that would run\u{2026}"),
+                Some(Err(e)) => said(Icon::Alert, Tone::Bad, format!("Cannot restart: {e}")),
+                Some(Ok(w)) => {
+                    let wardend = g.model.daemon.as_ref().map(|d| d.version.clone());
+                    let upgrade = match wardend {
+                        Some(v) if v != w.version => format!(" It replaces wardend {v}."),
+                        _ => String::new(),
+                    };
+                    said(Icon::Terminal, Tone::Muted, format!("Runs {} (warden {}).{upgrade}", w.command, w.version))
+                }
+            };
+            let aim = match &dir {
+                Some(d) => said(
+                    Icon::Server,
+                    Tone::Muted,
+                    format!("On the wardend in {} (the one this window shows).", d.display()),
+                ),
+                None => said(
+                    Icon::Alert,
+                    Tone::Bad,
+                    format!(
+                        "This window is connected to {}, which `warden` cannot be pointed at (it finds wardend \
+                         as wardend.sock in its runtime directory), so it would restart another wardend. Not offered.",
+                        g.target.endpoint.describe()
+                    ),
+                ),
+            };
+            let ready = matches!(g.restart_who, Some(Ok(_))) && dir.is_some();
+            c.push(who).push(aim).push(
+                row![
+                    text("Restart every app now?").size(13),
+                    space::horizontal(),
+                    button(text("Cancel").size(13).font(MEDIUM))
+                        .padding([6, 14])
+                        .style(look::quiet)
+                        .on_press(Message::CancelRestartAll),
+                    button(text("Restart now").size(13).font(MEDIUM))
+                        .padding([6, 14])
+                        .style(look::solid(Tone::Warn))
+                        .on_press_maybe(ready.then_some(Message::RestartAll)),
+                ]
+                .spacing(10)
+                .align_y(Center),
+            )
+        }
+        RestartAll::Running => {
+            let what = if g.resurrecting {
+                "Starting the saved apps again"
+            } else {
+                "Restarting: saving what runs, stopping every supervisor and wardend, starting them again"
+            };
+            c.push(said(
+                Icon::Loader,
+                Tone::Muted,
+                format!(
+                    "{what}\u{2026} {} s. The window reconnects when wardend is back. Wait for it to finish: \
+                     closing the window now would interrupt it.",
+                    g.restart_secs
+                ),
+            ))
+        }
     };
     c.into()
 }
@@ -2012,4 +2212,70 @@ fn toasts(g: &Gui) -> Element<'_, Message> {
     }))
     .spacing(8);
     container(list).width(Fill).height(Fill).align_right(Fill).align_bottom(Fill).padding(16).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capitals_and_wide_characters_take_more_room_than_narrow_ones() {
+        let (narrow, capitals, wide) = (
+            width_of("illiill", 13.0, false),
+            width_of("MWMWMWM", 13.0, false),
+            width_of("日本語日本語日", 13.0, false),
+        );
+        assert!(narrow < capitals / 2.0, "{narrow} against {capitals}");
+        assert!(wide > capitals, "{wide} against {capitals}");
+        // Mono is a fixed width per character, double for the wide ones.
+        assert_eq!(width_of("abc", 10.0, true), width_of("iWm", 10.0, true));
+        assert!(width_of("日", 10.0, true) > 2.0 * width_of("a", 10.0, true) - 0.01);
+    }
+
+    #[test]
+    fn text_that_fits_is_left_alone_and_text_that_does_not_is_cut_with_an_ellipsis() {
+        let (shown, tip) = fit("api", 14.0, false, 200.0);
+        assert_eq!((shown.as_ref(), tip), ("api", false), "plenty of room: no cut, no tooltip");
+        let long = "a-service-with-a-very-long-name-indeed";
+        let (shown, tip) = fit(long, 14.0, false, 150.0);
+        assert!(tip && shown.ends_with('…') && shown.len() < long.len(), "{shown}");
+        assert!(width_of(&shown, 14.0, false) <= 150.0, "the cut text fits: {shown}");
+    }
+
+    #[test]
+    fn the_same_room_holds_fewer_capitals_than_lower_case_letters() {
+        let (n60, w60) = ("n".repeat(60), "W".repeat(60));
+        let (lower, _) = fit(&n60, 13.0, false, 300.0);
+        let (upper, _) = fit(&w60, 13.0, false, 300.0);
+        assert!(upper.chars().count() < lower.chars().count(), "{upper} / {lower}");
+        assert!(width_of(&upper, 13.0, false) <= 300.0 && width_of(&lower, 13.0, false) <= 300.0);
+    }
+
+    #[test]
+    fn text_that_just_fits_still_gets_a_tooltip_as_the_estimate_may_be_short() {
+        let text = "abcdefghij";
+        let w = width_of(text, 13.0, false);
+        let (shown, tip) = fit(text, 13.0, false, w * 1.05);
+        assert_eq!((shown.as_ref(), tip), (text, true), "within 15% of the room");
+        let (_, tip) = fit(text, 13.0, false, w * 1.3);
+        assert!(!tip);
+    }
+
+    #[test]
+    fn a_wide_line_is_cut_for_a_mono_log_by_cells_not_by_characters() {
+        let line = "日本語のログ ".repeat(20);
+        let (shown, tip) = fit(&line, 12.0, true, 400.0);
+        assert!(tip);
+        assert!(width_of(&shown, 12.0, true) <= 400.0, "{} px: {shown}", width_of(&shown, 12.0, true));
+    }
+
+    #[test]
+    fn an_event_line_is_rated_by_its_words_only_when_it_is_asked() {
+        let line = |text, by_words| Line { time: None, text, tone: Tone::Muted, dot: None, mono: false, by_words };
+        // By its words: a crash is red, a ready worker is plain text with a green dot.
+        assert_eq!(line("worker 2 crashed", true).look(), (Tone::Bad, Some(Tone::Bad)));
+        assert_eq!(line("worker 2 ready", true).look(), (Tone::Plain, Some(Tone::Good)));
+        // A log line says its own tone (stderr, a note) and has no dot.
+        assert_eq!(line("worker 2 crashed", false).look(), (Tone::Muted, None));
+    }
 }

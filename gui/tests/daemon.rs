@@ -105,7 +105,13 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.stop_wardend();
         let _ = self.cmd().args(["kill", "--yes"]).output();
-        let _ = std::fs::remove_dir_all(&self.home);
+        // Something still shutting down may write into the folder while it goes: until it is gone.
+        for _ in 0..40 {
+            if std::fs::remove_dir_all(&self.home).is_ok() && !self.home.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

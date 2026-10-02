@@ -11,9 +11,10 @@ Usage: warden-gui [--socket PATH] [--warden PATH] [--theme system|warden|light|d
   --socket PATH         wardend's socket on this machine (default: where `warden` puts it)
   --warden PATH         the warden CLI here, for Add app, Edit config, Start wardend
                         (default: next to warden-gui, else on PATH)
-  --theme NAME          system (default): the desktop's own colors on macOS and GNOME/Ubuntu,
-                        light or dark as it is; warden: Warden's palette, light or dark as the
-                        desktop is; light or dark: Warden's palette, fixed (or WARDEN_GUI_THEME)
+  --theme NAME          warden (default): Warden's palette, light or dark as the desktop is;
+                        system: the desktop's own colors on macOS and GNOME/Ubuntu, light or
+                        dark as it is; light or dark: Warden's palette, fixed. For this run
+                        (or WARDEN_GUI_THEME); Settings keeps a choice
   --ssh USER@HOST       a remote host, through `ssh -L` (your SSH agent and keys; never a password)
   --remote-socket PATH  wardend's socket there (default: /run/warden/wardend.sock, root's wardend)
   --remote-warden PATH  the warden CLI there (default: warden, on its PATH)
@@ -100,5 +101,13 @@ mod tests {
         assert!(p("--ssh").unwrap_err().contains("needs a value"));
         assert!(p("--bogus").unwrap_err().contains("unknown"));
         assert_eq!(p("--version").unwrap(), None);
+    }
+
+    #[test]
+    fn the_help_names_the_theme_the_window_has_when_none_is_given() {
+        let named = USAGE.lines().find(|l| l.contains("(default)") && l.contains("--theme")).expect("a default");
+        assert!(named.contains("warden (default)"), "{named}");
+        // What the window starts with: Warden's palette, light or dark as the desktop is.
+        assert_eq!(warden_gui::system::Source::default(), warden_gui::system::Source::parse("warden").unwrap());
     }
 }

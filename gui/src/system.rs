@@ -542,9 +542,9 @@ mod tests {
 
     #[test]
     fn every_desktop_palette_reads() {
-        // Text, the accent as text, and what is written on the main button, in
-        // every combination, are readable: the system's colors are not chosen
-        // for this window, so the window moves them when they are not.
+        // Text in every role on every surface, the tones on their washes, and what is written on a
+        // fill, in every combination, read at 4.5, and the lines and shapes at 3: the system's
+        // colors are not chosen for this window, so the window moves them when they do not.
         let accents = [
             Accent::Blue,
             Accent::Teal,
@@ -570,14 +570,9 @@ mod tests {
                     assert_eq!(p.dark, dark, "{flavor:?} {accent:?}");
                     let ctx = format!("{flavor:?} dark={dark} {accent:?}");
                     assert!(look::contrast(p.ink, p.paper) >= 7.0, "text on the page: {ctx}");
-                    assert!(look::contrast(p.muted, p.paper) >= 3.0, "quiet text on the page: {ctx}");
-                    assert!(look::contrast(p.accent_text, p.paper) >= 3.0, "accent text: {ctx}");
-                    assert!(look::contrast(p.on_accent, p.accent) >= 3.0, "the main button: {ctx}");
-                    for (name, c) in [("good", p.good), ("warn", p.warn), ("danger", p.danger)] {
-                        assert!(look::contrast(c, p.paper) >= 3.0, "{name} text: {ctx}");
-                        assert!(look::contrast(c, p.card) >= 2.8, "{name} text on a card: {ctx}");
-                    }
-                    assert!(look::contrast(p.on_danger, p.danger) >= 3.0, "a danger button: {ctx}");
+                    // Every text pair at 4.5 and every shape at 3 (look::audit lists them).
+                    let bad = look::audit(&p);
+                    assert!(bad.is_empty(), "{ctx}: {bad:#?}");
                 }
             }
         }

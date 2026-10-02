@@ -99,17 +99,24 @@ pub fn exec_args(dest: &str, argv: &[String]) -> Result<Vec<String>, String> {
     if argv.is_empty() {
         return Err("no remote command".into());
     }
-    let mut a: Vec<String> = vec!["-T".into()];
-    a.extend(common_options());
-    a.push("--".into());
-    a.push(dest.to_string());
     let (prog, args) = argv.split_first().ok_or("no remote command")?;
     let mut line = shell_program(prog);
     for arg in args {
         line.push(' ');
         line.push_str(&shell_quote(arg));
     }
-    a.push(line);
+    exec_line_args(dest, &line)
+}
+
+/// Like [`exec_args`] for a command line the caller has quoted itself (to start it with
+/// `VAR=value`, say, and still let a leading `~/` mean the home directory).
+pub fn exec_line_args(dest: &str, line: &str) -> Result<Vec<String>, String> {
+    validate_dest(dest)?;
+    let mut a: Vec<String> = vec!["-T".into()];
+    a.extend(common_options());
+    a.push("--".into());
+    a.push(dest.to_string());
+    a.push(line.to_string());
     Ok(a)
 }
 
@@ -295,19 +302,20 @@ impl Tunnel {
     pub async fn open(t: &Target) -> Result<Tunnel, OpenError> {
         let local = local_socket()?;
         let args = tunnel_args(t, &local)?;
-        let mut child = tokio::process::Command::new("ssh")
-            .args(&args)
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    "ssh is not installed (or not on PATH): install OpenSSH's client to reach a remote host".to_string()
-                }
-                _ => format!("cannot run ssh: {e}"),
-            })?;
+            .kill_on_drop(true);
+        // A window that is killed takes its tunnel with it (Linux; see `parent_death`).
+        crate::parent_death::with_parent(cmd.as_std_mut());
+        let mut child = cmd.spawn().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                "ssh is not installed (or not on PATH): install OpenSSH's client to reach a remote host".to_string()
+            }
+            _ => format!("cannot run ssh: {e}"),
+        })?;
         let stderr = Arc::new(Mutex::new(Stderr::default()));
         if let Some(err) = child.stderr.take() {
             let keep = stderr.clone();

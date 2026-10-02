@@ -275,6 +275,18 @@ pub struct Gui {
     pub starting_wardend: bool,
     /// Settings' "Restart everything": asking first, then running `warden update --yes`.
     pub restart_all: RestartAll,
+    /// The `warden` a restart would run (looked up when it asks); `None` while looking.
+    pub restart_who: Option<Result<commands::Who, String>>,
+    /// Seconds since "Restart now" (it ticks while the restart runs).
+    pub restart_secs: u64,
+    /// A restart that did not finish: the apps may be stopped. Shown, with the way back, until the next try.
+    pub restart_note: Option<String>,
+    /// What runs is "start the saved apps again", not a restart.
+    pub resurrecting: bool,
+    /// Counts the hosts this window has shown and never starts over (unlike `generation`, which
+    /// reconnects): what a request brings back carries the one it was sent in, and a reply from
+    /// another host's time is not applied to this one.
+    pub epoch: u64,
     /// "Install command line tool": what `warden` is on this machine, and the action in flight
     /// (the first-run banner and Settings). Always this machine, whatever host the window shows.
     pub cli: cli_install::State,
@@ -339,10 +351,25 @@ pub enum Message {
     AskRestartAll,
     CancelRestartAll,
     RestartAll,
-    RestartedAll(Result<Output, String>),
+    /// The `warden` that "Restart now" would run, and its version.
+    RestartWho(Result<commands::Who, String>),
+    RestartedAll(commands::Restart),
+    /// After a restart that did not finish: `warden resurrect`.
+    ResurrectAll,
+    /// A second of a restart went by.
+    RestartTick,
+    /// A reply to a request sent to the host of epoch `epoch` (`host` names it): applied only while
+    /// that host is still the one shown.
+    FromHost {
+        epoch: u64,
+        host: String,
+        inner: Box<Message>,
+    },
     /// "Install command line tool" (Settings, or the first-run banner), and its undoing.
     InstallCli,
-    CliInstalled(Result<cli_install::Installed, String>),
+    /// "Install for this user only": `~/.local/bin`, with no administrator prompt.
+    InstallCliForMe,
+    CliInstalled(Result<cli_install::Outcome, String>),
     UninstallCli,
     CliRemoved(Result<cli_install::Removed, String>),
     /// "Not now" on the banner: it does not come back.
@@ -404,6 +431,19 @@ pub enum Message {
     HostHistoryLoaded(Result<ResourceHistory, String>),
 }
 
+/// Stamps the reply of a request to this host (see [`Message::FromHost`]).
+#[derive(Debug, Clone)]
+struct Tag {
+    epoch: u64,
+    host: String,
+}
+
+impl Tag {
+    fn wrap(&self, m: Message) -> Message {
+        Message::FromHost { epoch: self.epoch, host: self.host.clone(), inner: Box::new(m) }
+    }
+}
+
 impl Gui {
     pub fn new(opts: Options) -> (Gui, Task<Message>) {
         if let Some(w) = &opts.warden {
@@ -425,9 +465,7 @@ impl Gui {
         g.cli = cli_install::State::detect();
         g.auto_local = opts.ssh.is_none() && opts.socket.is_none();
         g.saved_path = hosts::path();
-        if let Some(p) = &g.saved_path {
-            g.saved = hosts::load(p);
-        }
+        let told_saved = g.read_saved();
         // The flag and the variable win for this run; else what Settings saved.
         g.source = opts.theme.or_else(system::Source::from_env).unwrap_or(g.saved.appearance);
         if g.source.follows_system() {
@@ -438,7 +476,23 @@ impl Gui {
             Some(e) => g.toast(false, format!("--ssh: {e}; connecting to this machine instead")),
             None => Task::none(),
         };
-        (g, task)
+        (g, Task::batch([task, told_saved]))
+    }
+
+    /// Read the saved machines and settings. A file that was damaged is told
+    /// (with where its original is kept), and one that cannot be read is not
+    /// written over: the settings are then not saved this run.
+    fn read_saved(&mut self) -> Task<Message> {
+        let Some(path) = self.saved_path.clone() else { return Task::none() };
+        let loaded = hosts::load_checked(&path);
+        self.saved = loaded.saved;
+        if !loaded.writable {
+            self.saved_path = None;
+        }
+        match loaded.problem {
+            Some(text) => self.toast(false, text),
+            None => Task::none(),
+        }
     }
 
     pub fn with_target(target: Target) -> Gui {
@@ -462,6 +516,11 @@ impl Gui {
             modal: Modal::None,
             starting_wardend: false,
             restart_all: RestartAll::Idle,
+            restart_who: None,
+            restart_secs: 0,
+            restart_note: None,
+            resurrecting: false,
+            epoch: 0,
             cli: cli_install::State::default(),
             busy: Vec::new(),
             range: Range::Hour,
@@ -542,6 +601,37 @@ impl Gui {
         Task::perform(async move { tokio::time::sleep(d).await }, move |_| Message::ToastExpired(id))
     }
 
+    /// What to stamp on the reply of a request to the host shown now.
+    fn tag(&self) -> Tag {
+        Tag { epoch: self.epoch, host: self.target.machine_name() }
+    }
+
+    /// The runtime directory of the wardend this window is connected to: what makes the `warden`
+    /// CLI act on that wardend (`WARDEN_RUNTIME_DIR`). `None` for a socket the CLI cannot be pointed at.
+    pub fn wardend_dir(&self) -> Option<PathBuf> {
+        match &self.target.endpoint {
+            Endpoint::Socket(p) => commands::runtime_dir_of(p),
+            Endpoint::Ssh(t) => commands::runtime_dir_of(std::path::Path::new(&t.remote_socket)),
+        }
+    }
+
+    /// A reply from a host that is no longer the one shown. Nothing of it is applied (not the busy
+    /// flags, not a reconnect, not a toast about this host); a failure the person should still hear
+    /// of is told with the host's name.
+    fn late(&mut self, host: &str, m: Message) -> Task<Message> {
+        match m {
+            Message::Done { app, act, result: Err(e) } => {
+                self.toast(false, format!("{host}: {} {app} failed: {e}", act.label()))
+            }
+            Message::WardendStarted(Ok(out)) if !out.ok => {
+                self.toast(false, format!("{host}: starting wardend failed: {}", out.text()))
+            }
+            Message::WardendStarted(Err(e)) => self.toast(false, format!("{host}: starting wardend failed: {e}")),
+            Message::RestartedAll(r) if !r.ok => self.toast(false, format!("{host}: restart everything: {}", r.text)),
+            _ => Task::none(),
+        }
+    }
+
     fn select(&mut self, name: String) -> Task<Message> {
         if self.selected.as_deref() == Some(name.as_str()) {
             return Task::none();
@@ -564,6 +654,7 @@ impl Gui {
 
     fn fetch_chart(&mut self) -> Task<Message> {
         let socket = self.request_socket();
+        let tag = self.tag();
         let (Some(c), Ok(socket)) = (&mut self.chart, socket) else { return Task::none() };
         c.load = Load::Loading;
         let (app, range) = (c.app.clone(), c.range);
@@ -571,7 +662,7 @@ impl Gui {
         let step = range.step_s() as u32;
         let asked = app.clone();
         Task::perform(async move { client::history(&socket, &asked, since, step).await }, move |result| {
-            Message::HistoryLoaded { app: app.clone(), range, result }
+            tag.wrap(Message::HistoryLoaded { app: app.clone(), range, result })
         })
     }
 
@@ -580,7 +671,10 @@ impl Gui {
         let Ok(socket) = self.request_socket() else { return Task::none() };
         let since = now_ms().saturating_sub(Range::Hour.secs() * 1000);
         let step = Range::Hour.step_s() as u32;
-        Task::perform(async move { client::history(&socket, "", since, step).await }, Message::HostHistoryLoaded)
+        let tag = self.tag();
+        Task::perform(async move { client::history(&socket, "", since, step).await }, move |r| {
+            tag.wrap(Message::HostHistoryLoaded(r))
+        })
     }
 
     /// Show the newest lines (the lists keep their scroll offset across apps).
@@ -731,8 +825,10 @@ impl Gui {
                     return Task::none();
                 }
                 self.starting_wardend = true;
-                let host = self.target.host.clone();
-                Task::perform(async move { commands::start_wardend(&host).await }, Message::WardendStarted)
+                let (host, tag) = (self.target.host.clone(), self.tag());
+                Task::perform(async move { commands::start_wardend(&host).await }, move |r| {
+                    tag.wrap(Message::WardendStarted(r))
+                })
             }
             Message::WardendStarted(r) => {
                 self.starting_wardend = false;
@@ -749,8 +845,20 @@ impl Gui {
                 }
             }
             Message::AskRestartAll => {
-                if self.restart_all == RestartAll::Idle {
-                    self.restart_all = RestartAll::Asking;
+                if self.restart_all != RestartAll::Idle {
+                    return Task::none();
+                }
+                self.restart_all = RestartAll::Asking;
+                self.restart_who = None;
+                // Which warden would run, before anything is stopped.
+                let (host, tag) = (self.target.host.clone(), self.tag());
+                Task::perform(async move { commands::warden_who(&host).await }, move |r| {
+                    tag.wrap(Message::RestartWho(r))
+                })
+            }
+            Message::RestartWho(r) => {
+                if self.restart_all == RestartAll::Asking {
+                    self.restart_who = Some(r);
                 }
                 Task::none()
             }
@@ -761,38 +869,92 @@ impl Gui {
                 Task::none()
             }
             Message::RestartAll => {
-                if self.restart_all != RestartAll::Asking {
+                // Only once the warden that would run is known, and only aimed at the wardend shown.
+                let (RestartAll::Asking, Some(Ok(_)), Some(dir)) =
+                    (self.restart_all, &self.restart_who, self.wardend_dir())
+                else {
+                    return Task::none();
+                };
+                self.restart_all = RestartAll::Running;
+                self.restart_secs = 0;
+                self.restart_note = None;
+                self.resurrecting = false;
+                let (host, tag) = (self.target.host.clone(), self.tag());
+                Task::perform(async move { commands::restart_everything(&host, Some(&dir)).await }, move |r| {
+                    tag.wrap(Message::RestartedAll(r))
+                })
+            }
+            Message::ResurrectAll => {
+                if self.restart_all != RestartAll::Idle || self.restart_note.is_none() {
                     return Task::none();
                 }
                 self.restart_all = RestartAll::Running;
-                let host = self.target.host.clone();
-                Task::perform(async move { commands::restart_everything(&host).await }, Message::RestartedAll)
+                self.restart_secs = 0;
+                self.resurrecting = true;
+                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::resurrect_all(&host, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::RestartedAll(r))
+                })
+            }
+            Message::RestartTick => {
+                if self.restart_all == RestartAll::Running {
+                    self.restart_secs += 1;
+                }
+                Task::none()
             }
             Message::RestartedAll(r) => {
                 self.restart_all = RestartAll::Idle;
+                self.restart_secs = 0;
+                let what = if std::mem::take(&mut self.resurrecting) {
+                    "Starting the saved apps"
+                } else {
+                    "Restart everything"
+                };
                 // wardend went away and came back: connect now, not at the next retry.
                 self.generation += 1;
-                match r {
-                    Ok(out) if out.ok => {
-                        self.toast(true, "Restarted every supervisor and wardend from the installed warden.".into())
-                    }
-                    Ok(out) => self.toast(false, format!("restart failed: {} (`{}`)", out.text(), out.command)),
-                    Err(e) => self.toast(false, format!("restart failed: {e}")),
+                self.restart_note = r.stopped.then(|| r.text.clone());
+                if r.ok { self.toast(true, r.text) } else { self.toast(false, format!("{what}: {}", r.text)) }
+            }
+            Message::FromHost { epoch, host, inner } => {
+                if epoch == self.epoch {
+                    self.update(*inner)
+                } else {
+                    self.late(&host, *inner)
                 }
             }
-            Message::InstallCli => {
+            Message::InstallCli | Message::InstallCliForMe => {
+                let choice = if matches!(message, Message::InstallCliForMe) {
+                    cli_install::Choice::ThisUserOnly
+                } else {
+                    cli_install::Choice::Preferred
+                };
                 let (Ok(places), cli_install::Work::Idle) = (self.cli.places.clone(), self.cli.work) else {
                     return Task::none();
                 };
                 self.cli.work = cli_install::Work::Installing;
-                Task::perform(cli_install::install(places), Message::CliInstalled)
+                Task::perform(cli_install::install(places, choice), Message::CliInstalled)
             }
             Message::CliInstalled(r) => {
                 self.cli.work = cli_install::Work::Idle;
                 self.cli.refresh();
+                self.cli.cancelled = false;
                 match (r, &self.cli.places) {
-                    (Ok(done), Ok(p)) => self.toast(true, done.summary(&p.cli)),
-                    (Ok(done), Err(_)) => self.toast(true, format!("Installed {}.", done.link.display())),
+                    (Ok(cli_install::Outcome::Installed(done)), Ok(p)) => self.toast(true, done.summary(&p.cli)),
+                    (Ok(cli_install::Outcome::Installed(done)), Err(_)) => {
+                        self.toast(true, format!("Installed {}.", done.link.display()))
+                    }
+                    // A "no" is not an error, and nothing else is done in its place.
+                    (Ok(cli_install::Outcome::Cancelled { wanted }), _) => {
+                        self.cli.cancelled = true;
+                        self.toast(
+                            true,
+                            format!(
+                                "Cancelled: nothing was installed ({} was not made). Settings has \"Install for this \
+                                 user only\": a link in your own folder, with no password.",
+                                wanted.display()
+                            ),
+                        )
+                    }
                     (Err(e), _) => self.toast(false, format!("installing the command line tool failed: {e}")),
                 }
             }
@@ -947,8 +1109,10 @@ impl Gui {
                     return Task::none();
                 }
                 a.status = AddStatus::Running;
-                let (host, form) = (self.target.host.clone(), a.form.clone());
-                Task::perform(async move { commands::add_app(&host, &form).await }, Message::Added)
+                let (host, form, tag) = (self.target.host.clone(), a.form.clone(), self.tag());
+                Task::perform(async move { commands::add_app(&host, &form).await }, move |r| {
+                    tag.wrap(Message::Added(r))
+                })
             }
             Message::Added(r) => {
                 let name = match &self.modal {
@@ -978,9 +1142,9 @@ impl Gui {
                     dirty: false,
                     saved: false,
                 });
-                let host = self.target.host.clone();
+                let (host, tag) = (self.target.host.clone(), self.tag());
                 Task::perform(async move { commands::read_config(&host, &path).await }, move |result| {
-                    Message::EditorLoaded { app: app.clone(), result }
+                    tag.wrap(Message::EditorLoaded { app: app.clone(), result })
                 })
             }
             Message::EditorLoaded { app, result } => {
@@ -1018,10 +1182,15 @@ impl Gui {
                 }
                 e.status = if save { EditorStatus::Saving } else { EditorStatus::Checking };
                 let (host, path, text) = (self.target.host.clone(), e.path.clone(), e.content.text());
+                let tag = self.tag();
                 if save {
-                    Task::perform(async move { commands::save_config(&host, &path, &text).await }, Message::Saved)
+                    Task::perform(async move { commands::save_config(&host, &path, &text).await }, move |r| {
+                        tag.wrap(Message::Saved(r))
+                    })
                 } else {
-                    Task::perform(async move { commands::check_config(&host, &path, &text).await }, Message::Validated)
+                    Task::perform(async move { commands::check_config(&host, &path, &text).await }, move |r| {
+                        tag.wrap(Message::Validated(r))
+                    })
                 }
             }
             Message::Validated(r) | Message::Saved(r) => {
@@ -1096,6 +1265,8 @@ impl Gui {
             filter: std::mem::take(&mut self.filter),
             auto_local: self.auto_local,
             window: self.window,
+            // Replies of the old host's time (see `epoch`) are then not this host's.
+            epoch: self.epoch + 1,
             // The window's look is the person's, not the host's.
             source: self.source,
             system: self.system,
@@ -1112,6 +1283,7 @@ impl Gui {
         let up = self.model.apps.get(&app).is_some_and(|a| a.supervisor_up());
         self.busy.push((app.clone(), act));
         let done_app = app.clone();
+        let tag = self.tag();
         Task::perform(
             async move {
                 match act.request(up) {
@@ -1125,7 +1297,7 @@ impl Gui {
                     None => client::start_app(&socket, &app).await,
                 }
             },
-            move |result| Message::Done { app: done_app.clone(), act, result },
+            move |result| tag.wrap(Message::Done { app: done_app.clone(), act, result }),
         )
     }
 
@@ -1218,6 +1390,7 @@ impl Gui {
     }
 
     fn on_log_feed(&mut self, m: FeedMsg) -> Task<Message> {
+        let tag = self.tag();
         let Some(pane) = &mut self.logs else { return Task::none() };
         match m {
             FeedMsg::Connected { socket } => {
@@ -1229,7 +1402,7 @@ impl Gui {
                             let result = client::app_logs(&socket, &app, logs::HISTORY_LINES).await;
                             (app, result)
                         },
-                        |(app, result)| Message::LogHistory { app, result },
+                        move |(app, result)| tag.wrap(Message::LogHistory { app, result }),
                     );
                 }
                 Task::none()
@@ -1273,6 +1446,9 @@ impl Gui {
         };
         let size = iced::window::resize_events().map(|(_, size)| Message::Resized(size));
         let mut all = vec![main, logs, size];
+        if self.restart_all == RestartAll::Running {
+            all.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::RestartTick));
+        }
         if self.source.follows_system() {
             // The desktop's look: GNOME says when it changes; elsewhere it is read
             // again when the window is focused or the mode changes.
@@ -1551,53 +1727,176 @@ mod tests {
         assert_eq!(g.host_spark.grid.series[crate::history::HOST_CPU].last(), Some(50.0));
     }
 
-    #[test]
-    fn restarting_everything_asks_first_and_reconnects_after() {
+    fn who() -> commands::Who {
+        commands::Who { command: "/Applications/Warden.app/Contents/MacOS/warden".into(), version: "0.1.0".into() }
+    }
+
+    /// Connected to a wardend that `warden` can be pointed at (its socket is `wardend.sock`).
+    fn connected_to_a_runtime_dir() -> Gui {
         let mut g = connected();
+        g.target.endpoint = Endpoint::Socket("/tmp/wg-test-run/wardend.sock".into());
+        g
+    }
+
+    #[test]
+    fn restarting_everything_asks_first_names_the_warden_and_reconnects_after() {
+        let mut g = connected_to_a_runtime_dir();
         assert_eq!(g.restart_all, RestartAll::Idle);
         // Nothing runs without the second click.
         let _ = g.update(Message::RestartAll);
         assert_eq!(g.restart_all, RestartAll::Idle, "a confirm without a question does nothing");
         let _ = g.update(Message::AskRestartAll);
         assert_eq!(g.restart_all, RestartAll::Asking);
+        assert!(g.restart_who.is_none(), "it is being looked up");
+        let _ = g.update(Message::RestartAll);
+        assert_eq!(g.restart_all, RestartAll::Asking, "not before it is known which warden would run");
         let _ = g.update(Message::CancelRestartAll);
         assert_eq!(g.restart_all, RestartAll::Idle);
         let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartWho(Err("the warden CLI was not found".into())));
+        let _ = g.update(Message::RestartAll);
+        assert_eq!(g.restart_all, RestartAll::Asking, "and not when there is none");
+        let _ = g.update(Message::CancelRestartAll);
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartWho(Ok(who())));
         let _ = g.update(Message::RestartAll);
         assert_eq!(g.restart_all, RestartAll::Running);
-        // Asking again while it runs changes nothing.
+        // Asking again while it runs changes nothing; a second ticks.
         let _ = g.update(Message::AskRestartAll);
         assert_eq!(g.restart_all, RestartAll::Running);
+        let _ = g.update(Message::RestartTick);
+        let _ = g.update(Message::RestartTick);
+        assert_eq!(g.restart_secs, 2, "the dialog shows how long it has been");
         // Done: connect to the new wardend now, and say so.
         let before = g.generation;
-        let out = Output {
-            command: "warden update --yes".into(),
+        let ok = commands::Restart { ok: true, text: "Restarted every supervisor and wardend.".into(), stopped: false };
+        let _ = g.update(Message::RestartedAll(ok));
+        assert_eq!(g.restart_all, RestartAll::Idle);
+        assert_eq!(g.restart_secs, 0);
+        assert_eq!(g.generation, before + 1);
+        assert!(g.restart_note.is_none());
+        assert!(g.toasts.last().is_some_and(|t| t.ok && t.text.contains("Restarted")));
+    }
+
+    #[test]
+    fn a_restart_for_a_socket_warden_cannot_be_pointed_at_is_not_offered() {
+        // `--socket /tmp/custom.sock`: the CLI finds wardend as wardend.sock in its runtime directory only.
+        let mut g = connected();
+        g.target.endpoint = Endpoint::Socket("/tmp/custom.sock".into());
+        assert_eq!(g.wardend_dir(), None);
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartWho(Ok(who())));
+        let _ = g.update(Message::RestartAll);
+        assert_eq!(g.restart_all, RestartAll::Asking, "it would restart another wardend");
+        // A remote one is aimed by its socket's directory.
+        g.switch_target(Target::ssh("deploy@web-1", "/run/warden/wardend.sock", "warden").unwrap());
+        assert_eq!(g.wardend_dir(), Some(PathBuf::from("/run/warden")));
+    }
+
+    #[test]
+    fn a_restart_that_did_not_finish_says_the_apps_may_be_stopped_and_offers_the_way_back() {
+        let mut g = connected_to_a_runtime_dir();
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartWho(Ok(who())));
+        let _ = g.update(Message::RestartAll);
+        let lost = commands::Restart {
+            ok: false,
+            text: "it failed: `warden update --yes` did not finish within 900 s; it was stopped. Apps may be stopped: \
+                   what was running was saved first, so starting it again brings them back (use \"Start the saved apps again\" in Settings, or run `warden resurrect`)."
+                .into(),
+            stopped: true,
+        };
+        let _ = g.update(Message::RestartedAll(lost));
+        let t = g.toasts.last().unwrap();
+        assert!(!t.ok && t.text.contains("Apps may be stopped"), "{}", t.text);
+        assert!(g.restart_note.as_deref().is_some_and(|n| n.contains("resurrect")), "it stays in Settings");
+        // The way back is one click, and it is only there after such a failure.
+        let _ = g.update(Message::ResurrectAll);
+        assert_eq!(g.restart_all, RestartAll::Running);
+        assert!(g.resurrecting);
+        let back = commands::Restart { ok: true, text: "Started the saved apps again.".into(), stopped: false };
+        let _ = g.update(Message::RestartedAll(back));
+        assert!(g.restart_note.is_none(), "the note goes when the apps are back");
+        assert!(!g.resurrecting);
+        let _ = g.update(Message::ResurrectAll);
+        assert_eq!(g.restart_all, RestartAll::Idle, "nothing to bring back: nothing runs");
+        // A failure before anything was stopped says so and leaves no alarm.
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartWho(Ok(who())));
+        let _ = g.update(Message::RestartAll);
+        let untouched = commands::Restart {
+            ok: false,
+            text: "it failed: the save failed, so nothing was stopped. Nothing was stopped.".into(),
+            stopped: false,
+        };
+        let _ = g.update(Message::RestartedAll(untouched));
+        assert!(g.restart_note.is_none());
+        assert!(g.toasts.last().unwrap().text.contains("Nothing was stopped"));
+    }
+
+    #[test]
+    fn a_reply_from_before_a_host_switch_changes_nothing() {
+        let mut g = connected_to_a_runtime_dir();
+        let old = g.tag();
+        assert_eq!((g.epoch, old.epoch), (0, 0));
+        // An action and an open editor on the first host...
+        g.busy.push(("api".into(), Act::Reload));
+        g.modal = Modal::Editor(Editor {
+            app: "api".into(),
+            path: "/etc/warden/api.toml".into(),
+            content: text_editor::Content::new(),
+            status: EditorStatus::Loading,
+            result: None,
+            dirty: false,
+            saved: false,
+        });
+        // ...then the person switches host, and starts the same on the new one.
+        g.switch_target(Target::ssh("deploy@web-1", "/run/warden/wardend.sock", "warden").unwrap());
+        assert_eq!(g.epoch, 1, "a switch is counted, and never counted back");
+        g.busy.push(("api".into(), Act::Reload));
+        g.modal = Modal::Editor(Editor {
+            app: "api".into(),
+            path: "/etc/warden/api.toml".into(),
+            content: text_editor::Content::new(),
+            status: EditorStatus::Loading,
+            result: None,
+            dirty: false,
+            saved: false,
+        });
+        let (toasts, generation) = (g.toasts.len(), g.generation);
+        // The first host's answers arrive now.
+        let done = Message::Done { app: "api".into(), act: Act::Reload, result: Ok("reloaded".into()) };
+        let _ = g.update(old.wrap(done));
+        assert_eq!(g.busy.len(), 1, "the new host's busy flag stays");
+        let text = Message::EditorLoaded { app: "api".into(), result: Ok("the first host's config".into()) };
+        let _ = g.update(old.wrap(text));
+        assert!(matches!(&g.modal, Modal::Editor(e) if e.status == EditorStatus::Loading), "not its text");
+        let restarted = commands::Restart { ok: true, text: "Restarted every supervisor.".into(), stopped: false };
+        let _ = g.update(old.wrap(Message::RestartedAll(restarted)));
+        assert_eq!(g.generation, generation, "a late restart does not tear down this host's connection");
+        let _ = g.update(old.wrap(Message::WardendStarted(Ok(Output {
+            command: "warden wardend --background".into(),
             ok: true,
             code: Some(0),
-            stdout: "x".into(),
+            stdout: "started".into(),
             stderr: String::new(),
-        };
-        let _ = g.update(Message::RestartedAll(Ok(out)));
-        assert_eq!(g.restart_all, RestartAll::Idle);
-        assert_eq!(g.generation, before + 1);
-        assert!(g.toasts.last().is_some_and(|t| t.ok && t.text.contains("Restarted")));
-        // A failure carries the command and what it said.
-        let _ = g.update(Message::AskRestartAll);
-        let _ = g.update(Message::RestartAll);
-        let bad = Output {
-            command: "warden update --yes".into(),
-            ok: false,
-            code: Some(1),
-            stdout: String::new(),
-            stderr: "the save failed, so nothing was stopped".into(),
-        };
-        let _ = g.update(Message::RestartedAll(Ok(bad)));
+        }))));
+        assert_eq!(g.generation, generation);
+        assert_eq!(g.toasts.len(), toasts, "no toast about a success on another host");
+        // A failure there is still told, with the host it was on.
+        let failed = Message::Done { app: "api".into(), act: Act::Reload, result: Err("refused".into()) };
+        let _ = g.update(old.wrap(failed));
         let t = g.toasts.last().unwrap();
-        assert!(
-            !t.ok && t.text.contains("nothing was stopped") && t.text.contains("warden update --yes"),
-            "{}",
-            t.text
-        );
+        assert!(!t.ok && t.text.starts_with("This machine:") && t.text.contains("refused"), "{}", t.text);
+        assert_eq!(g.busy.len(), 1);
+        // The new host's own reply is applied.
+        let done = Message::Done { app: "api".into(), act: Act::Reload, result: Ok("reloaded".into()) };
+        let _ = g.update(g.tag().wrap(done));
+        assert!(g.busy.is_empty());
+        // Reconnecting to the same host is not a switch.
+        let same = g.target.clone();
+        g.switch_target(same);
+        assert_eq!(g.epoch, 1);
     }
 
     /// A fake `Warden.app` and the folders of a Linux home, all under one temporary folder.
@@ -1627,6 +1926,34 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_settings_file_is_told_and_kept_when_the_window_starts() {
+        let dir = std::env::temp_dir().join(format!("wg-app-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gui.json");
+        let text = r#"{"machines":[{"dest":"deploy@web-1""#;
+        std::fs::write(&file, text).unwrap();
+        let mut g = connected();
+        g.saved_path = Some(file.clone());
+        let _ = g.read_saved();
+        let t = g.toasts.last().expect("a toast says so");
+        assert!(!t.ok && t.text.contains("gui.json.bad"), "{}", t.text);
+        // Changing a setting writes a new file; the damaged one is still there to be mended by hand.
+        let _ = g.update(Message::DismissCliBanner);
+        assert!(hosts::load(&file).cli_banner_dismissed);
+        assert_eq!(std::fs::read_to_string(hosts::bad_path(&file)).unwrap(), text);
+        // A file that cannot be read is not written over, and the window says the settings are not kept.
+        let unreadable = dir.join("dir.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        let mut h = connected();
+        h.saved_path = Some(unreadable.clone());
+        let _ = h.read_saved();
+        assert!(h.saved_path.is_none(), "nothing is written there");
+        assert!(h.toasts.last().unwrap().text.contains("not saved"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_command_line_tool_is_installed_and_removed_from_the_window() {
         use cli_install::{State, Status, Work};
         let (root, places) = cli_places("flow");
@@ -1647,7 +1974,7 @@ mod tests {
         assert_eq!(g.cli.work, Work::Installing, "one action at a time");
         // What the task does, on the temporary folders (no administrator: there is no system folder).
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        let done = rt.block_on(cli_install::install(places.clone()));
+        let done = rt.block_on(cli_install::install(places.clone(), cli_install::Choice::Preferred));
         let _ = g.update(Message::CliInstalled(done));
         assert_eq!(g.cli.work, Work::Idle);
         let link = places.user_dir.clone().unwrap().join("warden");
@@ -1676,6 +2003,34 @@ mod tests {
         let _ = g.update(Message::DismissCliBanner);
         assert!(g.saved.cli_banner_dismissed && !g.cli.banner(g.saved.cli_banner_dismissed));
         assert!(hosts::load(&file).cli_banner_dismissed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cancelled_administrator_prompt_installs_nothing_and_offers_the_users_folder() {
+        use cli_install::{Outcome, State, Status, Work};
+        let (root, places) = cli_places("cancel");
+        let mut g = connected();
+        g.cli = State::of(Ok(places.clone()));
+        let _ = g.update(Message::InstallCli);
+        assert_eq!(g.cli.work, Work::Installing);
+        // The prompt was closed.
+        let wanted = std::path::PathBuf::from("/usr/local/bin/warden");
+        let _ = g.update(Message::CliInstalled(Ok(Outcome::Cancelled { wanted })));
+        assert_eq!((g.cli.work, &g.cli.status), (Work::Idle, &Status::Missing), "nothing was installed");
+        assert!(g.cli.cancelled, "Settings says so");
+        let t = g.toasts.last().unwrap();
+        assert!(t.text.contains("Cancelled") && t.text.contains("nothing was installed"), "{}", t.text);
+        assert!(t.text.contains("Install for this user only"), "{}", t.text);
+        assert!(!places.user_dir.clone().unwrap().join("warden").exists(), "not even in the users folder");
+        // The users folder is its own button, and works with no prompt.
+        let _ = g.update(Message::InstallCliForMe);
+        assert_eq!(g.cli.work, Work::Installing);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let done = rt.block_on(cli_install::install(places.clone(), cli_install::Choice::ThisUserOnly));
+        let _ = g.update(Message::CliInstalled(done));
+        assert!(!g.cli.cancelled);
+        assert!(matches!(g.cli.status, Status::Linked { .. }));
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1,7 +1,7 @@
 //! A popover menu: a widget that draws `base` in the layout and, while
 //! `open`, a `menu` on top of everything, under the base and left-aligned
 //! with it (above it when there is no room below, moved left when it would
-//! leave the window).
+//! leave the window, and no taller than the room on the side it takes).
 //!
 //! iced has a tooltip (not interactive) and a pick list (a value, not
 //! buttons) but no menu, so this is the tooltip's overlay made clickable. A
@@ -16,6 +16,8 @@ use iced::{Element, Event, Length, Point, Rectangle, Renderer, Size, Theme, Vect
 
 /// Space between the base and its menu.
 const GAP: f32 = 4.0;
+/// Space kept between the menu and the window's edge.
+const EDGE: f32 = 8.0;
 
 pub struct Dropdown<'a, Message> {
     base: Element<'a, Message>,
@@ -157,14 +159,26 @@ struct Menu<'a, 'b, Message> {
 
 impl<Message: Clone> overlay::Overlay<Message, Theme, Renderer> for Menu<'_, '_, Message> {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
-        let node = self.menu.as_widget_mut().layout(self.tree, renderer, &layout::Limits::new(Size::ZERO, bounds));
+        let mut node = self.menu.as_widget_mut().layout(self.tree, renderer, &layout::Limits::new(Size::ZERO, bounds));
+        let below = self.anchor.y + self.anchor.height + GAP;
+        let space_below = (bounds.height - below - EDGE).max(0.0);
+        let space_above = (self.anchor.y - GAP - EDGE).max(0.0);
+        let mut y = below;
+        if node.size().height > space_below {
+            // No room below: above the base when it has more, and in either place no taller than the
+            // room there is (what is taller has to scroll: it is laid out again with that height).
+            let above = space_above > space_below;
+            let room = if above { space_above } else { space_below };
+            if node.size().height > room {
+                let limits = layout::Limits::new(Size::ZERO, Size::new(bounds.width, room));
+                node = self.menu.as_widget_mut().layout(self.tree, renderer, &limits);
+            }
+            if above {
+                y = (self.anchor.y - GAP - node.size().height).max(0.0);
+            }
+        }
         let size = node.size();
         let mut x = self.anchor.x;
-        let mut y = self.anchor.y + self.anchor.height + GAP;
-        if y + size.height > bounds.height {
-            // No room below: above the base, and at the top edge at worst.
-            y = (self.anchor.y - GAP - size.height).max(0.0);
-        }
         if x + size.width > bounds.width {
             x = (bounds.width - size.width).max(0.0);
         }

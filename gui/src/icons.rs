@@ -187,3 +187,20 @@ impl Icon {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL` is the enum, variant for variant and in order: a test draws each icon of `ALL`, so a
+    /// variant left out of it would never be checked against the font.
+    #[test]
+    fn all_lists_every_variant_of_the_enum_once() {
+        let source = include_str!("icons.rs");
+        let body = source.split("pub enum Icon {").nth(1).and_then(|s| s.split("\n}").next()).expect("the enum");
+        let declared: Vec<&str> =
+            body.lines().map(|l| l.trim().trim_end_matches(',')).filter(|l| !l.is_empty()).collect();
+        let listed: Vec<String> = Icon::ALL.iter().map(|i| format!("{i:?}")).collect();
+        assert_eq!(listed, declared);
+    }
+}

@@ -337,7 +337,7 @@ fn settings_dialog_offers_colors_and_mode() {
     let mut g = connected();
     // As on a Mac with Warden.app in Applications and no `warden` on PATH yet (the banner was
     // turned away, so the main screen behind the dialog is the usual one).
-    g.cli = State { places: Ok(mac_places()), status: Status::Missing, work: Work::Idle };
+    g.cli = State { places: Ok(mac_places()), status: Status::Missing, work: Work::Idle, cancelled: false };
     g.saved.cli_banner_dismissed = true;
     let mut ui = sim(&g);
     let _ = ui.click(warden_gui::icons::Icon::Settings.glyph().to_string().as_str());
@@ -379,6 +379,7 @@ fn settings_dialog_offers_colors_and_mode() {
 /// nothing runs from the first.
 #[test]
 fn settings_restarts_everything_after_asking() {
+    use warden_gui::commands::{Restart, Who};
     let mut g = connected();
     let _ = g.update(Message::OpenSettings);
     let mut ui = sim(&g);
@@ -386,9 +387,24 @@ fn settings_restarts_everything_after_asking() {
     let _ = ui.click("Restart everything\u{2026}").expect("the button");
     assert!(matches!(messages(ui).as_slice(), [Message::AskRestartAll]));
 
+    // Asking: before it is known which warden would run, "Restart now" waits.
     let _ = g.update(Message::AskRestartAll);
     let mut ui = sim(&g);
     assert!(ui.find("Restart every app now?").is_ok());
+    assert!(ui.find("Looking for the warden that would run\u{2026}").is_ok());
+    let _ = ui.click("Restart now").expect("the button is there, not pressable");
+    assert!(messages(ui).is_empty(), "a restart that has not said what it runs sends nothing");
+
+    // Then the binary and its version, the wardend it replaces, and the one it is aimed at.
+    let who = Who { command: "/usr/local/bin/warden".into(), version: "0.2.0".into() };
+    let _ = g.update(Message::RestartWho(Ok(who)));
+    let mut ui = sim(&g);
+    for t in [
+        "Runs /usr/local/bin/warden (warden 0.2.0). It replaces wardend 0.1.0.",
+        "On the wardend in /run/warden (the one this window shows).",
+    ] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in the dialog");
+    }
     save(&mut ui, "settings-restart");
     let _ = ui.click("Restart now").expect("the confirm button");
     assert!(matches!(messages(ui).as_slice(), [Message::RestartAll]));
@@ -396,9 +412,35 @@ fn settings_restarts_everything_after_asking() {
     let _ = ui.click("Cancel").expect("cancel");
     assert!(matches!(messages(ui).as_slice(), [Message::CancelRestartAll]));
 
+    // Running: what it does and for how long, and no second start.
     let _ = g.update(Message::RestartAll);
+    let _ = g.update(Message::RestartTick);
+    let _ = g.update(Message::RestartTick);
     let mut ui = sim(&g);
-    assert!(ui.find("Restarting\u{2026} the window reconnects when wardend is back.").is_ok());
+    let running = "Restarting: saving what runs, stopping every supervisor and wardend, starting them again\u{2026} 2 s. \
+                   The window reconnects when wardend is back. Wait for it to finish: closing the window now would \
+                   interrupt it.";
+    assert!(ui.find(running).is_ok(), "the running line is not in the dialog");
+    assert!(ui.find("Restart every app now?").is_err() && ui.find("Restart everything\u{2026}").is_err());
+    drop(ui);
+
+    // Not finished: the apps may be stopped, and the way back is a button.
+    let lost = Restart {
+        ok: false,
+        text:
+            "it failed: `warden update --yes` did not finish within 900 s; it was stopped. Apps may be stopped: what \
+               was running was saved first, so starting it again brings them back (use \"Start the saved apps again\" \
+               in Settings, or run `warden resurrect`)."
+                .into(),
+        stopped: true,
+    };
+    let note = lost.text.clone();
+    let _ = g.update(Message::RestartedAll(lost));
+    let mut ui = sim(&g);
+    assert!(ui.find(note.as_str()).is_ok(), "the warning stays in Settings");
+    save(&mut ui, "settings-restart-failed");
+    let _ = ui.click("Start the saved apps again").expect("the way back");
+    assert!(matches!(messages(ui).as_slice(), [Message::ResurrectAll]));
 }
 
 /// A supervisor keeps the code it started with: after a rebuild it shows `-` for what a newer
@@ -693,6 +735,38 @@ fn connection_menu_lists_this_machine_and_the_saved_ones() {
     assert!(matches!(&msgs[..], [Message::UseMachine(d)] if d == "deploy@web-2"), "{msgs:?}");
 }
 
+/// Many saved machines in the smallest window: the list scrolls, and "Add SSH machine" stays in view.
+#[test]
+fn connection_menu_scrolls_when_there_are_more_machines_than_room() {
+    let mut g = connected();
+    for i in 1..=14 {
+        g.saved.remember(Machine {
+            dest: format!("deploy@web-{i}"),
+            remote_socket: "/run/warden/wardend.sock".into(),
+            remote_warden: "warden".into(),
+        });
+    }
+    let _ = g.update(Message::ToggleMenu(MenuKind::Machines));
+    for height in [560.0, 640.0, 900.0] {
+        let _ = g.update(Message::Resized(iced::Size::new(900.0, height)));
+        let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, height), warden_gui::view::view(&g));
+        let add = ui.find("Add SSH machine").expect("the way to add one").bounds();
+        assert!(add.y + add.height <= height, "at {height}: Add SSH machine is at {add:?}, below the window");
+        let first = ui.find("deploy@web-1").expect("the first machine").bounds();
+        assert!(first.y + first.height <= add.y, "at {height}: the list is above Add SSH machine");
+        let this = ui.find("This machine").expect("this machine");
+        assert!(this.bounds().y >= 0.0);
+        if height == 560.0 {
+            save(&mut ui, "connection-menu-many");
+        }
+    }
+    // The rows themselves are still pressed to connect.
+    let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, 560.0), warden_gui::view::view(&g));
+    let _ = ui.click("deploy@web-2").expect("a machine in the list");
+    let msgs = messages(ui);
+    assert!(matches!(&msgs[..], [Message::UseMachine(d)] if d == "deploy@web-2"), "{msgs:?}");
+}
+
 /// A column nobody fills in (loop delay without the shim, health without a check, last
 /// exit before any exit) is left out; it is there as soon as one worker has a value.
 #[test]
@@ -742,6 +816,34 @@ fn narrow_window_still_draws_the_table() {
     save(&mut ui, "main-screen-narrow");
 }
 
+/// A long app name is cut to what its row leaves (the state label stays), in the list and in the
+/// header of the page (the state and Edit config stay), and the whole name is in a tooltip. Drawn
+/// at the smallest window.
+#[test]
+fn a_long_app_name_leaves_room_for_its_state_and_edit_config() {
+    let long = "customer-facing-checkout-and-billing-api-service-v2";
+    let mut g = connected();
+    let apps: Event = serde_json::from_value(json!({"type": "apps", "apps": [
+        {"name": long, "namespace": "default", "config": "/srv/customer-facing-checkout-and-billing/deploy/warden.toml",
+         "socket": "/run/warden/long/control.sock", "state": "gave_up", "supervised_by": "wardend", "supervisor_restarts": 10,
+         "problem": "died 10 times in 10 minutes; wardend stopped restarting it"},
+        {"name": "api", "namespace": "default", "config": "/etc/warden/api.toml", "socket": "/run/warden/api/control.sock",
+         "state": "running", "supervised_by": "wardend"},
+    ]}))
+    .unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![apps], ..Batch::default() })));
+    let _ = g.update(Message::Select(long.into()));
+    let size = warden_gui::app::WINDOW_MIN;
+    let _ = g.update(Message::Resized(size));
+    let mut ui = Simulator::with_size(warden_gui::settings(), (size.width, size.height), warden_gui::view::view(&g));
+    assert!(ui.find(long).is_err(), "the name is cut, not drawn over its neighbours");
+    for t in ["gave up", "Edit config", "Add app"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is still on the screen");
+    }
+    assert!(ui.find("api").is_ok(), "and the other app's row");
+    save(&mut ui, "long-app-name");
+}
+
 /// What a Mac with `Warden.app` in Applications knows about itself, with no file touched: the
 /// folders are only names here.
 fn mac_places() -> Places {
@@ -760,7 +862,7 @@ fn mac_places() -> Places {
 
 fn with_cli(status: Status, work: Work) -> Gui {
     let mut g = connected();
-    g.cli = State { places: Ok(mac_places()), status, work };
+    g.cli = State { places: Ok(mac_places()), status, work, cancelled: false };
     g
 }
 
@@ -805,7 +907,9 @@ fn settings_installs_and_removes_the_command_line_tool() {
         Work::Idle,
     );
     let mut ui = sim(&g);
-    let line = "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc";
+    // One command, and the same one run twice adds the line once.
+    let line = "grep -qsF 'export PATH=\"$HOME/.local/bin:$PATH\"' ~/.zshrc \
+                || echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc";
     assert!(ui.find(line).is_ok(), "the line to add is shown");
     assert!(ui.find("If a new Terminal does not find `warden`, put /Users/ana/.local/bin on your PATH (zsh):").is_ok());
     save(&mut ui, "settings-cli-path");
@@ -835,6 +939,43 @@ fn settings_installs_and_removes_the_command_line_tool() {
     let mut ui = sim(&g);
     assert!(ui.find("`warden` is installed: /opt/homebrew/bin/warden").is_ok());
     assert!(ui.find("Install command line tool").is_err() && ui.find("Uninstall").is_err());
+
+    // On a Mac that can ask for the password there is a second way that never does, and a cancelled
+    // prompt installs nothing and says so.
+    let mut g = settings_with(Status::Missing, Work::Idle);
+    let mut ui = sim(&g);
+    assert!(ui.find("Install for this user only").is_ok(), "the choice that needs no password");
+    let _ = ui.click("Install for this user only").expect("the button");
+    assert!(matches!(messages(ui).as_slice(), [Message::InstallCliForMe]));
+    g.cli.cancelled = true;
+    let mut ui = sim(&g);
+    assert!(ui.find("The administrator prompt was cancelled, so nothing was installed.").is_ok());
+    assert!(ui.find("Install command line tool").is_ok() && ui.find("Install for this user only").is_ok());
+    save(&mut ui, "settings-cli-cancelled");
+    drop(ui);
+
+    // A link into another copy of the app (an older download, `Warden 2.app`): said, and it can be
+    // pointed at this one or removed.
+    let g = settings_with(
+        Status::Linked {
+            link: "/usr/local/bin/warden".into(),
+            target: "/Users/ana/Downloads/Warden 2.app/Contents/MacOS/warden".into(),
+        },
+        Work::Idle,
+    );
+    let mut ui = sim(&g);
+    assert!(
+        ui.find(
+            "/usr/local/bin/warden is a link to another copy of Warden: \
+             /Users/ana/Downloads/Warden 2.app/Contents/MacOS/warden"
+        )
+        .is_ok()
+    );
+    assert!(ui.find("This app's command is /Applications/Warden.app/Contents/MacOS/warden.").is_ok());
+    save(&mut ui, "settings-cli-other-copy");
+    let _ = ui.click("Point it at this app").expect("repoint");
+    let _ = ui.click("Uninstall").expect("remove it");
+    assert!(matches!(messages(ui).as_slice(), [Message::InstallCli, Message::UninstallCli]));
 
     // Working: the button says so and does nothing.
     let g = settings_with(Status::Missing, Work::Installing);
@@ -896,7 +1037,7 @@ fn first_run_banner_offers_the_command_line_tool_once() {
     for g in [
         {
             let mut g = connected();
-            g.cli = State { places: Ok(linux), status: Status::Missing, work: Work::Idle };
+            g.cli = State { places: Ok(linux), status: Status::Missing, work: Work::Idle, cancelled: false };
             g
         },
         with_cli(Status::Present { path: "/opt/homebrew/bin/warden".into() }, Work::Idle),

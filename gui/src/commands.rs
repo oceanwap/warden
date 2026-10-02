@@ -76,17 +76,19 @@ pub fn find_local_warden() -> Result<PathBuf, String> {
     if let Some(p) = beside.as_ref().filter(|p| is_executable(p)) {
         return Ok(p.clone());
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let p = dir.join("warden");
-            if is_executable(&p) {
-                return Ok(p);
-            }
+    // On PATH, then where a window opened from Finder or a menu (launchd's short PATH) still finds
+    // it: the places the "command line tool" check looks in.
+    let on_path = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+    for dir in on_path.into_iter().chain(crate::cli_install::usual_dirs(home.as_deref())) {
+        let p = dir.join("warden");
+        if is_executable(&p) {
+            return Ok(p);
         }
     }
     Err(format!(
-        "the warden CLI was not found next to the GUI ({}) or on PATH: install it (install.sh, or the GUI + CLI \
-         download), or put it on PATH",
+        "the warden CLI was not found next to the GUI ({}), on PATH, or in /usr/local/bin, /opt/homebrew/bin, \
+         ~/.local/bin or ~/.cargo/bin: install it (install.sh, or the GUI + CLI download), or put it on PATH",
         beside.and_then(|p| p.parent().map(|d| d.display().to_string())).unwrap_or_else(|| "?".into())
     ))
 }
@@ -203,10 +205,148 @@ pub async fn start_wardend(host: &Host) -> Result<Output, String> {
 
 // ------------------------------------------------------- restart everything
 
+/// How long `warden update --yes` may take before the window stops waiting and says so. It saves,
+/// stops everything and starts it again (each app waits for its workers), so it is not short, and
+/// it is never stopped early: killing it half way is what would leave the apps stopped.
+pub const RESTART_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// The `warden` that will run, and its version: shown before "Restart now".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Who {
+    /// Its path here, or `warden on <host>`.
+    pub command: String,
+    /// `warden --version` without the name: `0.1.0`.
+    pub version: String,
+}
+
+/// Which `warden` a command on `host` runs, and what version it is (`warden --version`).
+pub async fn warden_who(host: &Host) -> Result<Who, String> {
+    let command = match host {
+        Host::Local => find_local_warden()?.display().to_string(),
+        Host::Ssh { dest, warden } => format!("{warden} on {dest}"),
+    };
+    let out = run_warden(host, &["--version".into()], None, &[], Duration::from_secs(15)).await?;
+    if !out.ok {
+        return Err(format!("`{}` failed: {}", out.command, out.text()));
+    }
+    let said = out.stdout.trim();
+    Ok(Who { command, version: said.strip_prefix("warden ").unwrap_or(said).to_string() })
+}
+
+/// The runtime directory a wardend socket belongs to, for `WARDEN_RUNTIME_DIR`: the CLI finds
+/// wardend as `wardend.sock` in that directory, so only a socket of that name can be pointed at.
+/// (`--socket` of the CLI is one app's control socket, not wardend's.)
+pub fn runtime_dir_of(socket: &Path) -> Option<PathBuf> {
+    (socket.file_name()? == warden_protocol::paths::WARDEND_SOCKET).then(|| socket.parent().map(Path::to_path_buf))?
+}
+
+/// What a restart came to, in the words to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restart {
+    pub ok: bool,
+    pub text: String,
+    /// It got as far as stopping things and did not finish: the apps may be stopped.
+    pub stopped: bool,
+}
+
+impl Restart {
+    fn failed(what: &str, stopped: bool, resurrect: &str) -> Restart {
+        let text = if stopped {
+            format!(
+                "{what}. Apps may be stopped: what was running was saved first, so starting it again brings them \
+                 back (use \"Start the saved apps again\" in Settings, or {resurrect})."
+            )
+        } else {
+            format!("{what}. Nothing was stopped.")
+        };
+        Restart { ok: false, text, stopped }
+    }
+}
+
+/// A program, its arguments and the environment variables to set for it.
+type Invocation = (PathBuf, Vec<String>, Vec<(String, String)>);
+
+/// The program, arguments and environment that run `warden <args>` on `host`, aimed at the wardend
+/// whose runtime directory is `dir` (the one the window is connected to), else at the one the CLI
+/// finds by itself. Over ssh the variable is set on the remote command line.
+fn aimed(host: &Host, args: &[String], dir: Option<&Path>) -> Result<Invocation, String> {
+    const VAR: &str = "WARDEN_RUNTIME_DIR";
+    match host {
+        Host::Local => {
+            let (prog, argv) = warden_command(host, args)?;
+            Ok((prog, argv, dir.map(|d| (VAR.to_string(), d.display().to_string())).into_iter().collect()))
+        }
+        Host::Ssh { dest, warden } => {
+            let mut line = String::new();
+            if let Some(d) = dir {
+                line.push_str(&format!("{VAR}={} ", ssh::shell_quote(&d.display().to_string())));
+            }
+            line.push_str(&ssh::shell_program(warden));
+            for a in args {
+                line.push(' ');
+                line.push_str(&ssh::shell_quote(a));
+            }
+            Ok((PathBuf::from("ssh"), ssh::exec_line_args(dest, &line)?, Vec::new()))
+        }
+    }
+}
+
+/// A run that did not give an `Output`: what to say, and whether the CLI got to run at all.
+struct NotDone {
+    text: String,
+    ran: bool,
+}
+
+async fn run_aimed(host: &Host, args: &[String], dir: Option<&Path>) -> Result<Output, NotDone> {
+    let (prog, argv, env) = aimed(host, args, dir).map_err(|text| NotDone { text, ran: false })?;
+    let out = run(&prog, &argv, None, &env, RESTART_LIMIT)
+        .await
+        .map_err(|text| NotDone { ran: !text.starts_with("cannot run "), text })?;
+    if let Host::Ssh { warden, .. } = host
+        && let Some(text) = remote_failure(host, &out, warden)
+    {
+        // ssh could not log in, or the shell did not find `warden`: nothing ran there.
+        return Err(NotDone { text, ran: false });
+    }
+    Ok(out)
+}
+
+/// The words for a `warden update` / `warden resurrect` that ended as `r`.
+fn restart_report(r: Result<Output, NotDone>, ok_text: &str, resurrect: &str) -> Restart {
+    match r {
+        Ok(out) if out.ok => Restart { ok: true, text: ok_text.into(), stopped: false },
+        Ok(out) => {
+            let said = out.text();
+            let untouched = said.contains("nothing was stopped") || said.contains("nothing stopped");
+            Restart::failed(&format!("it failed: {said} (`{}`)", out.command), !untouched, resurrect)
+        }
+        Err(n) => Restart::failed(&format!("it failed: {}", n.text), n.ran, resurrect),
+    }
+}
+
+/// How to start the saved apps by hand, for the words of a failed restart.
+fn resurrect_by_hand(host: &Host) -> String {
+    match host {
+        Host::Local => match find_local_warden() {
+            Ok(p) => format!("run `{} resurrect` in Terminal", p.display()),
+            Err(_) => "run `warden resurrect` in Terminal".into(),
+        },
+        Host::Ssh { dest, warden } => format!("run `{warden} resurrect` on {dest}"),
+    }
+}
+
 /// `warden update --yes`: save, stop every supervisor and wardend, start them again from the
 /// `warden` on disk (what picks up a rebuild or an upgrade). The apps stop for a few seconds.
-pub async fn restart_everything(host: &Host) -> Result<Output, String> {
-    run_warden(host, &["update".into(), "--yes".into()], None, &[], Duration::from_secs(180)).await
+/// `dir`: the runtime directory of the wardend the window shows ([`runtime_dir_of`]).
+pub async fn restart_everything(host: &Host, dir: Option<&Path>) -> Restart {
+    let r = run_aimed(host, &["update".into(), "--yes".into()], dir).await;
+    restart_report(r, "Restarted every supervisor and wardend from the installed warden.", &resurrect_by_hand(host))
+}
+
+/// `warden resurrect`: start what the last `warden save` (the first step of a restart) remembered.
+pub async fn resurrect_all(host: &Host, dir: Option<&Path>) -> Restart {
+    let r = run_aimed(host, &["resurrect".into()], dir).await;
+    restart_report(r, "Started the saved apps again.", &resurrect_by_hand(host))
 }
 
 // ----------------------------------------------------------------- add app
@@ -729,5 +869,119 @@ mod tests {
         assert!(slow.contains("did not finish"), "{slow}");
         let missing = run(Path::new("/no/such/prog"), &[], None, &[], Duration::from_secs(1)).await.unwrap_err();
         assert!(missing.contains("not found"), "{missing}");
+    }
+
+    /// A `warden` that answers by the runtime directory it is pointed at, and the same for every test
+    /// of this process (`set_local_warden`: the first call wins).
+    fn fake_warden() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static FAKE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        FAKE.get_or_init(|| {
+            // Under target/ (not /tmp): nothing is left behind outside the build folder.
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/tmp/wg-fake-warden");
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("warden");
+            std::fs::write(
+                &bin,
+                "#!/bin/sh\n\
+                 case \"$1\" in --version) echo 'warden 9.9.9'; exit 0;; esac\n\
+                 echo \"ran $* in ${WARDEN_RUNTIME_DIR:-nowhere}\"\n\
+                 case \"$WARDEN_RUNTIME_DIR\" in\n\
+                   */nosave) echo 'warden: the save failed, so nothing was stopped' >&2; exit 1;;\n\
+                   */crash) echo 'warden: wardend did not come back' >&2; exit 1;;\n\
+                 esac\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            set_local_warden(bin.clone());
+            bin
+        })
+        .clone()
+    }
+
+    #[test]
+    fn a_wardend_socket_gives_the_runtime_directory_the_cli_is_aimed_with() {
+        assert_eq!(runtime_dir_of(Path::new("/run/warden/wardend.sock")), Some(PathBuf::from("/run/warden")));
+        assert_eq!(
+            runtime_dir_of(Path::new("/run/user/1000/warden/wardend.sock")),
+            Some("/run/user/1000/warden".into())
+        );
+        // `--socket` of the CLI is an app's, so a socket of another name cannot be pointed at.
+        assert_eq!(runtime_dir_of(Path::new("/tmp/custom.sock")), None);
+        assert_eq!(runtime_dir_of(Path::new("/")), None);
+    }
+
+    #[test]
+    fn a_restart_runs_the_warden_in_the_connected_wardends_runtime_directory_here_and_over_ssh() {
+        let bin = fake_warden();
+        let args = ["update".to_string(), "--yes".to_string()];
+        let (prog, argv, env) = aimed(&Host::Local, &args, Some(Path::new("/run/user/1000/warden"))).unwrap();
+        assert_eq!((prog, argv), (bin, args.to_vec()));
+        assert_eq!(env, [("WARDEN_RUNTIME_DIR".to_string(), "/run/user/1000/warden".to_string())]);
+        let (_, _, none) = aimed(&Host::Local, &args, None).unwrap();
+        assert!(none.is_empty(), "without a directory the CLI finds its own wardend");
+        // Over ssh the variable is on the remote command line, and `~/` in the warden still means the home.
+        let host = Host::Ssh { dest: "deploy@web-1".into(), warden: "~/.local/bin/warden".into() };
+        let (prog, argv, env) = aimed(&host, &args, Some(Path::new("/run/warden"))).unwrap();
+        assert_eq!(prog, PathBuf::from("ssh"));
+        assert!(env.is_empty());
+        assert_eq!(argv.last().unwrap(), "WARDEN_RUNTIME_DIR=/run/warden \"$HOME\"/.local/bin/warden update --yes");
+        assert!(argv.contains(&"deploy@web-1".to_string()));
+        let (_, argv, _) = aimed(&host, &args, Some(Path::new("/srv/with space"))).unwrap();
+        assert!(argv.last().unwrap().starts_with("WARDEN_RUNTIME_DIR='/srv/with space' "), "{argv:?}");
+    }
+
+    #[tokio::test]
+    async fn a_restart_reports_whether_the_apps_may_be_stopped() {
+        fake_warden();
+        let local = Host::Local;
+        // The warden that would run, and its version, before anything is stopped.
+        let who = warden_who(&local).await.unwrap();
+        assert_eq!(who.version, "9.9.9");
+        assert!(who.command.ends_with("/warden"), "{}", who.command);
+        // It is aimed at the directory it is given.
+        let ok = restart_everything(&local, Some(Path::new("/run/test/ok"))).await;
+        assert!(ok.ok && !ok.stopped, "{ok:?}");
+        let back = resurrect_all(&local, Some(Path::new("/run/test/ok"))).await;
+        assert_eq!(back.text, "Started the saved apps again.");
+        // The save failed: nothing was stopped, and it says so without alarming.
+        let nosave = restart_everything(&local, Some(Path::new("/run/test/nosave"))).await;
+        assert!(!nosave.ok && !nosave.stopped, "{nosave:?}");
+        assert!(nosave.text.contains("Nothing was stopped"), "{}", nosave.text);
+        // It ran and failed: the apps may be stopped, and the way back is in the words.
+        let crash = restart_everything(&local, Some(Path::new("/run/test/crash"))).await;
+        assert!(!crash.ok && crash.stopped, "{crash:?}");
+        assert!(
+            crash.text.contains("Apps may be stopped")
+                && crash.text.contains("resurrect")
+                && crash.text.contains("wardend did not come back"),
+            "{}",
+            crash.text
+        );
+    }
+
+    #[test]
+    fn a_restart_that_never_ran_or_never_finished_is_told_apart() {
+        let by_hand = "run `warden resurrect`";
+        // Cannot start it at all: nothing happened.
+        let r =
+            restart_report(Err(NotDone { text: "cannot run /x/warden: not found".into(), ran: false }), "ok", by_hand);
+        assert!(!r.stopped && r.text.ends_with("Nothing was stopped."), "{}", r.text);
+        // Did not finish in the time: the CLI was stopped half way.
+        let slow =
+            NotDone { text: "`warden update --yes` did not finish within 900 s; it was stopped".into(), ran: true };
+        let r = restart_report(Err(slow), "ok", by_hand);
+        assert!(r.stopped && r.text.contains("Apps may be stopped") && r.text.contains(by_hand), "{}", r.text);
+        // The limit is long: a restart waits for every app's workers.
+        assert!(RESTART_LIMIT >= Duration::from_secs(10 * 60));
+    }
+
+    #[test]
+    fn the_cli_is_looked_for_in_the_places_the_install_check_looks_in() {
+        let home = Path::new("/home/me");
+        let usual = crate::cli_install::usual_dirs(Some(home));
+        for d in ["/usr/local/bin", "/opt/homebrew/bin", "/home/me/.local/bin", "/home/me/.cargo/bin"] {
+            assert!(usual.contains(&PathBuf::from(d)), "{d} in {usual:?}");
+        }
     }
 }

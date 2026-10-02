@@ -20,14 +20,22 @@ the icon.
 
 - **Connection bar**: wardend's version and pid, the host's CPU, memory and
   load (from `host` events), with sparklines of the last hour of CPU and of
-  memory (out of the total). When wardend is not running it says so, why it
+  memory (out of the total). With no `--socket` it connects to this user's
+  wardend if one answers, else to a system one (`sudo warden startup`); each
+  socket is tried with a short `connect()`, so a socket file left by a wardend
+  that died does not hide a live one. When wardend is not running it says so, why it
   matters, and offers **Start wardend** (`warden wardend --background`, with
   the `warden` next to the GUI, else the one on PATH). It reconnects by
   itself, with backoff (0.25 s up to 5 s), and says `reconnecting…` meanwhile.
 - **App list**: each app's state, who supervises it, workers ready /
   configured, CPU and resident memory (workers, the Bun host in worker mode,
   the supervisor), and its problem with the fix (`AppEntry.problem`). Live
-  from `apps` and `status` events.
+  from `apps` and `status` events. A long app name is cut with `…` to what its row
+  leaves (the state label always stays), and the same in the page's header
+  (the state and Edit config stay); the whole name is in a tooltip. The same goes
+  for a line of the events or the logs that is wider than its list (the width is
+  estimated letter by letter, so capitals and wide characters count for more, and a
+  line that is close to fitting gets the tooltip too).
 - **App detail**: the workers table (id, state, pid, uptime, restarts, CPU,
   RSS, health, last exit, and a per-worker restart), the rollout in progress
   with a progress bar (`rollout` / `rollout_done`), the last rollout's
@@ -90,9 +98,17 @@ opens **Settings**:
   system colors or libadwaita's. The accent fills every button and bar, so it is
   mixed a little with the window's own surface color (a fifth on a dark window,
   a seventh on a light one): the same hue you chose, sitting in the window
-  instead of shouting from it. A color that would be hard to read is moved only
-  as far as it needs. On KDE, Xfce and the rest there is nothing to follow, and
-  the choice keeps Warden's colors.
+  instead of shouting from it. On KDE, Xfce and the rest there is nothing to follow,
+  and the choice keeps Warden's colors.
+- **Readable in every look**: text is at least 4.5:1 (WCAG AA) against every surface it
+  sits on (the page, a card or dialog, a chip, a tile, a box), the colors of a state on
+  their own wash in a badge or a banner too, the text on a button's fill (also under the
+  pointer and pressed) and on the chosen tab; the outline of a field and of a checkbox,
+  the focus ring and the progress bar are at least 3:1 against the page and the dialogs.
+  A color of the desktop that would not be is moved toward the text color only as far as
+  it needs (the same hue, a little deeper on a light window, lighter on a dark one). A
+  test checks all of it, for Warden's two palettes and for each of the 60 looks the
+  desktop can give (macOS and GNOME, light and dark, 15 accents).
 - **Mode**: *Auto* (the default), *Light* or *Dark*. Auto follows the desktop's
   light or dark setting, **live** (a change shows as it happens), and is dark
   when the desktop does not say.
@@ -101,14 +117,31 @@ opens **Settings**:
   *This desktop: macOS, dark, purple accent.*
 - `--theme system|warden|light|dark` (or `WARDEN_GUI_THEME`; the flag wins) sets
   it for one run: `system` is System colors with Auto; `warden` is Warden colors
-  with Auto; `light` and `dark` are Warden colors in that mode.
+  with Auto (what a window starts with, and what `--help` calls the default);
+  `light` and `dark` are Warden colors in that mode.
+- If `gui.json` cannot be read as JSON (cut short, edited by hand), the window starts
+  with the defaults, says so in a toast, and moves the file to `gui.json.bad` instead of
+  writing over it: your machines are in it. A value this version does not know (a newer
+  window's, a mistyped one) or a machine with a field missing costs only that value; the
+  rest of the file loads, and what a newer window wrote is kept when this one saves. A file
+  that cannot be read at all (permissions) is not written over either: changes to Settings
+  then last only for that run.
 
 - **Restart everything** (also in Settings) runs `warden update --yes` on the machine the
   window shows: it saves what runs, stops every supervisor and wardend, and starts them again
   from the installed `warden` (a supervisor keeps the code it started with, so this is what
-  picks up an upgrade). It asks first; the apps stop for a few seconds, stopped apps stay
-  stopped, and the window reconnects when wardend is back. Over SSH it runs on the remote
-  machine.
+  picks up an upgrade). It asks first, and the question says which `warden` will run (its
+  path and `warden --version`; over SSH, `warden on <host>`), which wardend it replaces, and
+  which wardend it is aimed at: the CLI is pointed at the one the window shows through
+  `WARDEN_RUNTIME_DIR`, and when the window is connected to a socket the CLI cannot be pointed
+  at (`--socket /tmp/other.sock`: it finds wardend as `wardend.sock` in its runtime directory
+  only), the button is not offered, since it would restart another wardend. The apps stop for
+  a few seconds, stopped apps stay stopped, and the window shows how long it has been running
+  (it is allowed 15 minutes, not cut short) and reconnects when wardend is back. If it does not
+  finish, or fails after it began to stop things, Settings says that the apps may be stopped,
+  that what ran was saved first, and offers **Start the saved apps again** (`warden resurrect`);
+  a failure before anything was stopped says nothing was. Closing the window while it runs
+  interrupts it. Over SSH it runs on the remote machine.
 - Under the app's name the window shows the directory its workers run in (the folder a static
   site serves); a click copies it.
 
@@ -178,27 +211,40 @@ The link goes, in this order:
    created when it does not exist and its parent lets you);
 2. else the same through the system's administrator prompt (`osascript`:
    `do shell script … with administrator privileges`): macOS asks for the password
-   itself, and Warden never sees it;
-3. else **`~/.local/bin/warden`**: also when the prompt is cancelled or fails (the
-   toast says why), and the only choice on Linux, where the link points at the `warden`
-   next to `warden-gui`. When that folder is not on PATH, Settings shows the line that
-   puts it there, as `install.sh` does (zsh: `echo 'export PATH="$HOME/.local/bin:$PATH"'
-   >> ~/.zshrc`; bash, fish and others the same way), with a click to copy it. No file
-   of yours is changed.
+   itself, and Warden never sees it. **Cancelling the prompt means stop**: nothing is
+   installed (the toast and Settings say so), and Settings has a second button,
+   **Install for this user only**, for the next choice. The script the
+   prompt runs checks again, as the administrator, before it replaces anything: it
+   only replaces a link that is dead or points into a `Warden.app` (a Homebrew link made
+   while the prompt waited is left alone and said so);
+3. **`~/.local/bin/warden`**: when you choose *Install for this user only*, when the
+   prompt *fails* (as opposed to being closed; the toast says why), and always on Linux,
+   where the link points at the `warden` next to `warden-gui`. When that folder is not
+   on PATH, Settings shows one command that puts it there, as `install.sh` does (zsh:
+   `grep -qsF 'export PATH="$HOME/.local/bin:$PATH"' ~/.zshrc || echo 'export
+   PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`; bash, fish and others the same way),
+   with a click to copy it. Running it twice adds the line once, and the hint goes away
+   by itself once a startup file of that shell already adds the folder (a window opened
+   from Finder never has `~/.local/bin` on its PATH, whatever your Terminal does). No file
+   of yours is changed by the window.
 
 Settings then says `Installed: /usr/local/bin/warden` (a link to the CLI in the app) and
-offers **Uninstall**. Only links are made and removed, and only ones that point into the
-app (this app's CLI, or a `Warden.app/Contents/MacOS/warden` anywhere):
+offers **Uninstall**. Only links are made and removed, and only ones that point into an app
+of Warden's (this app's CLI, a `Warden.app/Contents/MacOS/warden` anywhere, or a `warden`
+beside a `warden-gui`, as in an unpacked download) or that point nowhere:
 
 - a `warden` that is a file, or a link to something else (Homebrew, `install.sh`, a
   package), is never replaced or deleted: Settings says `` `warden` is installed:
   <path> `` and offers nothing;
-- a link to a `Warden.app` that was moved or deleted shows as dead, with **Install
-  again** and **Remove the link**;
-- from a disk image (`/Volumes/…`) or from the randomized place macOS runs an app
-  downloaded and opened before it was moved (App Translocation) the window refuses,
-  because a link to such a place would break: it says to drag Warden.app to
-  Applications and open it from there.
+- a link to **another copy** of the app (`Warden 2.app`, an older download) is said to be
+  one, with **Point it at this app** and **Uninstall**; a link to an app that was moved or
+  deleted shows as dead, with **Install again** and **Remove the link**;
+- from a **disk image** or another read-only volume, or from the randomized place macOS
+  runs an app downloaded and opened before it was moved (App Translocation), the window
+  refuses, because a link to such a place would break: it says to drag Warden.app to
+  Applications and open it from there. A `Warden.app` on another internal or external
+  drive that is writable is fine (`/Volumes` as a whole is not refused; the volume's
+  read-only flag decides).
 
 It is always about this machine, whichever host the window shows. `cli_install.rs`
 takes every folder as a parameter (so its tests run on temporary ones); the
@@ -272,7 +318,17 @@ warden-gui --ssh deploy@web-1 --remote-warden '~/.local/bin/warden'   # for Add 
   on this machine; on a remote host add `env_file` with Edit config.
 - The tunnel is dropped with the connection (its ssh is killed and the local
   socket removed), and re-opened (with backoff) if ssh exits or is killed;
-  the window says which.
+  the window says which. On Linux the kernel also ends the tunnel's ssh when the window
+  dies without closing (a crash, `kill -9`; `PR_SET_PDEATHSIG`, in `parent_death.rs`, the
+  one place the GUI has `unsafe`). macOS has no such call: after a killed window a tunnel
+  stays until you stop its `ssh -N -L` (its socket is in `warden-gui-<uid>/`). The
+  commands run over ssh (Add app, Restart everything) are not tied to the window this way:
+  ending them half way would be worse than letting them finish.
+- A reply that arrives after you switched machines (a toast, a busy flag, a restart that
+  finished) is dropped when it is about the machine you left, and only a failure is shown,
+  named with that machine.
+- The **Connection…** menu's list of machines scrolls, and the menu is cut to the room the
+  window has, so **Add SSH machine** and the rest below the list are always reachable.
 
 ## How it works
 
@@ -348,15 +404,24 @@ cargo build --bin warden && cargo test -p warden-gui
 - Unit tests: every `update` path (feed, actions and confirmations,
   toasts, logs, dialogs, Settings kept in `gui.json`), reading the desktop's
   look (macOS, GNOME, Yaru, others: from fake `defaults` and `gsettings`
-  answers) and that every desktop palette is readable, event → state, the bounded buffers, batching and
+  answers), event → state, the bounded buffers, batching and
   backoff, and the command lines for Add app and ssh (quoting included:
   quoted command lines are run through `sh` and must come back unchanged).
+  The colors are audited pair by pair (`look::audit`: 4.5 for text, 3 for shapes) for
+  Warden's two palettes and for all 60 desktop looks; `gui.json` is read from damaged,
+  half-known and unreadable files, and saved without losing what a newer window wrote;
+  a restart that fails, times out or is not offered; a reply from before a switch of
+  machine changing nothing; the choice of socket among a live one, a dead file and none;
+  the estimate of how wide a text is; and that `Icon::ALL` is every icon.
 - `src/cli_install.rs` (unit tests, on temporary folders): the link in the system folder
   with and without the administrator (a folder that says no is simulated: the tests may
-  run as root), the fallback to `~/.local/bin` when the prompt is cancelled or fails, a
+  run as root), a cancelled prompt (nothing installed), the users folder by choice and as
+  the fallback when the prompt fails, a
   file or somebody else's link in the way (left alone, no second copy elsewhere), a dead
   link, uninstalling (only a link of the app's), the first-run banner's conditions, the
-  PATH line for each shell, a disk image or a translocated app refused, and the
+  PATH line for each shell and its idempotence, a read-only volume or a translocated app
+  refused, a link into another copy of the app, a `warden` made while the prompt waited
+  (the script's guard, run with `sh`), and the
   `osascript` command: the shell quoting and then the AppleScript quoting of a path with
   a space, a quote and a backslash, and that the shell reads the path back unchanged. The
   prompt itself only runs on a Mac and is not tested.
@@ -368,8 +433,9 @@ cargo build --bin warden && cargo test -p warden-gui
   app that gave up, standbys and draining workers, the worker table's
   columns, the Restart and Connection menus, the logs tab, a confirmation,
   the Add app, Edit config, machine and Settings dialogs (Settings in each state of
-  the command line tool, and in a window too short for it, where it scrolls and keeps
-  Done in view), the first-run banner (wide and narrow), the main screen in the
+  the command line tool and of Restart everything, and in a window too short for it, where
+  it scrolls and keeps Done in view), the Connection menu with a dozen machines, a long app
+  name in the narrowest window, the first-run banner (wide and narrow), the main screen in the
   desktop colors of macOS and Ubuntu (light and dark), the "wardend is not
   running" screen, and the History tab (`history-1h` with
   the crosshair over the memory chart, `history-24h-light`, and the error

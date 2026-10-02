@@ -10,6 +10,7 @@
 //! - `client`: wardend's socket (one long-lived subscription with reconnect
 //!   and backoff, short requests), all off the UI thread;
 //! - `ssh`: the tunnel to a remote wardend, and shell quoting for remote commands;
+//!   `parent_death` ends its ssh with the window on Linux (the one `unsafe` of the crate);
 //! - `commands`: the `warden` CLI as a subprocess (local, or over SSH);
 //! - `cli_install`: the link that puts `warden` on PATH, from Settings or the first-run banner;
 //! - `model`, `logs`, `history`, `format`, `ring`: state and text, no I/O
@@ -17,7 +18,8 @@
 //! - `app`, `view`, `charts`: the iced program (update, subscriptions,
 //!   widgets, the canvas charts).
 
-#![forbid(unsafe_code)]
+// No `unsafe` but in `parent_death`: one `pre_exec` closure of two system calls.
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod charts;
@@ -32,6 +34,8 @@ pub mod icons;
 pub mod logs;
 pub mod look;
 pub mod model;
+#[allow(unsafe_code)]
+mod parent_death;
 pub mod ring;
 pub mod ssh;
 pub mod system;

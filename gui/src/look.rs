@@ -58,52 +58,134 @@ pub struct Pal {
     pub tile_bg: Color,
     /// How much of its color a tone's wash takes (the rest is what is behind it).
     pub wash: f32,
-    /// The accent as a fill (the main button, a progress bar, a focus ring), and
+    /// The accent as a fill (the main button, a checked box), and
     /// what is written on it.
     pub accent: Color,
     pub on_accent: Color,
     /// The accent as text or an icon: the fill, moved until it can be read on the page.
     pub accent_text: Color,
-    /// What is well, and what is written on it as a fill.
+    /// The accent as a line or a bar (the focus ring of a field, a progress bar): the fill, moved
+    /// until it stands out from the page and the dialogs at 3 (WCAG 1.4.11).
+    pub ring: Color,
+    /// What is well (as text, a dot, a line), and as a fill with what is written on it.
     pub good: Color,
+    pub good_fill: Color,
     pub on_good: Color,
     pub warn: Color,
+    pub warn_fill: Color,
+    pub on_warn: Color,
     pub danger: Color,
+    pub danger_fill: Color,
     pub on_danger: Color,
+    /// The outline of a field or a checkbox: it reads against the page and the dialogs (WCAG 1.4.11).
+    pub edge: Color,
     /// The chosen one of a segmented control.
     pub pill: Color,
     pub on_pill: Color,
 }
+
+/// The contrast text needs against what it is on (WCAG AA, 4.5), and the lines and shapes that
+/// carry meaning (3).
+pub const TEXT_MIN: f32 = 4.5;
+pub const GRAPHIC_MIN: f32 = 3.0;
 
 impl Pal {
     pub fn from_palette(p: Palette, dark: bool) -> Pal {
         let (paper, ink) = (p.background, p.text);
         let chip = mix(paper, ink, if dark { 0.09 } else { 0.045 });
         let veil = |a: f32| Color { a, ..Color::WHITE };
-        let readable_on_page = |c: Color| ensure_contrast(c, paper, 3.0);
+        let card = if dark { mix(paper, Color::WHITE, 0.045) } else { Color::WHITE };
+        let box_bg = veil(if dark { 0.035 } else { 0.55 });
+        let tile_bg = if dark { veil(0.055) } else { Color { a: 0.6, ..chip } };
+        let wash = if dark { 0.13 } else { 0.10 };
+        let surfaces = surfaces_of(paper, card, chip, box_bg, tile_bg);
+        // Quiet text: moved toward the ink until it reads on every surface it sits on.
+        let muted = toward(mix(ink, paper, if dark { 0.38 } else { 0.40 }), ink, |c| {
+            surfaces.iter().all(|s| contrast(c, *s) >= TEXT_MIN)
+        });
+        // A color as text: moved toward the end that reads until it does, on every surface and on its own wash.
+        let as_text = |c: Color| tone_text(c, paper, &surfaces, &washed_on(&surfaces), wash);
+        let (accent, on_accent) = fill_and_text(p.primary);
+        let (good, warn, danger) = (as_text(p.success), as_text(p.warning), as_text(p.danger));
+        let (good_fill, on_good) = fill_and_text(good);
+        let (warn_fill, on_warn) = fill_and_text(warn);
+        let (danger_fill, on_danger) = fill_and_text(danger);
         Pal {
             dark,
             ink,
             paper,
-            muted: mix(ink, paper, if dark { 0.38 } else { 0.40 }),
+            muted,
             line: mix(paper, ink, if dark { 0.12 } else { 0.07 }),
-            card: if dark { mix(paper, Color::WHITE, 0.045) } else { Color::WHITE },
+            card,
             chip,
-            box_bg: veil(if dark { 0.035 } else { 0.55 }),
-            tile_bg: if dark { veil(0.055) } else { Color { a: 0.6, ..chip } },
-            wash: if dark { 0.13 } else { 0.10 },
-            accent: p.primary,
-            on_accent: readable(p.primary),
-            accent_text: readable_on_page(p.primary),
-            good: readable_on_page(p.success),
-            on_good: readable(p.success),
-            warn: readable_on_page(p.warning),
-            danger: readable_on_page(p.danger),
-            on_danger: readable(p.danger),
+            box_bg,
+            tile_bg,
+            wash,
+            accent,
+            on_accent,
+            accent_text: as_text(p.primary),
+            ring: toward(accent, ink, |c| contrast(c, paper) >= GRAPHIC_MIN && contrast(c, card) >= GRAPHIC_MIN),
+            good,
+            good_fill,
+            on_good,
+            warn,
+            warn_fill,
+            on_warn,
+            danger,
+            danger_fill,
+            on_danger,
+            edge: toward(mix(paper, ink, 0.4), ink, |c| {
+                contrast(c, paper) >= GRAPHIC_MIN && contrast(c, card) >= GRAPHIC_MIN
+            }),
             pill: if dark { mix(ink, paper, 0.05) } else { Color::WHITE },
             on_pill: if dark { paper } else { ink },
         }
     }
+
+    /// Everything text sits on: the page, a card or dialog, a chip, a tile, a box and a tile in a box.
+    pub fn surfaces(&self) -> [Color; 6] {
+        surfaces_of(self.paper, self.card, self.chip, self.box_bg, self.tile_bg)
+    }
+}
+
+fn surfaces_of(paper: Color, card: Color, chip: Color, box_bg: Color, tile_bg: Color) -> [Color; 6] {
+    let boxed = over(box_bg, paper);
+    [paper, card, chip, over(tile_bg, paper), boxed, over(tile_bg, boxed)]
+}
+
+/// `top` (with its alpha) over `base`.
+pub fn over(top: Color, base: Color) -> Color {
+    Color {
+        r: base.r + (top.r - base.r) * top.a,
+        g: base.g + (top.g - base.g) * top.a,
+        b: base.b + (top.b - base.b) * top.a,
+        a: 1.0,
+    }
+}
+
+/// `c` as it is when `fine` says so, else moved toward `end` in small steps until it is (`end` when
+/// nothing before it was).
+fn toward(c: Color, end: Color, fine: impl Fn(Color) -> bool) -> Color {
+    if fine(c) {
+        return c;
+    }
+    (1..=40).map(|i| mix(c, end, i as f32 * 0.025)).find(|t| fine(*t)).unwrap_or(end)
+}
+
+/// The surfaces a tone's wash lies on (a banner on the page, a badge in a dialog, a card or a
+/// selected row): not the resting chips and tiles, which hold figures and text but no badges.
+fn washed_on(surfaces: &[Color; 6]) -> [Color; 4] {
+    [surfaces[0], surfaces[1], surfaces[3], surfaces[4]]
+}
+
+/// A tone's color as text: readable on every surface, and on its own wash over the surfaces that
+/// have one (a badge, a banner), moved toward white on a dark page and black on a light one.
+fn tone_text(c: Color, paper: Color, surfaces: &[Color], washed: &[Color], wash: f32) -> Color {
+    let end = if luminance(paper) < 0.5 { Color::WHITE } else { Color::BLACK };
+    toward(c, end, |t| {
+        surfaces.iter().all(|s| contrast(t, *s) >= TEXT_MIN)
+            && washed.iter().all(|s| contrast(t, over(Color { a: wash, ..t }, *s)) >= TEXT_MIN)
+    })
 }
 
 /// `a` moved toward `b`: 0 is `a`, 1 is `b`.
@@ -123,33 +205,20 @@ pub fn contrast(a: Color, b: Color) -> f32 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// White when it reads well enough on `fill` (the desktops put white on their blues,
-/// purples and reds), else near-black.
-pub fn readable(fill: Color) -> Color {
-    const DARK: Color = Color { r: 0.05, g: 0.06, b: 0.05, a: 1.0 };
-    if contrast(Color::WHITE, fill) >= WHITE_ENOUGH || contrast(Color::WHITE, fill) >= contrast(DARK, fill) {
-        Color::WHITE
-    } else {
-        DARK
+/// A fill and what is written on it, at 4.5: white when it reads on `fill`, white on a deeper shade
+/// of it when it nearly does (the desktops put white on their blues, purples and reds), else near-black.
+pub fn fill_and_text(fill: Color) -> (Color, Color) {
+    const DARK: Color = Color { r: 0.01, g: 0.012, b: 0.01, a: 1.0 };
+    if contrast(Color::WHITE, fill) >= TEXT_MIN {
+        return (fill, Color::WHITE);
     }
-}
-
-const WHITE_ENOUGH: f32 = 3.0;
-
-/// `fg` as it is when it reads on `bg` (a ratio of `min`), else moved toward
-/// the end of the scale that reads (white on a dark page, black on a light one).
-pub fn ensure_contrast(fg: Color, bg: Color, min: f32) -> Color {
-    if contrast(fg, bg) >= min {
-        return fg;
+    if contrast(Color::WHITE, fill) >= 3.5
+        && let Some(deeper) =
+            (1..=20).map(|i| mix(fill, Color::BLACK, i as f32 * 0.02)).find(|f| contrast(Color::WHITE, *f) >= TEXT_MIN)
+    {
+        return (deeper, Color::WHITE);
     }
-    let end = if luminance(bg) < 0.5 { Color::WHITE } else { Color::BLACK };
-    for step in 1..=20 {
-        let c = mix(fg, end, step as f32 * 0.05);
-        if contrast(c, bg) >= min {
-            return c;
-        }
-    }
-    end
+    (fill, DARK)
 }
 
 pub fn pal(theme: &Theme) -> Pal {
@@ -462,27 +531,24 @@ fn solid_with(tone: Tone, theme: &Theme, status: button::Status, radius: border:
     let p = pal(theme);
     let (base, text_color) = match tone {
         Tone::Plain | Tone::Muted => (p.ink, p.paper),
-        Tone::Bad => (p.danger, p.on_danger),
-        Tone::Warn => (p.warn, readable(p.warn)),
-        Tone::Good => (p.good, p.on_good),
+        Tone::Bad => (p.danger_fill, p.on_danger),
+        Tone::Warn => (p.warn_fill, p.on_warn),
+        Tone::Good => (p.good_fill, p.on_good),
         Tone::Accent => (p.accent, p.on_accent),
     };
+    // Under the pointer the fill moves away from the text, so what is written stays as readable
+    // as it was: light text on a deeper fill, dark text on a lighter one.
+    let light_text = luminance(text_color) > 0.5;
     let bg = match status {
         button::Status::Active => base,
         button::Status::Hovered => {
-            if p.dark {
-                lift(base, 0.1)
-            } else {
+            if light_text {
                 sink(base, 0.14)
-            }
-        }
-        button::Status::Pressed => {
-            if p.dark {
-                sink(base, 0.1)
             } else {
-                sink(base, 0.26)
+                lift(base, 0.1)
             }
         }
+        button::Status::Pressed => sink(base, if light_text { 0.26 } else { 0.1 }),
         button::Status::Disabled => Color { a: 0.3, ..base },
     };
     button::Style {
@@ -699,16 +765,16 @@ pub fn heading<'a>(t: impl Into<String>) -> Text<'a> {
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let p = pal(theme);
     let line = match status {
-        text_input::Status::Active => p.line,
-        text_input::Status::Hovered => Color { a: 0.9, ..p.muted },
-        text_input::Status::Focused { .. } => p.accent,
+        text_input::Status::Active => p.edge,
+        text_input::Status::Hovered => p.muted,
+        text_input::Status::Focused { .. } => p.ring,
         text_input::Status::Disabled => p.line,
     };
     text_input::Style {
         background: Background::Color(p.tile_bg),
         border: Border { radius: PILL.into(), width: 1.25, color: line },
         icon: p.muted,
-        placeholder: Color { a: 0.8, ..p.muted },
+        placeholder: p.muted,
         value: if matches!(status, text_input::Status::Disabled) { Color { a: 0.5, ..p.ink } } else { p.ink },
         selection: Color { a: 0.3, ..p.accent },
     }
@@ -718,15 +784,15 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
 pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
     let p = pal(theme);
     let line = match status {
-        text_editor::Status::Active => p.line,
-        text_editor::Status::Hovered => Color { a: 0.9, ..p.muted },
-        text_editor::Status::Focused { .. } => p.accent,
+        text_editor::Status::Active => p.edge,
+        text_editor::Status::Hovered => p.muted,
+        text_editor::Status::Focused { .. } => p.ring,
         text_editor::Status::Disabled => p.line,
     };
     text_editor::Style {
         background: Background::Color(p.tile_bg),
         border: Border { radius: 14.0.into(), width: 1.25, color: line },
-        placeholder: Color { a: 0.8, ..p.muted },
+        placeholder: p.muted,
         value: p.ink,
         selection: Color { a: 0.3, ..p.accent },
     }
@@ -740,15 +806,16 @@ pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
         checkbox::Status::Hovered { is_checked } => (is_checked, true),
         checkbox::Status::Disabled { is_checked } => (is_checked, false),
     };
-    let accent = if hovered { lift(p.accent, 0.1) } else { p.accent };
+    // Under the pointer the fill moves away from what is drawn on it (see `solid_with`).
+    let accent = match (hovered, luminance(p.on_accent) > 0.5) {
+        (false, _) => p.accent,
+        (true, true) => sink(p.accent, 0.1),
+        (true, false) => lift(p.accent, 0.1),
+    };
     checkbox::Style {
         background: Background::Color(if checked { accent } else { p.card }),
         icon_color: p.on_accent,
-        border: Border {
-            radius: 6.0.into(),
-            width: 1.5,
-            color: if checked { accent } else { Color { a: 0.7, ..p.muted } },
-        },
+        border: Border { radius: 6.0.into(), width: 1.5, color: if checked { accent } else { p.edge } },
         text_color: None,
     }
 }
@@ -758,7 +825,7 @@ pub fn progress(theme: &Theme) -> progress_bar::Style {
     let p = pal(theme);
     progress_bar::Style {
         background: Background::Color(p.chip),
-        bar: Background::Color(p.accent),
+        bar: Background::Color(p.ring),
         border: border::rounded(PILL),
     }
 }
@@ -774,4 +841,124 @@ pub fn scroll(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
         rail.scroller.border.radius = PILL.into();
     }
     s
+}
+
+/// Every pair of colors the window draws text or a meaningful shape with, as the words of each one
+/// that is below what it needs (WCAG AA: 4.5 for text, 3 for shapes). Empty when all read.
+#[cfg(test)]
+pub(crate) fn audit(p: &Pal) -> Vec<String> {
+    let mut bad = Vec::new();
+    let mut check = |what: &str, fg: Color, bg: Color, min: f32| {
+        let got = contrast(fg, bg);
+        if got < min {
+            bad.push(format!("{what}: {got:.2} < {min}"));
+        }
+    };
+    let names = ["page", "card", "chip", "tile", "box", "tile in a box"];
+    for (name, s) in names.iter().zip(p.surfaces()) {
+        for (what, c) in [
+            ("ink", p.ink),
+            ("muted", p.muted),
+            ("placeholder", p.muted),
+            ("accent text", p.accent_text),
+            ("good", p.good),
+            ("warn", p.warn),
+            ("danger", p.danger),
+        ] {
+            check(&format!("{what} on the {name}"), c, s, TEXT_MIN);
+        }
+    }
+    // The tones as text on their own wash (a badge, a banner, a hovered quiet button).
+    let surfaces = p.surfaces();
+    for (name, s) in ["page", "card", "tile", "box"].iter().zip(washed_on(&surfaces)) {
+        for (what, c) in [("accent text", p.accent_text), ("good", p.good), ("warn", p.warn), ("danger", p.danger)] {
+            check(&format!("{what} on its wash over the {name}"), c, over(Color { a: p.wash, ..c }, s), TEXT_MIN);
+        }
+    }
+    // What is written on a fill.
+    for (what, text, fill) in [
+        ("the main button", p.on_accent, p.accent),
+        ("a good button", p.on_good, p.good_fill),
+        ("a warning button", p.on_warn, p.warn_fill),
+        ("a danger button", p.on_danger, p.danger_fill),
+        ("the chosen tab and a tooltip", p.on_pill, p.pill),
+        ("the dark button", p.paper, p.ink),
+    ] {
+        check(what, text, fill, TEXT_MIN);
+    }
+    // Lines and shapes that mean something.
+    for (name, s) in [("page", p.paper), ("card", p.card)] {
+        check(&format!("the outline of a field on the {name}"), p.edge, s, GRAPHIC_MIN);
+        check(&format!("a focus ring or a progress bar on the {name}"), p.ring, s, GRAPHIC_MIN);
+    }
+    bad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::widget::button::Status;
+
+    #[test]
+    fn the_warden_palette_reads_in_light_and_dark() {
+        for light in [true, false] {
+            let p = pal(&theme(light));
+            let bad = audit(&p);
+            assert!(bad.is_empty(), "Warden {}: {bad:#?}", if light { "light" } else { "dark" });
+        }
+    }
+
+    #[test]
+    fn every_solid_button_reads_at_rest_under_the_pointer_and_pressed() {
+        for light in [true, false] {
+            let t = theme(light);
+            for tone in [Tone::Plain, Tone::Good, Tone::Warn, Tone::Bad, Tone::Accent] {
+                for status in [Status::Active, Status::Hovered, Status::Pressed] {
+                    let s = solid(tone)(&t, status);
+                    let Some(Background::Color(fill)) = s.background else { panic!("a fill") };
+                    let got = contrast(s.text_color, fill);
+                    assert!(got >= TEXT_MIN, "{tone:?} {status:?} light={light}: {got:.2}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_fill_gets_white_when_it_reads_a_deeper_shade_when_it_nearly_does_else_near_black() {
+        // Warden's green: white.
+        let (fill, text) = fill_and_text(color!(0x1b6b45));
+        assert_eq!((fill, text), (color!(0x1b6b45), Color::WHITE));
+        // macOS blue: white reads at 4.0 only, so the blue is a little deeper and the text stays white.
+        let blue = color!(0x007aff);
+        let (fill, text) = fill_and_text(blue);
+        assert_eq!(text, Color::WHITE);
+        assert!(fill.b < blue.b && fill.b > fill.r, "{fill:?} is still a blue, deeper");
+        assert!(contrast(text, fill) >= TEXT_MIN);
+        // A light fill (yellow, the light greens): near-black, and the fill is as it was.
+        let yellow = color!(0xffd60a);
+        let (fill, text) = fill_and_text(yellow);
+        assert_eq!(fill, yellow);
+        assert!(luminance(text) < 0.01 && contrast(text, fill) >= TEXT_MIN);
+    }
+
+    #[test]
+    fn a_color_is_moved_only_as_far_as_it_needs() {
+        // Already readable: untouched. Not readable: moved toward the end, a little at a time.
+        let paper = color!(0xf7f4ee);
+        let ok = color!(0x1b6b45);
+        assert_eq!(tone_text(ok, paper, &[paper], &[paper], 0.1), ok);
+        let pale = color!(0x6fae8f);
+        let moved = tone_text(pale, paper, &[paper], &[paper], 0.0);
+        assert!(contrast(moved, paper) >= TEXT_MIN && contrast(pale, paper) < TEXT_MIN);
+        assert!(luminance(moved) < luminance(pale), "darker on a light page");
+        // The least that reads: one step (2.5% of the way to black) less would not.
+        let steps = (1..=40).find(|i| contrast(mix(pale, Color::BLACK, *i as f32 * 0.025), paper) >= TEXT_MIN).unwrap();
+        assert_eq!(moved, mix(pale, Color::BLACK, steps as f32 * 0.025));
+        assert!(contrast(mix(pale, Color::BLACK, (steps - 1) as f32 * 0.025), paper) < TEXT_MIN);
+        // Over its own wash (a badge) it has to read there as well, so it goes a little further.
+        let on_wash = tone_text(pale, paper, &[paper], &[paper], 0.1);
+        assert!(contrast(on_wash, over(Color { a: 0.1, ..on_wash }, paper)) >= TEXT_MIN);
+        assert!(luminance(on_wash) < luminance(moved));
+        assert!(steps < 20, "and nowhere near black");
+    }
 }
