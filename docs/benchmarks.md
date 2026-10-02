@@ -139,7 +139,9 @@ protocol allows, and no transfer keeps it from its other connections.
   (the request is there when `accept` returns), `TCP_NODELAY` on the
   listener (Linux sockets inherit it), no `shutdown(2)` at close;
   `SO_NOSIGPIPE` once per accepted connection on macOS. A kept-alive request
-  is 3 system calls (`epoll_wait`, `recv`, `send`), a new connection 9.
+  is 3 system calls (`epoll_wait`, `recv`, `send`); a new connection whose request is already
+  there and whose answer is cached is 4 (`accept4`, `recv`, `send`, `close`: it is answered
+  from the accept loop, no task, no epoll registration, no timer), otherwise 9.
 - **Big files in pieces.** At most 1 MiB per `sendfile`, then the connection
   yields, so one download never holds up the other requests of its worker
   (with several workers the others are not blocked either, but a connection
@@ -315,6 +317,92 @@ page 105.6k vs 91.6k req/s (8.7 vs 11.4 µs), 48 KB script 77.8k vs 74.9k
 (11.2 vs 12.7), 1 MB file 5.7k vs 4.7k (211.8 vs 267.5), new connection per
 request 31.5k vs 30.2k (23.2 vs 26.3); nginx's p99 was lower on the new
 connection load (4.6 vs 5.1 ms).
+
+2026-10-02, second part: the cost of a request in the worker's own code.
+The first part left the small-file path alone ("nothing to gain"); a profile
+(`perf`, software clock: no hardware counters in this VM) of a cached 1 KB
+keep-alive request says 74 % of the worker's CPU is the kernel's TCP
+(`tcp_sendmsg`, the loopback delivery and the wake-up of the client) and 26 %
+its own: parsing the head into a dozen heap strings, a tokio timer per
+request, a formatted cache key, and the task machinery. Three changes, in
+`src/static_server.rs` and `src/static_server/idle.rs`:
+
+- **The head is parsed in place.** No allocation per request: the method,
+  target and the seven headers the server reads are slices of the read buffer
+  (reused from one connection to the next), found in one pass; the path is
+  checked without copying when it has no escapes, dots or empty segments (a
+  test compares the fast check with the full one on 40,000 generated paths);
+  the cache key is built in a buffer the connection keeps.
+- **No timer per request.** The 10 s (first head) and 15 s (between requests)
+  limits are enforced by one task ticking once a second that shuts down the
+  sockets of connections over their limit (`idle.rs`), so the limit holds to
+  within about a second. A tokio timer per request cost a wheel insert and
+  removal, and on a connection that lives a few hundred microseconds it also
+  woke the timer driver's own thread: an eventfd `write(2)` per connection
+  (strace: one system call in eight).
+- **A cached answer to a new connection is sent from the accept loop.** On
+  Linux the request is in the socket when `accept` returns (`TCP_DEFER_ACCEPT`),
+  so for a plain GET or HEAD of a small cached file the whole exchange is
+  `accept4`, `recv`, `send`, `close`: no task, no epoll registration (and so
+  no deregistration), no timer. A kept-alive request goes on as a task after
+  its first answer; anything else (a miss, a stale entry, a range, auth, a head
+  still arriving, a response the socket has no room for) is handed on as it
+  stands. 120 requests of every kind are compared byte for byte with the
+  normal path (`WARDEN_STATIC_INLINE=0`) in `tests/static_perf.rs`, which also
+  checks from the worker's own count that the accept loop did answer them.
+  A loop that never awaits would starve everything else on the worker's one
+  thread while the listen queue stays full (tokio's readiness wait on a bare
+  descriptor does not count against its cooperative budget; its own
+  `TcpListener::accept` does), so the loop spends one unit of budget per
+  accept and yields every 128. A review found that; a test now fails without it.
+
+Server CPU per request in µs (user + system from `/proc/<pid>/stat`), 16
+connections, wrk on CPU 1, one worker on CPU 0, nginx 1.24 with one worker,
+medians of 3 rounds of 4 s each on the loaded VM; "before" is the build of
+the first part:
+
+| | Before | After | nginx |
+|---|---|---|---|
+| 1 KB, keep-alive (of which user space) | 6.47 (1.70) | 6.46 (1.42) | 13.4 (3.7) |
+| 1 KB, new connection (of which user space) | 16.8 (4.7) | 13.1 (2.1) | 19.4 (4.3) |
+| 20 KB, keep-alive | 8.45 | 7.93 | 10.7 |
+| 20 KB, new connection | 18.8 | 17.9 | 19.9 |
+| 100 KB, keep-alive | 19.5 | 20.3 | 20.4 |
+| 100 KB, new connection | 31.7 | 30.9 | 26.5 |
+
+The 1 KB rows of "After" were measured again on the final build, with the
+fixes from the independent review (2 rounds: keep-alive 6.50 and 6.42, new
+connection 12.97 and 13.24; the same run gave nginx 14.0 and 19.3, and the
+build of the first part 6.4 and 17.1-17.8). The new-connection figure had been
+12.8 before the fixes: a difference of the size of the spread between rounds.
+The other rows were measured before the fixes and not repeated.
+
+With the client and the server on the same CPU (so the numbers are the sum of
+both sides' work, with no cross-CPU wake-ups), requests per second, 1 KB, 3
+rounds: keep-alive 110-115k before, 115-119k after (nginx 71-73k); a new
+connection each time 25.7-27.4k before, 28.4-30.2k after (nginx 27.3-28.4k).
+
+What this does not do, and one thing that looks like it does. The user-space
+share of a keep-alive request fell by a fifth (1.7 to 1.3 µs), but the
+whole request costs the same: the rest is the kernel's, and the faster
+user-space code idles more between requests on this VM (context switches per
+request 0.02 before, 0.13 after), which makes the kernel side a little dearer
+(system time 4.7 to 5.1 µs). A **closed-loop
+benchmark with the client on the other CPU also reports it as slower** (wrk:
+144-149k before, 122-133k after; and oha, the slower client, put Warden at 70k
+and nginx at 94k even before this work):
+the server finishes each batch and sleeps, and then every request the client
+sends pays a cross-CPU wake-up that costs this VM several microseconds, on the
+client's CPU, which is the one that limits the loop (oha ran at 99 % of its
+core against both servers; against the slower nginx the server never slept,
+and the same oha did 94k). Measured as the server's CPU per request, or with
+both on one CPU, the order is the other way round, and that is what the tables
+use. Read req/s from a single client pinned next to the server as the
+client's speed, not the server's. Not done: files above `cache_max_file`
+(64 KB) on a new connection per request (31 vs nginx 26.5 µs: both sides make
+the same system calls; a 1 MB `cache_max_file` measured 14 % less CPU for
+100 KB but makes a miss read the whole file into memory first, so it stays
+off by default).
 
 Tried and not kept, or not done:
 

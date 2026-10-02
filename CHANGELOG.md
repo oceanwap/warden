@@ -172,6 +172,19 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   connection costs two fewer syscalls. On macOS `SO_NOSIGPIPE` is set once per
   connection and head plus body go out in one `sendfile` (not yet run on a
   Mac). Measured on a loaded 2-CPU VM: [`docs/benchmarks.md`](docs/benchmarks.md).
+- Static serving, the worker's own cost per request: the request head is
+  parsed in place (no allocation), the 10 s and 15 s waits for a request are
+  enforced by one task ticking once a second instead of a timer per request
+  (so they hold to within about a second), and a new connection whose request
+  has arrived and whose answer is cached is answered from the accept loop
+  (`accept`, `recv`, `send`, `close`; no task, no epoll registration). User-space
+  CPU per request is down by a fifth on a kept-alive connection and by 60 % on
+  a new one; a cached 1 KB page on a new connection costs 13.1 µs of server CPU
+  instead of 16.8 (nginx 19.4), 4 system calls instead of 9; the exit summary
+  says how many requests the accept loop answered. Keep-alive throughput
+  is bound by the kernel and does not change. Measured on a loaded 2-CPU VM, with
+  a note on why a single pinned client misreads it:
+  [`docs/benchmarks.md`](docs/benchmarks.md).
 - `Status.watching` (the `watching` column) says whether a watcher is running
   now, not only that `[watch]` is enabled: it reads `disabled` for a stopped
   app or a watcher that died (`describe` says "set, but not running").

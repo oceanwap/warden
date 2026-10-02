@@ -662,6 +662,114 @@ pub fn send(sock: BorrowedFd<'_>, buf: &[u8], more: bool) -> io::Result<usize> {
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
+/// Take one connection off a listening socket without waiting: the new
+/// descriptor is non-blocking and close-on-exec. `WouldBlock` when none is
+/// waiting. Linux does it in one call (accept4); elsewhere accept(2) and two
+/// fcntl calls. The peer's address is not asked for (nothing here uses it).
+#[cfg(target_os = "linux")]
+pub fn accept_nonblocking(listener: BorrowedFd<'_>) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    loop {
+        // SAFETY: the listener is borrowed and open; null address pointers
+        // are allowed and mean "don't return the peer's address".
+        let fd = unsafe {
+            libc::accept4(
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: accept4 returned a new descriptor that nothing else owns.
+            return Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn accept_nonblocking(listener: BorrowedFd<'_>) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = loop {
+        // SAFETY: as above.
+        let fd = unsafe { libc::accept(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut()) };
+        if fd >= 0 {
+            break fd;
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    };
+    // SAFETY: accept returned a new descriptor that nothing else owns; from
+    // here it closes on every path out.
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    // SAFETY: fcntl on the descriptor we own, with integer arguments only.
+    let ok = unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) >= 0 && {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+        }
+    };
+    if ok { Ok(owned) } else { Err(io::Error::last_os_error()) }
+}
+
+/// recv(2) into the spare room of `buf`, growing its length by what arrived.
+/// `WouldBlock` when nothing has (the socket must be non-blocking); `Ok(0)`
+/// when the peer has closed (or `buf` has no room).
+pub fn recv_into(sock: BorrowedFd<'_>, buf: &mut Vec<u8>) -> io::Result<usize> {
+    loop {
+        let spare = buf.spare_capacity_mut();
+        // SAFETY: `spare` is writable memory of the length given; recv
+        // writes at most that many bytes into it; `sock` stays open.
+        let n = unsafe { libc::recv(sock.as_raw_fd(), spare.as_mut_ptr().cast::<libc::c_void>(), spare.len(), 0) };
+        if n >= 0 {
+            let n = n as usize;
+            // SAFETY: recv initialised the first `n` spare bytes, and n <= spare.len().
+            unsafe { buf.set_len(buf.len() + n) };
+            return Ok(n);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// A small send buffer on `sock`, so a test can fill it with a modest write.
+#[cfg(test)]
+pub fn set_send_buffer(sock: BorrowedFd<'_>, bytes: i32) -> io::Result<()> {
+    setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_SNDBUF, bytes)
+}
+
+/// shutdown(2) both directions of the socket `fd`: a read waiting on it
+/// returns end-of-file at once, so the task that owns the connection ends and
+/// closes it. Takes a bare descriptor because the caller (the static server's
+/// idle sweep, `static_server/idle.rs`) is not the owner; it must know the
+/// connection is still open, and that is its whole job. The call itself is
+/// memory-safe for any number, a stale one only fails (EBADF, ENOTSOCK).
+pub fn shutdown_both(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: shutdown takes two integers and touches no memory.
+    let r = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Is at least one byte waiting to be read on the socket `fd`? A peek that
+/// never blocks and takes nothing off the queue. False when the queue is
+/// empty, the peer has closed, or the call fails.
+pub fn has_unread(fd: std::os::fd::RawFd) -> bool {
+    let mut b = 0u8;
+    // SAFETY: `b` is a valid one-byte buffer for the call; MSG_PEEK leaves
+    // the data queued and MSG_DONTWAIT makes the call return at once.
+    let n =
+        unsafe { libc::recv(fd, (&mut b as *mut u8).cast::<libc::c_void>(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n > 0
+}
+
 /// Make later `send`s and `sendfile`s on this connection fail with EPIPE
 /// instead of raising SIGPIPE. Linux: nothing to do (`send` passes
 /// MSG_NOSIGNAL per call). Not Linux: SO_NOSIGPIPE, once, when the

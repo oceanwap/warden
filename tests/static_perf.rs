@@ -98,17 +98,24 @@ fn quiet() {
 struct Worker {
     child: Child,
     port: u16,
+    log: PathBuf,
 }
 
 impl Worker {
     /// `extra`: keys of the `[static]` section (`root` and `host` are set).
     fn start(tmp: &Tmp, root: &Path, extra: Value) -> Worker {
+        Worker::start_env(tmp, root, extra, &[])
+    }
+
+    /// The same, with more environment variables for the worker.
+    fn start_env(tmp: &Tmp, root: &Path, extra: Value, env: &[(&str, &str)]) -> Worker {
         let port = free_port();
         let mut cfg = json!({ "root": root, "host": "127.0.0.1" });
         for (k, v) in extra.as_object().unwrap() {
             cfg[k] = v.clone();
         }
-        let log = std::fs::File::create(tmp.0.join(format!("worker-{port}.log"))).unwrap();
+        let log_path = tmp.0.join(format!("worker-{port}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
         let child = Command::new(bin())
             .arg("serve-static")
             .env("WARDEN_STATIC", cfg.to_string())
@@ -116,11 +123,12 @@ impl Worker {
             // What the supervisor always sets: the worker's liveness timer.
             .env("WARDEN_HEARTBEAT_MS", "1000")
             .env("WARDEN_DRAIN_MS", "500")
+            .envs(env.iter().copied())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(log)
             .spawn()
             .unwrap();
-        let mut w = Worker { child, port };
+        let mut w = Worker { child, port, log: log_path };
         let t0 = Instant::now();
         while TcpStream::connect(("127.0.0.1", port)).is_err() {
             assert!(t0.elapsed() < Duration::from_secs(10), "the worker never listened on {port}");
@@ -135,6 +143,19 @@ impl Worker {
     #[cfg(target_os = "linux")]
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Ask it to stop (SIGTERM) and return what it printed, which ends with
+    /// its cache summary.
+    fn stop(mut self) -> String {
+        // SAFETY: plain kill(2) of a child this test spawned.
+        unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+        let t0 = Instant::now();
+        while self.child.try_wait().unwrap().is_none() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the worker did not stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::read_to_string(&self.log).unwrap()
     }
 }
 
@@ -508,6 +529,242 @@ fn head_and_pipelined_requests_get_one_exact_response_each() {
     assert_eq!((r.status, r.body.as_slice()), (401, b"401 Unauthorized\n".as_slice()));
     let r = c.recv(false);
     assert_eq!((r.status, r.body.as_slice()), (200, home));
+}
+
+/// Everything a client sends on one connection, `pause` apart, and everything
+/// the server sends back until it closes (the last request says
+/// `Connection: close`, or is HTTP/1.0).
+fn exchange(port: u16, segments: &[&str], pause: Duration) -> Vec<u8> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_nodelay(true).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(pause);
+        }
+        s.write_all(seg.as_bytes()).unwrap();
+    }
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).expect("the server closes the connection after the last response");
+    out
+}
+
+/// A new connection whose request is already in the socket and whose answer
+/// is cached is answered from the accept loop (`first_request`), with no task
+/// and no epoll registration. The bytes must be exactly what the normal path
+/// sends (`WARDEN_STATIC_INLINE=0`), whatever the request, however it arrives.
+#[test]
+fn a_request_answered_from_the_accept_loop_matches_the_normal_path() {
+    let tmp = Tmp::new("inline");
+    let site = make_site(&tmp);
+    write(&site, "gz.js", b"console.log('plain')");
+    write(&site, "gz.js.gz", b"not really gzip, but a sibling");
+    write(&site, "sp ace.txt", b"percent-encoded in the URL");
+    quiet();
+    // Entries stay fresh for the whole test (the default is 1 s, after which a
+    // hit takes the normal path to be checked against the disk): every case
+    // below is a hit, and on the first worker an accept-loop one.
+    let fresh = json!({ "cache_valid_ms": 600_000 });
+    let inline = Worker::start(&tmp, &site, fresh.clone());
+    let normal = Worker::start_env(&tmp, &site, fresh, &[("WARDEN_STATIC_INLINE", "0")]);
+
+    let paths = [
+        "/index.html",
+        "/",
+        "/sub/",
+        "/page.html",
+        "/style.css",
+        "/app.3f9a2c1b.js",
+        "/small.bin",
+        "/mid10k.bin",
+        "/mid12k.bin",
+        "/gz.js",
+        "/sp%20ace.txt",
+        "/style.css?v=1",
+    ];
+    // The first answer of each is a miss and fills the cache, for both.
+    for w in [&inline, &normal] {
+        for p in paths {
+            for enc in ["", "Accept-Encoding: gzip, br\r\n"] {
+                let r = Client::connect(w.port).get(p, &format!("{enc}Connection: close\r\n"));
+                assert_eq!(r.status, 200, "{p}");
+            }
+        }
+    }
+    let etag = Client::connect(inline.port).get("/style.css", "").h("etag").to_string();
+    let none = Duration::ZERO;
+    let slow = Duration::from_millis(120);
+    let mut cases: Vec<(String, Vec<String>, Duration)> = Vec::new();
+    let mut add = |name: &str, segs: &[&str], pause: Duration| {
+        cases.push((name.to_string(), segs.iter().map(|s| s.to_string()).collect(), pause));
+    };
+    for p in paths {
+        for (how, extra) in [
+            ("GET", "Connection: close\r\n"),
+            ("GET gzip", "Accept-Encoding: gzip, br\r\nConnection: close\r\n"),
+            ("GET gzip;q", "Accept-Encoding: deflate, gzip;q=0.5\r\nConnection: close\r\n"),
+            ("GET conditional", &format!("If-None-Match: {etag}\r\nConnection: close\r\n")),
+            ("GET since", "If-Modified-Since: Fri, 02 Oct 2099 00:00:00 GMT\r\nConnection: close\r\n"),
+            ("GET range", "Range: bytes=1-4\r\nConnection: close\r\n"),
+        ] {
+            add(&format!("{how} {p}"), &[&format!("GET {p} HTTP/1.1\r\nHost: x\r\n{extra}\r\n")], none);
+        }
+        add(&format!("HEAD {p}"), &[&format!("HEAD {p} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")], none);
+        add(&format!("HTTP/1.0 {p}"), &[&format!("GET {p} HTTP/1.0\r\nHost: x\r\n\r\n")], none);
+        add(
+            &format!("HTTP/1.0 keep-alive {p}"),
+            &[&format!("GET {p} HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET {p} HTTP/1.0\r\n\r\n")],
+            none,
+        );
+    }
+    add("missing", &["GET /missing.txt HTTP/1.1\r\nConnection: close\r\n\r\n"], none);
+    add("traversal", &["GET /%2e%2e/x HTTP/1.1\r\nConnection: close\r\n\r\n"], none);
+    add("method", &["POST /index.html HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"], none);
+    add("bare LF", &["GET /index.html HTTP/1.1\nHost: x\nConnection: close\n\n"], none);
+    add("header cases", &["GET /index.html HTTP/1.1\r\nhost: x\r\nCONNECTION:   Close  \r\n\r\n"], none);
+    add("stray blank line first", &["\r\nGET /index.html HTTP/1.1\r\nConnection: close\r\n\r\n"], none);
+    // Kept alive, then more requests: one write, or one after another.
+    let two =
+        "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\nGET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    add("pipelined", &[two], none);
+    add(
+        "one after another",
+        &[
+            "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        ],
+        slow,
+    );
+    add(
+        "three, the last half sent late",
+        &[
+            "GET /index.html HTTP/1.1\r\n\r\nHEAD /style.css HTTP/1.1\r\n\r\nGET /small.bin HTTP/1.1\r\nCon",
+            "nection: close\r\n\r\n",
+        ],
+        slow,
+    );
+    // A head that arrives in pieces: the first piece is not a request yet.
+    add("split head", &["GET /index.html HTTP/1.1\r\nHo", "st: x\r\nConnection: close\r\n\r\n"], slow);
+    add("split at the end", &["GET /index.html HTTP/1.1\r\nConnection: close\r\n\r", "\n"], slow);
+    add("split in the request line", &["GET /ind", "ex.html HTTP/1.1\r\nConnection: close\r\n\r\n"], slow);
+
+    assert!(cases.len() > 100, "{} cases", cases.len());
+    for (name, segs, pause) in &cases {
+        let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+        let a = exchange(inline.port, &segs, *pause);
+        let b = exchange(normal.port, &segs, *pause);
+        assert!(a.starts_with(b"HTTP/1.1 "), "{name}: {:?}", String::from_utf8_lossy(&a));
+        assert_eq!(
+            String::from_utf8_lossy(&a),
+            String::from_utf8_lossy(&b),
+            "{name}: the accept-loop answer differs from the normal one"
+        );
+    }
+
+    // The comparison above means something only if the accept loop really did
+    // answer on the first worker, and never on the second: the workers say
+    // how many when they stop.
+    let answered = |log: &str| -> u64 {
+        let line = log.lines().find(|l| l.contains("static cache: ")).unwrap_or_else(|| panic!("no summary in {log}"));
+        let (n, _) = line.split("; ").last().unwrap().split_once(' ').unwrap();
+        n.parse().unwrap_or_else(|_| panic!("{line}"))
+    };
+    let n = answered(&inline.stop());
+    assert!(n > cases.len() as u64 / 2, "only {n} of {} exchanges were answered in the accept loop", cases.len());
+    assert_eq!(answered(&normal.stop()), 0, "WARDEN_STATIC_INLINE=0 turns it off");
+}
+
+/// The limits on a connection that is waiting for a request (idle.rs): the
+/// first head, the wait between requests, and nothing while a response is
+/// being sent. The limits are shortened for the test.
+#[test]
+fn connections_waiting_for_a_request_time_out_and_busy_ones_do_not() {
+    let tmp = Tmp::new("timeouts");
+    let site = make_site(&tmp);
+    write(&site, "huge.bin", &pattern(40_000_000));
+    let w = Worker::start_env(&tmp, &site, json!({}), &[("WARDEN_STATIC_TIMEOUTS", "2,5")]);
+    quiet(); // so that the files can be cached
+
+    // Closed after how long, or None if it stays open past `within`.
+    fn closes_after(s: &mut TcpStream, within: Duration) -> Option<Duration> {
+        s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let t0 = Instant::now();
+        let mut b = [0u8; 1];
+        while t0.elapsed() < within {
+            match s.read(&mut b) {
+                Ok(0) => return Some(t0.elapsed()),
+                Ok(_) => {}
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(_) => return Some(t0.elapsed()),
+            }
+        }
+        None
+    }
+
+    // Connects and says nothing: closed at the head limit (2 s, to within the
+    // sweep's second; the kernel holds such a connection back first).
+    let mut s = TcpStream::connect(("127.0.0.1", w.port)).unwrap();
+    let t = closes_after(&mut s, Duration::from_secs(9)).expect("a silent connection is closed");
+    assert!(t >= Duration::from_millis(1900), "not at once: {t:?}");
+
+    // Sends half a head and stalls: the same.
+    let mut s = TcpStream::connect(("127.0.0.1", w.port)).unwrap();
+    s.write_all(b"GET /index.html HTTP/1.1\r\nHo").unwrap();
+    let t = closes_after(&mut s, Duration::from_secs(9)).expect("a stalled head is closed");
+    assert!(t >= Duration::from_millis(1900) && t <= Duration::from_secs(4), "{t:?}");
+
+    // Idle between requests: closed at the idle limit (5 s), not at the head
+    // limit (2 s). One connection's first request fills the response cache
+    // (a miss, served by its task); the second's is then answered from the
+    // cache by the accept loop. Both wait for their next request the same.
+    let mut a = Client::connect(w.port);
+    assert_eq!(a.get("/index.html", "").status, 200);
+    let t_a = Instant::now();
+    let mut b = Client::connect(w.port);
+    assert_eq!(b.get("/index.html", "").status, 200);
+    let t_b = Instant::now();
+    let (mut closed_a, mut closed_b) = (None, None);
+    a.s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    b.s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    while (closed_a.is_none() || closed_b.is_none()) && t_a.elapsed() < Duration::from_secs(12) {
+        for (s, since, closed) in [(&mut a.s, t_a, &mut closed_a), (&mut b.s, t_b, &mut closed_b)] {
+            if closed.is_some() {
+                continue;
+            }
+            match s.read(&mut [0u8; 1]) {
+                Ok(0) => *closed = Some(since.elapsed()),
+                Err(e) if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    *closed = Some(since.elapsed())
+                }
+                _ => {}
+            }
+        }
+    }
+    for (who, t) in [("served by its task", closed_a), ("answered in the accept loop", closed_b)] {
+        let t = t.unwrap_or_else(|| panic!("an idle keep-alive connection {who} is closed"));
+        assert!(t >= Duration::from_millis(4500) && t <= Duration::from_secs(8), "{who}: {t:?}");
+    }
+
+    // A connection that keeps asking stays open past the idle limit: each
+    // request starts a new wait.
+    let mut c = Client::connect(w.port);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(7) {
+        assert_eq!(c.get("/index.html", "").status, 200, "after {:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(900));
+    }
+
+    // A client that stops reading in the middle of a big response is not
+    // idle: the server is sending, and no limit applies to that.
+    let mut c = Client::connect(w.port);
+    c.send("GET /huge.bin HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut head = [0u8; 100];
+    let n = c.s.read(&mut head).unwrap();
+    assert!(n > 0);
+    std::thread::sleep(Duration::from_secs(5));
+    c.buf.extend_from_slice(&head[..n]);
+    let r = c.recv(false);
+    assert_eq!((r.status, r.body.len()), (200, 40_000_000), "the whole file arrives after the pause");
 }
 
 #[test]
@@ -958,14 +1215,18 @@ mod linux {
         let (keep, fresh) = (keep as f64 / N as f64, fresh as f64 / N as f64);
         eprintln!("system calls per request: {keep:.2} kept alive, {fresh:.2} on a new connection");
         // Kept alive: wait for readiness, read the request, send the response
-        // (3 measured). A new connection adds accept, the epoll registration
-        // and the close (9 measured; the worker used to set TCP_NODELAY on
-        // each connection and shut it down before closing: 11). One system
-        // call more per request is a regression; the margin is the heartbeat
-        // timer and the freshness check of a cached file, which a slower
-        // (debug) build runs more often per request (10.02 measured there).
+        // (3 measured). A new connection whose request is already in the
+        // socket and whose answer is cached never leaves the accept loop:
+        // wait for the listener, accept, read, send, close (5 measured when
+        // connections arrive one by one; 4 when they queue up). It used to
+        // register the socket with epoll and take it out again, start a
+        // task and a timer (9, and 11 before the worker stopped setting
+        // TCP_NODELAY and shutting down each connection). One system call
+        // more per request is a regression; the margin is the heartbeat and
+        // idle-sweep timers, which a slower (debug) build runs more often per
+        // request.
         assert!(keep <= 3.5, "{keep:.2} system calls per kept-alive request");
-        assert!(fresh <= 10.5, "{fresh:.2} system calls per new-connection request");
+        assert!(fresh <= 5.6, "{fresh:.2} system calls per new-connection request");
     }
 
     /// A trivial HTTP server: one thread, blocking sockets, one canned

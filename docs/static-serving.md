@@ -38,6 +38,29 @@ anyway (each worker resolves the root once), which starts with an empty
 cache. With `access_log = true` each line ends in `cache=hit` or
 `cache=miss`, and each worker prints its cache counters when it stops.
 
+## Connections
+
+Requests are read into a buffer that is reused from one connection to the
+next, and parsed where they lie. A new connection whose request has already
+arrived (Linux accepts a connection only once it has data) and is a plain GET
+or HEAD of a cached file is answered from the accept loop itself: `accept`,
+`recv`, `send`, `close`, with no task and no epoll registration; a kept-alive
+connection then continues as a task. A miss, a revalidation, a range, a password
+or a request that is still arriving takes the normal path. Where this
+does not apply (macOS, `cache_size = 0`) nothing else changes.
+
+A connection waiting for its first request may take 10 s, and one waiting
+between requests on a kept-alive connection 15 s (a connection whose first
+request was answered from the accept loop counts as kept-alive); then it is
+closed. One task checks all connections once a second, so the limit holds to
+within about a second, and never ends early. A response being sent has no
+limit. If the worker itself stalled for a few seconds (a hung disk, a stopped
+process), every wait starts over instead of closing connections that were
+never idle. The accept loop gives the thread back every 128 connections, so
+a backlog that never empties cannot starve the connections already open, the
+heartbeat or SIGTERM. When the worker stops it prints how many requests the
+accept loop answered, with its cache summary.
+
 ## Keys
 
 The `[static]` section replaces the app's command: no `command` is needed,
