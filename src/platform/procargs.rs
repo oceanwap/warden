@@ -12,10 +12,29 @@
 //! env[0]\0 env[1]\0 …   `NAME=value`, ended by an empty string or the end
 //! (then the "apple" strings, which this does not read)
 //! ```
+//!
+//! Nothing but alignment padding separates the environment from the apple
+//! strings (`executable_path=…`, `ptr_munge=…`, …), so when no padding is
+//! needed they look like more variables: the environment stops at the first
+//! of the kernel's own keys. An empty `argv[0]` cannot be told from the
+//! padding (`ps` has the same ambiguity): the arguments then read one short.
 
 use super::Environ;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+
+/// The keys of the strings the kernel appends after the environment.
+const APPLE_KEYS: [&[u8]; 9] = [
+    b"executable_path",
+    b"executable_file",
+    b"dyld_file",
+    b"ptr_munge",
+    b"main_stack",
+    b"stack_guard",
+    b"malloc_entropy",
+    b"th_port",
+    b"kernel_flags",
+];
 
 /// What the kernel kept of one process's start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +76,9 @@ pub(crate) fn parse_procargs(buf: &[u8]) -> Option<ProcArgs> {
             break; // the end of the environment
         }
         if let Some(i) = kv.iter().position(|b| *b == b'=') {
+            if APPLE_KEYS.contains(&&kv[..i]) {
+                break; // the kernel's own strings, not the environment
+            }
             env.push((OsString::from_vec(kv[..i].to_vec()), OsString::from_vec(kv[i + 1..].to_vec())));
         }
     }
@@ -114,6 +136,16 @@ mod tests {
                 (os("A"), os("b=c")), // the first `=` splits
             ]
         );
+    }
+
+    #[test]
+    fn the_apple_strings_are_not_the_environment_even_without_a_separator() {
+        // No padding bytes: the environment's last string is followed at once by the apple strings.
+        let mut b = 1i32.to_ne_bytes().to_vec();
+        b.extend(b"/bin/x\0\0\0\0\0\0\0");
+        b.extend(b"x\0A=1\0B=2\0executable_path=/bin/x\0ptr_munge=0x1\0main_stack=0x2\0");
+        let p = parse_procargs(&b).unwrap();
+        assert_eq!(p.env, [(os("A"), os("1")), (os("B"), os("2"))]);
     }
 
     #[test]

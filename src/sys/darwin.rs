@@ -10,8 +10,9 @@
 //! the kernel returns: if a future macOS changed the layout the call fails
 //! with an error, it does not read the wrong field.
 //!
-//! Processes of other users answer EPERM (the same as `ps -E`): callers get
-//! an `io::Error` and treat the process as unreadable.
+//! Processes of other users answer EPERM (EINVAL for `KERN_PROCARGS2`, as for
+//! a process that does not exist): callers get an `io::Error` and treat the
+//! process as unreadable.
 
 use std::ffi::{OsString, c_int, c_void};
 use std::io;
@@ -31,7 +32,7 @@ const TSI_S_LISTEN: i32 = 1;
 // struct socket_fdinfo { struct proc_fileinfo pfi (24 bytes);
 //                        struct socket_info psi; }
 // struct socket_info   { struct vinfo_stat soi_stat (136); u64 soi_so; u64 soi_pcb;
-//                        int soi_type, soi_protocol, soi_family; 7 shorts;
+//                        int soi_type, soi_protocol, soi_family; 8 shorts;
 //                        u32 soi_oobmark; 2 × sockbuf_info (24); int soi_kind;
 //                        u32 rfu_1; union soi_proto (8-aligned, 528 bytes) }
 // so soi_kind is at 24 + 232, soi_proto at 24 + 240, and in the tcp_sockinfo
@@ -111,11 +112,12 @@ pub fn task_info(pid: u32) -> io::Result<TaskInfo> {
 }
 
 /// The user id a process runs as (its effective user):
-/// `proc_pidinfo(PROC_PIDTBSDINFO)`.
+/// `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`, which, unlike the full
+/// `PROC_PIDTBSDINFO`, answers for other users' processes too.
 pub fn owner(pid: u32) -> io::Result<u32> {
-    let mut buf = [0u8; size_of::<libc::proc_bsdinfo>()];
-    pidinfo_exact(pid, libc::PROC_PIDTBSDINFO, &mut buf)?;
-    Ok(ne_u32(&buf, offset_of!(libc::proc_bsdinfo, pbi_uid)))
+    let mut buf = [0u8; size_of::<libc::proc_bsdshortinfo>()];
+    pidinfo_exact(pid, libc::PROC_PIDT_SHORTBSDINFO, &mut buf)?;
+    Ok(ne_u32(&buf, offset_of!(libc::proc_bsdshortinfo, pbsi_uid)))
 }
 
 /// The working directory: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
@@ -208,13 +210,12 @@ pub fn listening_tcp_ports(pid: u32) -> io::Result<Vec<u16>> {
     let ipid = c_int::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
     // SAFETY: a null buffer of size 0 only asks for the size.
     let need = unsafe { libc::proc_pidinfo(ipid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if need < 0 {
+    // libproc answers 0 (not -1) when it fails: a process that is gone or not
+    // ours. Every live process has descriptors, so 0 is an error here too.
+    if need <= 0 {
         return Err(io::Error::last_os_error());
     }
     let mut list = vec![0u8; need as usize + 32 * size_of::<libc::proc_fdinfo>()];
-    if need == 0 {
-        return Ok(Vec::new());
-    }
     let n = pidinfo(pid, libc::PROC_PIDLISTFDS, &mut list)?;
     let step = size_of::<libc::proc_fdinfo>();
     let (fd_at, type_at) = (offset_of!(libc::proc_fdinfo, proc_fd), offset_of!(libc::proc_fdinfo, proc_fdtype));
@@ -224,7 +225,10 @@ pub fn listening_tcp_ports(pid: u32) -> io::Result<Vec<u16>> {
             continue;
         }
         let fd = ne_u32(entry, fd_at) as c_int;
-        let mut info = [0u8; SOCKET_FDINFO_SIZE];
+        // Room to spare: the kernel refuses a buffer smaller than its struct
+        // (ENOMEM), which would look like a closed descriptor. A larger struct
+        // in a later macOS then shows as a size mismatch below, not as no ports.
+        let mut info = [0u8; 2 * SOCKET_FDINFO_SIZE];
         // SAFETY: `info` is a valid byte array of its length, which
         // proc_pidfdinfo may write up to; the rest are integers.
         let got = unsafe {
@@ -264,8 +268,10 @@ fn host_port() -> u32 {
     })
 }
 
-/// Cumulative CPU ticks since boot: (busy = user + system + nice, total).
-pub fn host_cpu_ticks() -> io::Result<(u64, u64)> {
+/// The kernel's 32-bit CPU tick counters, one per state: user, system,
+/// idle, nice. They wrap (about every 50 days on ten cores); the caller
+/// extends them to 64 bits (`platform::counter`).
+pub fn host_cpu_ticks() -> io::Result<[u32; 4]> {
     let mut ticks = [0i32; libc::CPU_STATE_MAX as usize];
     let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
     // SAFETY: `ticks` is a valid array of CPU_STATE_MAX ints (the size of
@@ -274,9 +280,8 @@ pub fn host_cpu_ticks() -> io::Result<(u64, u64)> {
     if rc != 0 {
         return Err(io::Error::other(format!("host_statistics(HOST_CPU_LOAD_INFO) failed: {rc}")));
     }
-    let t = |state: c_int| u64::from(ticks[state as usize] as u32);
-    let busy = t(libc::CPU_STATE_USER) + t(libc::CPU_STATE_SYSTEM) + t(libc::CPU_STATE_NICE);
-    Ok((busy, busy + t(libc::CPU_STATE_IDLE)))
+    let t = |state: c_int| ticks[state as usize] as u32;
+    Ok([t(libc::CPU_STATE_USER), t(libc::CPU_STATE_SYSTEM), t(libc::CPU_STATE_IDLE), t(libc::CPU_STATE_NICE)])
 }
 
 /// Memory in use the way Activity Monitor counts it: app memory (anonymous
@@ -325,14 +330,33 @@ pub fn memory_total_bytes() -> io::Result<u64> {
     sysctl_by_name::<8>(c"hw.memsize").map(u64::from_ne_bytes)
 }
 
-/// When the system booted (`kern.boottime`): seconds and microseconds.
-pub fn boot_time() -> io::Result<(i64, i64)> {
-    const SEC: usize = offset_of!(libc::timeval, tv_sec);
-    const USEC: usize = offset_of!(libc::timeval, tv_usec);
-    let raw = sysctl_by_name::<{ size_of::<libc::timeval>() }>(c"kern.boottime")?;
-    let sec = i64::from_ne_bytes(raw[SEC..SEC + 8].try_into().map_err(|_| io::ErrorKind::InvalidData)?);
-    let usec = i64::from(i32::from_ne_bytes(raw[USEC..USEC + 4].try_into().map_err(|_| io::ErrorKind::InvalidData)?));
-    Ok((sec, usec))
+/// What identifies this boot: `kern.bootsessionuuid`, a UUID the kernel
+/// makes at boot and keeps (`kern.boottime` moves when the clock is set).
+pub fn boot_session_uuid() -> io::Result<String> {
+    let mut out = [0u8; 64];
+    let mut len: libc::size_t = out.len();
+    // SAFETY: the name is a valid NUL-terminated string; `out` is a valid
+    // byte array of `len` bytes that the kernel may write up to, and `len`
+    // is updated; no new value is passed.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            out.as_mut_ptr().cast::<c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let text = out.get(..len.min(out.len())).unwrap_or(&[]);
+    let text = text.split(|b| *b == 0).next().unwrap_or(&[]);
+    let id = String::from_utf8_lossy(text).trim().to_string();
+    if id.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "kern.bootsessionuuid is empty"));
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -455,12 +479,13 @@ mod tests {
 
     #[test]
     fn host_numbers_are_plausible() {
-        let (busy, total) = host_cpu_ticks().unwrap();
-        assert!(total > 0 && busy <= total);
+        let t = host_cpu_ticks().unwrap();
+        assert!(t.iter().map(|x| u64::from(*x)).sum::<u64>() > 0, "{t:?}");
         let (total_mem, used) = (memory_total_bytes().unwrap(), memory_used_bytes().unwrap());
         assert!(total_mem >= 1 << 30, "{total_mem}");
         assert!(used > 0 && used <= total_mem, "{used} of {total_mem}");
-        let (sec, usec) = boot_time().unwrap();
-        assert!(sec > 1_000_000_000 && (0..1_000_000).contains(&usec));
+        let id = boot_session_uuid().unwrap();
+        assert_eq!(id.len(), 36, "{id}");
+        assert_eq!(boot_session_uuid().unwrap(), id);
     }
 }

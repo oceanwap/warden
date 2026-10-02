@@ -6,12 +6,18 @@
 //! does not hear when its parent dies, and the kernel does not say which
 //! process it killed for memory.
 
+use super::counter::Extend32;
 use super::procargs::parse_procargs;
 use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Platform, ProcStats};
 use crate::sys::darwin;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
 
 pub(crate) struct Macos;
+
+/// The host's four 32-bit CPU tick counters (user, system, idle, nice),
+/// extended to 64 bits across wraps.
+static CPU_TICKS: Mutex<[Extend32; 4]> = Mutex::new([Extend32::new(); 4]);
 
 impl Platform for Macos {
     fn name(&self) -> &'static str {
@@ -69,7 +75,13 @@ impl Platform for Macos {
     }
 
     fn host_snapshot(&self) -> Option<HostSnapshot> {
-        let (busy, total) = darwin::host_cpu_ticks().ok()?;
+        let raw = darwin::host_cpu_ticks().ok()?;
+        let [user, system, idle, nice] = {
+            let mut counters = CPU_TICKS.lock().unwrap_or_else(PoisonError::into_inner);
+            std::array::from_fn(|i| counters[i].feed(raw[i]))
+        };
+        let busy = user + system + nice;
+        let total = busy + idle;
         Some(HostSnapshot {
             cpu: CpuTimes { busy, total },
             mem_used_bytes: darwin::memory_used_bytes().ok()?,
@@ -79,9 +91,7 @@ impl Platform for Macos {
     }
 
     fn boot_id(&self) -> Option<String> {
-        // The boot time identifies the boot; the microseconds keep two boots
-        // in one second apart.
-        let (sec, usec) = darwin::boot_time().ok()?;
-        Some(format!("{sec}.{usec:06}"))
+        // A UUID the kernel makes at boot (the boot time moves when the clock is set).
+        darwin::boot_session_uuid().ok()
     }
 }

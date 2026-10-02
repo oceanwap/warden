@@ -27,6 +27,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod counter;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux;
 #[cfg(target_os = "macos")]
