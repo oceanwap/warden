@@ -3,7 +3,7 @@
 # macOS adapter, then drives a real supervisor and wardend and checks what the
 # macOS adapter (src/platform/macos.rs) is there to provide: CPU and memory,
 # the process owner, listening-port readiness, a process's environment, the
-# host's numbers, the boot id.
+# host's numbers, the boot id, and how fast `warden serve` answers.
 #
 #   scripts/mac-check.sh [--quick] [--no-build]
 #
@@ -220,6 +220,46 @@ if grep -q "$me" "$out/list.txt"; then result PASS "warden list shows the user c
 if grep -q "│ user *│ $me" "$out/describe.txt"; then result PASS "warden describe shows the user"; else result FAIL "warden describe shows the user" "see describe.txt"; fi
 WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" stop all >/dev/null 2>&1
 WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" delete all >/dev/null 2>&1
+
+# ------------------------------------------------------ smoke: static serve
+# `warden serve`: the bodies are right and the answers are fast. Keep-alive
+# requests from python, so the time is the server's and the kernel's (no
+# browser). A Mac opens files through the realpath fallback; this shows what
+# that costs.
+cat >"$work/lat.py" <<'PY'
+import http.client, sys, time
+port, name, size = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+c = http.client.HTTPConnection("127.0.0.1", port)
+times = []
+for i in range(300):
+    t = time.perf_counter()
+    c.request("GET", "/" + name)
+    r = c.getresponse()
+    body = r.read()
+    times.append((time.perf_counter() - t) * 1000)
+    if r.status != 200 or len(body) != size:
+        print("FAIL\t%s\tstatus %s, %d bytes (want %d)" % (name, r.status, len(body), size))
+        sys.exit(0)
+times = sorted(times[20:])
+med, p99 = times[len(times) // 2], times[int(len(times) * 0.99)]
+print("%s\t%s\tmedian %.2f ms, p99 %.2f ms" % ("PASS" if med < 25 else "FAIL", name, med, p99))
+PY
+mkdir -p "$work/site"
+python3 -c 'open("'"$work"'/site/small.html","w").write("<p>" + "x" * 1500 + "</p>"); open("'"$work"'/site/big.html","w").write("<p>" + "y" * 90000 + "</p>")'
+sport=$(free_port)
+w env WARDEN_NO_DAEMON=1 "$bin" serve "$work/site" "$sport" --name site >"$out/start-site.log" 2>&1
+sleep 2
+for f in "small.html 1507" "big.html 90007"; do
+    set -- $f
+    line=$(python3 "$work/lat.py" "$sport" "$1" "$2" 2>&1 | tail -n 1)
+    verdict=$(printf '%s' "$line" | cut -f1)
+    detail=$(printf '%s' "$line" | cut -f3-)
+    case "$verdict" in
+        PASS) result PASS "static serve $1 (keep-alive)" "$detail" ;;
+        *) result FAIL "static serve $1 (keep-alive)" "$detail" ;;
+    esac
+done
+w env WARDEN_NO_DAEMON=1 "$bin" delete all >/dev/null 2>&1
 
 # -------------------------------------------------------- smoke: wardend
 # wardend: host events, and a supervisor it restarts with the environment it

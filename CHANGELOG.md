@@ -49,7 +49,8 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
 - `warden doctor` checks the OS adapter live (a `platform` row: it asks about
   its own process and says what it could not read), and
   `scripts/mac-check.sh` runs that, the platform tests and a smoke test of a
-  real supervisor and wardend on a Mac, and writes a report.
+  real supervisor and wardend on a Mac (and times `warden serve`), and writes
+  a report.
 - A `user` column in `warden list` and the workers table, and a `user` row in
   `status` and `describe`: who the app's processes run as (`Status.user`,
   [`docs/protocol.md`](docs/protocol.md)).
