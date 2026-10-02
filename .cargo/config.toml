@@ -2,11 +2,13 @@
 #   cargo xtask bench        run every benchmark, update docs/benchmarks.md and bench/results/latest.md
 #   cargo bench-all          the same
 #   cargo xtask bench --help
-#   cargo release 0.2.0      release: checks, version bump, tag, push, macOS archives (on a
-#                            Mac), follow the Release workflow (cargo xtask release --help;
-#                            docs/releasing.md)
+#   cargo release 0.2.0      release: checks, version bump, tag, push, follow the Release
+#                            workflow (cargo xtask release --help; docs/releasing.md). The
+#                            macOS archives are built by the workflow on a GitHub runner, or
+#                            on this Mac with --macos local
 #   cargo dist-macos         the macOS archives, built on this Mac, uploaded to the draft
-#                            release (scripts/dist-macos.sh --help)
+#                            release: the Mac's half of `cargo release --macos local`
+#                            (scripts/dist-macos.sh --help)
 [alias]
 xtask = "run --quiet --package xtask --"
 bench-all = "run --quiet --package xtask -- bench"

@@ -23,10 +23,16 @@ Releases Warden: checks everything, sets VERSION in Cargo.toml, protocol/ and
 gui/ (and Cargo.lock), commits \"Release vVERSION\", tags vVERSION and pushes
 both. GitHub Actions (.github/workflows/release.yml) then builds and tests the
 Linux archives and publishes the GitHub Release, which this follows to the end.
-The macOS archives are built here, on a Mac (scripts/dist-macos.sh, after the
-push) and wait in a draft release; the workflow takes them from there. On any
-other machine, run `cargo xtask dist-macos` on a Mac while the workflow waits
-(it waits an hour).
+
+The macOS archives (CLI, Warden.app zip, .dmg) come from one of two places,
+chosen per release with --macos. The tag's annotation records the choice (a line
+\"macos: runner\" or \"macos: local\") and the workflow reads it there:
+    --macos runner   (default) the workflow builds them on a GitHub macOS runner.
+                     No Mac step runs here: nothing is built or uploaded.
+    --macos local    they are built on this Mac (scripts/dist-macos.sh, after the
+                     push) and uploaded to a draft release, which the workflow
+                     waits for (an hour). On any other machine, run
+                     `cargo xtask dist-macos` on a Mac in that hour.
 
 VERSION:
     X.Y.Z, X.Y.Z-PRE   e.g. 0.2.0 or 0.2.0-rc.1 (a leading v is fine)
@@ -36,13 +42,15 @@ VERSION:
 OPTIONS:
     --dry-run          Run the read-only checks, print every other step, change nothing
     --branch NAME      Release from branch NAME (default: main)
+    --macos SOURCE     Where the macOS archives are built: runner or local (above;
+                       default: runner)
+    --no-macos         With --macos local: don't build them here either (build them
+                       on a Mac: cargo xtask dist-macos)
     --skip-checks      Skip the local cargo fmt / clippy / test
     --full             Also run the integration tests (cargo test --test integration)
     --no-ci-check      Don't require a green CI run for the commit
     --wait-ci          If CI is still running for the commit, wait for it
     --no-wait          Don't follow the Release workflow after pushing
-    --no-macos         Don't build the macOS archives here (build them on a Mac:
-                       cargo xtask dist-macos)
     --trailer TEXT     Add a trailer (\"Key: value\") to the release commit; repeatable
     -y, --yes          Don't ask for confirmation
     -h, --help         This help
@@ -50,7 +58,7 @@ OPTIONS:
 GITHUB_TOKEN or GH_TOKEN, if set, authenticates the GitHub API calls (CI status,
 following the workflow): a higher rate limit, and private repositories work.
 NEEDS: git; curl (unless --no-ci-check --no-wait); the right to push tags to origin;
-on a Mac, for the macOS archives: rustup, cargo-about and the GitHub CLI (gh auth login).
+with --macos local, on a Mac: rustup, cargo-about and the GitHub CLI (gh auth login).
 ";
 
 const MACOS_SCRIPT: &str = "scripts/dist-macos.sh";
@@ -64,6 +72,35 @@ const CI_WORKFLOW: &str = "CI";
 const RELEASE_WORKFLOW: &str = "Release";
 const STEPS: usize = 9;
 
+/// Where the macOS archives of a release are built: written into the tag's
+/// annotation (`macos: runner` / `macos: local`), which the Release workflow's
+/// `meta` job reads to decide which of its two macOS jobs runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacosSource {
+    /// A GitHub-hosted macOS runner, by the workflow itself.
+    Runner,
+    /// The maintainer's Mac: scripts/dist-macos.sh builds them and uploads them
+    /// to a draft release that the workflow waits for.
+    Local,
+}
+
+impl MacosSource {
+    const ALL: [MacosSource; 2] = [MacosSource::Runner, MacosSource::Local];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MacosSource::Runner => "runner",
+            MacosSource::Local => "local",
+        }
+    }
+
+    fn parse(s: &str) -> Result<MacosSource, String> {
+        Self::ALL.into_iter().find(|m| m.as_str() == s).ok_or_else(|| {
+            format!("--macos {s:?}: use runner (the workflow builds the macOS archives) or local (this Mac does)")
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Options {
     version: String,
@@ -74,7 +111,10 @@ pub(crate) struct Options {
     ci_check: bool,
     wait_ci: bool,
     follow: bool,
-    macos: bool,
+    /// Where the macOS archives come from (`--macos`, default: a runner).
+    macos: MacosSource,
+    /// With `--macos local`: build them on this Mac (`--no-macos` says no).
+    macos_here: bool,
     yes: bool,
     trailers: Vec<String>,
 }
@@ -90,7 +130,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Option<Options>, String> {
         ci_check: true,
         wait_ci: false,
         follow: true,
-        macos: true,
+        macos: MacosSource::Runner,
+        macos_here: true,
         yes: false,
         trailers: Vec::new(),
     };
@@ -108,7 +149,8 @@ pub(crate) fn parse(args: &[String]) -> Result<Option<Options>, String> {
             "--no-ci-check" => o.ci_check = false,
             "--wait-ci" => o.wait_ci = true,
             "--no-wait" => o.follow = false,
-            "--no-macos" => o.macos = false,
+            "--no-macos" => o.macos_here = false,
+            "--macos" => o.macos = MacosSource::parse(it.next().ok_or("--macos needs runner or local")?)?,
             "-y" | "--yes" => o.yes = true,
             "--branch" => o.branch = it.next().ok_or("--branch needs a branch name")?.clone(),
             "--trailer" => {
@@ -140,6 +182,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Option<Options>, String> {
     if o.wait_ci && !o.ci_check {
         return Err("--wait-ci waits for the CI check that --no-ci-check skips: pick one".into());
     }
+    if !o.macos_here && o.macos != MacosSource::Local {
+        return Err("--no-macos only goes with --macos local (it skips building the macOS archives on this Mac). \
+             With --macos runner, the default, no Mac step runs anyway: leave it out, or give --macos local \
+             --no-macos to build them yourself on a Mac later (cargo xtask dist-macos)"
+            .into());
+    }
     Ok(Some(o))
 }
 
@@ -149,7 +197,7 @@ pub(crate) struct Env {
     token: Option<String>,
     /// The cargo that runs the checks and `cargo update` (`$CARGO`).
     cargo: String,
-    /// This is a Mac: it builds the macOS archives itself.
+    /// This is a Mac: with `--macos local` it builds the macOS archives itself.
     mac: bool,
 }
 
@@ -167,8 +215,9 @@ pub(crate) fn main(args: &[String], root: &Path) -> Result<(), String> {
     )
 }
 
-/// `cargo xtask dist-macos`: the macOS archives, built here and uploaded to a
-/// draft release (scripts/dist-macos.sh, which has the options).
+/// `cargo xtask dist-macos`: the macOS archives, built here on a Mac and
+/// uploaded to a draft release (scripts/dist-macos.sh, which has the options):
+/// the "local" source of a release. The "runner" source needs no command.
 pub(crate) fn dist_macos(args: &[String], root: &Path) -> Result<(), String> {
     let script = root.join(MACOS_SCRIPT);
     if !script.is_file() {
@@ -181,6 +230,65 @@ pub(crate) fn dist_macos(args: &[String], root: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| format!("running bash {MACOS_SCRIPT}: {e}"))?;
     if status.success() { Ok(()) } else { Err(format!("{MACOS_SCRIPT} failed ({status})")) }
+}
+
+/// What becomes of the macOS archives of this release, from `--macos` and the
+/// machine this runs on (steps 1, 5 and 8).
+#[derive(Debug, PartialEq)]
+enum MacosPlan {
+    /// `--macos runner`: the Release workflow builds them on a GitHub macOS
+    /// runner. No Mac step runs here.
+    Runner,
+    /// `--macos local`, on a Mac: built here after the push, uploaded to the
+    /// draft release the workflow waits for.
+    Here,
+    /// `--macos local`, but not built here (the reason): somebody runs
+    /// `cargo xtask dist-macos` on a Mac while the workflow waits.
+    ByHand(&'static str),
+}
+
+fn macos_plan(o: &Options, env: &Env, root: &Path) -> MacosPlan {
+    if o.macos == MacosSource::Runner {
+        MacosPlan::Runner
+    } else if !o.macos_here {
+        MacosPlan::ByHand("--no-macos")
+    } else if !env.mac {
+        MacosPlan::ByHand("this is not a Mac")
+    } else if !root.join(MACOS_SCRIPT).is_file() {
+        MacosPlan::ByHand("scripts/dist-macos.sh not found")
+    } else {
+        MacosPlan::Here
+    }
+}
+
+/// The messages (`-m`, one paragraph each) of the annotated tag: its subject,
+/// then the line the workflow's `meta` job reads, `macos: runner` or `macos: local`.
+fn tag_messages(target: &Version, source: MacosSource) -> [String; 2] {
+    [format!("Warden {target}"), format!("macos: {}", source.as_str())]
+}
+
+/// What the confirmation says the workflow will do, and where the macOS
+/// archives come from.
+fn workflow_summary(plan: &MacosPlan, release_url: &str) -> String {
+    match plan {
+        MacosPlan::Runner => format!(
+            "then    GitHub Actions (release.yml) builds the CLI and the GUI for Linux x86_64/arm64 and, on a\n        \
+             GitHub macOS runner (the tag says macos: runner), for macOS arm64/x86_64, writes SHA256SUMS,\n        \
+             tests install.sh, and publishes\n        {release_url}"
+        ),
+        MacosPlan::Here => format!(
+            "then    GitHub Actions (release.yml) builds the CLI and the GUI for Linux x86_64/arm64, writes\n        \
+             SHA256SUMS, tests install.sh, and publishes\n        {release_url}\n        \
+             The macOS archives (arm64/x86_64) are built on this Mac after the push and uploaded to a draft\n        \
+             release, which the workflow waits for (the tag says macos: local)"
+        ),
+        MacosPlan::ByHand(why) => format!(
+            "then    GitHub Actions (release.yml) builds the CLI and the GUI for Linux x86_64/arm64, writes\n        \
+             SHA256SUMS, tests install.sh, and publishes\n        {release_url}\n        \
+             The macOS archives are NOT built here ({why}); the tag says macos: local, so the workflow\n        \
+             waits an hour for you to build them on a Mac (cargo xtask dist-macos)"
+        ),
+    }
 }
 
 // ------------------------------------------------------------------ semver
@@ -919,6 +1027,7 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     let current = Version::parse(&current_str).map_err(|e| format!("Cargo.toml: version {current_str:?} {e}"))?;
     let target = target_version(&o.version, &current)?;
     let tag = format!("v{target}");
+    let plan = macos_plan(o, env, root);
     let push_cmd = format!("git push --atomic origin {} {tag}", o.branch);
     let mut r = Report { dry: o.dry_run, step: 0, problems: Vec::new() };
     eprintln!(
@@ -930,16 +1039,18 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     r.step("Preconditions");
     let git_version = git.out(&["--version"]).map_err(|_| "git is not installed (or not on PATH)".to_string())?;
     r.ok(&git_version);
-    // The Mac side of a release, before anything is pushed: a missing gh
-    // login or cargo-about would otherwise show only once the tag is on origin.
-    // (Read-only, so a dry run runs it too.)
-    if o.macos && env.mac && root.join(MACOS_SCRIPT).is_file() {
+    // The Mac side of a release that builds the macOS archives here, before
+    // anything is pushed: a missing gh login or cargo-about would otherwise
+    // show only once the tag is on origin. (Read-only, so a dry run runs it
+    // too. With --macos runner no Mac step exists, and nothing is run.)
+    if plan == MacosPlan::Here {
         match dist_macos(&["--check".to_string()], root) {
             Ok(()) => r.ok(&format!("this Mac can build the macOS archives ({MACOS_SCRIPT} --check)")),
             Err(e) => r.fail(
                 &format!("the macOS archives can't be built here ({e})"),
-                "fix what is shown above; or release with --no-macos and build them on a Mac\n\
-                 while the workflow waits for them (cargo xtask dist-macos)",
+                "fix what is shown above; or release with --macos runner (the default: the workflow builds\n\
+                 them on a GitHub runner), or --macos local --no-macos and build them on a Mac while the\n\
+                 workflow waits for them (cargo xtask dist-macos)",
             )?,
         }
     }
@@ -1214,8 +1325,9 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
         } else {
             r.note(&format!("commit  \"Release {tag}\" on {}: {}", o.branch, restore.join(", ")));
         }
+        let [subject, macos_line] = tag_messages(&target, o.macos);
         r.note(&format!(
-            "tag     {tag}, annotated \"Warden {target}\", on {}",
+            "tag     {tag}, annotated \"{subject}\" with the line \"{macos_line}\", on {}",
             if edits.is_empty() { short.as_str() } else { "that commit" }
         ));
         let lease_short = origin_head.as_deref().map_or("?", |s| s.get(..7).unwrap_or(s));
@@ -1225,10 +1337,7 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
             if edits.is_empty() { short.as_str() } else { "that commit" },
             b = o.branch,
         ));
-        r.note(&format!(
-            "then    GitHub Actions (release.yml) builds the CLI and the GUI for Linux x86_64/arm64 and\n        \
-             macOS arm64/x86_64, writes SHA256SUMS, tests install.sh, and publishes\n        {release_url}"
-        ));
+        r.note(&workflow_summary(&plan, &release_url));
         if o.dry_run {
             r.note(&format!("would ask: Release {tag}? [y/N]   (--yes skips the question)"));
         } else if o.yes {
@@ -1306,12 +1415,13 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     // The exact push of step 7, for printing.
     let lease_shown = origin_head.clone().unwrap_or_else(|| format!("<origin's {}>", o.branch));
     let push_line = format!("git {}", push_args(&o.branch, &tag, sha_shown, &lease_shown).join(" "));
-    let tag_message = format!("Warden {target}");
-    r.cmd(&format!("git tag -a {tag} -m \"{tag_message}\" {sha_short}"));
+    // The annotation: the subject, and the macOS source the workflow reads.
+    let [subject, macos_line] = tag_messages(&target, o.macos);
+    r.cmd(&format!("git tag -a {tag} -m \"{subject}\" -m \"{macos_line}\" {sha_short}"));
     if !o.dry_run {
-        git.out(&["tag", "-a", &tag, "-m", &tag_message, &sha]).map_err(|e| {
+        git.out(&["tag", "-a", &tag, "-m", &subject, "-m", &macos_line, &sha]).map_err(|e| {
             format!(
-                "{e}\n  {}tag it yourself (git tag -a {tag} -m \"{tag_message}\" {sha}) and push ({push_line})",
+                "{e}\n  {}tag it yourself (git tag -a {tag} -m \"{subject}\" -m \"{macos_line}\" {sha}) and push ({push_line})",
                 if edits.is_empty() {
                     ""
                 } else {
@@ -1377,37 +1487,40 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
     }
 
     // ---------------------------------------------------------------- 8
-    // After the push: the workflow's Linux builds are already running, and its
-    // `macos` job waits (an hour) for the archives this uploads to the draft.
+    // With --macos local, after the push: the workflow's Linux builds are
+    // already running, and its `macos-local` job waits (an hour) for the
+    // archives this uploads to the draft. With --macos runner there is nothing
+    // to do: the workflow's `macos-runner` job builds them.
     r.step("macOS archives");
     let by_hand = format!("on a Mac with {tag} checked out (git pull): cargo xtask dist-macos");
-    if !o.macos {
-        r.note(&format!(
-            "skipped (--no-macos). The Release workflow waits up to an hour for the macOS archives: {by_hand}"
-        ));
-    } else if !env.mac {
-        r.note(&format!(
-            "this is not a Mac. The Release workflow waits up to an hour for the macOS archives: {by_hand}"
-        ));
-    } else if !root.join(MACOS_SCRIPT).is_file() {
-        r.note(&format!("{MACOS_SCRIPT} not found: the macOS archives are not built here ({by_hand})"));
-    } else {
-        let cmd = format!("{MACOS_SCRIPT} --branch {}", o.branch);
-        r.cmd(&cmd);
-        if !o.dry_run {
-            let built = dist_macos(&["--branch".to_string(), o.branch.clone()], root);
-            if let Err(e) = built {
-                r.fail(
-                    &format!("the macOS archives were not built or uploaded ({e})"),
-                    &format!(
-                        "{tag} is pushed, and the Release workflow waits up to an hour for them.\n\
-                         Fix the cause shown above, then run here: cargo xtask dist-macos\n\
-                         (it needs rustup, cargo-about and gh logged in). If the hour passed, re-run the\n\
-                         workflow afterwards (Actions > Release > Re-run all jobs)."
-                    ),
-                )?;
-            } else {
-                r.ok(&format!("the macOS archives are in the draft release {tag}"));
+    match &plan {
+        MacosPlan::Runner => r.note(
+            "built by the Release workflow on a GitHub macOS runner (--macos runner, the tag says macos: runner):\n\
+             no Mac step runs here",
+        ),
+        MacosPlan::ByHand(why) => r.note(&format!(
+            "not built here ({why}). The Release workflow waits up to an hour for the macOS archives \
+             (the tag says macos: local): {by_hand}"
+        )),
+        MacosPlan::Here => {
+            let cmd = format!("{MACOS_SCRIPT} --branch {}", o.branch);
+            r.cmd(&cmd);
+            if !o.dry_run {
+                let built = dist_macos(&["--branch".to_string(), o.branch.clone()], root);
+                if let Err(e) = built {
+                    r.fail(
+                        &format!("the macOS archives were not built or uploaded ({e})"),
+                        &format!(
+                            "{tag} is pushed, and the Release workflow waits up to an hour for them.\n\
+                             Fix the cause shown above, then run here: cargo xtask dist-macos\n\
+                             (it needs rustup, cargo-about and gh logged in). If the hour passed, re-run the\n\
+                             workflow afterwards (Actions > Release > Re-run all jobs). To build them on a\n\
+                             runner instead, re-create the tag with the line \"macos: runner\" (docs/releasing.md)."
+                        ),
+                    )?;
+                } else {
+                    r.ok(&format!("the macOS archives are in the draft release {tag}"));
+                }
             }
         }
     }
@@ -2123,10 +2236,9 @@ version = \"0.2.0\"
         let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
         let o = parse(&a("0.2.0 --dry-run --yes --branch release --no-wait")).unwrap().unwrap();
         assert_eq!(
-            (o.version.as_str(), o.branch.as_str(), o.dry_run, o.yes, o.follow, o.macos),
-            ("0.2.0", "release", true, true, false, true)
+            (o.version.as_str(), o.branch.as_str(), o.dry_run, o.yes, o.follow, o.macos, o.macos_here),
+            ("0.2.0", "release", true, true, false, MacosSource::Runner, true)
         );
-        assert!(!parse(&a("0.2.0 --no-macos")).unwrap().unwrap().macos);
         assert!(parse(&a("")).unwrap_err().contains("which version"));
         assert!(parse(&a("0.2.0 0.3.0")).unwrap_err().contains("one version"));
         assert!(parse(&a("0.2.0 --nope")).unwrap_err().contains("unknown option"));
@@ -2135,6 +2247,108 @@ version = \"0.2.0\"
         assert!(parse(&a("0.2.0 --trailer nocolon")).is_err());
         let o = parse(&["patch".into(), "--trailer".into(), "Signed-off-by: A <a@b>".into()]).unwrap().unwrap();
         assert_eq!(o.trailers, vec!["Signed-off-by: A <a@b>"]);
+    }
+
+    #[test]
+    fn macos_option() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let src = |s: &str| {
+            let o = parse(&a(s)).unwrap().unwrap();
+            (o.macos, o.macos_here)
+        };
+        // The runner is the default; the option takes its value, before or after the version.
+        assert_eq!(src("0.2.0"), (MacosSource::Runner, true));
+        assert_eq!(src("0.2.0 --macos runner"), (MacosSource::Runner, true));
+        assert_eq!(src("0.2.0 --macos local"), (MacosSource::Local, true));
+        assert_eq!(src("--macos local minor"), (MacosSource::Local, true));
+        // The last one wins, as for the other options that take a value.
+        assert_eq!(src("0.2.0 --macos local --macos runner"), (MacosSource::Runner, true));
+        // --no-macos: don't build here, but only where the Mac is the source.
+        assert_eq!(src("0.2.0 --macos local --no-macos"), (MacosSource::Local, false));
+        assert_eq!(src("0.2.0 --no-macos --macos local"), (MacosSource::Local, false));
+        let e = parse(&a("0.2.0 --no-macos")).unwrap_err();
+        assert!(e.contains("--no-macos only goes with --macos local") && e.contains("runner"), "{e}");
+        assert!(parse(&a("0.2.0 --macos runner --no-macos")).is_err());
+        // A value that is neither: nothing is guessed (a typo must not pick a source).
+        for bad in ["0.2.0 --macos", "0.2.0 --macos mac", "0.2.0 --macos Local"] {
+            assert!(parse(&a(bad)).is_err(), "{bad:?} parsed");
+        }
+        let e = parse(&a("0.2.0 --macos both")).unwrap_err();
+        assert!(e.contains("use runner") && e.contains("local"), "{e}");
+        assert_eq!(MacosSource::ALL.map(MacosSource::as_str), ["runner", "local"]);
+        // The help says it all: both sources, the tag line, the option.
+        for text in ["--macos SOURCE", "--macos runner", "--macos local", "macos: runner", "macos: local", "--no-macos"]
+        {
+            assert!(USAGE.contains(text), "USAGE lacks {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_tag_annotation_carries_the_macos_line() {
+        let v = Version::parse("0.2.0").unwrap();
+        assert_eq!(tag_messages(&v, MacosSource::Runner), ["Warden 0.2.0", "macos: runner"]);
+        assert_eq!(tag_messages(&v, MacosSource::Local), ["Warden 0.2.0", "macos: local"]);
+        assert_eq!(
+            tag_messages(&Version::parse("0.2.0-rc.1").unwrap(), MacosSource::Local),
+            ["Warden 0.2.0-rc.1", "macos: local"]
+        );
+    }
+
+    /// The workflow reads what this writes: the same two words, and the `macos:` line.
+    #[test]
+    fn the_workflow_reads_the_line_this_writes() {
+        let yml =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/release.yml"))
+                .unwrap();
+        let words: Vec<&str> = MacosSource::ALL.iter().map(|m| m.as_str()).collect();
+        assert!(yml.contains(&format!("options: [{}]", words.join(", "))), "the macos_source input's options");
+        assert!(yml.contains(&format!("{}) chosen=", words.join("|"))), "the values meta accepts");
+        assert!(yml.contains("grep -iE '^macos:'"), "meta reads a line that starts with macos:");
+        // The line, as it is written, is one `^macos:` line of the annotation.
+        for m in MacosSource::ALL {
+            let line = &tag_messages(&Version::parse("0.2.0").unwrap(), m)[1];
+            assert!(line.starts_with("macos:") && !line.contains('\n'), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_confirmation_says_where_the_macos_archives_come_from() {
+        let url = "https://github.com/o/r/releases/tag/v0.2.0";
+        let runner = workflow_summary(&MacosPlan::Runner, url);
+        assert!(
+            runner.contains("macOS runner") && runner.contains("macos: runner") && runner.contains(url),
+            "{runner}"
+        );
+        assert!(!runner.contains("this Mac") && !runner.contains("waits"), "{runner}");
+        let here = workflow_summary(&MacosPlan::Here, url);
+        assert!(here.contains("built on this Mac") && here.contains("macos: local") && here.contains(url), "{here}");
+        let by_hand = workflow_summary(&MacosPlan::ByHand("this is not a Mac"), url);
+        assert!(
+            by_hand.contains("NOT built here (this is not a Mac") && by_hand.contains("cargo xtask dist-macos"),
+            "{by_hand}"
+        );
+        // Every line of it is indented to sit under the others in the output.
+        for text in [&runner, &here, &by_hand] {
+            assert!(text.starts_with("then    ") && text.lines().skip(1).all(|l| l.starts_with("        ")), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_plan_follows_the_source_and_the_machine() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let env = |mac| Env { interactive: false, token: None, cargo: cargo_bin(), mac };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let plan = |args: &str, mac| macos_plan(&parse(&a(args)).unwrap().unwrap(), &env(mac), &root);
+        // A runner build is the same on any machine, and never a Mac step.
+        assert_eq!(plan("0.2.0", true), MacosPlan::Runner);
+        assert_eq!(plan("0.2.0 --macos runner", false), MacosPlan::Runner);
+        // A local one is built here only on a Mac that has the script, unless --no-macos.
+        assert_eq!(plan("0.2.0 --macos local", true), MacosPlan::Here);
+        assert_eq!(plan("0.2.0 --macos local", false), MacosPlan::ByHand("this is not a Mac"));
+        assert_eq!(plan("0.2.0 --macos local --no-macos", true), MacosPlan::ByHand("--no-macos"));
+        let nowhere = std::env::temp_dir().join("xtask-release-no-such-repo");
+        let o = parse(&a("0.2.0 --macos local")).unwrap().unwrap();
+        assert_eq!(macos_plan(&o, &env(true), &nowhere), MacosPlan::ByHand("scripts/dist-macos.sh not found"));
     }
 
     // ---------------------------------------------------------------- the git flow, for real
@@ -2302,6 +2516,8 @@ version = \"0.2.0\"
         // An annotated tag on that commit, and both pushed.
         assert_eq!(t.git(&["cat-file", "-t", "v0.2.0"]), "tag");
         assert_eq!(t.git(&["tag", "-l", "--format=%(contents:subject)", "v0.2.0"]), "Warden 0.2.0");
+        // The macOS source is the default one, a runner, and the tag says so.
+        assert_eq!(t.git(&["tag", "-l", "--format=%(contents)", "v0.2.0"]), "Warden 0.2.0\n\nmacos: runner");
         assert_eq!(t.git(&["rev-parse", "v0.2.0^{commit}"]), head);
         assert_eq!(sh(&t.origin, "git", &["rev-parse", "main"]), head);
         assert_eq!(sh(&t.origin, "git", &["rev-parse", "v0.2.0^{commit}"]), head);
@@ -2358,11 +2574,19 @@ version = \"0.2.0\"
         assert_eq!(sh(&t.origin, "git", &["rev-parse", "v0.2.0^{commit}"]), t.git(&["rev-parse", "HEAD"]));
     }
 
+    /// The annotation of `tag` as git has it, here and on origin.
+    fn annotation(t: &TempRepo, tag: &str) -> (String, String) {
+        let format = ["for-each-ref", "--format=%(objecttype) %(contents)"];
+        let here = sh(&t.work, "git", &[format[0], format[1], &format!("refs/tags/{tag}")]);
+        let there = sh(&t.origin, "git", &[format[0], format[1], &format!("refs/tags/{tag}")]);
+        (here, there)
+    }
+
     #[test]
     fn the_macos_archives_are_checked_first_and_built_after_the_push_on_a_mac() {
         let t = TempRepo::new("macos");
         t.fake_dist_script(0, 0);
-        t.release_on(&["0.2.0", "--yes"], true).unwrap();
+        t.release_on(&["0.2.0", "--macos", "local", "--yes"], true).unwrap();
         let ran = t.dist_ran();
         let (checked, built) = ran.split_once("call: --branch main\n").unwrap_or_else(|| panic!("never built: {ran}"));
         // --check first, before the push: origin had no tag yet. The build
@@ -2370,21 +2594,56 @@ version = \"0.2.0\"
         assert!(checked.starts_with("call: --check\n"), "{ran}");
         assert!(!checked.contains("refs/tags/v0.2.0"), "the tag was pushed before the check: {ran}");
         assert!(built.contains("refs/tags/v0.2.0"), "the tag was not on origin when the build ran: {ran}");
+        // The tag the workflow reads says the Mac is the source, here and on origin.
+        let want = "tag Warden 0.2.0\n\nmacos: local".to_string();
+        assert_eq!(annotation(&t, "v0.2.0"), (want.clone(), want));
     }
 
     #[test]
-    fn the_macos_archives_are_not_built_elsewhere_or_when_declined_or_in_a_dry_run() {
-        for (args, mac) in [(vec!["0.2.0", "--yes"], false), (vec!["0.2.0", "--yes", "--no-macos"], true)] {
+    fn a_runner_release_runs_no_mac_step_even_on_a_mac() {
+        // The default, and --macos runner said out loud. The script would fail
+        // both its check and its build: it must never be called.
+        for args in [vec!["0.2.0", "--yes"], vec!["0.2.0", "--yes", "--macos", "runner"]] {
+            let t = TempRepo::new("macos-runner");
+            t.fake_dist_script(1, 1);
+            t.release_on(&args, true).unwrap();
+            assert_eq!(t.dist_ran(), "", "{args:?}");
+            assert_eq!(sh(&t.origin, "git", &["tag", "--list"]), "v0.2.0");
+            let want = "tag Warden 0.2.0\n\nmacos: runner".to_string();
+            assert_eq!(annotation(&t, "v0.2.0"), (want.clone(), want), "{args:?}");
+        }
+        // A dry run prints the same plan and calls nothing either.
+        let t = TempRepo::new("macos-runner-dry");
+        t.fake_dist_script(1, 1);
+        t.release_on(&["0.2.0", "--dry-run"], true).unwrap();
+        assert_eq!(t.dist_ran(), "");
+        assert_eq!(t.git(&["tag", "--list"]), "");
+    }
+
+    #[test]
+    fn a_local_release_not_built_here_still_says_local() {
+        // Not a Mac, or --no-macos: nothing is built here, and the workflow
+        // waits for a Mac's upload (the tag says so).
+        for (args, mac) in [
+            (vec!["0.2.0", "--macos", "local", "--yes"], false),
+            (vec!["0.2.0", "--macos", "local", "--yes", "--no-macos"], true),
+        ] {
             let t = TempRepo::new("macos-skip");
             t.fake_dist_script(0, 0);
             t.release_on(&args, mac).unwrap();
             assert_eq!(t.dist_ran(), "", "{args:?} on a Mac: {mac}");
             assert_eq!(t.git(&["tag", "--list"]), "v0.2.0");
+            let want = "tag Warden 0.2.0\n\nmacos: local".to_string();
+            assert_eq!(annotation(&t, "v0.2.0"), (want.clone(), want), "{args:?} on a Mac: {mac}");
         }
+    }
+
+    #[test]
+    fn a_local_dry_run_only_checks() {
         // A dry run only checks (read-only): nothing is built, tagged or pushed.
         let t = TempRepo::new("macos-dry");
         t.fake_dist_script(0, 0);
-        t.release_on(&["0.2.0", "--dry-run"], true).unwrap();
+        t.release_on(&["0.2.0", "--macos", "local", "--dry-run"], true).unwrap();
         let ran = t.dist_ran();
         assert!(ran.starts_with("call: --check\n") && !ran.contains("--branch"), "{ran}");
         assert_eq!(t.git(&["tag", "--list"]), "");
@@ -2395,23 +2654,29 @@ version = \"0.2.0\"
         let t = TempRepo::new("macos-check");
         t.fake_dist_script(1, 0);
         let origin_refs = sh(&t.origin, "git", &["show-ref"]);
-        let e = t.release_on(&["0.2.0", "--yes"], true).unwrap_err();
+        let e = t.release_on(&["0.2.0", "--macos", "local", "--yes"], true).unwrap_err();
         assert!(e.contains("stopped at step 1/9"), "{e}");
         assert!(e.contains("macOS archives can't be built here"), "{e}");
         // Nothing was edited, committed, tagged or pushed.
         assert_eq!(sh(&t.origin, "git", &["show-ref"]), origin_refs);
         assert_eq!(t.git(&["tag", "--list"]), "");
         assert_eq!(t.git(&["status", "--porcelain"]), "");
-        // --no-macos releases anyway.
-        t.release_on(&["0.2.0", "--yes", "--no-macos"], true).unwrap();
+        // --no-macos releases anyway (and says a Mac builds them later), and so
+        // does the runner, which needs no Mac at all.
+        t.release_on(&["0.2.0", "--macos", "local", "--yes", "--no-macos"], true).unwrap();
         assert_eq!(sh(&t.origin, "git", &["tag", "--list"]), "v0.2.0");
+        let t = TempRepo::new("macos-check-runner");
+        t.fake_dist_script(1, 0);
+        t.release_on(&["0.2.0", "--yes"], true).unwrap();
+        assert_eq!(sh(&t.origin, "git", &["tag", "--list"]), "v0.2.0");
+        assert_eq!(t.dist_ran(), "");
     }
 
     #[test]
     fn a_failed_macos_build_leaves_the_pushed_release_and_says_what_to_do() {
         let t = TempRepo::new("macos-fail");
         t.fake_dist_script(0, 1);
-        let e = t.release_on(&["0.2.0", "--yes"], true).unwrap_err();
+        let e = t.release_on(&["0.2.0", "--macos", "local", "--yes"], true).unwrap_err();
         assert!(e.contains("stopped at step 8/9"), "{e}");
         assert!(e.contains("macOS archives were not built or uploaded"), "{e}");
         // Nothing is undone: the tag is on origin, where the workflow waits.

@@ -7,33 +7,46 @@
 #                                            Linux packages (docs/packages.md), amd64/arm64
 # plus install.sh and SHA256SUMS covering every file, and macos-build-info.txt.
 #
-# Linux is built, tested and packaged here. macOS is NOT: the macOS archives are
-# built on the maintainer's Mac (scripts/dist-macos.sh, which `cargo release`
-# runs after pushing the tag), where Warden.app is signed and the signing
-# certificate stays in that Mac's keychain (no secrets in CI), and uploaded to
-# a DRAFT release for the tag. The `macos` job waits for them (up to an hour),
-# refuses any that were built from another commit, and the release is
-# published only with all of them. (Standard GitHub-hosted runners, macOS
-# included, are free for a public repository, so building them here is an
-# option: docs/releasing.md says what that would change.) Every archive
-# carries LICENSE-MIT, LICENSE-APACHE and the third-party notices
+# Linux is built, tested and packaged here. The macOS archives have two possible
+# sources, chosen per release (`macos_source`, see below), and exactly one of
+# the two jobs runs:
+#   runner  (the default) the `macos-runner` job builds them here, on a
+#           GitHub-hosted macOS runner (standard runners, macOS included, are
+#           free for a public repository): scripts/dist-macos.sh --no-upload,
+#           which builds, packages and checks everything and sends nothing
+#           anywhere, then checks the files again for real (Mach-O architectures,
+#           licenses, Info.plist, the .dmg mounted). A dry run builds them too.
+#           Ad-hoc signed only; no secrets.
+#   local   they are built on the maintainer's Mac (the same script, which
+#           `cargo release --macos local` runs after pushing the tag), where
+#           Warden.app is signed and the signing certificate stays in that Mac's
+#           keychain (no secrets in CI), and uploaded to a DRAFT release for the
+#           tag. The `macos-local` job waits for them (up to an hour), refuses
+#           any that were built from another commit, and the release is
+#           published only with all of them. A dry run has none.
+# Every archive carries LICENSE-MIT, LICENSE-APACHE and the third-party notices
 # (cargo-about, about.toml): THIRD-PARTY-LICENSES.txt, and
 # THIRD-PARTY-LICENSES-GUI.txt in the GUI bundles.
 #
 # What starts a run:
 #   - a pushed tag v<version> (matching Cargo.toml): the real release.
-#     `cargo release <version>` does that from a checkout;
+#     `cargo release <version>` does that from a checkout. The macOS source is
+#     the line `macos: runner` or `macos: local` in the tag's annotation (a
+#     lightweight tag, or no such line, means runner);
 #   - Actions > Release > Run workflow, on any branch, with "Publish the
 #     release" UNTICKED (the default): a DRY RUN. Everything is built, packaged,
 #     checksummed and install-tested exactly as for a release and kept as
 #     workflow artifacts (release-<version>: every file, SHA256SUMS included;
-#     release-notes: the notes), but no macOS archives are taken, no tag is
-#     made and no GitHub Release is created or touched. Use it before tagging,
-#     and after changing this file;
+#     release-notes: the notes), but no tag is made and no GitHub Release is
+#     created or touched. With the macOS source "runner" (the input
+#     `macos_source`, default runner) the macOS archives are built and checked
+#     too; with "local" none are taken. Use it before tagging, and after
+#     changing this file;
 #   - the same, on `main`, with "Publish the release" TICKED: no checkout at
 #     all. The tag v<version> is created at that commit once everything is
 #     built and tested, so a failed build leaves no tag behind. Needs a green
-#     CI run on the commit (see docs/releasing.md).
+#     CI run on the commit (see docs/releasing.md). The macOS source is the
+#     input `macos_source`.
 name: Release
 
 on:
@@ -49,6 +62,11 @@ on:
         description: "Publish even without a green CI run on this commit (not recommended)"
         type: boolean
         default: false
+      macos_source:
+        description: "Where the macOS archives are built: runner (a GitHub macOS runner, also in a dry run) or local (on your Mac: run cargo dist-macos while a release waits; a dry run has none)"
+        type: choice
+        options: [runner, local]
+        default: runner
 
 permissions:
   contents: read
@@ -84,12 +102,18 @@ jobs:
       publish: ${{ steps.version.outputs.publish }}
       tag: ${{ steps.version.outputs.tag }}
       gui: ${{ steps.gui.outputs.present == 'true' }}
+      # runner | local: which of the two macOS jobs runs (the other is skipped)
+      macos_source: ${{ steps.macos.outputs.macos_source }}
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE: ${{ inputs.release }}
       SKIP_CI_CHECK: ${{ inputs.skip_ci_check }}
     steps:
+      # The whole history, so that every tag is fetched with its annotation:
+      # the macOS source is written in the annotation of the tag that was pushed.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - id: version
         name: Version (the tag must match Cargo.toml), and what this run is
         run: |
@@ -145,6 +169,60 @@ jobs:
         name: GUI crate present?
         if: hashFiles('gui/Cargo.toml') != ''
         run: echo "present=true" >> "$GITHUB_OUTPUT"
+      # Where the macOS archives are built: "runner" (the default) or "local".
+      # Run by hand, it is the macos_source input. For a pushed tag it is the
+      # line `macos: runner` or `macos: local` in the tag's annotation
+      # (`cargo release --macos` writes it); a lightweight tag, or an annotation
+      # without that line, means runner. Any other value after `macos:` is an
+      # error, so that a typo never builds in the wrong place.
+      - id: macos
+        name: Where the macOS archives are built (runner or local)
+        env:
+          INPUT: ${{ inputs.macos_source }}
+          PUBLISH: ${{ steps.version.outputs.publish }}
+        run: |
+          set -euo pipefail
+          chosen=runner
+          why="the default"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            case "${INPUT:-runner}" in
+              runner|local) chosen=${INPUT:-runner}; why="the macos_source input" ;;
+              *)
+                echo "::error title=Bad macos_source::the macos_source input is \"$INPUT\": use runner or local. Nothing was built or published."
+                exit 1 ;;
+            esac
+          elif [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag=$GITHUB_REF_NAME
+            # The checkout may leave the pushed tag as a lightweight one (it can
+            # fetch the commit instead of the tag object): fetch the tag again.
+            git fetch --quiet --no-tags origin "+refs/tags/$tag:refs/tags/$tag"
+            # A lightweight tag has no message of its own (for-each-ref would
+            # show the commit's): only an annotated tag is read.
+            if [ "$(git for-each-ref --format='%(objecttype)' "refs/tags/$tag")" = tag ]; then
+              line=$(git for-each-ref --format='%(contents)' "refs/tags/$tag" | grep -iE '^macos:' | tail -n 1 || true)
+              if [ -n "$line" ]; then
+                value=$(printf '%s' "${line#*:}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+                case "$value" in
+                  runner|local) chosen=$value; why="the line \"$line\" in the annotation of $tag" ;;
+                  *)
+                    echo "::error title=Bad macos line::the annotation of $tag has the line \"$line\": write \"macos: runner\" or \"macos: local\" (no such line means runner). Nothing was built or published. Re-create the tag with the right line (docs/releasing.md, When something fails)."
+                    exit 1 ;;
+                esac
+              else
+                why="no macos line in the annotation of $tag"
+              fi
+            else
+              why="$tag is a lightweight tag, so it has no macos line"
+            fi
+          fi
+          echo "macos_source=$chosen" >> "$GITHUB_OUTPUT"
+          if [ "$chosen" = runner ]; then
+            echo "::notice title=macOS archives::built on a GitHub macOS runner ($why)."
+          elif [ "$PUBLISH" = true ]; then
+            echo "::notice title=macOS archives::built on a Mac ($why): the macos-local job waits up to an hour for them. On a Mac with this commit checked out: cargo dist-macos."
+          else
+            echo "::notice title=macOS archives::from a Mac ($why), so a dry run takes none. Run with macos_source runner to build and check them on a runner."
+          fi
       # CHANGELOG.md's section for this version (.github/release-notes.sh says
       # which one it took). Also on a dry run, to read them before publishing.
       - name: Release notes
@@ -428,15 +506,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # The macOS archives, built on the maintainer's Mac and waiting in a draft
-  # release for this tag (scripts/dist-macos.sh uploads them). Only a real
-  # release needs them; a dry run has none. The files must have been built from
-  # this very commit (macos-build-info.txt), and each is checked to be what its
-  # name says. A Linux runner: it only waits and downloads.
-  macos:
+  # The macOS archives, source "local": built on the maintainer's Mac and
+  # waiting in a draft release for this tag (scripts/dist-macos.sh uploads
+  # them). Only a real release needs them; a dry run has none. The files must
+  # have been built from this very commit (macos-build-info.txt), and each is
+  # checked to be what its name says. A Linux runner: it only waits and
+  # downloads. Skipped when the release chose "runner" (the job below).
+  macos-local:
     needs: meta
-    if: needs.meta.outputs.publish == 'true'
-    name: macOS archives (from the draft release)
+    if: needs.meta.outputs.publish == 'true' && needs.meta.outputs.macos_source == 'local'
+    name: macOS archives (from the draft release, built on a Mac)
     runs-on: ubuntu-24.04
     timeout-minutes: 65
     permissions:
@@ -502,7 +581,7 @@ jobs:
           last_said=-1000
           until poll; do
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error title=No macOS archives::gave up after an hour: $why. On a Mac with this commit checked out ($GITHUB_SHA), run: scripts/dist-macos.sh (needs gh logged in), then re-run this workflow (Re-run all jobs). Nothing was published."
+              echo "::error title=No macOS archives::gave up after an hour: $why. On a Mac with this commit checked out ($GITHUB_SHA), run: scripts/dist-macos.sh (needs gh logged in), then re-run this workflow (Re-run all jobs). Nothing was published. To build them on a GitHub runner instead, release again with macos: runner (docs/releasing.md, When something fails)."
               exit 1
             fi
             if [ $((SECONDS - last_said)) -ge 300 ]; then
@@ -553,17 +632,205 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The macOS archives, source "runner": built here, on a GitHub-hosted macOS
+  # runner, by the very script a Mac runs (scripts/dist-macos.sh), with
+  # --no-upload: it builds both architectures, packages, mounts the disk
+  # images, runs install.sh on the arm64 files, writes macos-build-info.txt, and
+  # sends nothing anywhere. The files are then checked again, for real, and kept
+  # as the artifact `macos-assets` (what `macos-local` makes from the draft). A
+  # dry run builds them too. No `contents: write`: it touches no release.
+  # Skipped when the release chose "local" (the job above).
+  #
+  # macos-15 is an Apple silicon (arm64) image, named like the Linux runners are
+  # (`macos-latest` moves to a newer macOS, Xcode and SDK on GitHub's schedule,
+  # not when someone has looked at a run, and these binaries are linked against
+  # the SDK of whichever image runs). The x86_64 archives are cross-built on it:
+  # warden and warden-gui are Rust with system frameworks and no C code (no `cc`
+  # in their dependency tree), so Xcode's linker and SDK are all they need;
+  # Rosetta is only for running the result (checked below, and said if absent).
+  # Ad-hoc signing only. TODO(signing): Developer ID signing and notarization
+  # would need the certificate and the notarization credentials as repository
+  # secrets here (the steps are in scripts/dist-macos.sh); the "local" source
+  # keeps them in the owner's keychain instead.
+  macos-runner:
+    needs: meta
+    if: needs.meta.outputs.macos_source == 'runner'
+    name: macOS archives (built on a runner)
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          cache: false
+          rustflags: ""
+      # Both targets (the script adds them too, which then changes nothing).
+      - name: Rust targets of both architectures
+        run: rustup target add --toolchain "$RUST_TOOLCHAIN" aarch64-apple-darwin x86_64-apple-darwin
+      # From source, as in the `licenses` job: scripts/dist-macos.sh writes the
+      # third-party notices of every archive itself.
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli --version "$CARGO_ABOUT_VERSION"
+      - name: The runner (macOS, Xcode, SDK, Rosetta)
+        run: |
+          sw_vers
+          xcodebuild -version
+          echo "SDK: $(xcrun --sdk macosx --show-sdk-version), $(xcrun --sdk macosx --show-sdk-path)"
+          rustc -vV
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta is here: the x86_64 binaries are run as well as built"
+          else
+            echo "::notice title=No Rosetta::this runner cannot run x86_64 binaries: the x86_64 archives are built and checked (architecture, contents) but not run"
+          fi
+      # Both architectures: the CLI archives, Warden.app (ad-hoc signed) in the
+      # zips and the disk images; refuses a dirty tree. Files: target/dist-macos.
+      - name: Build, package and check (scripts/dist-macos.sh --no-upload)
+        run: bash scripts/dist-macos.sh --no-upload
+      # What the script checked, again, on the files that will be released, with
+      # a Mac's own tools: the architecture of every binary (a build for the
+      # wrong target must not go out as another), the licenses, the version in
+      # Info.plist, the disk images really mounted (read-only, detached in a
+      # trap), the programs inside them run, and macos-build-info.txt vouching
+      # for exactly these files (as the `macos-local` job demands of a Mac's).
+      - name: Check the files for real
+        run: |
+          set -euo pipefail
+          cd target/dist-macos
+          scratch=$(mktemp -d)
+          mounted=""
+          detach() { # the image that is mounted, if any
+            [ -n "$mounted" ] || return 0
+            local m=$mounted
+            mounted=""
+            hdiutil detach "$m" >/dev/null 2>&1 || { sleep 2; hdiutil detach -force "$m" >/dev/null 2>&1; } || true
+          }
+          cleanup() { detach; rm -rf "$scratch"; }
+          trap cleanup EXIT
+          fail() { echo "::error::$*"; exit 1; }
+          rosetta=no
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then rosetta=yes; fi
+
+          # A Mach-O 64-bit binary of exactly this architecture. `file` is
+          # captured first: `grep -q` in a pipe can end it early (SIGPIPE under pipefail).
+          macho() { # file arch
+            local what archs
+            what=$(file "$1")
+            archs=$(lipo -archs "$1")
+            echo "$what  (lipo: $archs)"
+            grep -q "Mach-O 64-bit.* $2" <<<"$what" && [ "$archs" = "$2" ]
+          }
+          # What a program says when run (--version answers without a display).
+          says() { # arch program expected
+            local got
+            if [ "$1" = x86_64 ] && [ "$rosetta" = no ]; then echo "not run (no Rosetta): $2"; return 0; fi
+            if [ "$1" = x86_64 ]; then got=$(arch -x86_64 "$2" --version) || return 1; else got=$("$2" --version) || return 1; fi
+            echo "$got"
+            [ "$got" = "$3" ]
+          }
+          # Warden.app, from a zip or from a mounted disk image.
+          check_app() { # arch app label
+            local arch=$1 app=$2 label=$3 f key v
+            for f in warden-gui warden; do
+              macho "$app/Contents/MacOS/$f" "$arch" || fail "$label: $f is not a macOS $arch binary"
+            done
+            for key in CFBundleShortVersionString CFBundleVersion; do
+              v=$(plutil -extract "$key" raw -o - "$app/Contents/Info.plist") || fail "$label: Info.plist has no $key"
+              [ "$v" = "$VERSION" ] || fail "$label: Info.plist says $key $v, not $VERSION"
+            done
+            for f in LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt THIRD-PARTY-LICENSES-GUI.txt FONT-LICENSES.txt; do
+              [ -s "$app/Contents/Resources/$f" ] || fail "$label: Warden.app has no $f"
+            done
+            codesign --verify --deep --strict "$app" || fail "$label: Warden.app fails codesign --verify"
+            says "$arch" "$app/Contents/MacOS/warden" "warden $VERSION" || fail "$label: the warden inside does not say 'warden $VERSION'"
+            says "$arch" "$app/Contents/MacOS/warden-gui" "warden-gui $VERSION" || fail "$label: the warden-gui inside does not say 'warden-gui $VERSION'"
+          }
+
+          # First: macos-build-info.txt vouches for exactly these files, built
+          # from this commit (the same demand the `macos-local` job makes of a
+          # Mac's files), so that nothing is opened that is not what was built.
+          files=()
+          for arch in arm64 x86_64; do
+            files+=("warden-$VERSION-macos-$arch.tar.gz" "warden-gui-$VERSION-macos-$arch.zip" "Warden-$VERSION-macos-$arch.dmg")
+          done
+          echo "== macos-build-info.txt"
+          cat macos-build-info.txt
+          built=$(sed -n 's/^commit: //p' macos-build-info.txt | head -1)
+          [ "$built" = "$GITHUB_SHA" ] || fail "macos-build-info.txt says the files were built from ${built:-an unknown commit}, but this run is $GITHUB_SHA"
+          grep -qx 'dirty: no' macos-build-info.txt || fail "the files were built from a tree with uncommitted changes"
+          for f in "${files[@]}"; do
+            want=$(awk -v f="$f" '$1 == "sha256" && $3 == f { print $2 }' macos-build-info.txt)
+            got=$(shasum -a 256 "$f" | awk '{ print $1 }')
+            [ -n "$want" ] && [ "$got" = "$want" ] || fail "$f does not match the checksum in macos-build-info.txt"
+          done
+
+          for arch in arm64 x86_64; do
+            cli="warden-$VERSION-macos-$arch"
+            gui="warden-gui-$VERSION-macos-$arch"
+            dmg="Warden-$VERSION-macos-$arch.dmg"
+            echo "== $arch: $cli.tar.gz"
+            tar -tzf "$cli.tar.gz" > "$scratch/$arch.list"
+            for f in warden README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt contrib/nginx.conf; do
+              grep -qx "$cli/$f" "$scratch/$arch.list" || fail "$cli.tar.gz has no $f"
+            done
+            tar -xzf "$cli.tar.gz" -C "$scratch" "$cli/warden"
+            macho "$scratch/$cli/warden" "$arch" || fail "$cli.tar.gz does not hold a macOS $arch warden"
+            says "$arch" "$scratch/$cli/warden" "warden $VERSION" || fail "$cli.tar.gz: warden does not say 'warden $VERSION'"
+            echo "== $arch: $gui.zip"
+            ditto -x -k "$gui.zip" "$scratch/zip-$arch"
+            check_app "$arch" "$scratch/zip-$arch/Warden.app" "$gui.zip"
+            echo "== $arch: $dmg"
+            mnt="$scratch/mnt-$arch"
+            mkdir -p "$mnt"
+            mounted=$mnt
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null || fail "$dmg cannot be mounted"
+            check_app "$arch" "$mnt/Warden.app" "$dmg"
+            { [ -L "$mnt/Applications" ] && [ "$(readlink "$mnt/Applications")" = /Applications ]; } ||
+              fail "$dmg: there is no Applications link to /Applications"
+            detach
+          done
+
+          ls -l
+          { echo "### macOS archives, built on a runner"; echo; echo '```'; cat macos-build-info.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # Only the release's files (not the notices folder the script leaves).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-assets
+          path: |
+            target/dist-macos/warden-*-macos-*.tar.gz
+            target/dist-macos/warden-gui-*-macos-*.zip
+            target/dist-macos/Warden-*-macos-*.dmg
+            target/dist-macos/macos-build-info.txt
+          if-no-files-found: error
+          retention-days: 14
+
   checksums:
-    needs: [meta, cli, gui, packages, macos]
-    # The gui job is skipped until gui/ exists, the macos job in a dry run.
-    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') && needs.packages.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
+    needs: [meta, cli, gui, packages, macos-local, macos-runner]
+    # The gui job is skipped until gui/ exists. Of the two macOS jobs the
+    # release's macos_source picks one; the other is skipped by its own
+    # condition, which is as it should be. The chosen one must have succeeded
+    # (failed, cancelled, or skipped for any other reason: nothing goes on).
+    # The one more legitimate skip: a dry run that chose "local" has no macOS
+    # job at all.
+    if: >-
+      ${{ !cancelled()
+      && needs.cli.result == 'success'
+      && (needs.gui.result == 'success' || needs.gui.result == 'skipped')
+      && needs.packages.result == 'success'
+      && ((needs.meta.outputs.macos_source == 'runner' && needs.macos-runner.result == 'success')
+      || (needs.meta.outputs.macos_source == 'local' && needs.meta.outputs.publish == 'true' && needs.macos-local.result == 'success')
+      || (needs.meta.outputs.macos_source == 'local' && needs.meta.outputs.publish != 'true' && needs.macos-local.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       PUBLISH: ${{ needs.meta.outputs.publish }}
+      MACOS_SOURCE: ${{ needs.meta.outputs.macos_source }}
       WITH_GUI: ${{ needs.meta.outputs.gui }}
     steps:
       - uses: actions/checkout@v5
+      # macos-assets, from whichever macOS job ran.
       - uses: actions/download-artifact@v4
         with:
           pattern: "{cli,gui,packages,macos}-*"
@@ -588,8 +855,9 @@ jobs:
             want+=("warden-$VERSION-1.$a.rpm")
             if [ "$WITH_GUI" = true ]; then want+=("warden-gui-$VERSION-1.$a.rpm"); fi
           done
-          if [ "$PUBLISH" = true ]; then
-            # Not in a dry run: they are built on a Mac.
+          if [ "$MACOS_SOURCE" = runner ] || [ "$PUBLISH" = true ]; then
+            # Built on a runner (always, a dry run too), or taken from the
+            # draft a Mac filled (a real release only: a dry run has none).
             for a in arm64 x86_64; do
               want+=("warden-$VERSION-macos-$a.tar.gz")
               want+=("Warden-$VERSION-macos-$a.dmg")
@@ -668,11 +936,15 @@ jobs:
       - name: scripts/test-install.sh (the install.sh being released, against fake releases)
         run: INSTALL_SH="$PWD/dist/install.sh" bash scripts/test-install.sh
 
-  # The draft release already holds the macOS archives (the macos job read
-  # them there): add the Linux archives and packages, SHA256SUMS and
-  # install.sh, check the draft, write the notes (CHANGELOG.md) and publish it.
-  # A tag pushed by hand is what was built; started by hand, publishing creates
-  # the tag at the commit built. The only job besides `macos` that can write.
+  # The macOS archives are in the artifacts either way (macos-assets). With the
+  # source "local" the draft release already holds them (macos-local read them
+  # there); with "runner" there is no draft yet and it is made here. Add the
+  # Linux archives and packages, SHA256SUMS and install.sh, check the draft,
+  # write the notes (CHANGELOG.md) and publish it. A tag pushed by hand is what
+  # was built; started by hand, publishing creates the tag at the commit built.
+  # The only job besides `macos-local` that can write. It does not list the
+  # macOS jobs: it needs `checksums`, which runs only when the one the release
+  # chose has succeeded.
   publish:
     needs: [meta, checksums, install-test]
     if: needs.meta.outputs.publish == 'true'
@@ -692,12 +964,35 @@ jobs:
         with:
           name: release-notes
           path: notes
-      # A re-run after the release went out must not touch it.
+      # A re-run after the release went out must not touch it. With the macOS
+      # source "runner" no draft was made before this job: it is made here, empty
+      # (the next step puts every file in it). With "local" the Mac made it and
+      # the macos-local job read it, so a missing draft is an error.
       - id: draft
-        name: Is there a draft to publish?
+        name: Is there a draft to publish? (made here for the source "runner")
+        env:
+          MACOS_SOURCE: ${{ needs.meta.outputs.macos_source }}
         run: |
           set -euo pipefail
-          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          seen=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>&1) || true
+          case "$seen" in
+            true|false) draft=$seen ;;
+            *"not found"*)
+              if [ "$MACOS_SOURCE" != runner ]; then
+                echo "::error title=No draft release::there is no release $TAG, and the macOS archives were taken from the draft the Mac made: it was deleted meanwhile. Run scripts/dist-macos.sh on the Mac again, then re-run this workflow."
+                exit 1
+              fi
+              flags=(--draft --title "Warden $VERSION" --notes-file notes/RELEASE-NOTES.md)
+              if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+                # Started by hand: the tag does not exist yet; publishing creates it.
+                flags+=(--target "$GITHUB_SHA")
+              fi
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+              draft=true ;;
+            *)
+              echo "::error::can't look for the release $TAG: $seen"
+              exit 1 ;;
+          esac
           echo "draft=$draft" >> "$GITHUB_OUTPUT"
           if [ "$draft" != true ]; then
             echo "::notice::$TAG is already published: nothing to upload or publish (the last step verifies it)"
@@ -724,7 +1019,7 @@ jobs:
           sha256sum -c SHA256SUMS || { echo "::error::the draft's files do not match SHA256SUMS"; exit 1; }
           listed=$(wc -l < SHA256SUMS | tr -d ' ')
           files=$(find . -maxdepth 1 -type f ! -name SHA256SUMS | wc -l | tr -d ' ')
-          [ "$listed" = "$files" ] || { echo "::error::SHA256SUMS lists $listed files, the draft holds $files besides it"; exit 1; }
+          [ "$listed" = "$files" ] || { echo "::error::SHA256SUMS lists $listed files, the draft holds $files besides it (a draft left by an earlier attempt, or by cargo dist-macos, may hold others: delete the draft release and run this again)"; exit 1; }
           echo "all $files files of the draft match SHA256SUMS"
       - name: Publish
         if: steps.draft.outputs.draft == 'true'

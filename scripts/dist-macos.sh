@@ -1,26 +1,37 @@
 #!/usr/bin/env bash
-# The macOS release archives, built on this Mac instead of on GitHub's macOS
-# runners (a macOS minute costs ten Linux ones on a private repository).
+# The macOS release archives. They are built here, on a Mac, by one of two
+# callers, chosen per release (docs/releasing.md):
+#   - the maintainer's own Mac: `cargo dist-macos` (or `cargo release --macos
+#     local`) builds, checks and uploads them to a DRAFT release, which the
+#     Release workflow's `macos-local` job waits for;
+#   - a GitHub-hosted macOS runner: the Release workflow's `macos-runner` job
+#     runs this script with --no-upload (build and check only, nothing is sent
+#     anywhere) and takes the files from its own output.
+# The same script either way, so the same archives.
 #
 #   scripts/dist-macos.sh [OPTIONS]     (also: cargo xtask dist-macos [OPTIONS])
 #
-# Builds, for arm64 and x86_64 (either Mac can build both):
+# Builds, for arm64 and x86_64 (either kind of Mac builds both; on an Apple
+# silicon Mac the x86_64 build, the GUI included, is a cross-build that needs
+# only Xcode's tools, and Rosetta only to run the result):
 #   warden-<version>-macos-<arch>.tar.gz       the CLI
 #   warden-gui-<version>-macos-<arch>.zip      Warden.app (GUI + CLI), ad-hoc signed
 #   Warden-<version>-macos-<arch>.dmg          a disk image (volume "Warden", UDZO) with
 #                                              that Warden.app and a link to /Applications
-# the archives with the same names and contents the Release workflow made on
-# macOS runners before. It mounts each disk image to check what is inside, then
-# checks the host's files with install.sh (checksum, tampered archive refused,
-# Warden.app from the zip and from the image) and uploads everything to a DRAFT
-# GitHub Release for the tag v<version> (created if needed; never published
-# from here). The Release workflow (.github/workflows/release.yml) waits for
-# these files, adds the Linux archives, SHA256SUMS and install.sh, and
-# publishes. `macos-build-info.txt` goes up last: it names the commit these
-# files were built from, and the workflow refuses any other commit.
+# It mounts each disk image to check what is inside, then checks the host's
+# files with install.sh (checksum, tampered archive refused, Warden.app from the
+# zip and from the image) and writes macos-build-info.txt: the commit these
+# files were built from and the checksum of each, which the workflow checks.
+# Unless --no-upload, it then uploads everything to a DRAFT GitHub Release for
+# the tag v<version> (created if needed; never published from here), the info
+# file last. The Release workflow (.github/workflows/release.yml) takes the
+# files from there (macos-local) or from the runner's own build (macos-runner),
+# adds the Linux archives, SHA256SUMS and install.sh, and publishes.
 #
 # Options:
-#   --no-upload        Build and check only: files stay in the output directory
+#   --no-upload        Build and check only: files stay in the output directory.
+#                      Nothing is sent to GitHub and no tag or release is looked
+#                      at: gh is not needed. (What the runner job does.)
 #   --no-gui           CLI archives only (no zip, no disk image)
 #   --no-dmg           No disk images
 #   --arch LIST        arm64, x86_64 or arm64,x86_64 (default: both)
@@ -40,8 +51,9 @@
 # `cargo install cargo-about --locked --features cli` (third-party notices), and
 # for the upload the GitHub CLI: `gh auth login` with a right to write releases.
 # hdiutil (the disk images) comes with macOS.
-# (Run by hand or by `cargo release` on a Mac; not meant to be portable to
-# Linux: scripts/test-dist-macos.sh runs it there, against stubs.)
+# (Run by hand, by `cargo release --macos local` or by the workflow on a Mac; not
+# meant to be portable to Linux: scripts/test-dist-macos.sh runs it there,
+# against stubs.)
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
@@ -101,7 +113,7 @@ triple() { case "$1" in arm64) echo aarch64-apple-darwin ;; x86_64) echo x86_64-
 
 # ---------------------------------------------------------------- 1
 step "1. Preconditions"
-[ "$(uname -s)" = Darwin ] || die "this builds macOS binaries, so it needs a Mac (this is $(uname -s)). On another machine the Release workflow waits for the files: run this on a Mac."
+[ "$(uname -s)" = Darwin ] || die "this builds macOS binaries, so it needs a Mac (this is $(uname -s)). Run it on a Mac, or let the Release workflow build the macOS archives on a GitHub runner (cargo release --macos runner, the default)."
 command -v git >/dev/null || die "git is not installed"
 if [ "$dmg" = 1 ]; then
     command -v hdiutil >/dev/null || die "hdiutil is missing (it makes the disk images; it is part of macOS: is this a Mac with a normal PATH?). --no-dmg builds without them"
@@ -128,13 +140,18 @@ if [ "$check" = 0 ]; then
     say "version $version (tag $tag)"
 
     # The tag, here or on origin, must be on this very commit: the archives
-    # are released as the commit the tag names.
-    if tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null) && [ "$tagged" != "$sha" ]; then
-        die "the tag $tag here points at $(echo "$tagged" | cut -c1-7), but HEAD is $(echo "$sha" | cut -c1-7): check out the commit the tag names (git checkout $tag), or the release will refuse these files"
-    fi
-    remote_tagged=$(git ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" 2>/dev/null | awk 'END { print $1 }') || remote_tagged=""
-    if [ -n "$remote_tagged" ] && [ "$remote_tagged" != "$sha" ]; then
-        die "the tag $tag on origin points at $(echo "$remote_tagged" | cut -c1-7), but HEAD is $(echo "$sha" | cut -c1-7): check out the commit the tag names (git fetch --tags && git checkout $tag)"
+    # are released as the commit the tag names. Only an upload needs that: a
+    # build that stays here (--no-upload: the Release workflow's runner job, a
+    # test build) is tied to no release, and a dry run on any branch has no tag
+    # at its commit, or the tag of an older release.
+    if [ "$upload" = 1 ]; then
+        if tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null) && [ "$tagged" != "$sha" ]; then
+            die "the tag $tag here points at $(echo "$tagged" | cut -c1-7), but HEAD is $(echo "$sha" | cut -c1-7): check out the commit the tag names (git checkout $tag), or the release will refuse these files"
+        fi
+        remote_tagged=$(git ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" 2>/dev/null | awk 'END { print $1 }') || remote_tagged=""
+        if [ -n "$remote_tagged" ] && [ "$remote_tagged" != "$sha" ]; then
+            die "the tag $tag on origin points at $(echo "$remote_tagged" | cut -c1-7), but HEAD is $(echo "$sha" | cut -c1-7): check out the commit the tag names (git fetch --tags && git checkout $tag)"
+        fi
     fi
 fi
 

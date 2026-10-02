@@ -184,7 +184,7 @@ Each release at <https://github.com/oceanwap/warden/releases> holds, for
 | `Warden-<version>-macos-<arch>.dmg` | A disk image (volume `Warden`) with that `Warden.app` and a link to `/Applications`: drag one onto the other |
 | `install.sh` | This installer, as of the release |
 | `SHA256SUMS` | The SHA-256 of every other file above |
-| `macos-build-info.txt` | The commit and checksums of the macOS files, which are built on a Mac ([Releasing](releasing.md)) |
+| `macos-build-info.txt` | The commit and checksums of the macOS files, which are built on a GitHub macOS runner or on a Mac ([Releasing](releasing.md)) |
 
 `--version` takes the number as in the file names (`0.2.0`), with or without
 the `v` of the tag.

@@ -6,7 +6,8 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] — 0.1.0-unreleased
 
 Current `main`. There is no GitHub Release or tag yet; the first one is cut
-with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md)).
+with `cargo release 0.1.0` (the macOS archives are built on a GitHub runner, or
+on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
 
 ### Added
 
@@ -95,8 +96,9 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
 - `install.sh` for the release assets, and a Release workflow that builds and
   tests the Linux archives and can also be started by hand from GitHub
   (Actions → Release → Run workflow), which creates the tag itself once
-  everything is built and tested. The macOS archives are built on a Mac
-  (`cargo dist-macos`, run by `cargo release`) and published with the rest.
+  everything is built and tested. The macOS archives are built on a GitHub
+  macOS runner (the default) or on a Mac (`cargo release --macos local`, which
+  runs `cargo dist-macos`), chosen per release, and published with the rest.
 - [`contrib/nginx.conf`](contrib/nginx.conf) and
   [`docs/proxies.md`](docs/proxies.md) for running behind nginx or a cloud load
   balancer.

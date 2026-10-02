@@ -367,9 +367,15 @@ check "…nothing was uploaded" sh -c "! grep -Eq '^gh release (upload|create)' 
 R15=$T/r15
 mkrepo "$R15"
 (cd "$R15" && git tag "v$version" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m later)
-run "$R15" "$T/log15" -- --no-upload >"$T/out15" 2>&1
-check "HEAD is not the commit the tag names: refused" test $? -ne 0
+run "$R15" "$T/log15" -- >"$T/out15" 2>&1
+check "an upload from a HEAD that is not the commit the tag names: refused" test $? -ne 0
 check "…and says what to check out" grep -q "check out the commit the tag names" "$T/out15"
+check "…before anything was built or uploaded" sh -c "! grep -q ' build ' '$T/log15' && ! grep -Eq '^gh release (upload|create)' '$T/log15'"
+# The runner's way: a build that is not uploaded is tied to no release (a dry
+# run on any branch has no tag at its commit, or the tag of an older release).
+run "$R15" "$T/log15b" -- --no-upload >"$T/out15b" 2>&1
+check "a build that is not uploaded ignores a tag on another commit" test $? -eq 0
+check "…and still writes its build info for the commit it was built from" grep -qx "commit: $(cd "$R15" && git rev-parse HEAD)" "$R15/target/dist-macos/macos-build-info.txt"
 
 # ------------------------------------------------ 16. a Rosetta shell is an arm64 Mac
 run "$R1" "$T/log16" FAKE_ARCH=x86_64 FAKE_TRANSLATED=1 -- --no-upload >"$T/out16" 2>&1
@@ -424,6 +430,25 @@ check "…but still the zips" test -s "$R1/target/dist-macos/warden-gui-$version
 check "…and Warden.app still installs from the zip" grep -q "installed: Warden.app (from the zip)" "$T/out19"
 run "$R1" "$T/log19b" -- --no-upload --no-gui >"$T/out19b" 2>&1
 check "--no-gui builds no disk image either" sh -c "! ls '$R1/target/dist-macos' | grep -q '\.dmg\$' && ! grep -q '^hdiutil' '$T/log19b'"
+
+# ------------------------------------------------ 20. the runner's way: --no-upload, no gh at all
+run "$R1" "$T/log20" FAKE_GH_LOGIN=no FAKE_GH=published -- --no-upload >"$T/out20" 2>&1
+check "--no-upload needs no gh login, and a published release of this version does not matter" test $? -eq 0
+check "…gh was never called" sh -c "! grep -q '^gh ' '$T/log20'"
+missing=""
+for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip \
+    Warden-$version-macos-arm64.dmg Warden-$version-macos-x86_64.dmg macos-build-info.txt; do
+    [ -s "$R1/target/dist-macos/$f" ] || missing="$missing $f"
+done
+check "…and every file the workflow uploads as an artifact is there" test -z "$missing"
+extra=""
+for f in "$R1"/target/dist-macos/*; do
+    case "$(basename "$f")" in
+        warden-*.tar.gz|warden-gui-*.zip|Warden-*.dmg|macos-build-info.txt|notices) ;;
+        *) extra="$extra $(basename "$f")" ;;
+    esac
+done
+check "…and the output directory holds nothing else (but the notices folder)" test -z "$extra"
 
 echo
 if [ "$fails" -gt 0 ]; then

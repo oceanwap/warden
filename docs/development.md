@@ -18,7 +18,8 @@ cargo xtask bench           # benchmarks, all suites (~25 min on 2 CPUs); `--qui
                             # (see benchmarks.md and ../bench/README.md); `cargo xtask bench --help`
 cargo xtask chaos           # chaos soak: a fleet under load, random faults, invariants checked (chaos.md)
 cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
-cargo dist-macos            # the macOS release archives, built on this Mac (see Releasing below)
+cargo dist-macos            # the macOS release archives, built on this Mac: the local source of `cargo release --macos local`
+                            # (`--no-upload` builds and checks them without touching GitHub; see Releasing below)
 scripts/mac-check.sh        # on a Mac: builds, runs the platform tests and drives a real supervisor and
                             # wardend (CPU, memory, user, ports, environment, host events, static bodies and latency); the report
                             # is target/mac-check/report.txt
@@ -69,8 +70,12 @@ clippy and the tests, then commits `Release v<version>`, tags
 builds the CLI and the GUI for Linux, checksums them with the macOS archives,
 tests `install.sh` and publishes the
 [GitHub Release](https://github.com/oceanwap/warden/releases). The macOS
-archives and the `.dmg` are built on the Mac that runs `cargo release`: it builds, checks and uploads them to a draft
-release after the push, and the workflow takes them from there. The command
+archives and the `.dmg` have two sources, chosen per release: by default
+(`--macos runner`) the workflow builds them on a GitHub macOS runner, and with
+`--macos local` they are built on the Mac that runs `cargo release`, which
+builds, checks and uploads them to a draft release after the push, and the
+workflow takes them from there. The choice is a line in the tag's annotation
+(`macos: runner` or `macos: local`) that the workflow reads. The command
 follows the workflow to the end and prints the release's files. Pushing the
 tag needs the right to push tags to the repository. macOS notarization is
 still a TODO. Every step, the options and what to do when one fails:
