@@ -16,8 +16,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, oneshot};
 
 pub use warden_protocol::control::{
-    DRAINING, HostStatus, LoopDelay, MAX_CONNECTIONS, MAX_STREAMS, REQUEST_TIMEOUT, Request, Response, RolloutOutcome,
-    RolloutStatus, STANDBY, Status, WARMING, WorkerStatus,
+    DRAINING, HostStatus, Listener, LoopDelay, MAX_CONNECTIONS, MAX_STREAMS, REQUEST_TIMEOUT, Request, Response,
+    RolloutOutcome, RolloutStatus, STANDBY, Status, WARMING, WorkerStatus,
 };
 
 /// A connection's place in the budget: a request slot, until it becomes a

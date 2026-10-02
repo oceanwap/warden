@@ -1,12 +1,15 @@
 //! The Linux adapter: everything from `/proc`.
 
-use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Platform, ProcStats};
-use std::collections::HashSet;
+use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcStats};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{BufRead, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 pub(crate) struct Linux;
 
@@ -61,14 +64,64 @@ impl Platform for Linux {
         if inodes.is_empty() {
             return Some(Vec::new());
         }
-        let mut ports = Vec::new();
-        // /proc/<pid>/net/* shows the process's own network namespace.
-        for table in ["tcp", "tcp6"] {
-            if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")) {
-                ports.extend(parse_listening_ports(&text, &inodes));
+        let tcp = tcp_listeners(pid, &inodes);
+        Some(
+            tcp.into_iter()
+                .filter_map(|l| if let Listener::Tcp { port, .. } = l { Some(port) } else { None })
+                .collect(),
+        )
+    }
+
+    fn listeners(&self, pid: u32) -> Option<Vec<Listener>> {
+        self.listeners_of(&[pid])
+    }
+
+    fn listeners_of(&self, pids: &[u32]) -> Option<Vec<Listener>> {
+        // The socket tables belong to a network namespace and have a row per
+        // connection (megabytes on a busy host): each is read once for all the
+        // processes in the namespace, not once per process.
+        let mut spaces: Vec<(Option<PathBuf>, u32, HashSet<u64>)> = Vec::new();
+        for (i, pid) in pids.iter().enumerate() {
+            let Some(inodes) = socket_inodes(*pid) else {
+                if i == 0 {
+                    return None;
+                }
+                continue;
+            };
+            if inodes.is_empty() {
+                continue;
+            }
+            let ns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+            match spaces.iter_mut().find(|s| s.0 == ns) {
+                Some(s) => s.2.extend(inodes),
+                None => spaces.push((ns, *pid, inodes)),
             }
         }
-        Some(ports)
+        let mut found = Vec::new();
+        for (_, pid, inodes) in &spaces {
+            found.extend(tcp_listeners(*pid, inodes));
+            for_each_row(&format!("/proc/{pid}/net/unix"), |row| found.extend(parse_unix_row(row, inodes)));
+        }
+        Some(found)
+    }
+
+    fn children(&self, pid: u32) -> Option<Vec<u32>> {
+        // The children of every thread: a child belongs to the thread that
+        // forked it, and Node and Bun fork from whichever thread asked.
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+        if !has_task_children() {
+            return Some(scan_children(pid));
+        }
+        let mut kids = Vec::new();
+        for task in tasks.flatten().take(MAX_TASKS) {
+            // A thread that ended since the listing has no file: it has no children.
+            if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+                kids.extend(text.split_whitespace().filter_map(|p| p.parse::<u32>().ok()));
+            }
+        }
+        kids.sort_unstable();
+        kids.dedup();
+        Some(kids)
     }
 
     fn command_lines(&self) -> Vec<(u32, String)> {
@@ -143,21 +196,156 @@ fn socket_inodes(pid: u32) -> Option<HashSet<u64>> {
     Some(set)
 }
 
-/// The local ports of the rows of a /proc/net/tcp{,6} table in LISTEN (0A)
-/// whose inode is in `inodes`: one per socket.
-pub(crate) fn parse_listening_ports(text: &str, inodes: &HashSet<u64>) -> Vec<u16> {
-    text.lines()
-        .skip(1)
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            // sl local rem st tx:rx tr:when retrnsmt uid timeout inode
-            if f.len() > 9 && f[3] == "0A" && f[9].parse::<u64>().is_ok_and(|i| inodes.contains(&i)) {
-                u16::from_str_radix(f[1].rsplit(':').next()?, 16).ok()
-            } else {
-                None
+/// The most threads of one process whose children are read (a Node or Bun
+/// process has a few dozen).
+const MAX_TASKS: usize = 512;
+
+/// `/proc/<pid>/task/<tid>/children` exists (`CONFIG_PROC_CHILDREN`: distro
+/// kernels have it, some minimal ones do not); checked once.
+fn has_task_children() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        let me = std::process::id();
+        std::fs::metadata(format!("/proc/{me}/task/{me}/children")).is_ok()
+    })
+}
+
+/// Without the `children` files: every process whose parent is `pid`. One
+/// pass over `/proc/*/stat` answers all the questions of the next second (a
+/// walk of a process tree asks once per process).
+fn scan_children(pid: u32) -> Vec<u32> {
+    /// When the pass was taken, and the processes by their parent.
+    type Pass = Option<(Instant, HashMap<u32, Vec<u32>>)>;
+    static PASS: Mutex<Pass> = Mutex::new(None);
+    let mut pass = PASS.lock().unwrap_or_else(PoisonError::into_inner);
+    if !matches!(&*pass, Some((at, _)) if at.elapsed() < Duration::from_secs(1)) {
+        *pass = Some((Instant::now(), children_by_parent()));
+    }
+    pass.as_ref().and_then(|(_, map)| map.get(&pid).cloned()).unwrap_or_default()
+}
+
+/// Every process by its parent, from `/proc/*/stat`.
+fn children_by_parent() -> HashMap<u32, Vec<u32>> {
+    let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else { return map };
+    for entry in dir.flatten() {
+        let Some(pid) = entry.file_name().to_string_lossy().parse::<u32>().ok() else { continue };
+        if let Some(ppid) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| parse_stat_ppid(&s))
+        {
+            map.entry(ppid).or_default().push(pid);
+        }
+    }
+    for kids in map.values_mut() {
+        kids.sort_unstable();
+    }
+    map
+}
+
+/// The parent's pid (field 4) from the contents of /proc/<pid>/stat.
+pub(crate) fn parse_stat_ppid(stat: &str) -> Option<u32> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // f[0] is field 3 (state); the parent is field 4.
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The TCP listeners of a process, from the tables of its own network
+/// namespace (`/proc/<pid>/net/*`).
+fn tcp_listeners(pid: u32, inodes: &HashSet<u64>) -> Vec<Listener> {
+    let mut found = Vec::new();
+    for table in ["tcp", "tcp6"] {
+        for_each_row(&format!("/proc/{pid}/net/{table}"), |row| found.extend(parse_tcp_row(row, inodes)));
+    }
+    found
+}
+
+/// Each row of a /proc/net table (every line after the header), streamed: a
+/// busy host's tables are megabytes. Text that is not UTF-8 is read lossily:
+/// one odd socket name must not hide every other socket.
+fn for_each_row(path: &str, mut f: impl FnMut(&str)) {
+    let Ok(file) = std::fs::File::open(path) else { return };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line = Vec::new();
+    let mut header = true;
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        if std::mem::take(&mut header) {
+            continue;
+        }
+        f(String::from_utf8_lossy(&line).trim_end_matches('\n'));
+    }
+}
+
+/// The address of a /proc/net/tcp{,6} column: the kernel prints the
+/// address as 32-bit words in the machine's byte order, one word for IPv4 and
+/// four for IPv6.
+fn parse_hex_addr(hex: &str) -> Option<IpAddr> {
+    match hex.len() {
+        8 => Some(IpAddr::V4(Ipv4Addr::from(u32::from_str_radix(hex, 16).ok()?.to_ne_bytes()))),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (out, word) in bytes.chunks_exact_mut(4).zip(hex.as_bytes().chunks_exact(8)) {
+                let w = u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?;
+                out.copy_from_slice(&w.to_ne_bytes());
             }
-        })
-        .collect()
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
+}
+
+/// One row of /proc/net/tcp{,6}: a listener (state 0A) whose inode is in
+/// `inodes`, with the address it is bound to.
+fn parse_tcp_row(row: &str, inodes: &HashSet<u64>) -> Option<Listener> {
+    // sl local rem st tx:rx tr:when retrnsmt uid timeout inode: no allocation
+    // for the many rows that are not listeners.
+    let mut f = row.split_whitespace();
+    let local = f.nth(1)?;
+    if f.nth(1)? != "0A" {
+        return None;
+    }
+    if !f.nth(5)?.parse::<u64>().is_ok_and(|i| inodes.contains(&i)) {
+        return None;
+    }
+    let (addr, port) = local.rsplit_once(':')?;
+    Some(Listener::Tcp { port: u16::from_str_radix(port, 16).ok()?, addr: parse_hex_addr(addr)? })
+}
+
+/// The rows of a /proc/net/tcp{,6} table that are ours listeners.
+#[cfg(test)]
+pub(crate) fn parse_tcp_listeners(text: &str, inodes: &HashSet<u64>) -> Vec<Listener> {
+    text.lines().skip(1).filter_map(|row| parse_tcp_row(row, inodes)).collect()
+}
+
+/// One row of /proc/net/unix: a socket that accepts connections
+/// (`__SO_ACCEPTCON` in the flags), has a name, and whose inode is in
+/// `inodes`. A path that starts with `@` is an abstract socket (the kernel
+/// prints its NUL that way).
+fn parse_unix_row(row: &str, inodes: &HashSet<u64>) -> Option<Listener> {
+    /// `__SO_ACCEPTCON` (include/linux/net.h).
+    const ACCEPTING: u32 = 1 << 16;
+    // Num RefCount Protocol Flags Type St Inode [Path]; the inode is padded with spaces.
+    let mut rest = row;
+    let mut fields = [""; 7];
+    for slot in &mut fields {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        (*slot, rest) = rest.split_at(end);
+    }
+    let [_num, _refs, _proto, flags, _kind, _state, inode] = fields;
+    let path = rest.trim_start();
+    let accepting = u32::from_str_radix(flags, 16).ok()? & ACCEPTING != 0;
+    let mine = inode.parse::<u64>().is_ok_and(|i| inodes.contains(&i));
+    (accepting && mine && !path.is_empty()).then(|| Listener::Unix { path: path.to_string() })
+}
+
+/// The rows of a /proc/net/unix table that are our listeners.
+#[cfg(test)]
+pub(crate) fn parse_unix_listeners(text: &str, inodes: &HashSet<u64>) -> Vec<Listener> {
+    text.lines().skip(1).filter_map(|row| parse_unix_row(row, inodes)).collect()
 }
 
 /// The aggregate `cpu` line of /proc/stat: jiffies since boot, all of them
@@ -218,6 +406,7 @@ mod tests {
         assert!(parse_environ(b"").is_empty());
     }
 
+    #[cfg(target_endian = "little")]
     #[test]
     fn parses_proc_net_tcp() {
         let text = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -228,10 +417,108 @@ mod tests {
         let mine: HashSet<u64> = [11501, 5555, 1173].into_iter().collect();
         // Row 1 (inode 11501, port 0x0C1C = 3100) and row 0 (1173, 0x9A0D = 39437) listen and
         // are ours; row 2 is not ours; row 3 is established, not listening.
-        assert_eq!(parse_listening_ports(text, &mine), [0x9A0D, 3100]);
+        let tcp = |port, addr: &str| Listener::Tcp { port, addr: addr.parse().unwrap() };
+        assert_eq!(parse_tcp_listeners(text, &mine), [tcp(0x9A0D, "127.0.0.1"), tcp(3100, "0.0.0.0")]);
         let only: HashSet<u64> = [11501].into_iter().collect();
-        assert_eq!(parse_listening_ports(text, &only), [3100]);
-        assert!(parse_listening_ports(text, &HashSet::new()).is_empty());
+        assert_eq!(parse_tcp_listeners(text, &only), [tcp(3100, "0.0.0.0")]);
+        assert!(parse_tcp_listeners(text, &HashSet::new()).is_empty());
+    }
+
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn parses_proc_net_tcp6_addresses() {
+        let text = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 700 1 0000000000000000 100 0 0 10 0
+   1: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 701 1 0000000000000000 100 0 0 10 0
+   2: 0000000000000000FFFF00000100007F:1F92 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 702 1 0000000000000000 100 0 0 10 0
+   3: 000080FE00000000FF0F58E5F60FB4D8:1F93 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 703 1 0000000000000000 100 0 0 10 0";
+        let mine: HashSet<u64> = [700, 701, 702, 703].into_iter().collect();
+        let got = parse_tcp_listeners(text, &mine);
+        let want = |port, addr: &str| Listener::Tcp { port, addr: addr.parse().unwrap() };
+        assert_eq!(
+            got,
+            [
+                want(8080, "::"),
+                want(8081, "::1"),
+                want(8082, "::ffff:127.0.0.1"),
+                want(8083, "fe80::e558:fff:d8b4:ff6")
+            ]
+        );
+        assert_eq!(parse_hex_addr("0100007"), None, "a short word");
+        assert_eq!(parse_hex_addr("zz00007F"), None);
+    }
+
+    #[test]
+    fn parses_proc_net_unix() {
+        let text = "Num       RefCount Protocol Flags    Type St Inode Path
+ffff9d0ac7e46000: 00000002 00000000 00010000 0001 01 21490 /run/dbus/system_bus_socket
+ffff9d0ac7e47400: 00000002 00000000 00010000 0001 01  9001 @/tmp/dbus-abstract
+ffff9d0ac7e48800: 00000003 00000000 00000000 0001 03 21491 /run/dbus/system_bus_socket
+ffff9d0ac7e49c00: 00000002 00000000 00010000 0001 01 21492
+ffff9d0ac7e4a000: 00000002 00000000 00010000 0005 01 21493 /tmp/path with spaces/x.sock
+ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
+        let mine: HashSet<u64> = [21490, 9001, 21491, 21492, 21493].into_iter().collect();
+        let unix = |p: &str| Listener::Unix { path: p.into() };
+        // 21491 is a connected socket (no ACCEPTCON), 21492 has no name, 55555 is not ours.
+        assert_eq!(
+            parse_unix_listeners(text, &mine),
+            [unix("/run/dbus/system_bus_socket"), unix("@/tmp/dbus-abstract"), unix("/tmp/path with spaces/x.sock")]
+        );
+        assert!(parse_unix_listeners("Num RefCount Protocol Flags Type St Inode Path\nshort line\n", &mine).is_empty());
+    }
+
+    #[test]
+    fn a_table_with_a_name_that_is_not_utf8_still_gives_the_other_sockets() {
+        let dir = std::env::temp_dir().join(format!("wl-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("unix");
+        let mut text = b"Num RefCount Protocol Flags Type St Inode Path\n".to_vec();
+        text.extend_from_slice(b"0000000000000000: 00000002 00000000 00010000 0001 01 21490 /run/ok.sock\n");
+        text.extend_from_slice(b"0000000000000000: 00000002 00000000 00010000 0001 01  9001 @\xff\xfe-abstract\n");
+        text.extend_from_slice(b"0000000000000000: 00000002 00000000 00010000 0001 01 21491 /run/also-ok.sock\n");
+        std::fs::write(&file, &text).unwrap();
+        let mine: HashSet<u64> = [21490, 9001, 21491].into_iter().collect();
+        let mut found = Vec::new();
+        for_each_row(file.to_str().unwrap(), |row| found.extend(parse_unix_row(row, &mine)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths: Vec<String> =
+            found.into_iter().filter_map(|l| if let Listener::Unix { path } = l { Some(path) } else { None }).collect();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        assert!(
+            paths[0] == "/run/ok.sock" && paths[1].starts_with('@') && paths[2] == "/run/also-ok.sock",
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn processes_in_one_network_namespace_share_one_read_of_the_tables() {
+        // Two listeners in this process and a child's: one call lists all of them.
+        let a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let found = Linux.listeners_of(&[std::process::id(), child.id()]).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let port = a.local_addr().unwrap().port();
+        assert!(found.iter().any(|l| matches!(l, Listener::Tcp { port: p, .. } if *p == port)), "{found:?}");
+        assert_eq!(Linux.listeners_of(&[0x7fff_fff0, std::process::id()]), None, "the first must be readable");
+        assert!(Linux.listeners_of(&[std::process::id(), 0x7fff_fff0]).is_some(), "a later one may be gone");
+    }
+
+    #[test]
+    fn the_parent_is_field_four_of_stat() {
+        assert_eq!(parse_stat_ppid("1234 (my (weird) app) S 77 1234 1234 0 -1 4194304"), Some(77));
+        assert_eq!(parse_stat_ppid("garbage"), None);
+    }
+
+    #[test]
+    fn scanning_for_children_agrees_with_the_children_files() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let me = std::process::id();
+        let scanned = children_by_parent().remove(&me).unwrap_or_default();
+        let by_file = Linux.children(me).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(scanned.contains(&child.id()) && by_file.contains(&child.id()), "{scanned:?} {by_file:?}");
     }
 
     const STAT: &str = "cpu  4705 356 584 3699176 23 0 11 0 0 0\n\

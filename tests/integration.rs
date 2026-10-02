@@ -1655,6 +1655,134 @@ fn start_runs_any_command() {
     assert!(out.contains("quote it"), "{out}");
 }
 
+fn have_python() -> bool {
+    Command::new("python3").arg("-V").output().is_ok_and(|o| o.status.success())
+}
+
+/// The ports and Unix sockets an app really listens on are read from the OS:
+/// the app's own, a child's (the wrapper case: `npm run start`), a socket
+/// that is localhost only; and none of Warden's own.
+#[test]
+fn ports_show_what_the_app_really_listens_on() {
+    if !have_python() {
+        return;
+    }
+    let f = Fleet::new("ports");
+    // free_port frees the port again, so the same one can come back: ask until they differ.
+    let mut distinct = std::collections::BTreeSet::new();
+    while distinct.len() < 4 {
+        distinct.insert(free_port());
+    }
+    let mut ports = distinct.into_iter();
+    let (p1, p2, p3, web) =
+        (ports.next().unwrap(), ports.next().unwrap(), ports.next().unwrap(), ports.next().unwrap());
+    let sock = f.home.join("m.sock");
+    let script = f.home.join("multi.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, subprocess, sys, time
+p1, p2, p3, path = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+def tcp(host, port):
+    s = socket.socket()
+    s.bind((host, port))
+    s.listen()
+    return s
+keep = [tcp("127.0.0.1", p1), tcp("0.0.0.0", p2)]
+if os.path.exists(path):
+    os.unlink(path)
+u = socket.socket(socket.AF_UNIX)
+u.bind(path)
+u.listen()
+keep.append(u)
+# A child that listens too, and goes when its parent does.
+child = """
+import os, socket, time
+parent = os.getppid()
+s = socket.socket()
+s.bind(("127.0.0.1", %d))
+s.listen()
+while os.getppid() == parent:
+    time.sleep(0.2)
+""" % p3
+subprocess.Popen([sys.executable, "-c", child])
+while True:
+    time.sleep(1)
+"#,
+    )
+    .unwrap();
+    let out = f.ok(&[
+        "start",
+        script.to_str().unwrap(),
+        "--name",
+        "multi",
+        "--port",
+        &p1.to_string(),
+        "--",
+        &p1.to_string(),
+        &p2.to_string(),
+        &p3.to_string(),
+        sock.to_str().unwrap(),
+    ]);
+    assert!(out.contains("multi: online"), "{out}");
+    // A static site: its private health socket is Warden's, not the site's.
+    let site = f.home.join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    std::fs::write(site.join("index.html"), "hi").unwrap();
+    f.ok(&["serve", site.to_str().unwrap(), &web.to_string(), "--name", "web"]);
+
+    let sockets = |f: &Fleet, app: &str| -> Vec<Value> {
+        f.app(app)["status"]["workers"][0]["listening"].as_array().cloned().unwrap_or_default()
+    };
+    let has_tcp = |l: &[Value], port: u16, addr: &str| {
+        l.iter().any(|s| s["kind"] == "tcp" && s["port"] == port && s["addr"] == addr)
+    };
+    // The child binds a moment after the parent; the supervisor reads the OS every 2 s at most.
+    f.wait("every socket", |f| {
+        let l = sockets(f, "multi");
+        has_tcp(&l, p1, "127.0.0.1") && has_tcp(&l, p2, "0.0.0.0") && has_tcp(&l, p3, "127.0.0.1") && l.len() == 4
+    });
+    let l = sockets(&f, "multi");
+    assert!(l.iter().any(|s| s["kind"] == "unix" && s["path"] == sock.to_str().unwrap()), "{l:?}");
+    // A site listens on its port and nothing else the user would call a socket.
+    f.wait("the site's port", |f| sockets(f, "web").iter().any(|s| s["kind"] == "tcp" && s["port"] == web));
+    let site_sockets = sockets(&f, "web");
+    assert!(
+        site_sockets.iter().all(|s| s["kind"] == "tcp"),
+        "Warden's health socket is not the site's: {site_sockets:?}"
+    );
+
+    // The list's column, the boxes, and `warden ports` (table and JSON).
+    let list = f.ok(&["list"]);
+    let row = list.lines().find(|l| l.contains(" multi ") && l.contains("RUNNING")).expect("the multi row");
+    // p2 (all interfaces) is the plain port; the localhost-only ones carry their host.
+    assert!(row.contains(&format!("localhost:{p1}")) && row.contains(&p2.to_string()), "{list}");
+    assert!(list.contains(&format!("{web}")), "{list}");
+    let describe = f.ok(&["describe", "multi"]);
+    assert!(
+        describe.contains(&format!("{p2} (all interfaces)")) && describe.contains(&format!("{p1} (localhost only)")),
+        "{describe}"
+    );
+    assert!(describe.contains(&format!("unix {}", sock.display())), "{describe}");
+    let table = f.ok(&["ports", "multi"]);
+    assert!(table.contains("all interfaces") && table.contains("localhost only") && table.contains("unix"), "{table}");
+    assert!(table.contains(&format!("http://localhost:{p2}")), "{table}");
+    let json: Value = serde_json::from_str(&f.ok(&["ports", "--json"])).unwrap();
+    let rows = json.as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r["app"] == "web" && r["port"] == web && r["url"] == format!("http://localhost:{web}").as_str()),
+        "{json}"
+    );
+    assert!(rows.iter().any(|r| r["app"] == "multi" && r["kind"] == "unix"), "{json}");
+    assert!(rows.iter().all(|r| r["workers"] == serde_json::json!([1])), "{json}");
+
+    // Stopped: nothing is listening, nothing is shown.
+    f.ok(&["stop", "multi"]);
+    f.wait("multi to show no sockets", |f| sockets(f, "multi").is_empty());
+    let json: Value = serde_json::from_str(&f.ok(&["ports", "multi", "--json"])).unwrap();
+    assert_eq!(json, serde_json::json!([]), "{json}");
+}
+
 /// Old logs: rotated + gzipped files read back in order, searched, filtered,
 /// as JSON, and safe to pipe into `head`.
 #[test]

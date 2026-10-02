@@ -725,6 +725,7 @@ impl Supervisor {
                     last_exit: last_exit.clone(),
                     healthy,
                     loop_delay,
+                    listening: Vec::new(),
                 }
             };
         let now = Instant::now();

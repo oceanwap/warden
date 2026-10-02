@@ -535,6 +535,7 @@ mod tests {
                 last_exit: None,
                 healthy: None,
                 loop_delay: None,
+                listening: Vec::new(),
             })
             .collect();
         s

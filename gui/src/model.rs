@@ -329,6 +329,7 @@ pub(crate) mod tests {
             last_exit: None,
             healthy: Some(true),
             loop_delay: None,
+            listening: Vec::new(),
         }
     }
 

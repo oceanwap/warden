@@ -8,6 +8,8 @@ use crate::control::{self, Request, Status};
 use crate::table::{Cell, DIM, Fmt, GREEN, KEY, NAME, RED, YELLOW, boxed, clip};
 use std::path::PathBuf;
 
+pub mod ports;
+
 pub const USAGE: &str = "\
 warden - a fast, crash-safe supervisor for Bun and Node apps
 
@@ -27,6 +29,8 @@ APPS (familiar from PM2):
                      app's errors and leaves it stopped (errored)
     list             Every app and worker as a table with ids (also: ls, ps, status)  [--json]
     describe <app>   Config, paths, restart policy, workers, last rollout (also: show)
+    ports [app]      The ports and unix sockets each app listens on, read from the OS, with where they
+                     are reachable (all interfaces / localhost only) and a URL  [--json]
     restart <target> Replace the workers one at a time through the health gates (no
                      downtime); --hard stops them all, then starts them (like PM2)
     reload <target>  Like restart, but re-reads the config first (new code or settings);
@@ -183,6 +187,8 @@ pub enum DaemonCmd {
 pub enum Action {
     List,
     Describe,
+    /// The sockets the apps listen on (`warden ports`).
+    Ports,
     Stop,
     Shutdown,
     Restart {
@@ -477,6 +483,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             target = many(&rest);
             table_only = true;
             Command::Act(Action::List)
+        }
+        "ports" | "port" | "listening" => {
+            target = many(&rest);
+            Command::Act(Action::Ports)
         }
         "describe" | "show" | "info" => {
             target = many(&rest);
@@ -788,6 +798,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
                 Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                 Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                 Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
+                Cell::plain(ports::cell(&w.listening)),
                 Cell::plain(loop_p99(w)),
                 health_cell(w.healthy),
                 Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
@@ -795,7 +806,20 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
         })
         .collect();
     boxed(
-        Some(&["worker", "status", "pid", "uptime", "↺", "cpu", "mem", "user", "loop p99", "health", "last exit"]),
+        Some(&[
+            "worker",
+            "status",
+            "pid",
+            "uptime",
+            "↺",
+            "cpu",
+            "mem",
+            "user",
+            "ports",
+            "loop p99",
+            "health",
+            "last exit",
+        ]),
         &rows,
         fmt,
         None,
@@ -824,6 +848,10 @@ pub fn render_status_with(s: &Status, table_only: bool, id: Option<u32>, fmt: &F
     }
     kv(&mut rows, "mode", s.mode.clone());
     kv(&mut rows, "workers", format!("{} configured, {} ready", s.workers_configured, s.workers_ready));
+    let listening = ports::app_listeners(s);
+    if !listening.is_empty() {
+        kv(&mut rows, "ports", ports::detail(&listening));
+    }
     if !s.standbys.is_empty() {
         let up = s.standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
         kv(&mut rows, "standby", format!("{up}/{} ready to take over a crashed worker", s.standbys.len()));
@@ -1000,6 +1028,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                         Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                         Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                         Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
+                        Cell::plain(ports::cell(&w.listening)),
                         Cell::plain(loop_p99(w)),
                         health_cell(w.healthy),
                         Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
@@ -1024,7 +1053,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 let mut row = lead(true, &app.namespace);
                 row.push(Cell::plain("-"));
                 row.push(state_cell(what));
-                row.extend((0..9).map(|_| Cell::plain("-")));
+                row.extend((0..10).map(|_| Cell::plain("-")));
                 rows.push(row);
                 if what == "offline" {
                     offline.push(app);
@@ -1061,6 +1090,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
             "cpu",
             "mem",
             "user",
+            "ports",
             "loop p99",
             "health",
             "last exit",
@@ -1125,6 +1155,60 @@ pub fn render_describe(s: &Status, info: &serde_json::Value, id: Option<u32>, fm
             None => "none (not an HTTP app)".into(),
         },
     );
+    // What the workers really listen on, next to what the config says.
+    let listening = ports::app_listeners(s);
+    let tcp: Vec<u16> = listening
+        .iter()
+        .filter_map(|l| if let crate::control::Listener::Tcp { port, .. } = l { Some(*port) } else { None })
+        .collect();
+    let mut seen = if listening.is_empty() {
+        if s.workers.iter().any(|w| w.pid.is_some()) {
+            "none yet (a port shows a second or two after the app binds it)".to_string()
+        } else {
+            "-".to_string()
+        }
+    } else {
+        ports::detail(&listening)
+    };
+    // A worker that has been up a while and listens, but not on the port the
+    // config names (for `offset`, base + its number - 1): readiness waits for that one.
+    let strategy = text(c("/workers/port_strategy"));
+    match c("/app/port").as_u64() {
+        Some(base) => {
+            let lost: Vec<String> = s
+                .workers
+                .iter()
+                .filter(|w| w.pid.is_some() && w.uptime_secs.is_some_and(|u| u >= 10))
+                .filter(|w| {
+                    let want = if strategy == "offset" { base + w.id as u64 - 1 } else { base };
+                    let on: Vec<u64> = w
+                        .listening
+                        .iter()
+                        .filter_map(|l| {
+                            if let crate::control::Listener::Tcp { port, .. } = l {
+                                Some(u64::from(*port))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    !on.is_empty() && !on.contains(&want)
+                })
+                .map(|w| w.id.to_string())
+                .collect();
+            if !lost.is_empty() {
+                seen += &format!(
+                    ". Worker(s) {} listen on other ports than the configured one (port {base}, {strategy}): check `port` in [app]",
+                    lost.join(", ")
+                );
+            }
+        }
+        None if !tcp.is_empty() => {
+            seen += ". [app] has no `port`, so Warden does not wait for or check any of them";
+        }
+        None => {}
+    }
+    row("ports", seen);
     row("mode", format!("{}, {} worker(s)", s.mode, s.workers_configured));
     if num("/workers/standby") > 0 {
         row(
@@ -1541,6 +1625,7 @@ mod tests {
             last_exit: None,
             healthy: None,
             loop_delay: None,
+            listening: Vec::new(),
         }
     }
 
@@ -1711,6 +1796,113 @@ mod tests {
         let list = render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt::PLAIN);
         assert_eq!(cells(list.lines().nth(3).unwrap())[at], "-", "{list}");
         assert!(!render_status(&s, false).contains("│ user      │"));
+    }
+
+    fn api_status() -> Status {
+        serde_json::from_value(serde_json::json!({
+            "app": "api", "mode": "process", "pid": 7, "uptime_secs": 9, "workers_configured": 2, "workers_ready": 2,
+            "healthy": null, "supervisor_rss_bytes": null, "host": null, "reloading": false, "shutting_down": false,
+            "workers": []
+        }))
+        .unwrap()
+    }
+
+    /// What the workers listen on shows in the list, the boxes and `warden ports`.
+    #[test]
+    fn the_sockets_show_in_the_list_the_boxes_and_the_ports_table() {
+        use crate::control::Listener;
+        let tcp = |addr: &str, port| Listener::Tcp { addr: addr.into(), port };
+        let mut s = api_status();
+        let (mut one, mut two) = (row(1, "RUNNING", 101), row(2, "RUNNING", 102));
+        // Both workers share 3000 (SO_REUSEPORT); only the first has the debugger and a socket.
+        one.listening = vec![
+            tcp("0.0.0.0", 3000),
+            tcp("::", 3000),
+            tcp("127.0.0.1", 9229),
+            Listener::Unix { path: "/tmp/api.sock".into() },
+        ];
+        two.listening = vec![tcp("0.0.0.0", 3000), tcp("::", 3000)];
+        s.workers = vec![one, two];
+        let app = listed_app("api", Some(3));
+
+        let list = render_list_with(&[(app.clone(), Ok(s.clone()))], &Fmt::PLAIN);
+        // Cut at 26 characters: the unix socket is the "+1" (`warden ports` has it).
+        assert!(list.contains("│ ports") && list.contains("3000,localhost:9229,+1"), "{list}");
+        assert!(list.lines().any(|l| l.contains("│ 2 ") && l.contains("│ 3000 ")), "{list}");
+        // Status box: every socket once, with where it is reachable.
+        let status = render_status(&s, false);
+        assert!(status.contains("3000 (all interfaces), 9229 (localhost only), unix /tmp/api.sock"), "{status}");
+        // Describe: the same, and a configured port that nothing listens on is said.
+        let info = serde_json::json!({"config_path": "/x.toml", "config": {"app": {"command": "bun", "port": 4000}}});
+        let d = render_describe(&s, &info, Some(3), &Fmt::PLAIN);
+        // Young workers (5 s) are not judged: their port may still be about to move.
+        assert!(!d.contains("other ports than the configured one"), "{d}");
+        let mut old = s.clone();
+        for w in &mut old.workers {
+            w.uptime_secs = Some(30);
+        }
+        let d = render_describe(&old, &info, Some(3), &Fmt::PLAIN);
+        assert!(
+            d.contains("3000 (all interfaces)")
+                && d.contains("Worker(s) 1, 2 listen on other ports than the configured one (port 4000"),
+            "{d}"
+        );
+        let info = serde_json::json!({"config_path": "/x.toml", "config": {"app": {"command": "bun", "port": 3000}}});
+        assert!(!render_describe(&old, &info, Some(3), &Fmt::PLAIN).contains("other ports than the configured one"));
+        // No port in the config but the app listens: the hint to set one.
+        let info = serde_json::json!({"config_path": "/x.toml", "config": {"app": {"command": "bun"}}});
+        assert!(render_describe(&s, &info, Some(3), &Fmt::PLAIN).contains("[app] has no `port`"));
+
+        // warden ports: one row per socket, a port on 0.0.0.0 and :: is one, workers merged.
+        let table = ports::render(&[(app.clone(), Ok(s.clone()))], &Fmt::PLAIN);
+        assert_eq!(table.lines().filter(|l| l.contains("│ tcp ")).count(), 2, "{table}");
+        let row3000 = table.lines().find(|l| l.contains("│ 3000 ")).unwrap();
+        assert!(
+            row3000.contains("all interfaces")
+                && row3000.contains("│ 1,2 ")
+                && row3000.contains("http://localhost:3000"),
+            "{table}"
+        );
+        let row9229 = table.lines().find(|l| l.contains("│ 9229 ")).unwrap();
+        assert!(row9229.contains("localhost only") && row9229.contains("│ 1 "), "{table}");
+        let unix = table.lines().find(|l| l.contains("│ unix ")).unwrap();
+        assert!(unix.contains("/tmp/api.sock") && table.contains("curl --unix-socket"), "{table}");
+        // JSON: one object per socket, workers and URL included.
+        let j = ports::json(&ports::collect(&[(app.clone(), Ok(s.clone()))]));
+        let first = &j[0];
+        assert_eq!(
+            (first["kind"].as_str(), first["port"].as_u64(), first["app"].as_str()),
+            (Some("tcp"), Some(3000), Some("api")),
+            "{j}"
+        );
+        assert_eq!(first["workers"], serde_json::json!([1, 2]));
+        assert_eq!(first["url"], "http://localhost:3000");
+        assert!(j.as_array().unwrap().iter().any(|o| o["kind"] == "unix" && o["path"] == "/tmp/api.sock"), "{j}");
+    }
+
+    #[test]
+    fn nothing_listening_is_a_dash_and_a_sentence() {
+        let mut s = api_status();
+        s.workers = vec![row(1, "RUNNING", 101)];
+        let list = render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt::PLAIN);
+        let cells: Vec<String> = list.lines().nth(3).unwrap().split('│').map(|c| c.trim().to_string()).collect();
+        let head: Vec<String> = list.lines().nth(1).unwrap().split('│').map(|c| c.trim().to_string()).collect();
+        let at = head.iter().position(|c| c == "ports").expect("a ports column");
+        assert_eq!(cells[at], "-", "{list}");
+        assert!(!render_status(&s, false).contains("│ ports     │"), "no row without sockets");
+        let out = ports::render(&[(listed_app("api", Some(0)), Ok(s))], &Fmt::PLAIN);
+        assert!(out.starts_with("nothing is listening"), "{out}");
+        // An offline app is counted, not an error.
+        let off = ports::render(&[(listed_app("web", Some(1)), Err("not running".into()))], &Fmt::PLAIN);
+        assert!(off.contains("1 app(s) offline"), "{off}");
+    }
+
+    #[test]
+    fn the_ports_command_parses_with_an_optional_app() {
+        let a = parse(&["ports".to_string()]).unwrap();
+        assert!(matches!(a.command, Command::Act(Action::Ports)) && a.target.is_none());
+        let a = parse(&["ports".to_string(), "api".to_string(), "--json".to_string()]).unwrap();
+        assert!(matches!(a.command, Command::Act(Action::Ports)) && a.target.as_deref() == Some("api") && a.json);
     }
 
     #[test]

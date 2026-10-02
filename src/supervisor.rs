@@ -10,6 +10,7 @@
 //!   slot of a worker that died.
 //! - `release.rs`: release pinning (`[app] pin_release`).
 
+mod listening;
 mod release;
 #[cfg(test)]
 mod rig;
@@ -25,6 +26,7 @@ use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
 use crate::worker::{Instance, LoopState, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
 use crate::{debug, error, info, metrics, networking, systemd, warn};
+use listening::ListenerCache;
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -112,6 +114,9 @@ pub struct Supervisor {
     host_path: Option<PathBuf>,
     force_kill: bool,
     supervisor_cpu_prev: Option<(Instant, f64)>,
+    /// What each worker process listens on (a walk of its process tree
+    /// reads `/proc`, or asks libproc, for each: see `listening.rs`).
+    listeners: ListenerCache,
     ticks: u64,
     /// Fleet-wide health failure: a dependency is probably down; replacements held.
     outage: bool,
@@ -427,6 +432,7 @@ impl Supervisor {
             host_path,
             force_kill: false,
             supervisor_cpu_prev: None,
+            listeners: ListenerCache::default(),
             ticks: 0,
             outage: false,
             last_tick: Instant::now(),
@@ -2124,6 +2130,7 @@ impl Supervisor {
                     healthy: inst.and_then(|i| i.healthy),
                     // Each Worker thread has its own event loop and heartbeat.
                     loop_delay: inst.and_then(|i| i.loop_delay.get(&id)).and_then(|l| l.current(now)),
+                    listening: Vec::new(),
                 });
             }
         } else {
@@ -2155,6 +2162,7 @@ impl Supervisor {
                     last_exit: s.last_exit.clone(),
                     healthy,
                     loop_delay,
+                    listening: Vec::new(),
                 });
             }
             // Hot standbys: their own list (`Status.standbys`).
@@ -2185,12 +2193,27 @@ impl Supervisor {
                 healthy: None,
                 // An old process's loop delay is not tracked (the map is the new one's).
                 loop_delay: None,
+                listening: Vec::new(),
             });
         }
         draining.sort_by_key(|w| w.id);
         let me = std::process::id();
         let started = self.started;
         let sup = sample(me, &mut self.supervisor_cpu_prev, started);
+        // What the workers listen on (the standbys do not yet, the draining ones have closed theirs).
+        let own = listening::Own { runtime_dir: self.runtime_dir.clone(), app: self.cfg.app.name.clone() };
+        let mut live = std::collections::HashSet::new();
+        for w in workers.iter_mut() {
+            let Some(pid) = w.pid else { continue };
+            live.insert(pid);
+            // Worker mode: the threads share their host's process; only one that is up holds the port.
+            if worker_mode && w.state != "RUNNING" {
+                continue;
+            }
+            let young = w.uptime_secs.is_none_or(|u| u < listening::YOUNG.as_secs());
+            w.listening = self.listeners.of(pid, now, young, &own);
+        }
+        self.listeners.retain(&live);
         // Who the app runs as: a running worker's owner (the OS says), else our own user.
         let owner = workers.iter().find_map(|w| w.pid).and_then(crate::platform::proc_owner);
         let user = crate::platform::user_name(owner.unwrap_or_else(crate::sys::euid));

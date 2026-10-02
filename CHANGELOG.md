@@ -51,6 +51,15 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   `scripts/mac-check.sh` runs that, the platform tests and a smoke test of a
   real supervisor and wardend on a Mac (and times `warden serve`), and writes
   a report.
+- The ports and Unix sockets each app really listens on, read from the OS
+  (`/proc` on Linux, libproc on macOS) for the worker and the processes it
+  started, so a wrapper like `npm run start` or `turbo` and a monorepo's
+  several ports are found: a `ports` column in `warden list` and the workers
+  table, a `ports` row in `describe` and `status` (with `all interfaces` or
+  `localhost only`, and a warning when the configured `port` is not one of
+  them), `warden ports [app] [--json]` with a URL for each, and
+  `status.workers[].listening` in the protocol. Warden's own health sockets
+  are not shown.
 - A `user` column in `warden list` and the workers table, and a `user` row in
   `status` and `describe`: who the app's processes run as (`Status.user`,
   [`docs/protocol.md`](docs/protocol.md)).

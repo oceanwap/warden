@@ -30,12 +30,15 @@ use std::path::PathBuf;
 mod counter;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod linux;
+mod listeners;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 pub(crate) mod other;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod procargs;
+
+pub use listeners::Listener;
 
 /// A process's resident memory and CPU time.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -111,6 +114,26 @@ pub trait Platform: Sync {
     /// socket (a socket on 0.0.0.0 and one on :: are two).
     fn listening_ports(&self, pid: u32) -> Option<Vec<u16>>;
 
+    /// The sockets this one process accepts connections on: TCP in LISTEN
+    /// with the address, and Unix sockets (not UDP, not connected ones).
+    fn listeners(&self, pid: u32) -> Option<Vec<Listener>>;
+
+    /// The sockets of several processes at once, as one list. The first is
+    /// the one that matters: `None` when it cannot be read; one of the others
+    /// that cannot is skipped. An adapter whose OS keeps its socket tables
+    /// per host reads them once for all of them.
+    fn listeners_of(&self, pids: &[u32]) -> Option<Vec<Listener>> {
+        let (first, rest) = pids.split_first()?;
+        let mut found = self.listeners(*first)?;
+        for pid in rest {
+            found.extend(self.listeners(*pid).unwrap_or_default());
+        }
+        Some(found)
+    }
+
+    /// The processes this one started (its children, not their children).
+    fn children(&self, pid: u32) -> Option<Vec<u32>>;
+
     /// Every process the caller can read: its pid and its command line, the
     /// arguments joined by spaces.
     fn command_lines(&self) -> Vec<(u32, String)>;
@@ -161,6 +184,14 @@ pub fn proc_name(pid: u32) -> Option<String> {
 
 pub fn listening_ports(pid: u32) -> Option<Vec<u16>> {
     current().listening_ports(pid)
+}
+
+/// What the process and the processes below it listen on, sorted: the
+/// server is often not the process Warden started (`npm run start`, `turbo`,
+/// a shell script). At most 64 processes, 4 levels deep. `None` when the
+/// process itself cannot be read.
+pub fn listeners(pid: u32) -> Option<Vec<Listener>> {
+    listeners::of_tree(current(), pid)
 }
 
 pub fn command_lines() -> Vec<(u32, String)> {
@@ -296,6 +327,96 @@ pub(crate) mod contract_tests {
         drop(a);
         assert!(!listening_ports(me()).unwrap().contains(&port), "closed listener");
         assert_eq!(listening_ports(0x7fff_fff0), None);
+    }
+
+    #[test]
+    fn listeners_are_tcp_with_the_address_and_unix_sockets_that_accept() {
+        if !current().capabilities().listening_ports {
+            return;
+        }
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let loopback = Listener::Tcp { port, addr: "127.0.0.1".parse().unwrap() };
+        // A short path: a Unix socket's path is at most 104 bytes on macOS.
+        let path = std::env::temp_dir().join(format!("wl-{}.sock", me()));
+        let _ = std::fs::remove_file(&path);
+        let unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let ends_with_name =
+            |l: &Listener| matches!(l, Listener::Unix { path: p } if p.ends_with(&format!("wl-{}.sock", me())));
+
+        let all = current().listeners(me()).expect("listeners");
+        assert_eq!(all.iter().filter(|l| **l == loopback).count(), 1, "{all:?}");
+        assert_eq!(all.iter().filter(|l| ends_with_name(l)).count(), 1, "{all:?}");
+
+        // A connection to either is not another listener.
+        let c = std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap();
+        let (_peer, _) = tcp.accept().unwrap();
+        let u = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (_upeer, _) = unix.accept().unwrap();
+        let all = current().listeners(me()).unwrap();
+        assert_eq!(all.iter().filter(|l| **l == loopback).count(), 1, "{all:?}");
+        assert_eq!(all.iter().filter(|l| ends_with_name(l)).count(), 1, "{all:?}");
+        drop((c, u));
+
+        // IPv6, where the host has it.
+        if let Ok(v6) = std::net::TcpListener::bind("[::1]:0") {
+            let want = Listener::Tcp { port: v6.local_addr().unwrap().port(), addr: "::1".parse().unwrap() };
+            assert!(current().listeners(me()).unwrap().contains(&want));
+        }
+
+        drop((tcp, unix));
+        let _ = std::fs::remove_file(&path);
+        let all = current().listeners(me()).unwrap();
+        assert!(!all.contains(&loopback) && !all.iter().any(ends_with_name), "closed: {all:?}");
+        assert_eq!(current().listeners(0x7fff_fff0), None);
+    }
+
+    #[test]
+    fn children_are_the_processes_a_process_started() {
+        if !current().capabilities().listening_ports {
+            return;
+        }
+        let s = Sleeper::start(&std::env::temp_dir());
+        let kids = current().children(me()).expect("children of this process");
+        assert!(kids.contains(&s.pid()), "{kids:?}");
+        assert_eq!(current().children(s.pid()), Some(Vec::new()), "a sleeper has none");
+        assert!(
+            current().children(0x7fff_fff0).unwrap_or_default().is_empty(),
+            "no such process: none, or no children"
+        );
+    }
+
+    #[test]
+    fn a_wrapper_shows_what_its_child_listens_on() {
+        use std::io::{BufRead, BufReader};
+        if !current().capabilities().listening_ports {
+            return;
+        }
+        // sh stays the parent (a command after the python one: no exec); python listens
+        // and waits for its stdin to close.
+        let py = "import socket,sys; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); print(s.getsockname()[1], flush=True); sys.stdin.read()";
+        let Ok(mut sh) = Command::new("sh")
+            .arg("-c")
+            .arg(format!("python3 -c \"{py}\"; :"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+        let mut line = String::new();
+        let got = BufReader::new(sh.stdout.take().unwrap()).read_line(&mut line).unwrap_or(0);
+        // No python3 here: nothing to look at. Once it printed its port, the tree must be readable.
+        let port: Option<u16> = if got == 0 { None } else { line.trim().parse().ok() };
+        let tree = port.map(|_| listeners(sh.id()));
+        // python reads its stdin to the end: closing it lets it go.
+        drop(sh.stdin.take());
+        let _ = sh.kill();
+        let _ = sh.wait();
+        if let (Some(port), Some(tree)) = (port, tree) {
+            let tree = tree.expect("the wrapper's process tree is readable");
+            assert!(tree.iter().any(|l| matches!(l, Listener::Tcp { port: p, .. } if *p == port)), "{tree:?}");
+        }
     }
 
     #[test]

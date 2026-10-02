@@ -251,6 +251,7 @@ mod tests {
                 last_exit: None,
                 healthy: Some(false),
                 loop_delay: Some(crate::control::LoopDelay { p50_ms: 0.25, p99_ms: 12.5, max_ms: 40.0 }),
+                listening: Vec::new(),
             }],
             release: None,
             standbys: vec![],
@@ -285,6 +286,7 @@ mod tests {
             last_exit: None,
             healthy: None,
             loop_delay: None,
+            listening: Vec::new(),
         };
         st.standbys.push(standby(crate::control::STANDBY, 1000));
         st.standbys.push(standby(crate::control::WARMING, 500));

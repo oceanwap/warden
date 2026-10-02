@@ -150,6 +150,27 @@ supervisor's own user. Warden never switches user, so it is the user that ran
 `warden start`, or the unit's `User=`. A number when the user database has no
 such user.
 
+`status.workers[].listening` (an array, absent when empty; an addition older
+clients ignore): the sockets the worker's process listens on, and the
+processes it started (up to 64, 4 levels down: a wrapper such as `npm run
+start` or `turbo` is the process Warden starts, the server is below it),
+read from the OS about every 2 s (a port shows a second or two after the app
+binds it). One object per socket, tagged by `kind`:
+`{"kind":"tcp","addr":"0.0.0.0","port":3000}` (the address it is bound to:
+`0.0.0.0` or `::` for every interface, `127.0.0.1` or `::1` for this machine
+only, or one interface's address; a socket on both `0.0.0.0` and `::` is two
+objects) and `{"kind":"unix","path":"/run/app.sock"}` (a Unix socket that
+accepts connections; a Linux abstract socket is `@name`). A reader must skip
+a `kind` it does not know (a newer Warden may report more; the Rust type
+reads it as `Other`). Warden's own sockets (the private health sockets in
+its runtime directory, named `<app>.h<instance>-<worker>.sock`) are left
+out; any other socket the app makes there is shown. Not shown: UDP,
+connected sockets, a process of another user (the OS refuses), a standby (it
+does not listen yet) or a draining old process (`status.draining` lists it,
+without sockets). Workers of a shared port (`SO_REUSEPORT`) each list it; worker mode's threads share their host process's list.
+`warden ports --json` merges them: one object per socket with `app`, `id`,
+`workers` (the worker numbers) and, for TCP, a `url`.
+
 `status.workers[].loop_delay` (`{"p50_ms","p99_ms","max_ms"}`, absent
 without one) is the worker's event-loop delay over its last heartbeat
 interval (about a second), from Warden's shim; in worker mode each

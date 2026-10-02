@@ -8,8 +8,8 @@
 
 use super::counter::Extend32;
 use super::procargs::parse_procargs;
-use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Platform, ProcStats};
-use crate::sys::darwin;
+use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcStats};
+use crate::sys::darwin::{self, ListeningSocket};
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
@@ -60,6 +60,23 @@ impl Platform for Macos {
 
     fn listening_ports(&self, pid: u32) -> Option<Vec<u16>> {
         darwin::listening_tcp_ports(pid).ok()
+    }
+
+    fn listeners(&self, pid: u32) -> Option<Vec<Listener>> {
+        let sockets = darwin::listening_sockets(pid).ok()?;
+        Some(
+            sockets
+                .into_iter()
+                .map(|s| match s {
+                    ListeningSocket::Tcp { port, addr } => Listener::Tcp { port, addr },
+                    ListeningSocket::Unix(path) => Listener::Unix { path },
+                })
+                .collect(),
+        )
+    }
+
+    fn children(&self, pid: u32) -> Option<Vec<u32>> {
+        darwin::children(pid).ok()
     }
 
     fn command_lines(&self) -> Vec<(u32, String)> {

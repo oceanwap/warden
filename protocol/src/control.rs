@@ -266,6 +266,30 @@ pub struct WorkerStatus {
     /// the last few seconds). In worker mode, each Worker's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loop_delay: Option<LoopDelay>,
+    /// The sockets this worker's process (and the processes it started, for
+    /// a wrapper such as `npm run start`) listens on: TCP ports with the
+    /// address they are bound to, and Unix sockets. Read from the OS about
+    /// every 2 seconds, so a port shows a moment after the app binds it.
+    /// Warden's own sockets are left out. Absent (empty) when the worker
+    /// listens on nothing, is not running, or the OS cannot say (another
+    /// user's process, an OS without an adapter).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listening: Vec<Listener>,
+}
+
+/// A socket a worker listens on (`WorkerStatus.listening`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Listener {
+    /// A TCP socket in LISTEN: the address it is bound to (`0.0.0.0`, `::`,
+    /// `127.0.0.1`, `::1`, or one interface's) and its port.
+    Tcp { addr: String, port: u16 },
+    /// A Unix domain socket that accepts connections: its path. A Linux
+    /// abstract socket (no file) is `@name`.
+    Unix { path: String },
+    /// A kind a newer Warden reports; older readers skip it.
+    #[serde(other)]
+    Other,
 }
 
 /// Event-loop delay over one heartbeat interval, in milliseconds: the
@@ -327,6 +351,7 @@ mod tests {
             last_exit: None,
             healthy: None,
             loop_delay: None,
+            listening: Vec::new(),
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["standbys"][0]["state"], "STANDBY");
@@ -358,6 +383,7 @@ mod tests {
             last_exit: None,
             healthy: None,
             loop_delay: None,
+            listening: Vec::new(),
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!((v["draining"][0]["id"].as_u64(), v["draining"][0]["state"].as_str()), (Some(2), Some("DRAINING")));

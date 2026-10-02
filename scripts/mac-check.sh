@@ -103,10 +103,12 @@ for r in rows:
 else:
     print("no platform row")
 PY
-# list.py <list.json> <user>: one PASS/FAIL line per fact about the two smoke apps.
+# list.py <list.json> <user> <port of files> <port of wrap> <socket path>: one
+# PASS/FAIL line per fact about the smoke apps.
 cat >"$work/list.py" <<'PY'
 import json, sys
 apps, me = json.load(open(sys.argv[1])), sys.argv[2]
+fport, wport, spath = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 def pick(name):
     for a in apps:
         s = a.get("status") or {}
@@ -127,6 +129,18 @@ show((b.get("cpu_percent") or 0) > 20, "CPU percent of a busy worker is read", b
 show(burn.get("user") == me, "the app's user is the current user", burn.get("user"))
 show(f.get("state") == "RUNNING", "the listener is RUNNING (ready by listening port)", f.get("state"))
 show((f.get("rss_bytes") or 0) > 1000000, "memory of the listener is read", f.get("rss_bytes"))
+fl = f.get("listening") or []
+show(any(l.get("kind") == "tcp" and l.get("port") == fport and l.get("addr") == "127.0.0.1" for l in fl),
+     "the listener's port and address are read (libproc)", json.dumps(fl))
+wrap = pick("wrap")
+if not wrap or not wrap.get("workers"):
+    show(False, "the wrapper app is listed", json.dumps(apps)[:300])
+else:
+    wl = wrap["workers"][0].get("listening") or []
+    show(any(l.get("kind") == "tcp" and l.get("port") == wport for l in wl),
+         "a port in a child of the started process is found (sh -> python)", json.dumps(wl))
+    show(any(l.get("kind") == "unix" and l.get("path", "").endswith("/s.sock") for l in wl),
+         "a Unix socket of the child is found", json.dumps(wl))
 PY
 # pid.py <app> [not-this-pid]: the supervisor pid of an app from `list --json`.
 cat >"$work/pid.py" <<'PY'
@@ -200,15 +214,32 @@ port=$(free_port)
 export WARDEN_NO_DAEMON=1
 w "$bin" start /bin/sh --name burn --interpreter none -- -c 'while :; do :; done' >"$out/start-burn.log" 2>&1
 w "$bin" start "python3 -m http.server $port --bind 127.0.0.1" --name files --port "$port" >"$out/start-files.log" 2>&1
+# A shell that runs a python server with a TCP port and a Unix socket: what `npm run start` looks like.
+wport=$(free_port)
+cat >"$work/wrapped.py" <<'PY'
+import os, socket, sys, time
+t = socket.socket()
+t.bind(("127.0.0.1", int(sys.argv[1])))
+t.listen()
+path = sys.argv[2]
+if os.path.exists(path):
+    os.unlink(path)
+u = socket.socket(socket.AF_UNIX)
+u.bind(path)
+u.listen()
+time.sleep(600)
+PY
+w "$bin" start /bin/sh --name wrap --interpreter none -- -c "python3 $work/wrapped.py $wport $work/s.sock; :" >"$out/start-wrap.log" 2>&1
 sleep 3
 w "$bin" list --json >"$out/list.json" 2>"$out/list.err"
 w "$bin" list >"$out/list.txt" 2>&1
 w "$bin" describe files >"$out/describe.txt" 2>&1
+w "$bin" ports >"$out/ports.txt" 2>&1
 unset WARDEN_NO_DAEMON
 { echo "---- warden list"; cat "$out/list.txt"; echo; } >>"$report"
 
 me=$(id -un)
-python3 "$work/list.py" "$out/list.json" "$me" >"$out/list-check.txt" 2>&1
+python3 "$work/list.py" "$out/list.json" "$me" "$port" "$wport" "$work/s.sock" >"$out/list-check.txt" 2>&1
 while IFS=$'\t' read -r verdict name detail; do
     case "$verdict" in
         PASS) result PASS "$name" ;;
@@ -218,6 +249,8 @@ done <"$out/list-check.txt"
 [ -s "$out/list-check.txt" ] || result FAIL "reading list --json" "see list-check.txt"
 if grep -q "$me" "$out/list.txt"; then result PASS "warden list shows the user column"; else result FAIL "warden list shows the user column" "see list.txt"; fi
 if grep -q "│ user *│ $me" "$out/describe.txt"; then result PASS "warden describe shows the user"; else result FAIL "warden describe shows the user" "see describe.txt"; fi
+if grep -q "│ ports *│ $port (localhost only)" "$out/describe.txt"; then result PASS "warden describe shows the ports"; else result FAIL "warden describe shows the ports" "see describe.txt"; fi
+if grep -q "http://localhost:$port" "$out/ports.txt" && grep -q "s.sock" "$out/ports.txt"; then result PASS "warden ports lists the port and the Unix socket"; else result FAIL "warden ports lists the port and the Unix socket" "see ports.txt"; fi
 WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" stop all >/dev/null 2>&1
 WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" delete all >/dev/null 2>&1
 

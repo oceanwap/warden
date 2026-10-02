@@ -513,7 +513,7 @@ pub async fn act(args: &Args, action: &Action) -> i32 {
 
 async fn act_inner(args: &Args, action: &Action) -> i32 {
     let ctx = context(args);
-    let need = !matches!(action, Action::List | Action::Logs { .. } | Action::LogLevel(_));
+    let need = !matches!(action, Action::List | Action::Ports | Action::Logs { .. } | Action::LogLevel(_));
     let sels = match resolve(&ctx, args.target.as_deref(), need) {
         Ok(s) => s,
         Err(e) => {
@@ -524,6 +524,7 @@ async fn act_inner(args: &Args, action: &Action) -> i32 {
     match action {
         Action::List => list(&sels, args, &ctx).await,
         Action::Describe => describe(&sels, args).await,
+        Action::Ports => ports(&sels, args).await,
         Action::Env { show_secrets } => env(&sels, *show_secrets).await,
         Action::Config { show_secrets } => show_config(&sels, *show_secrets).await,
         Action::Logs { lines, follow, history, query } => {
@@ -585,6 +586,17 @@ async fn list(sels: &[Sel], args: &Args, ctx: &Ctx) -> i32 {
     print!("{}", cli::render_list_with(&all, &Fmt::stdout()));
     if let Some(w) = &ctx.ids_warning {
         eprintln!("warden: {w}");
+    }
+    0
+}
+
+/// `warden ports`: the sockets the apps listen on, as a table or JSON.
+async fn ports(sels: &[Sel], args: &Args) -> i32 {
+    let all = statuses(&unique_apps(sels)).await;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&cli::ports::json(&cli::ports::collect(&all))).unwrap_or_default());
+    } else {
+        print!("{}", cli::ports::render(&all, &Fmt::stdout()));
     }
     0
 }

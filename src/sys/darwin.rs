@@ -17,17 +17,24 @@
 use std::ffi::{OsString, c_int, c_void};
 use std::io;
 use std::mem::{offset_of, size_of};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// `PROC_PIDFDSOCKETINFO` (`sys/proc_info.h`): `libc` has the other flavors.
 const PROC_PIDFDSOCKETINFO: c_int = 3;
-/// `PROC_ALL_PIDS`.
+/// `PROC_ALL_PIDS` and `PROC_PPID_ONLY`: which processes `proc_listpids` lists.
 const PROC_ALL_PIDS: u32 = 1;
-/// `SOCKINFO_TCP` and `TSI_S_LISTEN`.
+const PROC_PPID_ONLY: u32 = 6;
+/// `SOCKINFO_TCP`, `SOCKINFO_UN` and `TSI_S_LISTEN`.
 const SOCKINFO_TCP: i32 = 2;
+const SOCKINFO_UN: i32 = 3;
 const TSI_S_LISTEN: i32 = 1;
+/// `SO_ACCEPTCONN`: in `soi_options` of a socket that called `listen`.
+const SO_ACCEPTCONN: u16 = 0x0002;
+/// `INI_IPV4` and `INI_IPV6` in `insi_vflag`.
+const INI_IPV6: u8 = 0x2;
 
 // struct socket_fdinfo { struct proc_fileinfo pfi (24 bytes);
 //                        struct socket_info psi; }
@@ -36,17 +43,39 @@ const TSI_S_LISTEN: i32 = 1;
 //                        u32 soi_oobmark; 2 × sockbuf_info (24); int soi_kind;
 //                        u32 rfu_1; union soi_proto (8-aligned, 528 bytes) }
 // so soi_kind is at 24 + 232, soi_proto at 24 + 240, and in the tcp_sockinfo
-// at its start: struct in_sockinfo { int insi_fport; int insi_lport; ... } (80
-// bytes), then `int tcpsi_state`.
+// at its start: struct in_sockinfo { int insi_fport; int insi_lport; u64
+// insi_gencnt; u32 insi_flags, insi_flow; u8 insi_vflag, insi_ip_ttl; u32 rfu_1;
+// 16-byte insi_faddr; 16-byte insi_laddr; (the rest) } (80 bytes), then `int
+// tcpsi_state`. The address is an in4in6_addr (an IPv4 address is its last four
+// bytes) or an in6_addr. For a Unix socket the union is struct un_sockinfo {
+// u64 unsi_conn_so, unsi_conn_pcb; sockaddr_un unsi_addr (sun_len, sun_family,
+// sun_path[104]); sockaddr_un unsi_caddr } (528 with padding); `soi_options`
+// is the first of the 8 shorts after soi_family.
 const SOCKET_FDINFO_SIZE: usize = 792;
 const SOI_KIND: usize = 24 + 232;
 const SOI_PROTO: usize = 24 + 240;
 const IN_SOCKINFO_SIZE: usize = 80;
 const INSI_LPORT: usize = SOI_PROTO + 4;
 const TCPSI_STATE: usize = SOI_PROTO + IN_SOCKINFO_SIZE;
+const SOI_OPTIONS: usize = 24 + 164;
+const INSI_VFLAG: usize = SOI_PROTO + 24;
+const INSI_LADDR: usize = SOI_PROTO + 48;
+const UNSI_ADDR_PATH: usize = SOI_PROTO + 16 + 2;
+const SUN_PATH_LEN: usize = 104;
+
+/// A socket a process accepts connections on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListeningSocket {
+    Tcp { port: u16, addr: IpAddr },
+    Unix(String),
+}
 
 fn ne_u32(buf: &[u8], at: usize) -> u32 {
     buf.get(at..at + 4).and_then(|b| b.try_into().ok()).map(u32::from_ne_bytes).unwrap_or(0)
+}
+
+fn ne_u16(buf: &[u8], at: usize) -> u16 {
+    buf.get(at..at + 2).and_then(|b| b.try_into().ok()).map(u16::from_ne_bytes).unwrap_or(0)
 }
 
 fn ne_u64(buf: &[u8], at: usize) -> u64 {
@@ -170,8 +199,22 @@ pub fn procargs(pid: u32) -> io::Result<Vec<u8>> {
 
 /// Every process id the caller may list.
 pub fn all_pids() -> io::Result<Vec<u32>> {
+    let pids = list_pids(PROC_ALL_PIDS, 0)?;
+    // A running system has processes: none means the call did not work.
+    if pids.is_empty() { Err(io::Error::other("proc_listpids listed no processes")) } else { Ok(pids) }
+}
+
+/// The processes whose parent is `pid` (empty for a process with none, and
+/// for one that does not exist: the kernel does not say which).
+pub fn children(pid: u32) -> io::Result<Vec<u32>> {
+    list_pids(PROC_PPID_ONLY, pid)
+}
+
+/// `proc_listpids`: the ids of the processes of one kind (`typeinfo`: the
+/// parent for `PROC_PPID_ONLY`).
+fn list_pids(kind: u32, typeinfo: u32) -> io::Result<Vec<u32>> {
     // SAFETY: a null buffer of size 0 only asks how many bytes a list needs.
-    let need = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    let need = unsafe { libc::proc_listpids(kind, typeinfo, std::ptr::null_mut(), 0) };
     if need <= 0 {
         return Err(io::Error::last_os_error());
     }
@@ -179,8 +222,8 @@ pub fn all_pids() -> io::Result<Vec<u32>> {
     let mut buf = vec![0u8; need as usize + 64 * size_of::<c_int>()];
     // SAFETY: `buf` is a valid byte vector of buf.len() bytes, which
     // proc_listpids writes pids (ints) into up to that size.
-    let n = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, buf.as_mut_ptr().cast::<c_void>(), buf.len() as c_int) };
-    if n <= 0 {
+    let n = unsafe { libc::proc_listpids(kind, typeinfo, buf.as_mut_ptr().cast::<c_void>(), buf.len() as c_int) };
+    if n < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(buf[..n as usize]
@@ -205,6 +248,15 @@ pub fn name(pid: u32) -> io::Result<String> {
 /// The ports of the TCP sockets this process listens on, one entry per
 /// socket (a socket on 0.0.0.0 and one on :: are two).
 pub fn listening_tcp_ports(pid: u32) -> io::Result<Vec<u16>> {
+    Ok(listening_sockets(pid)?
+        .into_iter()
+        .filter_map(|s| if let ListeningSocket::Tcp { port, .. } = s { Some(port) } else { None })
+        .collect())
+}
+
+/// The sockets this process accepts connections on: TCP in LISTEN and Unix
+/// sockets that called `listen`, one entry per socket.
+pub fn listening_sockets(pid: u32) -> io::Result<Vec<ListeningSocket>> {
     // First ask how large the descriptor list is, then read it with room for
     // descriptors opened in between.
     let ipid = c_int::try_from(pid).map_err(|_| io::Error::from_raw_os_error(libc::ESRCH))?;
@@ -219,7 +271,7 @@ pub fn listening_tcp_ports(pid: u32) -> io::Result<Vec<u16>> {
     let n = pidinfo(pid, libc::PROC_PIDLISTFDS, &mut list)?;
     let step = size_of::<libc::proc_fdinfo>();
     let (fd_at, type_at) = (offset_of!(libc::proc_fdinfo, proc_fd), offset_of!(libc::proc_fdinfo, proc_fdtype));
-    let mut ports = Vec::new();
+    let mut found = Vec::new();
     for entry in list[..n].chunks_exact(step) {
         if ne_u32(entry, type_at) != libc::PROX_FDTYPE_SOCKET as u32 {
             continue;
@@ -249,12 +301,36 @@ pub fn listening_tcp_ports(pid: u32) -> io::Result<Vec<u16>> {
                 format!("proc_pidfdinfo returned {got} bytes for a socket, expected {SOCKET_FDINFO_SIZE}"),
             ));
         }
-        if ne_u32(&info, SOI_KIND) as i32 == SOCKINFO_TCP && ne_u32(&info, TCPSI_STATE) as i32 == TSI_S_LISTEN {
-            // The port sits in the low 16 bits, in network byte order.
-            ports.push(u16::from_be(ne_u32(&info, INSI_LPORT) as u16));
-        }
+        found.extend(parse_listening(&info));
     }
-    Ok(ports)
+    Ok(found)
+}
+
+/// One `socket_fdinfo` as a listener, or `None` when the socket is not one
+/// (a connected socket, UDP, a route socket...).
+fn parse_listening(info: &[u8]) -> Option<ListeningSocket> {
+    match ne_u32(info, SOI_KIND) as i32 {
+        SOCKINFO_TCP if ne_u32(info, TCPSI_STATE) as i32 == TSI_S_LISTEN => {
+            // The port sits in the low 16 bits, in network byte order.
+            let port = u16::from_be(ne_u32(info, INSI_LPORT) as u16);
+            // The address is IPv6 when the socket has the v6 flag (a dual-stack
+            // socket on `::` has both); an IPv4 one keeps it in the last four bytes.
+            let laddr: [u8; 16] = info.get(INSI_LADDR..INSI_LADDR + 16)?.try_into().ok()?;
+            let addr = if info.get(INSI_VFLAG).is_some_and(|v| v & INI_IPV6 != 0) {
+                IpAddr::V6(Ipv6Addr::from(laddr))
+            } else {
+                let v4: [u8; 4] = info.get(INSI_LADDR + 12..INSI_LADDR + 16)?.try_into().ok()?;
+                IpAddr::V4(Ipv4Addr::from(v4))
+            };
+            Some(ListeningSocket::Tcp { port, addr })
+        }
+        SOCKINFO_UN if ne_u16(info, SOI_OPTIONS) & SO_ACCEPTCONN != 0 => {
+            let raw = info.get(UNSI_ADDR_PATH..UNSI_ADDR_PATH + SUN_PATH_LEN)?;
+            let path = raw.split(|b| *b == 0).next().unwrap_or(&[]);
+            (!path.is_empty()).then(|| ListeningSocket::Unix(String::from_utf8_lossy(path).into_owned()))
+        }
+        _ => None,
+    }
 }
 
 /// The Mach port of this host (one send right, cached: asking again would
@@ -406,6 +482,69 @@ mod tests {
         assert_eq!(SOI_KIND, 256);
         assert_eq!(INSI_LPORT, 268);
         assert_eq!(TCPSI_STATE, 344);
+        // The new reads: soi_options, the vflag, the local address, the Unix path.
+        assert_eq!(SOI_OPTIONS, 188);
+        assert_eq!(INSI_VFLAG, 288);
+        assert_eq!(INSI_LADDR, 312);
+        assert_eq!(UNSI_ADDR_PATH, 282);
+        // The Unix path is inside the union: 16 bytes of handles, sun_len and sun_family, the path.
+        const { assert!(UNSI_ADDR_PATH + SUN_PATH_LEN <= SOI_PROTO + 528) };
+        // The IPv6 address ends inside in_sockinfo.
+        const { assert!(INSI_LADDR + 16 <= SOI_PROTO + IN_SOCKINFO_SIZE) };
+    }
+
+    /// A zeroed `socket_fdinfo` with the given fields set.
+    fn fdinfo(kind: i32) -> Vec<u8> {
+        let mut b = vec![0u8; SOCKET_FDINFO_SIZE];
+        b[SOI_KIND..SOI_KIND + 4].copy_from_slice(&kind.to_ne_bytes());
+        b
+    }
+
+    #[test]
+    fn a_tcp_listener_is_read_with_its_address_and_a_connected_socket_is_not() {
+        let mut v4 = fdinfo(SOCKINFO_TCP);
+        v4[TCPSI_STATE..TCPSI_STATE + 4].copy_from_slice(&TSI_S_LISTEN.to_ne_bytes());
+        v4[INSI_LPORT..INSI_LPORT + 4].copy_from_slice(&(u32::from(8080u16.to_be())).to_ne_bytes());
+        v4[INSI_VFLAG] = 0x1;
+        v4[INSI_LADDR + 12..INSI_LADDR + 16].copy_from_slice(&[127, 0, 0, 1]);
+        assert_eq!(parse_listening(&v4), Some(ListeningSocket::Tcp { port: 8080, addr: "127.0.0.1".parse().unwrap() }));
+
+        let mut v6 = v4.clone();
+        v6[INSI_VFLAG] = 0x2;
+        v6[INSI_LADDR..INSI_LADDR + 16].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(parse_listening(&v6), Some(ListeningSocket::Tcp { port: 8080, addr: "::1".parse().unwrap() }));
+
+        // `::` with IPv4 allowed too (both flags): any address.
+        let mut dual = v6.clone();
+        dual[INSI_VFLAG] = 0x3;
+        dual[INSI_LADDR..INSI_LADDR + 16].fill(0);
+        assert_eq!(parse_listening(&dual), Some(ListeningSocket::Tcp { port: 8080, addr: "::".parse().unwrap() }));
+
+        let mut established = v4.clone();
+        established[TCPSI_STATE..TCPSI_STATE + 4].copy_from_slice(&4i32.to_ne_bytes());
+        assert_eq!(parse_listening(&established), None);
+        assert_eq!(parse_listening(&fdinfo(1)), None, "UDP and the like");
+        assert_eq!(parse_listening(&v4[..100]), None, "a short answer is not a listener");
+    }
+
+    #[test]
+    fn a_unix_listener_is_read_with_its_path_and_a_connected_one_is_not() {
+        let mut u = fdinfo(SOCKINFO_UN);
+        u[SOI_OPTIONS..SOI_OPTIONS + 2].copy_from_slice(&SO_ACCEPTCONN.to_ne_bytes());
+        u[UNSI_ADDR_PATH..UNSI_ADDR_PATH + 11].copy_from_slice(b"/tmp/x.sock");
+        assert_eq!(parse_listening(&u), Some(ListeningSocket::Unix("/tmp/x.sock".into())));
+        // Accepted or connecting: no ACCEPTCONN.
+        let mut c = u.clone();
+        c[SOI_OPTIONS..SOI_OPTIONS + 2].copy_from_slice(&0u16.to_ne_bytes());
+        assert_eq!(parse_listening(&c), None);
+        // No name (a socketpair end): nothing to show.
+        let mut unnamed = u.clone();
+        unnamed[UNSI_ADDR_PATH..UNSI_ADDR_PATH + 11].fill(0);
+        assert_eq!(parse_listening(&unnamed), None);
+        // A path of the full 104 bytes, no NUL: read to the end of the field.
+        let mut full = u.clone();
+        full[UNSI_ADDR_PATH..UNSI_ADDR_PATH + SUN_PATH_LEN].fill(b'a');
+        assert_eq!(parse_listening(&full), Some(ListeningSocket::Unix("a".repeat(SUN_PATH_LEN))));
     }
 
     #[test]
@@ -430,6 +569,25 @@ mod tests {
         assert!(cwd(0x7fff_fff0).is_err());
         assert!(procargs(0x7fff_fff0).is_err());
         assert!(listening_tcp_ports(0x7fff_fff0).is_err());
+        assert!(listening_sockets(0x7fff_fff0).is_err());
+        assert!(children(0x7fff_fff0).unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn a_child_is_listed_below_its_parent_and_a_unix_listener_with_its_path() {
+        let s = Sleeper::start(&std::env::temp_dir());
+        assert!(children(me()).unwrap().contains(&s.0.id()));
+        assert!(children(s.0.id()).unwrap().is_empty());
+        let path = std::env::temp_dir().join(format!("wd-{}.sock", me()));
+        let _ = std::fs::remove_file(&path);
+        let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let found = listening_sockets(me()).unwrap();
+        assert!(
+            found.iter().any(|s| matches!(s, ListeningSocket::Unix(p) if p.ends_with(&format!("wd-{}.sock", me())))),
+            "{found:?}"
+        );
+        drop(l);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

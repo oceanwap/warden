@@ -274,6 +274,7 @@ mod tests {
             last_exit: None,
             healthy: None,
             loop_delay: None,
+            listening: Vec::new(),
         };
         let mut s = crate::model::tests::status("api", 2);
         assert_eq!(status_summary(&s), "2/2 workers ready");
