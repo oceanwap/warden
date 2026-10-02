@@ -2,7 +2,7 @@
 
 **Today: not supported.** Warden runs on Linux (production) and macOS
 (development). On Windows, use **WSL2**: it is a real Linux kernel, so
-everything in the README's Linux column applies unchanged. This page records
+everything the docs say about Linux applies unchanged. This page records
 what a native Windows build would take, so the decision to do it (or not) can
 be made with the costs in view. Nothing here is scheduled.
 
@@ -153,12 +153,12 @@ refused.
 
 `warden-x86_64-pc-windows-msvc.zip` (CLI) and a GUI bundle, in the release
 workflow with the SHA256SUMS; `install.ps1`; Authenticode signing (SmartScreen
-treats unsigned binaries as suspicious); README Platforms and `docs/` updated
+treats unsigned binaries as suspicious); [platforms.md](platforms.md), the README and `docs/` updated
 with a list of the differences below.
 
 ## What will stay different on Windows
 
-Things we should say plainly in the README and `warden doctor` instead of
+Things we should say plainly in [platforms.md](platforms.md) and `warden doctor` instead of
 hiding:
 
 - No `SO_REUSEPORT` balancing: one worker per port (Phase 3 describes the
@@ -189,5 +189,5 @@ supervisor: ship **Phase 1 plus 2 with one worker per app**, label it
 
 Do not start until Phase 0's answers exist. If Bun on Windows can neither
 share a port nor listen on a named pipe, a native build is not worth it and
-WSL2 stays the answer; say so in the README and close this page's plan as
+WSL2 stays the answer; say so in [platforms.md](platforms.md) and close this page's plan as
 "rejected" with the evidence.

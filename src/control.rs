@@ -668,6 +668,7 @@ mod tests {
             user: None,
             build: None,
             cwd: None,
+            watching: false,
         }
     }
 

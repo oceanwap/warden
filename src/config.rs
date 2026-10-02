@@ -24,6 +24,10 @@ pub struct Config {
     pub watchdog: Watchdog,
     #[serde(default)]
     pub limits: Limits,
+    /// Opt-in file watching: a rolling restart when files change (PM2's
+    /// `watch`). Off by default.
+    #[serde(default)]
+    pub watch: Watch,
     #[serde(default)]
     pub logging: Logging,
     #[serde(default)]
@@ -52,11 +56,18 @@ pub struct Static {
     pub spa: bool,
     #[serde(default = "default_index")]
     pub index: String,
-    /// `Cache-Control: max-age` in seconds for files (HTML is always
-    /// revalidated; fingerprinted names like `app.3f9a2c1b.js` are cached a
-    /// year, immutable).
+    /// `Cache-Control: max-age` in seconds for files (HTML is revalidated
+    /// unless `html_max_age` is set; fingerprinted names like
+    /// `app.3f9a2c1b.js` are cached a year, immutable).
     #[serde(default = "default_cache_max_age")]
     pub cache_max_age: u64,
+    /// Opt in to browsers reusing HTML pages for this many seconds
+    /// (`Cache-Control: max-age`, at most a year) instead of asking again on
+    /// every page load: the default `no-cache` costs a round trip (a 304) per
+    /// navigation. A new deploy reaches a browser only after this time, so
+    /// keep it short (60-300). Unset or 0: always revalidate.
+    #[serde(default)]
+    pub html_max_age: Option<u64>,
     /// HTML listing for directories without an index.
     #[serde(default)]
     pub listing: bool,
@@ -108,6 +119,8 @@ fn default_index() -> String {
 fn default_cache_max_age() -> u64 {
     3600
 }
+/// `static.html_max_age` at most: a year, like fingerprinted assets.
+pub const MAX_HTML_MAX_AGE: u64 = 31_536_000;
 fn yes() -> bool {
     true
 }
@@ -402,6 +415,114 @@ pub struct Limits {
     pub max_memory: u64,
     /// Seconds; each worker is recycled after this, ±10% jitter. 0 = off.
     pub max_lifetime: u64,
+}
+
+/// Opt-in file watching (PM2's `watch`): Warden looks at the files of the
+/// app on a timer, and once they have been quiet for `debounce_ms` after a
+/// change it starts a gated rolling restart, like `warden restart`.
+/// docs/watch.md has the details.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Watch {
+    /// Watch the files at all (`warden start --watch`). Default false: a
+    /// production app is replaced on deploy with `warden reload`.
+    pub enabled: bool,
+    /// Directories or files to watch, relative to `[app] working_directory`
+    /// (else the directory Warden was started in); absolute paths are fine.
+    pub paths: Vec<String>,
+    /// Names, `*`/`?`/`**` globs and paths that are never watched (a
+    /// directory that matches is skipped with everything in it). A pattern
+    /// without a `/` matches a file or directory name at any depth; one with
+    /// a `/` matches the path from the working directory; `/abs/path` is an
+    /// absolute path.
+    pub ignore: Vec<String>,
+    /// Milliseconds the files must stay unchanged before the restart starts
+    /// (a build writes many files: this waits for it to finish).
+    pub debounce_ms: u64,
+    /// Milliseconds between looks at the files (the scan runs on its own
+    /// thread; a big tree is looked at less often, see docs/watch.md).
+    pub interval_ms: u64,
+    /// Most files and directories looked at; the rest are not watched (and
+    /// one warning says so).
+    pub max_files: usize,
+}
+
+/// `watch.ignore` when it isn't set: version control, dependencies, logs,
+/// editor droppings. Setting `ignore` replaces this list.
+pub const DEFAULT_WATCH_IGNORE: [&str; 11] =
+    ["node_modules", ".git", ".hg", ".svn", "*.log", "*.pid", "*.sock", "*.swp", "*.swx", "*~", ".DS_Store"];
+
+impl Default for Watch {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            paths: vec![".".into()],
+            ignore: DEFAULT_WATCH_IGNORE.iter().map(|s| s.to_string()).collect(),
+            debounce_ms: 500,
+            interval_ms: 1000,
+            max_files: 10_000,
+        }
+    }
+}
+
+impl Watch {
+    /// The limits `check_bounds` and `validate` enforce.
+    pub const MAX_PATHS: usize = 64;
+    pub const MAX_IGNORE: usize = 256;
+    pub const MAX_PATTERN_LEN: usize = 512;
+    pub const MAX_FILES: usize = 100_000;
+    pub const MAX_DEBOUNCE_MS: u64 = 600_000;
+    pub const MIN_INTERVAL_MS: u64 = 100;
+    pub const MAX_INTERVAL_MS: u64 = 3_600_000;
+
+    /// What is wrong with these settings, or Ok. Checked even when the
+    /// section is off, so a typo does not wait for the day it is enabled.
+    pub fn check(&self) -> Result<(), String> {
+        if self.paths.is_empty() {
+            return Err("watch.paths must name at least one directory or file (default [\".\"])".into());
+        }
+        if self.paths.len() > Self::MAX_PATHS {
+            return Err(format!("watch.paths has {} entries (at most {})", self.paths.len(), Self::MAX_PATHS));
+        }
+        for p in &self.paths {
+            if p.is_empty() || p.contains('\0') || p.len() > 4096 {
+                return Err(format!("watch.paths: {p:?} is not a path"));
+            }
+        }
+        if self.ignore.len() > Self::MAX_IGNORE {
+            return Err(format!("watch.ignore has {} entries (at most {})", self.ignore.len(), Self::MAX_IGNORE));
+        }
+        for pat in &self.ignore {
+            crate::watch::Glob::new(pat).map_err(|e| format!("watch.ignore: {pat:?}: {e}"))?;
+        }
+        if self.debounce_ms > Self::MAX_DEBOUNCE_MS {
+            return Err(format!(
+                "watch.debounce_ms = {} is out of range (maximum {})",
+                self.debounce_ms,
+                Self::MAX_DEBOUNCE_MS
+            ));
+        }
+        if !(Self::MIN_INTERVAL_MS..=Self::MAX_INTERVAL_MS).contains(&self.interval_ms) {
+            return Err(format!(
+                "watch.interval_ms = {} must be between {} and {}",
+                self.interval_ms,
+                Self::MIN_INTERVAL_MS,
+                Self::MAX_INTERVAL_MS
+            ));
+        }
+        if self.max_files == 0 || self.max_files > Self::MAX_FILES {
+            return Err(format!("watch.max_files = {} must be between 1 and {}", self.max_files, Self::MAX_FILES));
+        }
+        Ok(())
+    }
+
+    pub fn debounce(&self) -> Duration {
+        Duration::from_millis(self.debounce_ms.min(Self::MAX_DEBOUNCE_MS))
+    }
+
+    pub fn interval(&self) -> Duration {
+        Duration::from_millis(self.interval_ms.clamp(Self::MIN_INTERVAL_MS, Self::MAX_INTERVAL_MS))
+    }
 }
 
 /// On the wire too (`log-level`), so it lives in the protocol crate.
@@ -742,6 +863,12 @@ impl Config {
                     return Err(format!("{name} = {value} is out of range (maximum {unit})"));
                 }
             }
+            if let Some(n) = st.html_max_age.filter(|n| *n > MAX_HTML_MAX_AGE) {
+                return Err(format!(
+                    "static.html_max_age = {n} is out of range (maximum {MAX_HTML_MAX_AGE}, one year; \
+                     unset or 0 revalidates on every page load)"
+                ));
+            }
         }
         if self.workers.wait_ready && !self.shim_enabled() {
             return Err("workers.wait_ready needs Warden's shim, which loads into bun and node commands \
@@ -774,6 +901,12 @@ impl Config {
         }
         if let Some(expr) = &self.restart.schedule {
             crate::schedule::Cron::parse(expr).map_err(|e| format!("restart.schedule = {expr:?}: {e}"))?;
+        }
+        self.watch.check()?;
+        if self.watch.enabled && self.static_files.is_some() {
+            return Err("[watch] does not apply to a [static] site: Warden's file server reads the files from disk \
+                        (a changed file is served after [static] cache_valid_ms), so there is nothing to restart"
+                .into());
         }
         if (self.logging.out_file.is_some() || self.logging.err_file.is_some())
             && self.logging.worker_output == WorkerOutput::Inherit
@@ -1317,6 +1450,9 @@ mod tests {
             ("watchdog", "timeout"),
             ("limits", "max_memory"),
             ("limits", "max_lifetime"),
+            ("watch", "debounce_ms"),
+            ("watch", "interval_ms"),
+            ("watch", "max_files"),
         ];
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
@@ -1349,6 +1485,8 @@ mod tests {
                             let _ = now + std::time::Duration::from_secs(secs);
                         }
                         let _ = now + c.long_lived_timeout();
+                        let _ = now + c.watch.debounce() + c.watch.interval();
+                        assert!(c.watch.max_files <= Watch::MAX_FILES && c.watch.max_files > 0);
                     }
                 }
             }
@@ -1356,6 +1494,55 @@ mod tests {
         let e = Config::parse(&format!("{MIN}[reload]\ntimeout = 18446744073709551615\n")).unwrap_err();
         assert!(e.contains("reload.timeout") && e.contains("out of range"), "{e}");
         assert!(Config::parse(&format!("{MIN}[health]\noutage_threshold = 1.5\n")).is_err());
+    }
+
+    /// `[watch]`: off unless asked; every value is checked even while it is off.
+    #[test]
+    fn watch_defaults_and_rules() {
+        let c = Config::parse(MIN).unwrap();
+        let w = &c.watch;
+        assert!(!w.enabled, "opt-in");
+        assert_eq!(
+            (w.paths.as_slice(), w.debounce_ms, w.interval_ms, w.max_files),
+            ([".".to_string()].as_slice(), 500, 1000, 10_000)
+        );
+        assert!(["node_modules", ".git", "*.log"].iter().all(|d| w.ignore.iter().any(|i| i == d)), "{:?}", w.ignore);
+        assert_eq!(w.ignore.len(), DEFAULT_WATCH_IGNORE.len());
+        let on = |extra: &str| Config::parse(&format!("{MIN}[watch]\nenabled = true\n{extra}"));
+        let c = on("paths = [\"src\", \"/etc/app.json\"]\nignore = [\"dist\", \"**/*.test.ts\", \"/tmp/x\"]\ndebounce_ms = 0\n").unwrap();
+        assert!(c.watch.enabled && c.watch.debounce_ms == 0);
+        assert_eq!(c.watch.paths, ["src", "/etc/app.json"]);
+        // Rejected, with the key named, on or off.
+        for (extra, why) in [
+            ("paths = []\n", "watch.paths"),
+            ("paths = [\"\"]\n", "watch.paths"),
+            ("ignore = [\"!keep\"]\n", "negation"),
+            ("ignore = [\"\"]\n", "watch.ignore"),
+            ("ignore = [\"a\\\\\"]\n", "lone"),
+            ("interval_ms = 99\n", "watch.interval_ms"),
+            ("interval_ms = 3600001\n", "watch.interval_ms"),
+            ("max_files = 0\n", "watch.max_files"),
+            ("max_files = 100001\n", "watch.max_files"),
+            ("debounce_ms = 600001\n", "watch.debounce_ms"),
+            ("poll = 5\n", "unknown field"),
+        ] {
+            let e = Config::parse(&format!("{MIN}[watch]\n{extra}")).unwrap_err();
+            assert!(e.contains(why), "{extra}: {e}");
+            assert!(on(extra).is_err(), "{extra}");
+        }
+        let many = format!("ignore = [{}]\n", vec!["\"x\""; Watch::MAX_IGNORE + 1].join(","));
+        assert!(Config::parse(&format!("{MIN}[watch]\n{many}")).unwrap_err().contains("watch.ignore"));
+        let many = format!("paths = [{}]\n", vec!["\"x\""; Watch::MAX_PATHS + 1].join(","));
+        assert!(Config::parse(&format!("{MIN}[watch]\n{many}")).unwrap_err().contains("watch.paths"));
+        // A static site reads its files from disk: nothing to restart.
+        let site = "[app]\nname = \"s\"\nport = 8080\n[static]\nroot = \"/srv/s\"\n";
+        assert!(Config::parse(site).is_ok());
+        let e = Config::parse(&format!("{site}[watch]\nenabled = true\n")).unwrap_err();
+        assert!(e.contains("[static]"), "{e}");
+        // The settings reach the status/config JSON that `warden describe` reads.
+        let v = serde_json::to_value(on("").unwrap()).unwrap();
+        assert_eq!((v["watch"]["enabled"].clone(), v["watch"]["max_files"].clone()), (true.into(), 10_000.into()));
+        assert_eq!(on("debounce_ms = 250\ninterval_ms = 100\n").unwrap().watch.debounce(), Duration::from_millis(250));
     }
 
     #[test]
@@ -1411,6 +1598,8 @@ mod tests {
         assert_eq!(c.reload.max_draining, DEFAULT_MAX_DRAINING);
         assert_eq!(c.watchdog.loop_delay_warn, Watchdog::default().loop_delay_warn);
         assert!(c.app.pin_release);
+        // The [watch] block lists the defaults too (and is off).
+        assert_eq!(c.watch, Watch::default());
         // The commented [static] block is valid too.
         let uncommented: String = text
             .split("# [static]")
@@ -1457,6 +1646,29 @@ mod tests {
         // The worker gets the section as JSON (WARDEN_STATIC); sizes survive the round trip.
         let json = serde_json::to_string(&st).unwrap();
         assert_eq!(serde_json::from_str::<Static>(&json).unwrap(), st);
+    }
+
+    #[test]
+    fn static_html_max_age_is_opt_in_and_bounded() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        let parse = |extra: &str| Config::parse(&format!("{base}{extra}\n"));
+        assert_eq!(parse("").unwrap().static_files.unwrap().html_max_age, None, "unset: revalidate, as before");
+        for (text, want) in [("0", 0), ("300", 300), ("31536000", 31_536_000)] {
+            let st = parse(&format!("html_max_age = {text}")).unwrap().static_files.unwrap();
+            assert_eq!(st.html_max_age, Some(want));
+            // The worker gets it in WARDEN_STATIC.
+            let back: Static = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+            assert_eq!(back.html_max_age, Some(want));
+        }
+        for (bad, why) in [
+            ("html_max_age = 31536001", "static.html_max_age = 31536001 is out of range"),
+            ("html_max_age = -1", "invalid value"),
+            ("html_max_age = \"60\"", "invalid type"),
+            ("html_max_age = 1.5", "invalid type"),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]
@@ -1658,7 +1870,7 @@ level = "info"
     #[test]
     fn max_draining_default_and_bounds() {
         assert_eq!(Config::parse(MIN).unwrap().reload.max_draining, DEFAULT_MAX_DRAINING);
-        assert_eq!(DEFAULT_MAX_DRAINING, 4, "warden.example.toml and the README say 4");
+        assert_eq!(DEFAULT_MAX_DRAINING, 4, "warden.example.toml and docs/configuration.md say 4");
         let c = Config::parse(&format!("{MIN}[reload]\nmax_draining = 1\n")).unwrap();
         assert_eq!(c.reload.max_draining, 1);
         assert_eq!(Config::parse(&format!("{MIN}[reload]\nmax_draining = 1024\n")).unwrap().reload.max_draining, 1024);

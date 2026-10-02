@@ -100,6 +100,44 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
 - [`contrib/nginx.conf`](contrib/nginx.conf) and
   [`docs/proxies.md`](docs/proxies.md) for running behind nginx or a cloud load
   balancer.
+- Opt-in file watching: `[watch]` (`enabled`, `paths`, `ignore`, `debounce_ms`,
+  `interval_ms`, `max_files`) and `warden start --watch [--ignore-watch ...]
+  [--watch-delay ...]` restart an app with the same gated rolling restart
+  `warden restart` does when its files change (off by default; a polling scan,
+  debounced and throttled; [`docs/watch.md`](docs/watch.md)). `warden list`
+  has a `watching` column, `describe` a `watch` row and `status.watching` is in
+  the protocol. `pm2-migrate` maps PM2's `watch`, `ignore_watch` and
+  `watch_delay` to `[watch]` instead of reporting them as unsupported.
+- `[static] html_max_age` and `warden serve --html-max-age N`: seconds browsers
+  may reuse HTML pages (unset: revalidate on every load, as before; at most
+  one year; `private` with `basic_auth`).
+- `install.sh` options: `--gui`, `--version`, `--uninstall`, `--prefix`,
+  `--dry-run`, `--modify-path`; musl/glibc detection, a PATH hint, and every
+  download verified before anything is installed
+  ([`docs/install.md`](docs/install.md), `scripts/test-install.sh`).
+- Linux packages: `.deb` and `.rpm` for `warden` and `warden-gui` (amd64/arm64,
+  x86_64/aarch64), built with nfpm in the Release workflow and tested by
+  installing them in containers ([`docs/packages.md`](docs/packages.md)); a
+  macOS `.dmg` with `Warden.app` next to the zip.
+- The Release workflow can be run as a dry run (build and check everything,
+  publish nothing) and writes the release notes from this file.
+
+### Changed
+
+- README is short and aimed at people installing and using Warden; the detail
+  moved to `docs/` (commands, configuration, comparison, deploys, platforms,
+  static serving and more). `cargo xtask bench` now writes its tables to
+  `docs/benchmarks.md` (`--no-docs`; `--no-readme` still works).
+- Static serving: big files go out in 1 MiB `sendfile` pieces, so a download no
+  longer holds up other requests on its worker (a 1 KB request next to a 10 MB
+  download: 5.4 ms to 0.34 ms at p50); bodies of 1.25 MiB and more use
+  `TCP_CORK` (21-38% less CPU per 2-100 MB response); 404, 401, 405 and listing
+  responses are one packet, and HEAD to them no longer carries a body; a new
+  connection costs two fewer syscalls. On macOS `SO_NOSIGPIPE` is set once per
+  connection and head plus body go out in one `sendfile` (not yet run on a
+  Mac). Measured on a loaded 2-CPU VM: [`docs/benchmarks.md`](docs/benchmarks.md).
+- `warden start --watch` is no longer rejected ("Warden is for production").
+  `warden serve --watch` is an error: the file server reads from disk.
 
 ### Notes
 

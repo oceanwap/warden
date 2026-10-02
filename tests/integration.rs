@@ -7145,3 +7145,144 @@ fn a_standby_never_holds_up_a_stop() {
         assert!(log.contains("standby stopped"), "{name}:\n{log}");
     }
 }
+
+// ------------------------------------------------------------------ [watch]
+
+/// A directory for an app: `src/main.js` and an (empty) `node_modules`.
+fn watch_app_dir(f: &Fleet, name: &str) -> PathBuf {
+    let dir = f.home.join(format!("{name}-dir"));
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+    std::fs::write(dir.join("src/main.js"), "v1").unwrap();
+    dir
+}
+
+/// The app's workers are all new (none of `old` is left) and running.
+fn replaced(f: &Fleet, name: &str, old: &[u64]) -> bool {
+    let a = f.app(name);
+    let running = a["status"]["workers"].as_array().is_some_and(|w| w.iter().all(|x| x["state"] == "RUNNING"));
+    let now = f.pids(name);
+    running && now.len() == old.len() && now.iter().all(|p| !old.contains(p))
+}
+
+/// The supervisor has taken its first look at the files (what is written
+/// after that is a change).
+fn watching_since_start(f: &Fleet, name: &str) {
+    f.wait("the files to be watched", |f| {
+        f.cli(&["logs", name, "--nostream", "--events", "--lines", "100"]).1.contains("file watching started")
+    });
+}
+
+/// `[watch]`: a file changed in the app's directory starts a gated rolling
+/// restart; ignored files do not; an app without `[watch]` (the default) is
+/// left alone; `list`, `describe` and `status` say which is which.
+#[test]
+fn watched_files_restart_the_app_and_the_default_is_off() {
+    let f = Fleet::new("watch");
+    for (name, watch) in [
+        ("watched", "[watch]\nenabled = true\ndebounce_ms = 200\ninterval_ms = 100\n"),
+        ("quiet", ""),
+        ("off", "[watch]\nenabled = false\ndebounce_ms = 200\ninterval_ms = 100\n"),
+    ] {
+        let dir = watch_app_dir(&f, name);
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\
+             working_directory = {:?}\n{watch}",
+            dir.display().to_string()
+        );
+        std::fs::write(f.home.join(format!("{name}.toml")), cfg).unwrap();
+        f.ok(&["start", name]);
+    }
+    let watching = |name: &str| f.app(name)["status"]["watching"].clone();
+    assert_eq!((watching("watched"), watching("quiet"), watching("off")), (true.into(), false.into(), false.into()));
+    let list = f.ok(&["list"]);
+    let cell = |app: &str| list.lines().find(|l| l.contains(&format!(" {app} "))).unwrap_or_default().to_string();
+    assert!(list.contains("watching"), "a column: {list}");
+    assert!(cell("watched").contains("enabled") && cell("quiet").contains("disabled"), "{list}");
+    let d = f.ok(&["describe", "watched"]);
+    assert!(d.contains("enabled: a rolling restart 200 ms after the files in ."), "{d}");
+    assert!(f.ok(&["describe", "quiet"]).contains("disabled (`[watch] enabled = true`"));
+
+    let (w0, q0, o0) = (f.pids("watched"), f.pids("quiet"), f.pids("off"));
+    assert!(w0.len() == 1 && q0.len() == 1 && o0.len() == 1);
+    watching_since_start(&f, "watched");
+
+    // Ignored by default: node_modules, *.log. Nothing restarts.
+    let dir = f.home.join("watched-dir");
+    std::fs::write(dir.join("node_modules/dep.js"), "x").unwrap();
+    std::fs::write(dir.join("debug.log"), "x").unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(f.pids("watched"), w0, "ignored files are not a change");
+
+    // A source file is: written in all three apps, only the watched one restarts.
+    for name in ["watched", "quiet", "off"] {
+        std::fs::write(f.home.join(format!("{name}-dir/src/main.js")), "version 2").unwrap();
+    }
+    f.wait("the watched app's rolling restart", |f| replaced(f, "watched", &w0));
+    let log = f.ok(&["logs", "watched", "--nostream", "--events", "--lines", "100"]);
+    assert!(log.contains("files changed: rolling restart") && log.contains("src/main.js"), "{log}");
+    assert!(log.contains("restart started"), "gated like any restart: {log}");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!((f.pids("quiet"), f.pids("off")), (q0, o0), "nothing watches the others");
+    assert!(f.app("watched")["status"]["last_rollout"]["ok"] == true, "{}", f.app("watched"));
+    // Once, not again: the files stayed as they are.
+    let w1 = f.pids("watched");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(f.pids("watched"), w1);
+
+    // An app that exists is watched by turning `[watch]` on and `warden reload` (no restart of Warden).
+    let path = f.home.join("quiet.toml");
+    let cfg = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{cfg}[watch]\nenabled = true\ndebounce_ms = 200\ninterval_ms = 100\n")).unwrap();
+    f.ok(&["reload", "quiet"]);
+    f.wait("quiet to be watched", |f| f.app("quiet")["status"]["watching"] == true);
+    watching_since_start(&f, "quiet");
+    let q1 = f.pids("quiet");
+    std::fs::write(f.home.join("quiet-dir/src/main.js"), "version 3").unwrap();
+    f.wait("quiet's rolling restart", |f| replaced(f, "quiet", &q1));
+    // And off again the same way.
+    std::fs::write(&path, cfg).unwrap();
+    f.ok(&["reload", "quiet"]);
+    f.wait("quiet to stop being watched", |f| f.app("quiet")["status"]["watching"] == false);
+}
+
+/// PM2's flags: `warden start ... --watch --ignore-watch --watch-delay` write
+/// the `[watch]` section, and what they ignore is ignored.
+#[test]
+fn start_watch_flags_write_the_watch_section() {
+    let f = Fleet::new("watchflags");
+    let dir = watch_app_dir(&f, "flagged");
+    std::fs::create_dir_all(dir.join("dist")).unwrap();
+    let out = f.ok(&[
+        "start",
+        "sleep 300",
+        "--name",
+        "flagged",
+        "--cwd",
+        dir.to_str().unwrap(),
+        "--watch",
+        "--ignore-watch",
+        "dist,*.map",
+        "--watch-delay",
+        "200ms",
+    ]);
+    assert!(out.contains("flagged: online"), "{out}");
+    let cfg = std::fs::read_to_string(f.home.join("flagged.toml")).unwrap();
+    assert!(cfg.contains("[watch]") && cfg.contains("enabled = true") && cfg.contains("debounce_ms = 200"), "{cfg}");
+    assert!(cfg.contains("\"dist\"") && cfg.contains("\"*.map\"") && cfg.contains("\"node_modules\""), "{cfg}");
+    assert_eq!(f.app("flagged")["status"]["watching"], true);
+    // The flags that go with --watch mean nothing without it.
+    let (code, out) = f.cli(&["start", "sleep 300", "--name", "other", "--watch-delay", "4"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("go with --watch"), "{out}");
+
+    let before = f.pids("flagged");
+    watching_since_start(&f, "flagged");
+    std::fs::write(dir.join("dist/bundle.js"), "x").unwrap();
+    std::fs::write(dir.join("bundle.js.map"), "x").unwrap();
+    // Two looks at the files (interval 1 s) have passed: no restart.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(f.pids("flagged"), before, "dist and *.map are ignored");
+    std::fs::write(dir.join("src/main.js"), "version 2").unwrap();
+    f.wait("the rolling restart", |f| replaced(f, "flagged", &before));
+}

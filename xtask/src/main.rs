@@ -1,6 +1,6 @@
 //! Project tasks, run through the cargo aliases in `.cargo/config.toml`:
 //!
-//!   cargo xtask bench [--quick] [--only SUITES] [--duration S] [--no-readme]
+//!   cargo xtask bench [--quick] [--only SUITES] [--duration S] [--no-docs]
 //!                     [--app-cpus L] [--loadgen-cpus L] [--loadgen oha|wrk] [--rounds N]
 //!   cargo bench-all                       (the same as `cargo xtask bench`)
 //!   cargo xtask profile [bench/profile.ts options] (per-request cost, perf top symbols)
@@ -10,8 +10,9 @@
 //! `bench` checks the tools the benchmarks need, builds Warden in release
 //! mode, runs every suite in `bench/` against PM2, Watt (wattpm), nginx and
 //! `serve`, then writes `bench/results/latest.md`, copies each suite's raw
-//! JSON to `bench/results/latest/`, and replaces the README's benchmark
-//! tables (between `<!-- bench:start -->` and `<!-- bench:end -->`).
+//! JSON to `bench/results/latest/`, and replaces the benchmark tables in
+//! `docs/benchmarks.md` (between `<!-- bench:start -->` and `<!-- bench:end -->`).
+//! The README keeps a short hand-written table and links there.
 //! Nothing here is part of `cargo build`.
 
 mod chaos;
@@ -92,7 +93,7 @@ const USAGE: &str = "\
 cargo xtask TASK [OPTIONS]
 
 TASKS:
-    bench      Run every benchmark suite, update README.md (also: cargo bench-all)
+    bench      Run every benchmark suite, update docs/benchmarks.md (also: cargo bench-all)
     profile    What one request costs a server (CPU time, syscalls) and where the time
                goes (perf record, top symbols); Warden built with symbols
     chaos      A chaos soak: a fleet under load, random faults, invariants checked
@@ -109,14 +110,16 @@ TASKS:
 const BENCH_USAGE: &str = "\
 cargo xtask bench [OPTIONS]      (also: cargo bench-all)
 
-Runs every benchmark suite and updates README.md and bench/results/latest.md.
+Runs every benchmark suite and updates the tables in docs/benchmarks.md and
+bench/results/latest.md (the README's short table is edited by hand).
 
 OPTIONS:
     --quick            Short runs (3 s per measurement): a smoke test, not results to publish
     --only SUITES      Comma-separated subset of: node-http, nest-node, bun-http, nest-bun,
                        static, logs, fleet, longlived
     --duration S       Seconds per load measurement (default 10)
-    --no-readme        Leave README.md alone (still writes bench/results/latest.md)
+    --no-docs          Leave docs/benchmarks.md alone (still writes bench/results/latest.md;
+                       --no-readme is the old name and still works)
     --app-cpus L       Pin the apps and their managers to these CPUs (taskset list: 0-3,6)
     --loadgen-cpus L   Pin the load generator to these CPUs
     --loadgen G        oha (default) or wrk (lighter: more CPU left to the apps)
@@ -204,7 +207,7 @@ struct Options {
     quick: bool,
     only: Option<Vec<String>>,
     duration: Option<String>,
-    readme: bool,
+    docs: bool,
     /// `--app-cpus L`, `--loadgen-cpus L`, `--loadgen G`: passed to every suite.
     pinning: Vec<String>,
     loadgen: String,
@@ -229,7 +232,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         quick: false,
         only: None,
         duration: None,
-        readme: true,
+        docs: true,
         pinning: Vec::new(),
         loadgen: "oha".into(),
         rounds: None,
@@ -238,7 +241,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--quick" => o.quick = true,
-            "--no-readme" => o.readme = false,
+            "--no-docs" | "--no-readme" => o.docs = false,
             "--app-cpus" | "--loadgen-cpus" => {
                 let v = it.next().ok_or(format!("{a} needs a CPU list (taskset -c syntax, e.g. 0-3)"))?;
                 if !cpu_list(v) {
@@ -497,10 +500,10 @@ fn bench(args: &[String]) -> Result<(), String> {
         t_all.elapsed().as_secs_f64() / 60.0
     );
 
-    if o.readme && failed.is_empty() && o.only.is_none() {
-        update_readme(&root.join("README.md"), &md)?;
-    } else if o.readme {
-        eprintln!("xtask: README.md left as it was (only a subset ran, or a suite failed)");
+    if o.docs && failed.is_empty() && o.only.is_none() {
+        update_tables(&root.join("docs/benchmarks.md"), &md)?;
+    } else if o.docs {
+        eprintln!("xtask: docs/benchmarks.md left as it was (only a subset ran, or a suite failed)");
     }
     if failed.is_empty() { Ok(()) } else { Err(format!("suites failed: {}", failed.join(", "))) }
 }
@@ -535,8 +538,8 @@ fn profile(args: &[String]) -> Result<(), String> {
 const START: &str = "<!-- bench:start -->";
 const END: &str = "<!-- bench:end -->";
 
-/// Replace the text between the README's bench markers.
-fn update_readme(path: &Path, md: &str) -> Result<(), String> {
+/// Replace the text between the bench markers of docs/benchmarks.md.
+fn update_tables(path: &Path, md: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let (Some(a), Some(b)) = (text.find(START), text.find(END)) else {
         return Err(format!("{} has no {START} … {END} markers; add them where the tables go", path.display()));
@@ -555,17 +558,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn readme_markers_are_replaced_in_place() {
+    fn table_markers_are_replaced_in_place() {
         let dir = std::env::temp_dir().join(format!("xtask-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("README.md");
+        let p = dir.join("benchmarks.md");
         std::fs::write(&p, format!("# T\nintro\n{START}\nold tables\n{END}\nafter\n")).unwrap();
-        update_readme(&p, "new tables\n").unwrap();
+        update_tables(&p, "new tables\n").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("# T\nintro\n{START}\nnew tables\n{END}\nafter\n"));
-        update_readme(&p, "again").unwrap();
+        update_tables(&p, "again").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("# T\nintro\n{START}\nagain\n{END}\nafter\n"));
         std::fs::write(&p, "no markers").unwrap();
-        assert!(update_readme(&p, "x").unwrap_err().contains("markers"));
+        assert!(update_tables(&p, "x").unwrap_err().contains("markers"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -577,7 +580,8 @@ mod tests {
         assert_eq!(parse(&a("--only longlived")).unwrap().only.unwrap(), vec!["longlived"]);
         assert!(parse(&a("--only nope")).unwrap_err().contains("unknown suite"));
         assert!(parse(&a("--duration x")).is_err());
-        assert!(!parse(&a("--no-readme")).unwrap().readme);
+        assert!(!parse(&a("--no-docs")).unwrap().docs);
+        assert!(!parse(&a("--no-readme")).unwrap().docs, "the old flag name still works");
         let o = parse(&a("--app-cpus 0-3 --loadgen-cpus 4,5 --loadgen wrk --rounds 3")).unwrap();
         assert_eq!(o.pinning, ["--app-cpus", "0-3", "--loadgen-cpus", "4,5", "--loadgen", "wrk"]);
         assert_eq!((o.loadgen.as_str(), o.rounds.as_deref()), ("wrk", Some("3")));

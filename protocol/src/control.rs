@@ -213,6 +213,11 @@ pub struct Status {
     /// Absent from a supervisor that does not send it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// `[watch] enabled`: the app restarts by itself, through the rollout
+    /// gates, when its files change (PM2's `watching`). Always sent; an older
+    /// supervisor does not send it, and reads as `false`: it cannot watch.
+    #[serde(default)]
+    pub watching: bool,
 }
 
 /// An executable as the supervisor saw it at start: where it was and what
@@ -463,6 +468,21 @@ mod tests {
         );
         let r: Response = serde_json::from_str(r#"{"ok":false,"message":"no such worker"}"#).unwrap();
         assert!(!r.ok && r.message.as_deref() == Some("no such worker") && r.status.is_none());
+    }
+
+    /// `watching` is additive: absent from an older supervisor (which cannot
+    /// watch files), `false` unless `[watch]` is on.
+    #[test]
+    fn watching_is_additive() {
+        let old = r#"{"app":"api","mode":"process","pid":1,"uptime_secs":1,"workers_configured":1,"workers_ready":1,
+            "healthy":null,"supervisor_rss_bytes":null,"host":null,"reloading":false,"shutting_down":false,"workers":[]}"#;
+        let mut s: Status = serde_json::from_str(old).unwrap();
+        assert!(!s.watching, "an older supervisor does not watch");
+        s.watching = true;
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["watching"], true);
+        assert_eq!(serde_json::from_value::<Status>(v).unwrap(), s);
+        assert_eq!(serde_json::to_value(Status { watching: false, ..s }).unwrap()["watching"], false);
     }
 
     #[test]

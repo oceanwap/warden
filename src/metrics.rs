@@ -260,6 +260,7 @@ mod tests {
             user: None,
             build: None,
             cwd: None,
+            watching: false,
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));

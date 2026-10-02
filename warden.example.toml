@@ -15,7 +15,7 @@ env = { NODE_ENV = "production" }            # example
                                              # to this file, read again by `warden reload`; keep secrets there (0600).
                                              # Workers get the supervisor's environment, then env_file, then env, then
                                              # Warden's variables (PORT, NODE_APP_INSTANCE, WARDEN_*): each wins over
-                                             # the ones before. `warden env <app>` shows the result (README:
+                                             # the ones before. `warden env <app>` shows the result (docs/configuration.md:
                                              # "Environment variables")
 # shim = true                                # default: true when command is bun or node (reusePort,
                                              # readiness, drain, health socket); false for anything else
@@ -101,6 +101,25 @@ loop_delay_warn = 0.5                        # s (fractions ok); warn when a wor
 max_memory = 0                               # MB per worker process; recycle gracefully above it (0 = off)
 max_lifetime = 0                             # s; recycle each worker after this, ±10% jitter (0 = off)
 
+[watch]                                      # opt-in (PM2's watch): a gated rolling restart when files change.
+                                             # For development and staging; production deploys use `warden
+                                             # reload`. docs/watch.md has the details
+enabled = false                              # true, or `warden start server.ts --watch`
+paths = ["."]                                # directories or files, relative to working_directory (else where
+                                             # Warden was started); absolute paths work too
+ignore = ["node_modules", ".git", ".hg", ".svn", "*.log", "*.pid", "*.sock", "*.swp", "*.swx", "*~", ".DS_Store"]
+                                             # never watched: a name or glob (* ? **) matches at any depth, a
+                                             # pattern with a / is a path from working_directory, /abs/path is
+                                             # absolute, a trailing / matches directories only. Setting `ignore`
+                                             # replaces this list: keep node_modules and .git in it. Warden's own
+                                             # log files and sockets are never watched
+debounce_ms = 500                            # ms the files must stay unchanged before the restart starts (a build
+                                             # writes many files); restarts are also spaced 2 s apart, up to 30 s
+                                             # when files change again right after each one
+interval_ms = 1000                           # ms between looks at the files (100-3600000); a slow scan stretches it
+max_files = 10000                            # most files and directories looked at (1-100000); the rest is not
+                                             # watched, and one warning says so
+
 [logging]
 level = "info"                               # debug | info | warn | error
 # timestamps = true                          # default: off under journald (it adds its own)
@@ -156,7 +175,10 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # host = "0.0.0.0"
 # spa = false                                # unknown paths get index.html (single-page apps)
 # index = "index.html"
-# cache_max_age = 3600                       # s; HTML is always revalidated, fingerprinted names cached a year
+# cache_max_age = 3600                       # s; HTML is revalidated (see html_max_age), fingerprinted names cached a year
+# html_max_age = 60                          # example; opt in: browsers reuse a page for 60 s without asking (default: unset,
+#                                            # `no-cache`: a 304 round trip per page load). A deploy shows up after this long,
+#                                            # so keep it short; max 31536000 (a year); 0 = always revalidate
 # listing = false                            # HTML listing for directories without an index
 # dotfiles = false                           # serve dotfiles (.well-known is always served)
 # precompressed = true                       # serve file.br / file.gz when the client accepts them

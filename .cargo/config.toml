@@ -1,5 +1,5 @@
 # Project commands (cargo aliases, not part of any build):
-#   cargo xtask bench        run every benchmark, update README and bench/results/latest.md
+#   cargo xtask bench        run every benchmark, update docs/benchmarks.md and bench/results/latest.md
 #   cargo bench-all          the same
 #   cargo xtask bench --help
 #   cargo release 0.2.0      release: checks, version bump, tag, push, macOS archives (on a

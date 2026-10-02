@@ -2,16 +2,16 @@
 
 Everything here compares Warden with the tools people use today, on the same
 machine and the same apps: PM2, Platformatic Watt (`wattpm`), nginx and the
-`serve` package. The results in the main README come from one command:
+`serve` package. The tables in [`docs/benchmarks.md`](../docs/benchmarks.md) come from one command:
 
 ```sh
-cargo xtask bench              # every suite (~20 min on 2 CPUs); updates README.md
+cargo xtask bench              # every suite (~20 min on 2 CPUs); updates docs/benchmarks.md
 cargo bench-all                # the same, shorter to type
 cargo xtask bench --quick      # 3 s per measurement: a smoke test, not results to publish
-cargo xtask bench --only static,logs --no-readme
-cargo xtask bench --only longlived --no-readme   # WebSockets and SSE through a rolling restart
+cargo xtask bench --only static,logs --no-docs
+cargo xtask bench --only longlived --no-docs   # WebSockets and SSE through a rolling restart
 cargo xtask bench --app-cpus 0-3 --loadgen-cpus 4-7 --loadgen wrk   # apps and load generator apart
-cargo xtask bench --only static --rounds 3 --no-readme   # servers interleaved 3 times, medians
+cargo xtask bench --only static --rounds 3 --no-docs   # servers interleaved 3 times, medians
 cargo xtask profile --targets warden,nginx --path /assets/app.3f9a2c1b.js --strace   # see "Profiling"
 ```
 
@@ -23,7 +23,7 @@ below, installs the npm packages on first run (`npm ci` here and in
 `bench/nest`), builds Warden in release mode, runs every suite, writes
 `bench/results/latest.md` and `bench/results/latest/<suite>.json`, and
 replaces the tables between `<!-- bench:start -->` and `<!-- bench:end -->` in
-the README.
+`docs/benchmarks.md`.
 
 ## Needs
 
@@ -40,7 +40,7 @@ the README.
 
 ## In CI: x86_64 and ARM64
 
-`.github/workflows/bench.yml` runs `cargo xtask bench --no-readme` on
+`.github/workflows/bench.yml` runs `cargo xtask bench --no-docs` on
 GitHub's hosted runners, `ubuntu-latest` (x86_64) and `ubuntu-24.04-arm`
 (ARM64): 4 vCPUs for public repositories, 2 otherwise (the first run, on
 2026-10-01, got 2 vCPUs and 8 GB on both, a Xeon 6973P-C and an ARM64
@@ -60,7 +60,7 @@ Each job writes `bench/results/latest.md` to its summary, uploads it with
 the raw JSON as the artifact `bench-<arch>`, and emits one notice
 annotation per suite (the machine first), which the public API serves
 without a login:
-`GET /repos/<owner>/<repo>/check-runs/<job id>/annotations`. README.md is
+`GET /repos/<owner>/<repo>/check-runs/<job id>/annotations`. docs/benchmarks.md is
 not changed by these runs.
 
 ## Suites
@@ -74,7 +74,7 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `run.ts --app nest-node` | A minimal NestJS app on Node, same scenarios |
 | `run.ts --app bun-http` | A `Bun.serve` app under bare / the shim alone / PM2 (fork mode: it has no Bun cluster mode) / Warden processes / Warden worker threads |
 | `run.ts --app nest-bun` | The NestJS app on Bun, same scenarios |
-| `static.ts` | `warden serve` vs nginx vs `pm2 serve` vs `serve`: a 1.5 KB page, a 48 KB script and a 1 MB file, keep-alive and a new connection per request; `warden-nocache` is Warden with the response cache off (`cache_size = 0`), to show what the cache buys |
+| `static.ts` | `warden serve` vs nginx vs `pm2 serve` vs `serve`: a 1.5 KB page, a 48 KB script and a 1 MB file, keep-alive and a new connection per request; `warden-nocache` is Warden with the response cache off (`cache_size = 0`), to show what the cache buys; a second table (Warden and nginx, one process each) shows what a 10 MB download costs the 1.5 KB page requested next to it |
 | `logs.ts` | Capturing worker output: steady logging (CPU, completeness) and a flood (throughput, CPU per GB); `warden-direct` is `worker_output = "direct"` (bytes spliced into the file, unparsed) |
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
 | `longlived.ts` | WebSocket and SSE clients held through a rolling restart: PM2 (cluster mode for Node, fork mode for Bun) vs Warden (processes; Bun also worker mode) |
@@ -116,6 +116,9 @@ Every suite also takes:
 `static.ts` takes `--rounds N`: every server N times, interleaved (A B A B
 …), the table showing the median of each number: an A/B comparison that a
 busy machine moves less (`cargo xtask bench --rounds N` passes it on).
+`--warden PATH` runs another Warden build (an older one, for a before/after:
+two runs, one binary each) and `--no-blocking` skips the second table, the
+one about big downloads.
 `logs.ts` takes `--rate`, `--seconds` and `--mb`; `fleet.ts` takes `--apps`;
 `longlived.ts` takes `--clients N` (50 of each kind), `--apps node,bun` and
 `--warden <path>` (a debug build for a smoke run; default

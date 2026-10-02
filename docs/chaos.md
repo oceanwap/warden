@@ -239,8 +239,8 @@ out, and lists at the start and in the report: the pid namespace and the
 tmpfs (`disk-full`), memory cgroups (`oom` app, `oom-kill`), `memhog` and
 `memory-recycle` (Warden reads workers' RSS from `/proc`), and
 `kill-supervisor` (no parent-death signal: the workers of a SIGKILLed
-supervisor keep running next to the new ones, as the README's Platforms
-section says), and `api-node` (Node has no `reusePort` on macOS, so its 3
+supervisor keep running next to the new ones, as docs/platforms.md
+says), and `api-node` (Node has no `reusePort` on macOS, so its 3
 workers cannot share the port). Connections are not spread across
 `SO_REUSEPORT` listeners there, which changes which worker answers, not
 what may fail.
@@ -248,8 +248,7 @@ what may fail.
 ## In CI
 
 `.github/workflows/chaos.yml` runs `cargo xtask chaos --release --minutes 3
---seed 20261001` on pushes to `main` and once a day (not on every branch:
-macOS minutes count ten times against the account's spending limit): on
+--seed 20261001` on pushes to `main` and once a day (not on every branch): on
 Ubuntu as root (pid namespace, tmpfs, memory cgroup: everything), and on
 macOS. The fixed seed means the same faults in the same order on the same
 targets, so a new failure points at a change in Warden. The verdict,

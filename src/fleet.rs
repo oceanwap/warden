@@ -694,7 +694,7 @@ fn render_env(info: &serde_json::Value, show_secrets: bool) -> String {
             o += &match from {
                 "env_file" => format!("# from {env_file}\n"),
                 "env" => "# from [app] env\n".to_string(),
-                _ => "# set by Warden (README: Environment variables)\n".to_string(),
+                _ => "# set by Warden (docs/configuration.md: Environment variables)\n".to_string(),
             };
         }
         let note = match seen.insert(name, from) {
@@ -1254,6 +1254,9 @@ fn is_selector_list(what: &str) -> bool {
     ids || list
 }
 
+/// Where file watching is turned on for an app that already has a config.
+const WATCH_HINT: &str = "set `[watch] enabled = true` in its config, then `warden reload <app>` (docs/watch.md)";
+
 /// `warden start <app | id | config.toml | script>`.
 pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     let code = start_inner(args, what, opts).await;
@@ -1272,6 +1275,9 @@ async fn start_inner(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     // 1. Apps we know: a name, an id, a namespace, `all`, or a list of them.
     match resolve(&ctx, Some(what), true) {
         Ok(sels) => {
+            if opts.watch {
+                eprintln!("warden: --watch is ignored for apps that exist already; {WATCH_HINT}");
+            }
             let mut started: Vec<&str> = Vec::new();
             let mut each = Vec::new();
             for s in &sels {
@@ -1301,6 +1307,9 @@ async fn start_inner(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     let path = Path::new(what);
     // 2. A config file.
     if path.extension().is_some_and(|x| x == "toml") && path.is_file() {
+        if opts.watch {
+            eprintln!("warden: --watch is ignored for a config file; {WATCH_HINT}");
+        }
         let app = app_from_config(path);
         if let Some(p) = &app.problem {
             eprintln!("warden: {p}");
@@ -1406,6 +1415,9 @@ async fn serve_inner(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
     }
     if let Some(a) = &o.basic_auth {
         t += &format!("basic_auth = {}\n", toml_str(a));
+    }
+    if let Some(n) = o.html_max_age {
+        t += &format!("html_max_age = {n}\n");
     }
     if let Err(e) = Config::parse(&t) {
         eprintln!("warden: the generated config is invalid: {e}");
@@ -2112,6 +2124,27 @@ pub fn quick_config(what: &Launch, o: &StartOpts) -> Result<(String, String), St
     if let Some(mb) = o.max_memory_mb {
         t += &format!("\n[limits]\nmax_memory = {mb}\n");
     }
+    if o.watch {
+        t += "\n# Restart when files change (docs/watch.md); `warden reload` after editing this.\n[watch]\nenabled = true\n";
+        if !o.watch_paths.is_empty() {
+            let paths: Vec<String> = o.watch_paths.iter().map(|p| toml_str(p)).collect();
+            t += &format!("paths = [{}]\n", paths.join(", "));
+        }
+        if !o.ignore_watch.is_empty() {
+            // On top of the built-in list (node_modules, .git, *.log…), not instead of it.
+            let mut all: Vec<&str> = crate::config::DEFAULT_WATCH_IGNORE.to_vec();
+            for p in &o.ignore_watch {
+                if !all.contains(&p.as_str()) {
+                    all.push(p);
+                }
+            }
+            let all: Vec<String> = all.iter().map(|p| toml_str(p)).collect();
+            t += &format!("ignore = [{}]\n", all.join(", "));
+        }
+        if let Some(ms) = o.watch_delay_ms {
+            t += &format!("debounce_ms = {ms}\n");
+        }
+    }
     let abs = |p: &PathBuf| if p.is_absolute() { p.clone() } else { cwd_now.join(p) };
     let mut logging = String::new();
     if let Some(f) = &o.out_file {
@@ -2797,6 +2830,40 @@ mod tests {
         assert_eq!(standby("api:s1"), Ok((None, Some("s1".into()))));
         assert_eq!(standby("s3"), Ok((None, Some("s3".into()))));
         assert!(standby(":sx").is_err());
+    }
+
+    /// `--watch`: a `[watch]` section, on top of the defaults; none without it.
+    #[test]
+    fn quick_config_with_watch_flags() {
+        let shell = Launch::Shell("python3 app.py".into());
+        let (_, text) = quick_config(&shell, &StartOpts::default()).unwrap();
+        assert!(!text.contains("[watch]"), "off unless asked: {text}");
+        assert!(!Config::parse(&text).unwrap().watch.enabled);
+
+        let on = StartOpts { watch: true, ..Default::default() };
+        let (_, text) = quick_config(&shell, &on).unwrap();
+        let w = Config::parse(&text).unwrap().watch;
+        assert_eq!((w.enabled, w.paths.as_slice()), (true, [".".to_string()].as_slice()));
+        assert_eq!((w.debounce_ms, w.interval_ms), (500, 1000), "the defaults: {text}");
+
+        let more = StartOpts {
+            watch: true,
+            watch_paths: vec!["src".into(), "package.json".into()],
+            ignore_watch: vec!["dist".into(), "node_modules".into(), "*.map".into()],
+            watch_delay_ms: Some(4000),
+            ..Default::default()
+        };
+        let (_, text) = quick_config(&shell, &more).unwrap();
+        let w = Config::parse(&text).unwrap().watch;
+        assert_eq!(w.paths, ["src", "package.json"]);
+        assert_eq!(w.debounce_ms, 4000);
+        // Added to the built-in list, once each.
+        assert_eq!(w.ignore.len(), crate::config::DEFAULT_WATCH_IGNORE.len() + 2, "{:?}", w.ignore);
+        assert!(w.ignore.iter().any(|p| p == "dist") && w.ignore.iter().any(|p| p == ".git"), "{:?}", w.ignore);
+        // A pattern the config would refuse is refused here, with the generated text.
+        let bad = StartOpts { watch: true, ignore_watch: vec!["!keep".into()], ..Default::default() };
+        let e = quick_config(&shell, &bad).unwrap_err();
+        assert!(e.contains("watch.ignore") && e.contains("negation"), "{e}");
     }
 
     #[test]

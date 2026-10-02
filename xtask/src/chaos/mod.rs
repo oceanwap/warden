@@ -459,7 +459,7 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     if !rss {
         notes.push("Warden reads workers' RSS from /proc (Linux): no `memhog` app, memory-recycle is skipped".into());
     }
-    // README, Platforms: without a parent-death signal the workers of a
+    // docs/platforms.md: without a parent-death signal the workers of a
     // SIGKILLed supervisor keep running (and serving) next to the new ones.
     let pdeathsig = cfg!(target_os = "linux");
     if !pdeathsig {

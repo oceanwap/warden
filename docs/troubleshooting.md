@@ -54,6 +54,31 @@ warden logs <app> --history --grep error --since 2h   # the log files, rotated a
 | `worker started by a rollout that failed has stopped; restarting it with the previous config` | That worker had already taken its slot when the rollout failed (its old process was gone, so there was nothing to roll back to); it was stopped with the rollout | Nothing to undo: Warden starts the slot again at once on the previous config, without counting a crash. Fix what the rollout's failure (the line before) says and deploy again |
 | `config changes that need systemctl restart were not applied` | `reload` re-reads the config, but some keys only apply at start: `[workers]` (use `warden scale` for the count; `standby` too), `[metrics]`, `[control]`, `health.url/enabled/interval`, `logging.timestamps/worker_output` | The line lists them; `systemctl restart warden@<app>` (a full restart) applies them |
 
+## File watching (`[watch]`)
+
+How it works, and every key: [`watch.md`](watch.md). `warden describe <app>` shows
+the `watch` row, `warden logs <app> --events` the watcher's decisions.
+
+| You see | Why | Fix |
+|---|---|---|
+| Files change and nothing restarts | `watching` is `disabled` in `warden list` (it is off by default), or the file is ignored (`node_modules`, `.git`, `*.log`… and your `ignore`), or outside `paths`, or past `max_files` | `[watch] enabled = true`, then `warden reload <app>`; `warden start <script> --watch` for a new app. The `file watching on paths=… ignore=…` line says what is watched |
+| `[watch] enabled = true` was added to the config of a running app and nothing happens | A running app reads `[watch]` when you `warden reload` | `warden reload <app>`; `warden list` then shows `enabled` |
+| `files changed: rolling restart file=… change=… files=N` again and again | Something writes into a watched directory: a database or cache file, uploads, a build output the app triggers, a log file that is not `*.log` | `file=` is the first of the files that changed: add it (or its directory) to `ignore`. Restarts are spaced out meanwhile (2 s, doubling up to 30 s) |
+| `files keep changing right after each watch restart` | The same, for the fourth restart in a row | Add the directory in `last_file=` to `[watch] ignore` |
+| `watched files keep changing: waiting for them to settle before restarting` | Files were still changing 30 s after the first change: a long build (fine), or something that never stops writing | Wait for the build; otherwise `first_file=` names a file to ignore. Raise `debounce_ms` for a build with long pauses |
+| `files changed: restart waits for the rollout in progress` | A `reload`, `restart`, cron restart or replacement was running | Nothing to do: one restart follows once it ends |
+| `files changed again soon after a watch restart: waiting before the next` | Restarts begin at least 2 s apart (more when they keep coming) | Nothing to do; `wait_ms=` says how long |
+| The app did not change after a save: `warden status` shows a failed rollout, the old workers still serve | The new version failed a gate (did not start, or failed its health checks) and was rolled back, as for a reload | The rollout's reason says which; fix the file and save again (every change tries again) |
+| An edit of `app.toml` or the `env_file` did not take effect | A watch restart replaces the workers but does not read the config again | `warden reload <app>` |
+| `the watched tree is bigger than watch.max_files (or deeper than 64 levels): the rest is not watched` | More files and directories than `max_files` (default 10000): the rest, in name order, is not looked at | Put build output, caches and data in `ignore`, or list only the source in `paths`; `max_files` goes up to 100000, at the cost of a `stat` per file at every look |
+| `a scan of the watched files takes long: changes are noticed later than interval_ms` | A big tree or a slow (network) disk: a scan is paced to use at most a fifth of a core, so the interval stretches | Fewer files (`ignore`, `paths`), or a longer `interval_ms` |
+| `a watched path cannot be read; its files count as unchanged until it can` | A directory in `paths` (or `working_directory`) is missing: being deployed, or deleted | Nothing restarts for it. Create it, or fix `paths`; when it is back, what differs from before is a change |
+| `a watched directory cannot be listed; its files count as unchanged` | No permission to read it | Fix its permissions or add it to `ignore` |
+| `the restart for changed files could not start; trying again` | The release `current` points to did not resolve (a deploy halfway through swapping the link) | Tried again 3 s later, three times in all; then `giving up until the next change`: fix `working_directory`, `warden restart <app>` |
+| `file watching could not start` (at start or after a reload) | `[watch]` has a pattern or path the watcher refuses (`warden check` finds it first) | Fix `[watch]` and `warden reload <app>` |
+| `[watch] does not apply to a [static] site` | Warden's file server reads files from disk: a changed file is served after `[static] cache_valid_ms`; there is nothing to restart | Remove `[watch]`; `warden serve --watch` is refused for the same reason |
+| `--ignore-watch and --watch-delay go with --watch` | They set `[watch]` keys, and watching is off without `--watch` | Add `--watch` |
+
 ## Hot standbys (`[workers] standby`)
 
 Standbys are `s1`, `s2`… in `warden status`, `worker=s1` on their log
@@ -152,7 +177,7 @@ carries the same reason with a `hint=`.
 
 ## Reboots, crashes and wardend
 
-`warden startup` installs what brings the saved apps back (README:
+`warden startup` installs what brings the saved apps back (docs/production.md:
 "Surviving reboots and crashes"); `warden doctor` says whether anything does.
 
 | You see | Why | Fix |

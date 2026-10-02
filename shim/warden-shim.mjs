@@ -56,7 +56,7 @@ const forceReusePort = env.WARDEN_REUSE_PORT === "1";
 // spreads connections across the listeners: Linux, FreeBSD 12+, DragonFly,
 // Solaris 11.4, AIX 7.3. Elsewhere (macOS) listen() fails with ENOTSUP, so
 // a Node app could not listen at all; there it listens as it asked (one
-// worker per port: README, Platforms). Bun sets SO_REUSEPORT on macOS too.
+// worker per port: docs/platforms.md). Bun sets SO_REUSEPORT on macOS too.
 const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos", "aix"].includes(process.platform);
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
@@ -1022,7 +1022,7 @@ const nativeSource = new WeakMap();
 // isNative, core-js). What still tells them apart: it is another function
 // object, Bun.inspect shows `[Function: Response]` instead of
 // `[class Response]`, and `prototype` comes before the statics in its own
-// property names (README, "Limitations").
+// property names (docs/how-it-works.md, "Limitations").
 function passAsNative(wrapper, native) {
   for (const key of Reflect.ownKeys(native)) {
     if (key !== "prototype") Object.defineProperty(wrapper, key, Object.getOwnPropertyDescriptor(native, key));

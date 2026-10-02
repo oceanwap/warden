@@ -25,7 +25,7 @@ use crate::process::{self, IpcMsg, ProcEvent};
 use crate::restart::{Decision, Policy};
 use crate::signals::Sig;
 use crate::worker::{Instance, LoopState, Role, STANDBY_SLOT, Slot, State, ThreadInfo, describe_exit, standby_label};
-use crate::{debug, error, info, metrics, networking, systemd, warn};
+use crate::{debug, error, info, metrics, networking, systemd, warn, watch};
 use listening::ListenerCache;
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
@@ -60,6 +60,12 @@ enum Event {
     /// `[restart] schedule` fired (stale when `token` changed).
     Scheduled {
         token: u64,
+    },
+    /// `[watch]`: files changed and settled (stale when `token` is not the
+    /// running watcher's).
+    Watch {
+        token: u64,
+        change: watch::Change,
     },
     Gate(rollout::GateEvent),
     Snapshot(oneshot::Sender<Status>),
@@ -125,6 +131,23 @@ pub struct Supervisor {
     watchdog_enabled: bool,
     /// Invalidates the pending scheduled restart when the schedule changes.
     schedule_token: u64,
+    /// `[watch]`: the settings the running watcher was started with, and the
+    /// watcher itself (dropping it stops its scans). None while `[watch]` is
+    /// off, and while the workers are stopped or shutting down.
+    watch: Option<(watch::Spec, watch::Handle)>,
+    /// Told apart from an earlier watcher's late events.
+    watch_token: u64,
+    /// The settings that could not start a watcher (not retried every tick).
+    watch_failed: Option<watch::Spec>,
+    /// Files changed and the restart has not started yet (a rollout is in
+    /// progress, or the gap after the last watch restart has not passed).
+    watch_pending: Option<watch::Change>,
+    /// The wait for `watch_pending` was logged.
+    watch_held: bool,
+    /// A restart that could not start (the release did not resolve) is tried
+    /// again a few times: `(failures so far, not before)`.
+    watch_retry: Option<(u8, Instant)>,
+    watch_throttle: watch::Throttle,
     /// This binary, for `[static]` apps (their workers run `warden serve-static`).
     exe: PathBuf,
     /// Why we are shutting down, for the `bye` event.
@@ -442,6 +465,13 @@ impl Supervisor {
             last_tick: Instant::now(),
             watchdog_enabled: systemd::watchdog_requested(),
             schedule_token: 0,
+            watch: None,
+            watch_token: 0,
+            watch_failed: None,
+            watch_pending: None,
+            watch_held: false,
+            watch_retry: None,
+            watch_throttle: watch::Throttle::default(),
             exe: own_exe(),
             shutdown_reason: "shutdown".into(),
             rollout_published: None,
@@ -564,6 +594,8 @@ impl Supervisor {
         }
         // Standbys follow once the workers listen (`fill_pool` waits for them).
         self.fill_pool();
+        // `[watch]` looks at the files from the moment the workers have read them.
+        self.sync_watch();
     }
 
     /// Spawn the serving instance of a slot. On spawn failure the slot goes
@@ -672,7 +704,7 @@ impl Supervisor {
 
     /// The variables a worker process starts with on top of the supervisor's
     /// own environment, in the order applied (a later one wins): `env_file`,
-    /// `[app] env`, then Warden's (README, "Environment variables"), each
+    /// `[app] env`, then Warden's (docs/configuration.md, "Environment variables"), each
     /// with where it comes from. `slot_id` 0 with `standby`: a standby.
     /// Also what `warden env` prints, so the two can't drift apart.
     fn worker_env(
@@ -896,7 +928,13 @@ impl Supervisor {
             }
             Event::AppHealth(r) => self.on_app_health(r),
             Event::WorkerHealth { inst, result } => self.on_worker_health(inst, result),
-            Event::Tick => self.on_tick(),
+            Event::Tick => {
+                self.on_tick();
+                // `[watch]` changed by a reload, workers stopped or started again.
+                self.sync_watch();
+                self.try_watch_restart();
+            }
+            Event::Watch { token, change } => self.on_watch(token, change),
             Event::Gate(g) => self.on_gate(g),
             Event::Snapshot(reply) => {
                 let _ = reply.send(self.status());
@@ -1574,6 +1612,9 @@ impl Supervisor {
         self.shutting_down = true;
         self.shutdown_reason = why.to_string();
         self.start_after_stop = false;
+        // No scan outlives the shutdown, and no restart starts during it.
+        self.watch = None;
+        self.watch_pending = None;
         self.stop_all();
     }
 
@@ -1791,6 +1832,187 @@ impl Supervisor {
             }
         }
         self.schedule_next();
+    }
+
+    // ---------------------------------------------------------------- watch
+
+    /// What `[watch]` asks for now, or None: off, or nothing to restart.
+    fn watch_spec(&self) -> Option<watch::Spec> {
+        let w = &self.cfg.watch;
+        if !w.enabled || self.stopped || self.shutting_down {
+            return None;
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let abs = |p: &Path| if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+        // Relative paths are relative to where the workers run.
+        let base = abs(self.cfg.app.working_directory.as_deref().unwrap_or(Path::new(".")));
+        // What Warden writes itself is never a change to restart for: its
+        // log files (and their rotations) and its sockets and scripts.
+        let l = &self.cfg.logging;
+        let mut skip: Vec<PathBuf> =
+            [&l.file, &l.out_file, &l.err_file].into_iter().flatten().map(|p| abs(p)).collect();
+        skip.push(abs(&self.cfg.socket_path()));
+        skip.push(abs(&self.runtime_dir));
+        Some(watch::Spec::new(w, base, skip))
+    }
+
+    /// Start, replace or stop the watcher so that it matches `[watch]` (a
+    /// reload may have changed it) and whether the workers run. A new
+    /// watcher starts from the files as they are: what changed while the
+    /// workers were stopped is what they start with.
+    fn sync_watch(&mut self) {
+        let want = self.watch_spec();
+        if want.is_none() {
+            // Off, or the workers are not running: a later start tries afresh.
+            self.watch_failed = None;
+        }
+        if want.as_ref() == self.watch.as_ref().map(|(s, _)| s) || (want.is_some() && want == self.watch_failed) {
+            return;
+        }
+        let was_watching = self.watch.is_some();
+        self.watch = None;
+        self.watch_failed = None;
+        self.watch_pending = None;
+        self.watch_held = false;
+        self.watch_retry = None;
+        self.watch_token += 1;
+        let Some(spec) = want else { return };
+        let (tx, token) = (self.tx.clone(), self.watch_token);
+        match watch::spawn(spec.clone(), move |change| tx.send(Event::Watch { token, change }).is_ok()) {
+            Ok(handle) => {
+                info!(
+                    if was_watching { "file watching settings changed" } else { "file watching on" },
+                    paths = spec.paths.join(","),
+                    base = spec.base.display(),
+                    ignore = spec.ignore.len(),
+                    debounce_ms = spec.debounce.as_millis(),
+                    interval_ms = spec.interval.as_millis(),
+                    max_files = spec.max_files,
+                );
+                self.watch = Some((spec, handle));
+            }
+            Err(e) => {
+                error!(
+                    "file watching could not start",
+                    error = e,
+                    hint = "fix [watch] (`warden check` finds it) and `warden reload`",
+                );
+                self.watch_failed = Some(spec);
+            }
+        }
+    }
+
+    fn on_watch(&mut self, token: u64, change: watch::Change) {
+        if token != self.watch_token || self.shutting_down || self.stopped {
+            return;
+        }
+        debug!("files changed", file = change.file, change = change.kind.as_str(), files = change.count);
+        self.watch_pending = Some(match self.watch_pending.take() {
+            Some(earlier) => earlier.merge(change),
+            None => change,
+        });
+        self.try_watch_restart();
+    }
+
+    /// Tries for a restart that cannot begin, and the time between them.
+    const WATCH_TRIES: u8 = 3;
+    const WATCH_RETRY: Duration = Duration::from_secs(3);
+
+    /// Start the rolling restart for changed files, once it can: not while a
+    /// rollout runs (the change waits for it, and is not lost), and not
+    /// within the throttle's gap of the last one. It is gated like any
+    /// restart, so a release that does not start or pass its health checks
+    /// is rolled back and the old workers keep serving until the next change.
+    fn try_watch_restart(&mut self) {
+        let Some(change) = &self.watch_pending else { return };
+        if self.shutting_down || self.stopped {
+            // The workers that start next read the files as they are.
+            self.watch_pending = None;
+            return;
+        }
+        let now = Instant::now();
+        if self.roll.is_some() {
+            if !self.watch_held {
+                self.watch_held = true;
+                info!(
+                    "files changed: restart waits for the rollout in progress",
+                    file = change.file,
+                    files = change.count,
+                );
+            }
+            return;
+        }
+        if self.watch_retry.is_some_and(|(_, at)| now < at) {
+            return;
+        }
+        if let Some(wait) = self.watch_throttle.wait(now) {
+            if !self.watch_held {
+                self.watch_held = true;
+                info!(
+                    "files changed again soon after a watch restart: waiting before the next",
+                    file = change.file,
+                    files = change.count,
+                    wait_ms = wait.as_millis(),
+                    restarts_in_a_row = self.watch_throttle.streak() + 1,
+                );
+            }
+            return;
+        }
+        let Some(change) = self.watch_pending.take() else { return };
+        self.watch_held = false;
+        // Like `warden restart`: a worker that gave up (FAILED, its backoff
+        // running) is tried again; fixing the file that crashed it is the point.
+        for s in self.slots.values_mut() {
+            s.tracker.reset();
+            s.failed_at = None;
+        }
+        let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+        info!(
+            "files changed: rolling restart",
+            file = change.file,
+            change = change.kind.as_str(),
+            files = change.count,
+        );
+        match self.begin_rollout(Kind::Restart, ids, "watch".into(), false) {
+            Ok(_) => {
+                self.watch_retry = None;
+                self.watch_throttle.started(now);
+                if self.watch_throttle.streak() == 3 {
+                    warn!(
+                        "files keep changing right after each watch restart",
+                        restarts_in_a_row = self.watch_throttle.streak() + 1,
+                        last_file = change.file,
+                        hint = "something may be writing into a watched directory (a database, a cache, uploads, a \
+                                build output): add it to [watch] ignore. Restarts are spaced out meanwhile",
+                    );
+                }
+            }
+            // Nothing was touched (the release `current` points to did not
+            // resolve: a deploy may be halfway). The change is not lost: it is
+            // tried again, a few times, a few seconds apart.
+            Err(e) => {
+                let failures = self.watch_retry.map_or(0, |(n, _)| n) + 1;
+                if failures < Self::WATCH_TRIES {
+                    warn!(
+                        "the restart for changed files could not start; trying again",
+                        reason = e,
+                        attempt = failures,
+                        retry_in_s = Self::WATCH_RETRY.as_secs(),
+                        hint = "a deploy may be halfway through swapping `current`; check working_directory if it \
+                                keeps failing",
+                    );
+                    self.watch_retry = Some((failures, now + Self::WATCH_RETRY));
+                    self.watch_pending = Some(change);
+                } else {
+                    self.watch_retry = None;
+                    warn!(
+                        "the restart for changed files could not start; giving up until the next change",
+                        reason = e,
+                        hint = "`warden restart` starts it by hand once the cause is fixed",
+                    );
+                }
+            }
+        }
     }
 
     fn request_reload(&mut self, safe: bool) -> Response {
@@ -2275,6 +2497,7 @@ impl Supervisor {
             user: Some(user),
             build: crate::stamp::build(),
             cwd: self.shown_cwd(),
+            watching: self.cfg.watch.enabled,
         }
     }
 }
@@ -2385,7 +2608,7 @@ mod tests {
     }
 
     /// W1: what every worker, a standby and a worker-mode host start with
-    /// (README "Environment variables"), and that Warden's win.
+    /// (docs/configuration.md "Environment variables"), and that Warden's win.
     #[test]
     fn worker_environment() {
         let s = sup("[app]\nname = \"api\"\ncommand = \"bun\"\nport = 3000\nenv = { PORT = \"9\", A = \"x\" }\n\
@@ -2476,5 +2699,292 @@ mod tests {
         let env = s.info(false, None)["worker_env"].to_string();
         assert!(env.contains("WARDEN_STATIC") && !env.contains("pw"), "{env}");
         assert!(s.info(true, None)["worker_env"].to_string().contains("u:pw"));
+    }
+}
+
+/// `[watch]` in the supervisor: when a change starts a restart, and when it
+/// waits, is retried or is dropped (the scanner has its own tests in watch.rs).
+#[cfg(test)]
+mod watch_tests {
+    use super::rig::{Rig, local};
+    use super::*;
+
+    /// A worker that listens at once and stays up.
+    const APP: &str = "echo '{\"ev\":\"listening\",\"port\":1}' >&3\nexec sleep 60\n";
+
+    fn change(file: &str) -> watch::Change {
+        watch::Change { file: file.into(), kind: watch::Kind::Modified, count: 1 }
+    }
+
+    fn currents(s: &Supervisor) -> Vec<u64> {
+        let mut v: Vec<u64> = s.slots.values().filter_map(|x| x.current).collect();
+        v.sort();
+        v
+    }
+
+    fn all_running(s: &Supervisor) -> bool {
+        s.slots.values().all(|x| x.state == State::Running && x.current.is_some())
+    }
+
+    /// `count` workers running in a scratch directory, `[watch]` on with `watch` as its keys.
+    async fn rig(name: &str, count: usize, watch: &str) -> (Rig, PathBuf) {
+        rig_of(name, &format!("count = {count}\n"), APP, watch).await
+    }
+
+    /// The same for any `[workers]` keys and worker script.
+    async fn rig_of(name: &str, workers: &str, app: &str, watch: &str) -> (Rig, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("warden-watchrig-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sections = format!(
+            "working_directory = {:?}\n[workers]\n{workers}overlap = true\n[reload]\nhealth_passes = 0\n\
+             [watch]\nenabled = true\n{watch}",
+            dir.display().to_string()
+        );
+        let mut r = Rig::new(&format!("watch-{name}"), &sections, app);
+        r.sup.start_all();
+        r.until("every worker running", all_running).await;
+        (r, dir)
+    }
+
+    async fn finish(r: Rig, dir: PathBuf) {
+        r.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole way: a file written in the working directory is noticed by
+    /// the watcher, and every worker is replaced by a gated rolling restart.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_file_restarts_every_worker() {
+        local(async {
+            let (mut r, dir) = rig("e2e", 2, "debounce_ms = 100\ninterval_ms = 100\n").await;
+            assert!(r.sup.watch.is_some() && r.sup.status().watching, "started with the workers");
+            let before = currents(&r.sup);
+            // The first scan is the baseline: what is written after it is a change.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            std::fs::write(dir.join("app.js"), "v2").unwrap();
+            r.until("the restart begins", |s| s.roll.is_some() || s.last_rollout.is_some()).await;
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            let o = r.sup.last_rollout.clone().unwrap();
+            assert!(o.ok, "{o:?}");
+            let after = currents(&r.sup);
+            assert!(after.iter().all(|i| !before.contains(i)), "{before:?} -> {after:?}: every worker replaced");
+            assert!(all_running(&r.sup));
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// A change during a rollout is kept, and restarts once it is over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_change_during_a_rollout_waits_and_is_not_lost() {
+        local(async {
+            let (mut r, dir) = rig("wait", 2, "").await;
+            let ids: Vec<usize> = r.sup.slots.keys().copied().collect();
+            r.sup.begin_rollout(Kind::Reload, ids, String::new(), false).unwrap();
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token, change("a.js"));
+            r.sup.on_watch(token, change("b.js"));
+            assert!(r.sup.roll.is_some() && r.sup.watch_held, "waiting for the reload");
+            assert_eq!(r.sup.watch_pending.as_ref().map(|c| (c.file.as_str(), c.count)), Some(("a.js", 2)));
+            r.until("the reload ends", |s| s.roll.is_none()).await;
+            let before = currents(&r.sup);
+            // The next tick starts it.
+            r.sup.try_watch_restart();
+            assert_eq!(r.sup.roll.as_ref().map(|x| x.kind), Some(Kind::Restart));
+            assert!(r.sup.watch_pending.is_none() && !r.sup.watch_held);
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true));
+            assert!(currents(&r.sup).iter().all(|i| !before.contains(i)));
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// Changes right after a watch restart wait for the throttle's gap.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restarts_are_spaced_out() {
+        local(async {
+            let (mut r, dir) = rig("gap", 1, "").await;
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token, change("a.js"));
+            assert!(r.sup.roll.is_some(), "the first starts at once");
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            r.sup.on_watch(token, change("b.js"));
+            assert!(r.sup.roll.is_none() && r.sup.watch_pending.is_some() && r.sup.watch_held, "within the gap: waits");
+            r.sup.try_watch_restart();
+            assert!(r.sup.roll.is_none(), "a tick before the gap has passed changes nothing");
+            // Time passes: the last one began longer ago than the gap.
+            r.sup.watch_throttle = watch::Throttle::default();
+            r.sup.watch_throttle.started(Instant::now() - watch::Throttle::GAP - Duration::from_millis(100));
+            r.sup.try_watch_restart();
+            assert!(r.sup.roll.is_some() && r.sup.watch_pending.is_none());
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// Stopped or shutting down: nothing to restart, and the change is dropped
+    /// (the workers that start next read the files as they are). A late event
+    /// of an earlier watcher is ignored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn changes_are_dropped_when_there_is_nothing_to_restart() {
+        local(async {
+            let (mut r, dir) = rig("drop", 1, "").await;
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token + 1, change("late.js"));
+            assert!(r.sup.roll.is_none() && r.sup.watch_pending.is_none(), "a stale watcher's event");
+
+            r.sup.watch_pending = Some(change("a.js"));
+            r.sup.stopped = true;
+            r.sup.try_watch_restart();
+            assert!(r.sup.watch_pending.is_none() && r.sup.roll.is_none(), "stopped");
+            r.sup.on_watch(token, change("b.js"));
+            assert!(r.sup.watch_pending.is_none() && r.sup.roll.is_none());
+            r.sup.stopped = false;
+
+            r.sup.watch_pending = Some(change("c.js"));
+            r.sup.begin_shutdown("test");
+            assert!(r.sup.watch.is_none() && r.sup.watch_pending.is_none(), "shutting down: the watcher is gone");
+            r.sup.on_watch(token, change("d.js"));
+            assert!(r.sup.watch_pending.is_none());
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// The watcher follows `[watch]` and whether the workers run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_watcher_follows_the_config_and_the_workers() {
+        local(async {
+            let (mut r, dir) = rig("sync", 1, "paths = [\"src\"]\n").await;
+            let spec = |s: &Supervisor| s.watch.as_ref().map(|(sp, _)| (sp.base.clone(), sp.paths.clone()));
+            assert_eq!(spec(&r.sup), Some((dir.clone(), vec!["src".to_string()])));
+            let token = r.sup.watch_token;
+            r.sup.sync_watch();
+            assert_eq!(r.sup.watch_token, token, "nothing changed: the same watcher keeps its baseline");
+
+            // Stopped workers are not watched; started ones are, from the files as they are.
+            r.sup.stopped = true;
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none() && r.sup.watch_token > token);
+            r.sup.stopped = false;
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_some());
+
+            // A reload that changed [watch].
+            let token = r.sup.watch_token;
+            r.sup.cfg.watch.paths = vec!["lib".into()];
+            r.sup.watch_pending = Some(change("old.js"));
+            r.sup.sync_watch();
+            assert_eq!(spec(&r.sup).map(|s| s.1), Some(vec!["lib".to_string()]));
+            assert!(r.sup.watch_token > token && r.sup.watch_pending.is_none(), "an earlier watcher's change is void");
+
+            // Settings that cannot start a watcher: said once, not retried every tick.
+            r.sup.cfg.watch.ignore = vec!["!keep".into()];
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none() && r.sup.watch_failed.is_some());
+            let token = r.sup.watch_token;
+            r.sup.sync_watch();
+            assert_eq!(r.sup.watch_token, token, "not tried again until [watch] changes");
+
+            r.sup.cfg.watch.enabled = false;
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none() && r.sup.watch_failed.is_none() && !r.sup.status().watching);
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// A slot that gave up is tried again by the watch restart, as by `warden restart`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_slot_is_tried_again() {
+        local(async {
+            let (mut r, dir) = rig("failed", 1, "").await;
+            r.sup.slots.get_mut(&1).unwrap().failed_at = Some(Instant::now());
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token, change("fix.js"));
+            assert!(r.sup.roll.is_some());
+            assert!(r.sup.slots[&1].failed_at.is_none());
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// A worker and a hot standby: the restart replaces both (a standby would
+    /// otherwise keep the old files in memory and be promoted into a crash's slot).
+    #[tokio::test(flavor = "current_thread")]
+    async fn standbys_are_replaced_with_the_workers() {
+        local(async {
+            const POOL: &str = r#"
+if [ "$WARDEN_STANDBY" = 1 ]; then
+  echo '{"ev":"standby_ready","port":1}' >&3
+  read -r line <&3 || exit 0
+fi
+echo '{"ev":"listening","port":1}' >&3
+exec sleep 60
+"#;
+            let available = |s: &Supervisor| {
+                let mut ids: Vec<u64> = (s.insts.iter())
+                    .filter(|(_, i)| i.standby.as_ref().is_some_and(|g| g.available))
+                    .map(|(id, _)| *id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let (mut r, dir) = rig_of("standby", "count = 1\nstandby = 1\n", POOL, "").await;
+            r.until("a standby ready", |s| available(s).len() == 1).await;
+            let (worker, standby) = (currents(&r.sup)[0], available(&r.sup)[0]);
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token, change("a.js"));
+            r.until("worker and standby replaced", |s| {
+                s.roll.is_none() && available(s).len() == 1 && available(s)[0] != standby
+            })
+            .await;
+            assert_ne!(currents(&r.sup)[0], worker);
+            assert!(!r.sup.insts.contains_key(&standby), "the old standby is gone");
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// A restart that cannot begin (the release does not resolve: a deploy
+    /// may be halfway) is tried again a few times, then given up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restart_that_cannot_begin_is_retried_a_few_times() {
+        local(async {
+            let (mut r, dir) = rig("retry", 1, "").await;
+            let moved = dir.with_extension("away");
+            std::fs::rename(&dir, &moved).unwrap();
+            let token = r.sup.watch_token;
+            r.sup.on_watch(token, change("a.js"));
+            assert!(r.sup.roll.is_none());
+            assert!(matches!(r.sup.watch_retry, Some((1, _))), "{:?}", r.sup.watch_retry);
+            assert!(r.sup.watch_pending.is_some(), "kept for the next try");
+
+            // Not before the retry time; then again, and the directory is back.
+            r.sup.try_watch_restart();
+            assert!(matches!(r.sup.watch_retry, Some((1, _))), "too early to count as a try");
+            std::fs::rename(&moved, &dir).unwrap();
+            r.sup.watch_retry = Some((1, Instant::now()));
+            r.sup.try_watch_restart();
+            assert!(r.sup.roll.is_some() && r.sup.watch_retry.is_none() && r.sup.watch_pending.is_none());
+            r.until("the restart ends", |s| s.roll.is_none()).await;
+            r.sup.watch_throttle = watch::Throttle::default();
+
+            // Three failures in a row: dropped (the next change tries afresh).
+            std::fs::rename(&dir, &moved).unwrap();
+            r.sup.on_watch(token, change("b.js"));
+            for _ in 0..2 {
+                r.sup.watch_retry = r.sup.watch_retry.map(|(n, _)| (n, Instant::now()));
+                r.sup.try_watch_restart();
+            }
+            assert!(r.sup.watch_retry.is_none() && r.sup.watch_pending.is_none(), "gave up");
+            std::fs::rename(&moved, &dir).unwrap();
+            finish(r, dir).await;
+        })
+        .await;
     }
 }

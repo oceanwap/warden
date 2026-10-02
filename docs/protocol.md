@@ -150,6 +150,15 @@ supervisor's own user. Warden never switches user, so it is the user that ran
 `warden start`, or the unit's `User=`. A number when the user database has no
 such user.
 
+`status.watching` (a boolean, `false` from an older Warden, which cannot
+watch files): `[watch] enabled`, PM2's `watching` column. When true the app
+restarts through the rollout gates when its files change (docs/watch.md);
+the restart is a `restart` rollout like any other (`rollout` and
+`rollout_done` events, `status.last_rollout.kind` `restart`). It is sent
+whether or not the workers are stopped: it says what the config asks for.
+The settings (`paths`, `ignore`, `debounce_ms`, `interval_ms`, `max_files`)
+are in the `config` request's answer under `config.watch`.
+
 `status.workers[].listening` (an array, absent when empty; an addition older
 clients ignore): the sockets the worker's process listens on, and the
 processes it started (up to 64, 4 levels down: a wrapper such as `npm run

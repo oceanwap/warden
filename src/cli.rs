@@ -59,6 +59,8 @@ APPS (familiar from PM2):
     serve [dir] [port]   Serve static files (default: . on 8080) with Warden's built-in
                      server, like `pm2 serve`: --name --spa --listing -i N
                      --basic-auth user:pass (or --basic-auth-username/-password)
+                     --html-max-age SECONDS (browsers reuse HTML pages that long; default:
+                     revalidate on every page load)
     save             Remember the running apps, worker counts and stopped state
     resurrect        Start what `save` remembered (and wardend, if it is not running), the
                      apps at the same time but no more than one per CPU core at once:
@@ -118,6 +120,7 @@ START OPTIONS (a script, a program or a command line, as with PM2):
     --env KEY=VALUE  --max-memory-restart <300M>  --cron \"<m h dom mon dow>\"  --no-autorestart
     --kill-signal SIGINT  --kill-timeout <ms>  --restart-delay <ms>  --max-restarts <N>
     --stop-exit-codes 0,1  --wait-ready  --listen-timeout <ms>  --no-shim
+    --watch  --ignore-watch \"<name,glob,...>\"  --watch-delay <4 | 4000ms>   (restart when files change)
     -o, --output <file>  -e, --error <file>  -l, --log <file>  --time  --merge-logs
     -- <args for the app>
 
@@ -237,6 +240,14 @@ pub struct StartOpts {
     pub max_restarts: Option<u32>,
     pub cron: Option<String>,
     pub stop_exit_codes: Vec<i32>,
+    /// `--watch`: `[watch] enabled = true` (PM2's `--watch`); `--ignore-watch` and
+    /// `--watch-delay` set `ignore` and `debounce_ms`.
+    pub watch: bool,
+    /// What to watch, relative to the working directory (`pm2-migrate` sets
+    /// it; `--watch` watches the whole working directory).
+    pub watch_paths: Vec<String>,
+    pub ignore_watch: Vec<String>,
+    pub watch_delay_ms: Option<u64>,
     pub wait_ready: bool,
     pub listen_timeout_ms: Option<u64>,
     pub time: bool,
@@ -249,6 +260,8 @@ pub struct StartOpts {
     pub spa: bool,
     pub listing: bool,
     pub basic_auth: Option<String>,
+    /// `serve --html-max-age S`: `[static] html_max_age`.
+    pub html_max_age: Option<u64>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -304,6 +317,25 @@ pub fn parse_mb(s: &str) -> Result<u64, String> {
     };
     let v: f64 = num.parse().map_err(|_| format!("--max-memory-restart {s:?}: expected e.g. 300M or 1G"))?;
     Ok((v * mult).ceil().max(1.0) as u64)
+}
+
+/// PM2's `--watch-delay`: seconds (`4`, `0.5`), or milliseconds with `ms` (`4000ms`).
+fn parse_watch_delay(s: &str) -> Result<u64, String> {
+    let bad = || format!("--watch-delay {s:?}: expected seconds (4) or milliseconds (4000ms)");
+    let ms = match s.trim().strip_suffix("ms") {
+        Some(n) => n.trim().parse::<u64>().map_err(|_| bad())?,
+        None => {
+            let secs: f64 = s.trim().parse().map_err(|_| bad())?;
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(bad());
+            }
+            (secs * 1000.0).round() as u64
+        }
+    };
+    if ms > crate::config::Watch::MAX_DEBOUNCE_MS {
+        return Err(format!("--watch-delay {s:?}: at most {} s", crate::config::Watch::MAX_DEBOUNCE_MS / 1000));
+    }
+    Ok(ms)
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
@@ -392,6 +424,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 }
             }
             "--wait-ready" => so.wait_ready = true,
+            "--watch" => so.watch = true,
+            "--ignore-watch" => {
+                so.ignore_watch.extend(value(a)?.split([',', ' ']).filter(|p| !p.is_empty()).map(String::from));
+            }
+            "--watch-delay" => so.watch_delay_ms = Some(parse_watch_delay(&value(a)?)?),
             "--listen-timeout" => so.listen_timeout_ms = Some(num(a, &value(a)?)?),
             "--time" => so.time = true,
             "-o" | "--output" => so.out_file = Some(value(a)?.into()),
@@ -402,6 +439,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--spa" => so.spa = true,
             "--listing" => so.listing = true,
             "--basic-auth" => so.basic_auth = Some(value(a)?),
+            "--html-max-age" => so.html_max_age = Some(num(a, &value(a)?)?),
             "--basic-auth-username" => {
                 let u = value(a)?;
                 let pass = so.basic_auth.take().and_then(|x| x.split_once(':').map(|(_, p)| p.to_string()));
@@ -419,11 +457,6 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                             (--kill-signal)"
                     .into());
             }
-            "--watch" => {
-                return Err(
-                    "--watch is not supported: Warden is for production; restart on deploy with `warden reload`".into(),
-                );
-            }
             "-h" | "--help" => positional.insert(0, "help".into()),
             "-V" | "--version" => positional.insert(0, "version".into()),
             s if s.starts_with("--config=") => config = Some(s["--config=".len()..].into()),
@@ -436,6 +469,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             }
             s => positional.push(s.to_string()),
         }
+    }
+    if !so.watch && (!so.ignore_watch.is_empty() || so.watch_delay_ms.is_some()) {
+        return Err("--ignore-watch and --watch-delay go with --watch: file watching is off without it".into());
     }
     let config = config.or_else(|| std::env::var_os("WARDEN_CONFIG").filter(|v| !v.is_empty()).map(PathBuf::from));
     let mut pos = positional.into_iter();
@@ -468,6 +504,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
         "serve" => {
             too_many(2)?;
+            if so.watch {
+                return Err("--watch does not apply to `warden serve`: the file server reads the files from disk (a \
+                            changed file is served after [static] cache_valid_ms), so there is nothing to restart"
+                    .into());
+            }
             let dir = PathBuf::from(rest.first().cloned().unwrap_or_else(|| ".".into()));
             let port = match rest.get(1) {
                 Some(p) => p.parse().map_err(|_| format!("serve: {p:?} is not a port"))?,
@@ -807,6 +848,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
                 Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                 Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                 Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
+                watching_cell(s.watching),
                 Cell::plain(ports::cell(&w.listening)),
                 Cell::plain(loop_p99(w)),
                 health_cell(w.healthy),
@@ -824,6 +866,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
             "cpu",
             "mem",
             "user",
+            "watching",
             "ports",
             "loop p99",
             "health",
@@ -857,6 +900,7 @@ pub fn render_status_with(s: &Status, table_only: bool, id: Option<u32>, fmt: &F
     }
     kv(&mut rows, "mode", s.mode.clone());
     kv(&mut rows, "workers", format!("{} configured, {} ready", s.workers_configured, s.workers_ready));
+    kv(&mut rows, "watching", if s.watching { "enabled" } else { "disabled" });
     let listening = ports::app_listeners(s);
     if !listening.is_empty() {
         kv(&mut rows, "ports", ports::detail(&listening));
@@ -983,6 +1027,11 @@ fn state_cell(state: &str) -> Cell {
     Cell::styled(state, style)
 }
 
+/// The watching column (PM2's): `enabled` when `[watch]` restarts the app on file changes.
+fn watching_cell(on: bool) -> Cell {
+    if on { Cell::styled("enabled", GREEN) } else { Cell::styled("disabled", DIM) }
+}
+
 fn health_cell(h: Option<bool>) -> Cell {
     Cell::styled(
         health_word(h),
@@ -1051,6 +1100,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                         Cell::plain(w.cpu_percent.map(|c| format!("{c:.1}%")).unwrap_or_else(|| "-".into())),
                         Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                         Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
+                        watching_cell(s.watching),
                         Cell::plain(ports::cell(&w.listening)),
                         Cell::plain(loop_p99(w)),
                         health_cell(w.healthy),
@@ -1079,7 +1129,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 let mut row = lead(true, &app.namespace);
                 row.push(Cell::plain("-"));
                 row.push(state_cell(what));
-                row.extend((0..10).map(|_| Cell::plain("-")));
+                row.extend((0..11).map(|_| Cell::plain("-")));
                 rows.push(row);
                 if what == "offline" {
                     offline.push(app);
@@ -1119,6 +1169,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
             "cpu",
             "mem",
             "user",
+            "watching",
             "ports",
             "loop p99",
             "health",
@@ -1132,6 +1183,30 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
         o += &format!("  {n}\n");
     }
     o
+}
+
+/// The `watch` row of `warden describe`: what `[watch]` does, from the effective config.
+fn watch_text(on: bool, w: &serde_json::Value) -> String {
+    if !on {
+        return "disabled (`[watch] enabled = true`, or `warden start <script> --watch`, restarts the app when its \
+                files change; docs/watch.md)"
+            .into();
+    }
+    let list = |k: &str| -> String {
+        let v: Vec<&str> = w[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+        v.join(", ")
+    };
+    let n = |k: &str| w[k].as_u64().unwrap_or(0);
+    format!(
+        "enabled: a rolling restart {} ms after the files in {} stop changing (ignoring {} patterns: {}); looked at \
+         every {} ms, at most {} files",
+        n("debounce_ms"),
+        list("paths"),
+        w["ignore"].as_array().map_or(0, Vec::len),
+        list("ignore"),
+        n("interval_ms"),
+        n("max_files")
+    )
 }
 
 /// `warden describe api`.
@@ -1282,6 +1357,7 @@ pub fn render_describe(s: &Status, info: &serde_json::Value, id: Option<u32>, fm
             )
         },
     );
+    row("watch", watch_text(s.watching, &c("/watch")));
     let health = match c("/health/path") {
         serde_json::Value::String(p) if !p.is_empty() => format!(
             "{p} every {} s, unhealthy after {} failures; reload gates: {} passes",
@@ -1528,7 +1604,27 @@ mod tests {
         assert_eq!(act("signal SIGUSR2 api"), (Action::Signal("SIGUSR2".into()), Some("api".into())));
         assert_eq!(p("delete api").unwrap().command, Command::Delete { target: "api".into() });
         assert!(p("delete").is_err());
-        assert!(p("start app.js --watch").is_err());
+        // PM2's watch flags: `--watch`, and the ones that only make sense with it.
+        let o = |a: &str| match p(a).unwrap().command {
+            Command::Start { opts, .. } => *opts,
+            c => panic!("{c:?}"),
+        };
+        assert!(o("start app.js --watch").watch && !o("start app.js").watch);
+        let w = o("start app.js --watch --ignore-watch node_modules,dist,*.map --watch-delay 4");
+        assert_eq!((w.watch, w.watch_delay_ms), (true, Some(4000)));
+        assert_eq!(w.ignore_watch, ["node_modules", "dist", "*.map"]);
+        assert_eq!(o("start app.js --watch --watch-delay 250ms").watch_delay_ms, Some(250));
+        assert_eq!(o("start app.js --watch --watch-delay 0.5").watch_delay_ms, Some(500));
+        for bad in ["--watch-delay soon", "--watch-delay -1", "--watch-delay 9999", "--watch-delay"] {
+            assert!(p(&format!("start app.js --watch {bad}")).is_err(), "{bad}");
+        }
+        // They mean nothing without --watch (as in PM2), which is said rather than silently ignored.
+        let e = p("start app.js --watch-delay 4").unwrap_err();
+        assert!(e.contains("go with --watch"), "{e}");
+        assert!(p("start app.js --ignore-watch dist").is_err());
+        // A static site is read from disk on every request: nothing to restart.
+        let e = p("serve dist 8080 --watch").unwrap_err();
+        assert!(e.contains("does not apply to `warden serve`"), "{e}");
     }
 
     #[test]
@@ -1595,6 +1691,13 @@ mod tests {
         let Command::Serve { dir, port, .. } = p("serve").unwrap().command else { panic!() };
         assert_eq!((dir, port), (PathBuf::from("."), 8080));
         assert!(p("serve dist notaport").is_err());
+        // `--html-max-age`: seconds, optional (unset: HTML is revalidated).
+        let Command::Serve { opts, .. } = p("serve dist 80 --html-max-age 120").unwrap().command else { panic!() };
+        assert_eq!(opts.html_max_age, Some(120));
+        let Command::Serve { opts, .. } = p("serve dist 80").unwrap().command else { panic!() };
+        assert_eq!(opts.html_max_age, None);
+        assert!(p("serve dist 80 --html-max-age soon").unwrap_err().contains("--html-max-age expects a number"));
+        assert!(p("serve dist 80 --html-max-age").is_err());
     }
 
     #[test]
@@ -1897,6 +2000,64 @@ mod tests {
         let list = render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt::PLAIN);
         assert_eq!(cells(list.lines().nth(3).unwrap())[at], "-", "{list}");
         assert!(!render_status(&s, false).contains("│ user      │"));
+    }
+
+    /// PM2's `watching` column, right after `user`: `disabled` unless `[watch]` is on; `-` for an
+    /// app that is not running. `status` has a row and `describe` says what is watched.
+    #[test]
+    fn the_watching_column_row_and_describe_text() {
+        let mut s = api_status();
+        s.workers = vec![row(1, "RUNNING", 101)];
+        s.user = Some("deploy".into());
+        let cells = |line: &str| -> Vec<String> {
+            let mut v: Vec<String> = line.split('│').map(|c| c.trim().to_string()).collect();
+            v.remove(0);
+            v.pop();
+            v
+        };
+        let off = listed_app("web", None);
+        let list = |s: &Status| {
+            render_list_with(
+                &[(listed_app("api", Some(0)), Ok(s.clone())), (off.clone(), Err("not running".into()))],
+                &Fmt::PLAIN,
+            )
+        };
+        let text = list(&s);
+        let head = cells(text.lines().nth(1).unwrap());
+        let at = head.iter().position(|c| c == "watching").expect("a watching column");
+        assert_eq!(head[at - 1], "user", "after the user: {head:?}");
+        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "disabled", "{text}");
+        assert_eq!(cells(text.lines().nth(4).unwrap())[at], "-", "an app that is not running: {text}");
+        assert_eq!(cells(text.lines().nth(3).unwrap()).len(), head.len());
+        assert_eq!(cells(text.lines().nth(4).unwrap()).len(), head.len());
+        s.watching = true;
+        let text = list(&s);
+        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "enabled", "{text}");
+        let painted =
+            render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt { color: true, width: None });
+        assert!(painted.contains("\x1b[32menabled"), "green: {painted:?}");
+        // The workers table and the status box.
+        assert!(render_status(&s, true).contains("│ watching "), "{}", render_status(&s, true));
+        assert!(render_status(&s, true).contains(" enabled "));
+        assert!(render_status(&s, false).contains("│ watching  │ enabled"), "{}", render_status(&s, false));
+        s.watching = false;
+        assert!(render_status(&s, false).contains("│ watching  │ disabled"));
+        // Describe: what the setting does, from the effective config.
+        let info = serde_json::json!({
+            "config_path": "/etc/warden/api.toml",
+            "config": {"watch": {"enabled": true, "paths": ["src", "package.json"], "ignore": ["node_modules", "*.log"],
+                "debounce_ms": 500, "interval_ms": 1000, "max_files": 10000}}
+        });
+        let d = render_describe(&s, &info, Some(1), &Fmt::PLAIN);
+        assert!(d.contains("│ watch ") && d.contains("disabled (`[watch] enabled = true`"), "{d}");
+        s.watching = true;
+        let d = render_describe(&s, &info, Some(1), &Fmt::PLAIN);
+        assert!(
+            d.contains("enabled: a rolling restart 500 ms after the files in src, package.json stop changing")
+                && d.contains("ignoring 2 patterns: node_modules, *.log")
+                && d.contains("every 1000 ms, at most 10000 files"),
+            "{d}"
+        );
     }
 
     fn api_status() -> Status {

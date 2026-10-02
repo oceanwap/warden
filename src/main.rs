@@ -33,6 +33,7 @@ mod supervisor;
 mod sys;
 mod systemd;
 mod table;
+mod watch;
 mod worker;
 
 use cli::Command;

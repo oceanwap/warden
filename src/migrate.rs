@@ -72,6 +72,12 @@ pub struct Pm2App {
     pub namespace: Option<String>,
     pub max_memory_mb: Option<u64>,
     pub cron: Option<String>,
+    /// PM2's `watch`: on, and what it watches (empty: the working directory).
+    pub watch: bool,
+    pub watch_paths: Vec<String>,
+    pub ignore_watch: Vec<String>,
+    /// PM2's `watch_delay`, milliseconds.
+    pub watch_delay_ms: Option<u64>,
     pub kill_timeout_ms: Option<u64>,
     pub kill_signal: Option<String>,
     pub wait_ready: bool,
@@ -468,9 +474,7 @@ fn common(e: &Value) -> Pm2App {
         port: n(e, "port").and_then(|p| u16::try_from(p).ok()),
         ..Default::default()
     };
-    if b(e, "watch").unwrap_or(false) || matches!(e.get("watch"), Some(Value::Array(_)) | Some(Value::String(_))) {
-        a.notes.push(("watch".into(), "unsupported: restart on deploy with `warden reload` instead".into()));
-    }
+    map_watch(e, &mut a);
     if b(e, "shutdown_with_message").unwrap_or(false) {
         a.notes.push((
             "shutdown_with_message".into(),
@@ -493,6 +497,116 @@ fn common(e: &Value) -> Pm2App {
         ));
     }
     a
+}
+
+/// PM2's `watch`, `ignore_watch`, `watch_delay` and `watch_options` into `[watch]`: what maps is
+/// kept, what does not is listed in the report.
+fn map_watch(e: &Value, a: &mut Pm2App) {
+    let mut paths: Vec<String> = Vec::new();
+    match e.get("watch") {
+        Some(Value::Bool(true)) => a.watch = true,
+        Some(Value::String(p)) if p == "true" => a.watch = true,
+        Some(Value::String(p)) if !p.is_empty() && p != "false" => {
+            a.watch = true;
+            paths.push(p.clone());
+        }
+        Some(Value::Array(v)) => {
+            // An empty list is PM2's "the working directory".
+            a.watch = true;
+            paths.extend(v.iter().filter_map(|p| p.as_str().map(String::from)));
+        }
+        _ => {}
+    }
+    if !a.watch {
+        // Settings of a watch that is off do not matter.
+        return;
+    }
+    let named = !paths.is_empty();
+    for p in paths {
+        // PM2 takes globs (chokidar); Warden takes directories and files, and
+        // `ignore` does the narrowing: a glob becomes the directory it starts in.
+        let dir: Vec<&str> = p.split('/').take_while(|c| !c.contains(['*', '?', '[', '{', '('])).collect();
+        let kept = dir.join("/");
+        if kept.is_empty() && p.starts_with('/') {
+            // `/*.js`: the glob starts at the root of the disk.
+            a.notes
+                .push(("watch".into(), format!("unsupported: {p:?} is a glob at the root of the disk; not watched")));
+            continue;
+        }
+        let kept = if kept.is_empty() { ".".to_string() } else { kept };
+        if kept != p {
+            a.notes.push((
+                "watch".into(),
+                format!("approximated: {p:?} is a glob; Warden watches {kept:?} and everything under it (narrow it with [watch] ignore)"),
+            ));
+        }
+        if !a.watch_paths.contains(&kept) {
+            a.watch_paths.push(kept);
+        }
+    }
+    if named && a.watch_paths.is_empty() {
+        // Every path was one Warden cannot watch: no path means the whole directory, which is not what PM2 did.
+        a.watch = false;
+        a.notes.push(("watch".into(), "unsupported: none of its paths can be watched, so [watch] stays off".into()));
+        return;
+    }
+    if a.watch_paths.len() > crate::config::Watch::MAX_PATHS {
+        a.watch_paths.truncate(crate::config::Watch::MAX_PATHS);
+        a.notes.push(("watch".into(), "approximated: only the first 64 paths are kept".into()));
+    }
+    let (mut skipped, mut other): (Vec<String>, usize) = (Vec::new(), 0);
+    let entries: Vec<&Value> = match e.get("ignore_watch") {
+        Some(Value::Array(v)) => v.iter().collect(),
+        Some(v @ Value::String(_)) => vec![v],
+        _ => Vec::new(),
+    };
+    for v in entries {
+        match v.as_str() {
+            // Regular expressions, braces, negation: PM2's matcher has them, Warden's has `*`, `?` and `**`.
+            Some(p) if p.contains(['[', ']', '{', '}', '(', ')', '|', '!', '^', '$', '+', '\\']) => {
+                skipped.push(p.to_string())
+            }
+            Some(p) if crate::watch::Glob::new(p).is_err() => skipped.push(p.to_string()),
+            Some(p) => {
+                if !a.ignore_watch.iter().any(|x| x == p) {
+                    a.ignore_watch.push(p.to_string());
+                }
+            }
+            // A RegExp in an ecosystem file is not a string once it is JSON.
+            None => other += 1,
+        }
+    }
+    if !skipped.is_empty() || other > 0 {
+        let what = match (skipped.is_empty(), other) {
+            (false, 0) => skipped.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", "),
+            (true, n) => format!("{n} entries that are not strings (regular expressions)"),
+            (false, n) => format!(
+                "{} and {n} entries that are not strings",
+                skipped.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", ")
+            ),
+        };
+        a.notes.push((
+            "ignore_watch".into(),
+            format!(
+                "unsupported: {what}. Warden's [watch] ignore takes names, `*`, `?` and `**` globs and paths, not \
+                 regular expressions or braces: files they matched are watched now, so add the directories or \
+                 patterns you meant to [watch] ignore"
+            ),
+        ));
+    }
+    if a.ignore_watch.len() > crate::config::Watch::MAX_IGNORE - crate::config::DEFAULT_WATCH_IGNORE.len() {
+        a.ignore_watch.truncate(crate::config::Watch::MAX_IGNORE - crate::config::DEFAULT_WATCH_IGNORE.len());
+        a.notes.push(("ignore_watch".into(), "approximated: only the first entries are kept".into()));
+    }
+    a.watch_delay_ms = n(e, "watch_delay").map(|ms| ms.min(crate::config::Watch::MAX_DEBOUNCE_MS));
+    if matches!(e.get("watch_options"), Some(Value::Object(m)) if !m.is_empty()) {
+        a.notes.push((
+            "watch_options".into(),
+            "unsupported: chokidar's settings (usePolling, followSymlinks, awaitWriteFinish…); Warden always polls, \
+             never follows a symlink to a directory, and waits for the files to stop changing ([watch] debounce_ms)"
+                .into(),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------- ports
@@ -574,6 +688,10 @@ pub fn generate(a: &Pm2App, worker_mode: bool, env_file: &str) -> Result<(String
         restart_delay_ms: a.restart_delay_ms,
         max_restarts: a.max_restarts,
         cron: a.cron.clone(),
+        watch: a.watch,
+        watch_paths: a.watch_paths.clone(),
+        ignore_watch: a.ignore_watch.clone(),
+        watch_delay_ms: a.watch_delay_ms,
         stop_exit_codes: a.stop_exit_codes.clone(),
         wait_ready: a.wait_ready,
         listen_timeout_ms: a.listen_timeout_ms,
@@ -692,6 +810,14 @@ fn report(apps: &[(Pm2App, bool)], source: &str) -> String {
         }
         if a.cron.is_some() {
             r += "- cron_restart: mapped to [restart] schedule, a rolling restart through the health gates (PM2 restarts all at once)\n";
+        }
+        if a.watch {
+            r += &format!(
+                "- watch: mapped to [watch] enabled = true (paths: {}; ignore: the built-in list{}; debounce {} ms). Warden polls the files and starts a gated rolling restart once they stop changing (PM2 restarts at once, on the first event); docs/watch.md\n",
+                if a.watch_paths.is_empty() { ".".to_string() } else { a.watch_paths.join(", ") },
+                if a.ignore_watch.is_empty() { String::new() } else { format!(" + {}", a.ignore_watch.join(", ")) },
+                a.watch_delay_ms.unwrap_or(500)
+            );
         }
         if a.max_memory_mb.is_some() {
             r += "- max_memory_restart: mapped to [limits] max_memory: the worker is replaced gracefully, not killed\n";
@@ -1132,11 +1258,69 @@ mod tests {
             (a.instances.as_str(), a.kill_timeout_ms, a.min_uptime_ms, a.max_memory_mb),
             ("max", Some(5000), Some(10_000), Some(1024))
         );
-        assert!(a.notes.iter().any(|(f, h)| f == "watch" && h.starts_with("unsupported")));
+        assert!(a.watch && a.watch_paths.is_empty() && a.ignore_watch.is_empty(), "watch: true is the whole directory");
+        assert!(!a.notes.iter().any(|(f, _)| f == "watch"), "mapped, not reported as unsupported: {:?}", a.notes);
         let e = json!({"script":"worker.js","instances":-1});
         let a = from_ecosystem(&e, dir, None).unwrap();
         assert_eq!((a.name.as_str(), a.instances.as_str()), ("worker", "max-1"));
         assert!(from_ecosystem(&json!({"name":"x"}), dir, None).is_err());
+    }
+
+    /// `watch`, `ignore_watch`, `watch_delay` and `watch_options` become `[watch]`; what Warden
+    /// cannot express is in the report, not dropped silently.
+    #[test]
+    fn pm2_watch_maps_to_the_watch_section() {
+        let dir = Path::new("/srv/app");
+        let on = |e: serde_json::Value| from_ecosystem(&e, dir, None).unwrap();
+        // Off by default, and `watch: false` settings are not carried.
+        let a = on(json!({"name":"a","script":"a.js","watch":false,"ignore_watch":["x"],"watch_delay":5}));
+        assert!(!a.watch && a.ignore_watch.is_empty() && a.watch_delay_ms.is_none() && a.notes.is_empty());
+
+        let a = on(json!({"name":"a","script":"a.js","watch":["src","/etc/app.conf","lib/**/*.js","**/*.ts"],
+            "ignore_watch":["dist","logs/*.log","[\\/\\\\]\\./","a|b",{},"dist"],"watch_delay":1500,
+            "watch_options":{"usePolling":true}}));
+        assert!(a.watch);
+        assert_eq!(a.watch_paths, ["src", "/etc/app.conf", "lib", "."], "globs become their directory");
+        assert_eq!(a.ignore_watch, ["dist", "logs/*.log"], "what Warden can express, once");
+        assert_eq!(a.watch_delay_ms, Some(1500));
+        let notes: Vec<String> = a.notes.iter().map(|(f, h)| format!("{f}: {h}")).collect();
+        assert!(notes.iter().any(|n| n.starts_with("watch: approximated") && n.contains("lib/**/*.js")), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("ignore_watch: unsupported") && n.contains("a|b") && n.contains("1 entries")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.starts_with("watch_options: unsupported")), "{notes:?}");
+
+        // A string is one path; `true` is the whole directory; the generated config is valid and says so.
+        assert_eq!(on(json!({"name":"a","script":"a.js","watch":"src"})).watch_paths, ["src"]);
+        let real = std::env::temp_dir().join(format!("warden-migrate-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&real).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        std::fs::write(real.join("a.js"), "").unwrap();
+        let mut a = a;
+        a.cwd = Some(real.clone());
+        a.script = real.join("a.js");
+        let generated = generate(&a, false, "a.env");
+        let _ = std::fs::remove_dir_all(&real);
+        let (toml, _) = generated.unwrap();
+        let w = Config::parse(&toml).unwrap().watch;
+        assert_eq!((w.enabled, w.debounce_ms), (true, 1500));
+        assert_eq!(w.paths, ["src", "/etc/app.conf", "lib", "."]);
+        assert!(w.ignore.iter().any(|p| p == "dist") && w.ignore.iter().any(|p| p == "node_modules"), "{:?}", w.ignore);
+        let r = report(&[(a.clone(), false)], "test");
+        assert!(r.contains("- watch: mapped to [watch] enabled = true") && r.contains("debounce 1500 ms"), "{r}");
+        assert!(r.contains("- ignore_watch: unsupported"), "{r}");
+        // Nothing watchable left: off, and said.
+        let a = on(json!({"name":"a","script":"a.js","watch":["/*.js"]}));
+        assert!(!a.watch && a.notes.iter().any(|(f, h)| f == "watch" && h.contains("stays off")), "{:?}", a.notes);
+        // From `pm2 jlist`: `watch` is a boolean (the settings follow it).
+        let e = json!({"name":"w","pm_exec_path":"/srv/app/w.js","pm_cwd":"/srv/app","watch":true,
+            "ignore_watch":["node_modules","uploads"],"watch_delay":2000});
+        let a = from_pm2_env(&e, None);
+        assert_eq!((a.watch, a.watch_delay_ms), (true, Some(2000)));
+        assert_eq!(a.ignore_watch, ["node_modules", "uploads"]);
     }
 
     #[test]
