@@ -59,7 +59,7 @@ left out, printed at the start and listed in the report.
 | `memhog` | `bench/chaos/app.ts`, 2 workers, `[limits] max_memory = 200` (Linux: Warden reads RSS from /proc) | graceful memory recycling |
 | `oom` | `bench/chaos/app.ts`, 2 workers, its supervisor in the memory cgroup (Linux, root) | the kernel's OOM killer and how Warden reports it |
 | `nest` | `bench/nest/main.ts` (NestJS, Express) on Bun, 2 workers | `node:http` through the shim on a shared port, Nest's own shutdown hooks deferred to the drain |
-| wardend | `warden daemon --background`, an alert rule writing to a file | supervisor restarts, alerts, its own death |
+| wardend | `warden wardend --background`, an alert rule writing to a file | supervisor restarts, alerts, its own death |
 
 Every app runs with `[watchdog] timeout = 4`, `grace_period = 10` and
 `long_lived_timeout = 1`, and all but `site` and `crashy` with health

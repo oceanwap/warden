@@ -38,6 +38,20 @@ pub(crate) fn path() -> PathBuf {
     crate::fleet::config_dir().join(FILE_NAME)
 }
 
+/// What the rules file looked like when it was read: when it was changed, how big it is,
+/// which file it is (an editor that saves by renaming a new file over it changes the inode).
+/// `Default` is "not there". wardend compares it every couple of seconds to read the file
+/// again when it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct FileStamp(Option<(std::time::SystemTime, u64, u64)>);
+
+impl FileStamp {
+    pub(crate) fn of(path: &std::path::Path) -> FileStamp {
+        use std::os::unix::fs::MetadataExt;
+        FileStamp(std::fs::metadata(path).ok().and_then(|m| Some((m.modified().ok()?, m.len(), m.ino()))))
+    }
+}
+
 // ------------------------------------------------------------------- kinds
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

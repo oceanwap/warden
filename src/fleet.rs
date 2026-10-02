@@ -1257,6 +1257,12 @@ fn is_selector_list(what: &str) -> bool {
 /// `warden start <app | id | config.toml | script>`.
 pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     let code = start_inner(args, what, opts).await;
+    // wardend runs whenever something was started (it restarts supervisors that die and
+    // feeds the window): also when the app was running already, and under launchd or systemd.
+    // Not for a mistyped command.
+    if code <= 1 {
+        crate::daemon::client::autostart().await;
+    }
     show_apps(args, false).await;
     code
 }
@@ -1266,17 +1272,18 @@ async fn start_inner(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     // 1. Apps we know: a name, an id, a namespace, `all`, or a list of them.
     match resolve(&ctx, Some(what), true) {
         Ok(sels) => {
-            let mut worst = 0;
             let mut started: Vec<&str> = Vec::new();
+            let mut each = Vec::new();
             for s in &sels {
                 // `0,0:1` or a namespace plus a member: once is enough.
                 if started.contains(&s.app.name.as_str()) {
                     continue;
                 }
                 started.push(&s.app.name);
-                worst = worst.max(start_app(&ctx, &s.app, OnFailedStart::Stop).await);
+                each.push(start_app(&ctx, &s.app, OnFailedStart::Stop));
             }
-            return worst;
+            // Together (as many as `--parallel` allows): each waits for its own workers, not for the others.
+            return join_limited(each, parallel_limit(args.parallel)).await.into_iter().max().unwrap_or(0);
         }
         // Meant as app ids or a list of apps, not a script or a command line:
         // say what is wrong with it rather than trying it as a program.
@@ -1498,6 +1505,54 @@ enum OnFailedStart {
     /// Report it and leave the restart policy at work: `warden resurrect`
     /// at boot, where a dependency may still be coming up.
     Report,
+}
+
+/// How many apps start at once: `--parallel N`, else `$WARDEN_PARALLEL` (a number, or `all`), else
+/// the number of CPU cores. Starting every app of a big host together would slow each of them
+/// (and the host) to a crawl; a few per core keeps them all quick.
+pub(crate) fn parallel_limit(flag: Option<usize>) -> usize {
+    let env = std::env::var("WARDEN_PARALLEL").ok().and_then(|v| match v.trim() {
+        "all" | "max" => Some(usize::MAX),
+        n => n.parse::<usize>().ok().filter(|n| *n >= 1),
+    });
+    flag.or(env).unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// Run `futs`, at most `limit` at a time (on this task: they may borrow, and nothing is spawned),
+/// and give their outputs in order. As one finishes the next one starts. `warden start a b c` and
+/// `warden resurrect` start the apps this way: together instead of each waiting for the one before
+/// it to be ready, but not all of a big host's apps at once.
+pub(crate) async fn join_limited<F: std::future::Future>(futs: Vec<F>, limit: usize) -> Vec<F::Output> {
+    use std::task::Poll;
+    let limit = limit.max(1);
+    let n = futs.len();
+    let mut futs: Vec<std::pin::Pin<Box<F>>> = futs.into_iter().map(Box::pin).collect();
+    let mut out: Vec<Option<F::Output>> = futs.iter().map(|_| None).collect();
+    // Futures `0..started` have begun; those not in `out` yet are running.
+    let mut started = 0;
+    std::future::poll_fn(|cx| {
+        let mut running = 0;
+        for i in 0..started {
+            if out[i].is_none() {
+                match futs[i].as_mut().poll(cx) {
+                    Poll::Ready(v) => out[i] = Some(v),
+                    Poll::Pending => running += 1,
+                }
+            }
+        }
+        // Room for more: start them now, and again when one of those finishes at once.
+        while running < limit && started < n {
+            let i = started;
+            started += 1;
+            match futs[i].as_mut().poll(cx) {
+                Poll::Ready(v) => out[i] = Some(v),
+                Poll::Pending => running += 1,
+            }
+        }
+        if started == n && running == 0 { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    out.into_iter().flatten().collect()
 }
 
 async fn start_app(ctx: &Ctx, app: &App, on_fail: OnFailedStart) -> i32 {
@@ -1807,10 +1862,10 @@ pub(crate) fn spawn_background_as(
         .map_err(|e| format!("starting the supervisor: {e}"))
 }
 
-/// `warden daemon [--resurrect]` (wardend) in the background, logging to
+/// `warden wardend [--resurrect]` in the background, logging to
 /// `<state dir>/logs/wardend.log`.
 pub(crate) fn spawn_daemon(resurrect: bool) -> Result<std::process::Child, String> {
-    let mut args = vec![std::ffi::OsStr::new("daemon")];
+    let mut args = vec![std::ffi::OsStr::new("wardend")];
     if resurrect {
         args.push(std::ffi::OsStr::new("--resurrect"));
     }
@@ -2342,9 +2397,53 @@ fn stopped_note(s: &Saved) -> &'static str {
 }
 
 pub async fn resurrect(args: &Args) -> i32 {
+    // `kill` stopped wardend with the apps: resurrect brings it back, also when every app
+    // was running already (it is not an app's, and it harms nobody). First, so it is there
+    // before the apps are, and finds each as it comes up.
+    crate::daemon::client::autostart().await;
     let code = resurrect_inner(args).await;
     show_apps(args, false).await;
     code
+}
+
+/// `warden update`: every supervisor and wardend start again from the warden binary on disk,
+/// as `warden save && warden kill --yes && warden resurrect` does. A supervisor keeps the
+/// code it started with (a rebuild or an upgrade replaces the file, not the process), so
+/// this is how a running host picks it up. Nothing is stopped unless the save worked.
+pub async fn update(args: &Args) -> i32 {
+    if !args.yes && crate::sys::isatty(0) {
+        eprint!(
+            "Restart every app's supervisor and wardend from this warden binary? The apps stop for a few seconds. \
+             [y/N] "
+        );
+        let mut answer = String::new();
+        let _ = std::io::stdin().read_line(&mut answer);
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            eprintln!("nothing stopped");
+            return 1;
+        }
+    }
+    println!("update: saving what runs");
+    let code = save(args).await;
+    if code != 0 {
+        eprintln!("warden: the save failed, so nothing was stopped");
+        return code;
+    }
+    println!("update: stopping every supervisor and wardend");
+    let kill_all = Args {
+        command: cli::Command::Kill,
+        target: None,
+        config: args.config.clone(),
+        socket: args.socket.clone(),
+        json: false,
+        no_wait: args.no_wait,
+        yes: true,
+        table_only: false,
+        parallel: None,
+    };
+    let stopped = kill(&kill_all).await;
+    println!("update: starting them again");
+    stopped.max(resurrect(args).await)
 }
 
 async fn resurrect_inner(args: &Args) -> i32 {
@@ -2361,6 +2460,7 @@ async fn resurrect_inner(args: &Args) -> i32 {
     };
     let ctx = context(args);
     let mut worst = 0;
+    let mut to_start = Vec::new();
     for s in &dump.apps {
         if !s.config.is_file() {
             eprintln!("warden: {}: config {} no longer exists; skipped", s.name, s.config.display());
@@ -2372,9 +2472,14 @@ async fn resurrect_inner(args: &Args) -> i32 {
             println!("{}: already running", s.name);
             continue;
         }
-        worst = worst.max(start_app(&ctx, &app, OnFailedStart::Report).await);
+        to_start.push(app);
     }
-    worst
+    // The apps together, as wardend's own `--resurrect` does, a core's worth at a time: with ten apps
+    // that each take a few seconds to listen, one after another is a minute of downtime and together
+    // is a few seconds, and a host with hundreds of apps is not asked to start them all at once.
+    let each = to_start.iter().map(|app| start_app(&ctx, app, OnFailedStart::Report)).collect();
+    let started = join_limited(each, parallel_limit(args.parallel)).await;
+    worst.max(started.into_iter().max().unwrap_or(0))
 }
 
 // -------------------------------------------------------------------- top
@@ -2443,6 +2548,52 @@ mod tests {
                 _ => s.app.name,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn join_limited_runs_futures_together_up_to_the_limit_and_keeps_their_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let futs = |n: u64| -> Vec<_> {
+            (0..n)
+                .map(|i| {
+                    let (now, most) = (&now, &most);
+                    async move {
+                        let here = now.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(here, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100 + (i % 3) * 20)).await;
+                        now.fetch_sub(1, Ordering::SeqCst);
+                        i
+                    }
+                })
+                .collect()
+        };
+        // No limit: all six together, in the order given.
+        let t0 = Instant::now();
+        assert_eq!(join_limited(futs(6), usize::MAX).await, [0, 1, 2, 3, 4, 5]);
+        assert!(t0.elapsed() < Duration::from_millis(300), "together: {:?}", t0.elapsed());
+        assert_eq!(most.load(Ordering::SeqCst), 6);
+        // A limit of 2: never more than two at a time, and a finished one makes room for the next.
+        most.store(0, Ordering::SeqCst);
+        let t0 = Instant::now();
+        assert_eq!(join_limited(futs(6), 2).await, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(most.load(Ordering::SeqCst), 2, "at most two at once");
+        assert!(t0.elapsed() >= Duration::from_millis(300), "three rounds of two: {:?}", t0.elapsed());
+        // One at a time is the old behavior; nothing at all is fine; a limit of 0 is 1.
+        most.store(0, Ordering::SeqCst);
+        assert_eq!(join_limited(futs(3), 1).await, [0, 1, 2]);
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        assert_eq!(join_limited(Vec::<std::future::Ready<u8>>::new(), 4).await, Vec::<u8>::new());
+        assert_eq!(join_limited(futs(2), 0).await, [0, 1]);
+    }
+
+    #[test]
+    fn the_parallel_limit_is_the_flag_then_the_environment_then_the_cores() {
+        // The flag wins whatever the environment says (the test binary shares its environment,
+        // so only the flag's side is asserted here; the default is at least one).
+        assert_eq!(parallel_limit(Some(3)), 3);
+        assert_eq!(parallel_limit(Some(usize::MAX)), usize::MAX);
+        assert!(parallel_limit(None) >= 1);
     }
 
     #[test]

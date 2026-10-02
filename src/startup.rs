@@ -5,8 +5,8 @@
 //! |---|---|
 //! | Linux with systemd, root | `warden@.service` (enabled per saved app), `wardend.service`, the sysctl file |
 //! | Linux with systemd, a user (`--user`) | the same two units in ~/.config/systemd/user, and lingering |
-//! | macOS | a launchd job running `warden daemon --resurrect` (LaunchAgent; LaunchDaemon as root) |
-//! | anything else | nothing: `warden resurrect` or `warden daemon --resurrect` from the init system |
+//! | macOS | a launchd job running `warden wardend --resurrect` (LaunchAgent; LaunchDaemon as root) |
+//! | anything else | nothing: `warden resurrect` or `warden wardend --resurrect` from the init system |
 //!
 //! Under systemd every app has its own unit (cgroup, limits, restarts) and
 //! wardend only adds live events and restarts of background supervisors: it
@@ -190,7 +190,7 @@ pub(crate) fn wardend_unit(scope: Scope, exe: &str, env: &[(String, String)]) ->
         scope_word(scope)
     );
     render(WARDEND_UNIT, scope, &header, env, |line| {
-        line.starts_with("ExecStart=").then(|| format!("ExecStart={} daemon", unit_quote(exe)))
+        line.starts_with("ExecStart=").then(|| format!("ExecStart={} wardend", unit_quote(exe)))
     })
 }
 
@@ -198,7 +198,7 @@ fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-/// The launchd job: `warden daemon --resurrect`, at load (login or boot) and
+/// The launchd job: `warden wardend --resurrect`, at load (login or boot) and
 /// again whenever it did not exit cleanly.
 pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, String)]) -> String {
     let log = xml(&log.display().to_string());
@@ -210,12 +210,12 @@ pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, 
     );
     s += &format!("  <key>Label</key>\n  <string>{}</string>\n", xml(label));
     s += "  <key>ProgramArguments</key>\n  <array>\n";
-    for a in [exe, "daemon", "--resurrect"] {
+    for a in [exe, "wardend", "--resurrect"] {
         s += &format!("    <string>{}</string>\n", xml(a));
     }
     s += "  </array>\n  <key>RunAtLoad</key>\n  <true/>\n";
     s += "  <!-- Started again after a crash or kill -9, but not after a clean exit: `warden kill`\n       \
-          and `warden daemon stop` keep it stopped until the next login or boot. -->\n";
+          keeps it stopped until the next login or boot. -->\n";
     s += "  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n";
     s += &format!("  <key>StandardOutPath</key>\n  <string>{log}</string>\n");
     s += &format!("  <key>StandardErrorPath</key>\n  <string>{log}</string>\n");
@@ -331,7 +331,7 @@ warden: no service manager found: systemd is not running here (a container, or a
 so nothing was installed.
   To bring the saved apps back at boot, run one of these from your init system or the container's entrypoint:
     warden resurrect             start every app `warden save` recorded, in the background, then exit
-    warden daemon --resurrect    the same, then stay in the foreground as wardend and restart their
+    warden wardend --resurrect   the same, then stay in the foreground as wardend and restart their
                                  supervisors if they die (in a container: under an init, `docker run --init`)";
 
 pub async fn startup(args: &Args, want: Want) -> i32 {
@@ -379,6 +379,42 @@ pub(crate) fn wardend_managed() -> bool {
         return [false, true].into_iter().any(|s| plist_path(s).exists());
     }
     fleet::systemctl_bin().is_some() && [Scope::System, Scope::User].into_iter().any(|s| s.has_unit("wardend.service"))
+}
+
+/// Start wardend through the service manager that owns it (launchd: `kickstart`, or load
+/// the job again if `bootout` unloaded it; systemd: `start`): what `warden start` and
+/// `warden resurrect` do when wardend is not running but was set up with `warden startup`,
+/// as it is after `warden kill`. Starting a second one by hand would only fight the
+/// manager's for the socket. Ok(what was done), or why it could not be.
+pub(crate) fn start_wardend_managed() -> Result<String, String> {
+    if launchd_host() {
+        let lc = launchctl();
+        let mut last = "no launchd job for wardend".to_string();
+        for system in [false, true] {
+            let path = plist_path(system);
+            if !path.exists() {
+                continue;
+            }
+            let (domain, target) = (launchd_domain(system), format!("{}/{LAUNCHD_LABEL}", launchd_domain(system)));
+            // Loaded (the usual case after wardend exited): start it. Not loaded: load it
+            // again, which starts it (RunAtLoad). A job disabled earlier stays disabled.
+            let _ = run(&lc, &["enable", &target]);
+            let started = run(&lc, &["kickstart", &target])
+                .or_else(|_| run(&lc, &["bootstrap", &domain, &path.display().to_string()]));
+            match started {
+                Ok(()) => return Ok(format!("launchd started {target}")),
+                Err(e) => last = e,
+            }
+        }
+        return Err(last);
+    }
+    for scope in [Scope::System, Scope::User] {
+        if fleet::systemctl_bin().is_some() && scope.has_unit("wardend.service") {
+            return fleet::run_systemctl(scope, &["start", "wardend.service"])
+                .map(|()| format!("systemd started {}wardend.service", scope.shown()));
+        }
+    }
+    Err("no service manager has wardend".into())
 }
 
 /// Can `warden startup` do anything here?
@@ -727,7 +763,7 @@ async fn launchd_startup(system: bool) -> i32 {
         return 1;
     }
     println!(
-        "{target}: loaded. launchd runs `warden daemon --resurrect` {}: wardend starts the apps `warden save` \
+        "{target}: loaded. launchd runs `warden wardend --resurrect` {}: wardend starts the apps `warden save` \
          recorded and restarts their supervisors when they die; launchd restarts wardend if it crashes. Log: {}",
         if system { "at boot" } else { "at login" },
         log.display()
@@ -803,7 +839,7 @@ mod tests {
         assert!(!u.contains("/usr/local/bin/warden") && !u.contains("cp contrib"), "{u}");
         assert!(!u.contains("Environment="), "no environment for system units without overrides");
         let d = wardend_unit(Scope::System, "/opt/warden/bin/warden", &[]);
-        assert!(lines(&d).contains(&r#"ExecStart="/opt/warden/bin/warden" daemon"#), "{d}");
+        assert!(lines(&d).contains(&r#"ExecStart="/opt/warden/bin/warden" wardend"#), "{d}");
         assert!(!d.contains("--resurrect"), "systemd brings the apps back itself");
         for kept in ["KillMode=process", "Restart=always", "RuntimeDirectoryPreserve=yes", "WantedBy=multi-user.target"]
         {
@@ -860,7 +896,7 @@ mod tests {
         assert!(flat.contains("<key>Label</key><string>io.github.oceanwap.warden.daemon</string>"), "{p}");
         assert!(
             flat.contains(
-                "<key>ProgramArguments</key><array><string>/Users/me/bin/warden</string><string>daemon</string>\
+                "<key>ProgramArguments</key><array><string>/Users/me/bin/warden</string><string>wardend</string>\
                  <string>--resurrect</string></array>"
             ),
             "{p}"

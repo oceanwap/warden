@@ -201,7 +201,7 @@ pub fn explain(dest: &str, stderr: &str, exit: Option<i32>) -> String {
     } else if said.contains("Connection refused") || said.contains("timed out") || said.contains("No route to host") {
         "check that the host is up and that sshd listens (port 22, or the Port in ~/.ssh/config)".into()
     } else if said.contains("open failed") || said.contains("connect failed") {
-        "wardend does not answer on the remote socket: start it there (`warden daemon --background`, or the \
+        "wardend does not answer on the remote socket: start it there (`warden resurrect`, or the \
          Start wardend button) or fix the remote socket path (root: /run/warden/wardend.sock; a user: \
          /run/user/<uid>/warden/wardend.sock)"
             .into()
@@ -231,8 +231,8 @@ pub fn explain(dest: &str, stderr: &str, exit: Option<i32>) -> String {
 pub fn explain_channel(dest: &str, remote_socket: &str, ssh_said: &str) -> String {
     let said = if ssh_said.is_empty() { String::new() } else { format!(" (ssh: {ssh_said})") };
     format!(
-        "nothing answers on {remote_socket} on {dest}{said}. wardend is not running there: start it (`warden daemon \
-         --background`, or Start wardend); or it runs as another user or with another socket (root's wardend: \
+        "nothing answers on {remote_socket} on {dest}{said}. wardend is not running there: start it (`warden \
+         resurrect`, or Start wardend); or it runs as another user or with another socket (root's wardend: \
          /run/warden/wardend.sock; a user's: /run/user/<uid>/warden/wardend.sock); or sshd there does not forward \
          sockets (its sshd_config needs `AllowStreamLocalForwarding yes`, the default, and neither \
          `AllowTcpForwarding no` nor `DisableForwarding yes`)"
@@ -525,7 +525,7 @@ mod tests {
         let open_failed = "channel 2: open failed: connect failed: open failed";
         let e = explain_channel("u@h", "/run/warden/wardend.sock", open_failed);
         assert!(e.contains("nothing answers on /run/warden/wardend.sock on u@h (ssh: channel 2: open failed"), "{e}");
-        for cause in ["warden daemon --background", "another user", "AllowStreamLocalForwarding"] {
+        for cause in ["warden resurrect", "another user", "AllowStreamLocalForwarding"] {
             assert!(e.contains(cause), "{cause}: {e}");
         }
         assert!(!explain_channel("u@h", "/s", "").contains("(ssh:"));

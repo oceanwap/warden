@@ -59,7 +59,7 @@ new_main_pid() {
   [ "$p" != 0 ] && [ "$p" != "$2" ] && sc is-active --quiet "$1"
 }
 # wardend answers on its socket, and is the unit's main process.
-wardend_is_unit() { [ "$(w daemon status --json | jq .hello.pid)" = "$(mainpid wardend.service)" ]; }
+wardend_is_unit() { [ "$(w wardend status --json | jq .hello.pid)" = "$(mainpid wardend.service)" ]; }
 # No pid of the comma-separated list A is in B (and B is not empty).
 disjoint() {
   local a
@@ -99,7 +99,7 @@ diag() {
 app_field() { w list --json 2>/dev/null | jq -r --arg a "$1" ".[] | select(.app == \$a) | $2"; }
 app_ready() { [ "$(app_field "$1" '"\(.status.workers_ready)/\(.status.workers_configured)"')" = "$2/$2" ]; }
 wardend_sees() {
-  w daemon status --json | jq -e --arg a "$1" --arg s "$2" \
+  w wardend status --json | jq -e --arg a "$1" --arg s "$2" \
     '.apps[] | select(.name == $a and .state == "running" and .supervised_by == $s)' >/dev/null
 }
 worker_pids() { app_field "$1" '[.status.workers[].pid] | sort | map(tostring) | join(",")'; }

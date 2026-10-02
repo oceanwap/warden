@@ -89,7 +89,7 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   tracks state, restarts with backoff, drains on shutdown, answers the CLI over
   a Unix socket, optionally serves `/metrics`. Never proxies requests.
 - **Workers**: the application. Each binds the shared port itself.
-- **wardend** (`warden daemon`, optional, one per host and user): one socket
+- **wardend** (always on, one per host and user; `warden wardend` runs it): one socket
   for every app's live events and commands (the CLI's `warden events`,
   `warden-gui`), and a second level of supervision: it restarts supervisors
   that `warden start` launched in the background when they die (backoff, give

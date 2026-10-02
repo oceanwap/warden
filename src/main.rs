@@ -25,6 +25,7 @@ mod process;
 mod restart;
 mod schedule;
 mod signals;
+mod stamp;
 mod startup;
 mod static_server;
 mod supervisor;
@@ -38,6 +39,8 @@ use cli::Command;
 use std::path::PathBuf;
 
 fn main() {
+    // Which executable this process starts from (a supervisor reports it: see stamp.rs).
+    stamp::remember();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     // Internal: the worker process of an app with a [static] section.
     if argv.first().map(String::as_str) == Some("serve-static") {
@@ -69,6 +72,12 @@ fn main() {
             println!("warden {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        // `warden check -c wardend.toml`: the alert rules, with every problem and its line.
+        Command::Check
+            if args.config.as_ref().and_then(|p| p.file_name()).is_some_and(|n| n == daemon::alerts::FILE_NAME) =>
+        {
+            daemon::client::check(args.config.clone())
+        }
         Command::Check => {
             let path = config_path();
             match config::Config::load(&path) {
@@ -98,20 +107,18 @@ fn main() {
         Command::Delete { target } => rt.block_on(fleet::delete(&args, &target)),
         Command::Save => rt.block_on(fleet::save(&args)),
         Command::Resurrect => rt.block_on(fleet::resurrect(&args)),
+        Command::Update => rt.block_on(fleet::update(&args)),
         Command::Startup(want) => rt.block_on(startup::startup(&args, want)),
         Command::Unstartup(want) => rt.block_on(startup::unstartup(&args, want)),
         Command::Kill => rt.block_on(fleet::kill(&args)),
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
-        Command::Daemon(cli::DaemonCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
-        Command::Daemon(cli::DaemonCmd::Run { background: true, resurrect }) => {
+        Command::Wardend(cli::WardendCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
+        Command::Wardend(cli::WardendCmd::Run { background: true, resurrect }) => {
             rt.block_on(daemon::client::start_background(resurrect))
         }
-        Command::Daemon(cli::DaemonCmd::Status) => rt.block_on(daemon::client::status(args.json)),
-        Command::Daemon(cli::DaemonCmd::Stop) => rt.block_on(daemon::client::stop()),
-        Command::Daemon(cli::DaemonCmd::Check) => daemon::client::check(args.config.clone()),
-        Command::Daemon(cli::DaemonCmd::Reload) => rt.block_on(daemon::client::reload()),
+        Command::Wardend(cli::WardendCmd::Status) => rt.block_on(daemon::client::status(args.json)),
         Command::Events { logs, interval_ms } => {
             daemon::client::events(&rt, args.target.clone(), args.json, logs, interval_ms)
         }

@@ -513,7 +513,7 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
             "[[alert]]\non = [\"all\"]\ncommand = [\"sh\", \"-c\", \"cat >> '{q}'; echo >> '{q}'\"]\nmin_interval = \"1s\"\n"
         ),
     )?;
-    let r = fleet.cli(&["daemon", "check"], Duration::from_secs(20));
+    let r = fleet.cli(&["check", "-c", &home.join("wardend.toml").display().to_string()], Duration::from_secs(20));
     if !r.ok() {
         println!("chaos: note: wardend.toml rejected, running without alert rules: {}", r.brief());
         let _ = std::fs::remove_file(home.join("wardend.toml"));
@@ -530,7 +530,7 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
             return Err(format!("starting {}: {}", s.name, r.brief()));
         }
     }
-    let r = fleet.cli(&["daemon", "--background"], Duration::from_secs(30));
+    let r = fleet.cli(&["wardend", "--background"], Duration::from_secs(30));
     if !r.ok() {
         return Err(format!("starting wardend: {}", r.brief()));
     }

@@ -12,7 +12,7 @@ one ~8 MB binary, no web view, no GPU driver.
 - **Connection bar**: wardend's version and pid, the host's CPU, memory and
   load (from `host` events), with sparklines of the last hour of CPU and of
   memory (out of the total). When wardend is not running it says so, why it
-  matters, and offers **Start wardend** (`warden daemon --background`, with
+  matters, and offers **Start wardend** (`warden wardend --background`, with
   the `warden` next to the GUI, else the one on PATH). It reconnects by
   itself, with backoff (0.25 s up to 5 s), and says `reconnecting…` meanwhile.
 - **App list**: each app's state, who supervises it, workers ready /
@@ -91,6 +91,15 @@ opens **Settings**:
 - `--theme system|warden|light|dark` (or `WARDEN_GUI_THEME`; the flag wins) sets
   it for one run: `system` is System colors with Auto; `warden` is Warden colors
   with Auto; `light` and `dark` are Warden colors in that mode.
+
+- **Restart everything** (also in Settings) runs `warden update --yes` on the machine the
+  window shows: it saves what runs, stops every supervisor and wardend, and starts them again
+  from the installed `warden` (a supervisor keeps the code it started with, so this is what
+  picks up an upgrade). It asks first; the apps stop for a few seconds, stopped apps stay
+  stopped, and the window reconnects when wardend is back. Over SSH it runs on the remote
+  machine.
+- Under the app's name the window shows the directory its workers run in (the folder a static
+  site serves); a click copies it.
 
 ![Settings, over the main screen](../docs/gui-settings.png)
 
@@ -256,7 +265,7 @@ with wgpu; about 5 MB in the release tarball). `cargo build -p warden-gui
 `ICED_BACKEND=tiny-skia` forces the CPU one).
 
 To measure again: start 10 apps (`warden start "sleep 100000" --name appN -i
-2 --no-wait`), `warden daemon`, then read `Rss`/`Pss` in
+2 --no-wait`), `warden wardend`, then read `Rss`/`Pss` in
 `/proc/<pid>/smaps_rollup` and the CPU ticks in `/proc/<pid>/stat`.
 
 ## Tests
@@ -283,7 +292,7 @@ cargo build --bin warden && cargo test -p warden-gui
   what it must show, clicked, and saved as a PNG in
   `$WARDEN_GUI_SNAPSHOT_DIR` (default `target/tmp/snapshots`; CI uploads
   them as the `gui-snapshots` artifact).
-- `tests/daemon.rs`: the client layer against a real `warden daemon` (the
+- `tests/daemon.rs`: the client layer against a real `warden wardend` (the
   workspace's `target/debug/warden`, with a private `WARDEN_HOME`): apps,
   statuses and host metrics arrive, a reload is followed to `rollout_done`,
   errors come back with words, log lines stream, and the feed reconnects

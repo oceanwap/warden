@@ -18,6 +18,24 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   (`[reload] max_draining`), and WebSocket / SSE connections closed cleanly
   during a drain (`[shutdown] long_lived_timeout`).
 - Experimental worker mode (Bun Workers + embedded shim).
+- `warden update`: save, stop every supervisor and wardend, start them again
+  from the warden binary on disk (a supervisor keeps the code it started with,
+  so this is how a running host picks up an upgrade); the GUI has the same
+  under Settings, "Restart everything". `warden list` and the GUI say when a
+  supervisor is older than the warden asking, and which numbers it lacks.
+- wardend is always on: `warden start` and `warden resurrect` start it, a
+  supervisor starts it again when it dies without a clean exit (a crash or
+  `kill -9`), and only `warden kill` stops it. There is no `warden daemon`
+  command; `warden check -c wardend.toml` and `warden doctor` check the alert
+  rules, and wardend reads the file again by itself when it changes.
+- `warden resurrect`, `warden update` and `warden start a b c` start the apps at the same
+  time, one per CPU core at once so a big host is not asked to start everything together:
+  `--parallel N` (`-j N`, `all` for no limit) or `$WARDEN_PARALLEL` changes it; wardend's own
+  `--resurrect` follows `$WARDEN_PARALLEL` too.
+- The workers' directory (the folder a static site serves) shows under the
+  project name in the GUI and in `warden describe`.
+- GUI settings: Warden or the desktop's own colors (macOS, GNOME and
+  Ubuntu), and light, dark or automatic.
 - `wardend` control daemon: second-level supervision, alerts
   (webhook/command), a 24 h resource history that survives restarts, a
   Unix-socket protocol shared with the CLI and GUI (`protocol/`,

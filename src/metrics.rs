@@ -258,6 +258,8 @@ mod tests {
             draining: vec![],
             start_failed: None,
             user: None,
+            build: None,
+            cwd: None,
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));

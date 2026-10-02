@@ -195,9 +195,18 @@ pub fn remote_failure(host: &Host, out: &Output, program: &str) -> Option<String
 
 // ------------------------------------------------------------ start wardend
 
-/// `warden daemon --background`.
+/// `warden wardend --background` (internal: wardend is started by `warden start`, `resurrect` and the
+/// supervisors, and this is for when `warden kill` or a failure left it stopped).
 pub async fn start_wardend(host: &Host) -> Result<Output, String> {
-    run_warden(host, &["daemon".into(), "--background".into()], None, &[], Duration::from_secs(20)).await
+    run_warden(host, &["wardend".into(), "--background".into()], None, &[], Duration::from_secs(20)).await
+}
+
+// ------------------------------------------------------- restart everything
+
+/// `warden update --yes`: save, stop every supervisor and wardend, start them again from the
+/// `warden` on disk (what picks up a rebuild or an upgrade). The apps stop for a few seconds.
+pub async fn restart_everything(host: &Host) -> Result<Output, String> {
+    run_warden(host, &["update".into(), "--yes".into()], None, &[], Duration::from_secs(180)).await
 }
 
 // ----------------------------------------------------------------- add app

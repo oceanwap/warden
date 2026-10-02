@@ -20,7 +20,7 @@ NotifyAccess=main
 # Root, like `sudo warden start` and `warden startup`: it must reach every
 # app's control socket (/run/warden/<app>/control.sock, /etc/warden configs)
 # and restart a background supervisor as the user that started it.
-ExecStart=/usr/local/bin/warden daemon
+ExecStart=/usr/local/bin/warden wardend
 Restart=always
 RestartSec=1s
 # wardend pings every 2 s while its loop keeps up; a hung wardend is

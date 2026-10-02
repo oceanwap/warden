@@ -2413,6 +2413,11 @@ fn serve_static_files() {
     let port = free_port();
     let out = f.ok(&["serve", site.to_str().unwrap(), &port.to_string(), "--name", "site", "-i", "2", "--spa"]);
     assert!(out.contains("site: online (2/2"), "{out}");
+    // A site has no working_directory: the folder it serves is its cwd, in the status and in `describe`.
+    let root = std::fs::canonicalize(&site).unwrap();
+    assert_eq!(f.app("site")["status"]["cwd"], root.to_str().unwrap(), "{}", f.app("site"));
+    let d = f.ok(&["describe", "site"]);
+    assert!(d.lines().any(|l| l.starts_with("│ cwd ") && l.contains(root.to_str().unwrap())), "{d}");
 
     let (st, h, body) = get_close(port, "/", "");
     assert_eq!((st, body.as_slice()), (200, b"<h1>home</h1>".as_slice()));
@@ -2534,7 +2539,7 @@ struct Wardend {
 
 impl Wardend {
     fn start(f: &Fleet, env: &[(&str, &str)]) -> Wardend {
-        Self::start_args(f, &["daemon"], env)
+        Self::start_args(f, &["wardend"], env)
     }
 
     fn start_args(f: &Fleet, args: &[&str], env: &[(&str, &str)]) -> Wardend {
@@ -2723,9 +2728,9 @@ impl DetachedWardend {
 impl Drop for DetachedWardend {
     fn drop(&mut self) {
         let Some(pid) = self.0 else { return };
-        // Only if that pid is still our `warden daemon` (not a reused pid).
+        // Only if that pid is still our `warden wardend` (not a reused pid).
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        if cmdline != format!("{BIN}\0daemon\0").as_bytes() {
+        if cmdline != format!("{BIN}\0wardend\0").as_bytes() {
             return;
         }
         unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -2742,27 +2747,28 @@ impl Drop for DetachedWardend {
 #[test]
 fn wardend_runs_reports_and_stops() {
     let f = Fleet::new("wd-life");
-    let (code, out) = f.cli(&["daemon", "status"]);
+    let (code, out) = f.cli(&["wardend", "status"]);
     assert_eq!(code, 1, "not running yet: {out}");
     assert!(out.contains("not running"), "{out}");
 
     // --background detaches it; status answers; a second one is refused.
-    let out = f.ok(&["daemon", "--background"]);
+    let out = f.ok(&["wardend", "--background"]);
     let bg = DetachedWardend::from_output(&out);
     assert!(bg.0.is_some(), "{out}");
-    let out = f.ok(&["daemon", "status"]);
+    let out = f.ok(&["wardend", "status"]);
     assert!(out.contains("wardend: pid") && out.contains("protocol 1"), "{out}");
-    let (code, out) = f.cli(&["daemon"]);
+    let (code, out) = f.cli(&["wardend"]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("already running"), "{out}");
-    let out = f.ok(&["daemon", "--background"]);
+    let out = f.ok(&["wardend", "--background"]);
     assert!(out.contains("already running"), "{out}");
-    let out = f.ok(&["daemon", "stop"]);
-    assert!(out.contains("wardend stopped"), "{out}");
-    let (code, _) = f.cli(&["daemon", "status"]);
+    // `kill` (everything) is how it is stopped on purpose.
+    let out = f.ok(&["kill", "--yes"]);
+    assert!(out.contains("wardend: stopped"), "{out}");
+    let (code, _) = f.cli(&["wardend", "status"]);
     assert_eq!(code, 1);
     assert!(!f.home.join("run/wardend.sock").exists(), "socket removed");
-    assert!(f.ok(&["daemon", "stop"]).contains("was not running"));
+    assert!(!f.ok(&["kill", "--yes"]).contains("wardend"), "nothing left to stop");
 
     // Like PM2: `warden start` starts wardend too (without WARDEN_NO_DAEMON),
     // and `warden kill` stops it after the apps.
@@ -2777,14 +2783,178 @@ fn wardend_runs_reports_and_stops() {
     let autostarted = DetachedWardend::from_output(&out);
     assert_eq!(code, 0, "{out}");
     assert!(autostarted.0.is_some() && out.contains("api: online"), "{out}");
-    let out = f.ok(&["daemon", "status"]);
+    let out = f.ok(&["wardend", "status"]);
     assert!(
         out.lines().any(|l| l.starts_with("│ 0  │ api ") && l.contains("running") && l.contains("wardend")),
         "{out}"
     );
     let out = f.ok(&["kill", "--yes"]);
     assert!(out.contains("api: stopped") && out.contains("wardend: stopped"), "{out}");
-    assert_eq!(f.cli(&["daemon", "status"]).0, 1);
+    assert_eq!(f.cli(&["wardend", "status"]).0, 1);
+}
+
+/// wardend's pid, from `warden wardend status --json`; None when it does not answer.
+fn wardend_pid(f: &Fleet, env: &[(&str, &str)]) -> Option<i32> {
+    let (code, out) = f.cli_env(&["wardend", "status", "--json"], env);
+    if code != 0 {
+        return None;
+    }
+    serde_json::from_str::<Value>(&out).ok()?["hello"]["pid"].as_i64().map(|p| p as i32)
+}
+
+/// What it takes for wardend to be always on, with a short look interval so the test is quick.
+const ALWAYS_ON: [(&str, &str); 2] = [("WARDEN_NO_DAEMON", "0"), ("WARDEN_REVIVE_EVERY_MS", "200")];
+
+/// wardend comes back whenever it dies (a supervisor starts it again), except when it was
+/// stopped on purpose: a clean exit removes its socket, a kill leaves it behind.
+#[test]
+fn wardend_comes_back_when_killed_but_not_when_stopped_on_purpose() {
+    let f = Fleet::new("wd-revive");
+    sleeper_config(&f, "api");
+    let (code, out) = f.cli_env(&["start", "api"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("wardend started in the background"), "start starts wardend: {out}");
+    let first = wardend_pid(&f, &ALWAYS_ON).expect("wardend answers after start");
+
+    // kill -9: no clean exit, so the supervisor starts it again, with another pid.
+    unsafe { libc::kill(first, libc::SIGKILL) };
+    let t0 = Instant::now();
+    let second = loop {
+        match wardend_pid(&f, &ALWAYS_ON) {
+            Some(p) if p != first => break p,
+            _ => {
+                assert!(t0.elapsed() < Duration::from_secs(30), "wardend was not started again");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    assert!(f.home.join("run/wardend.lock").exists(), "its lock is there while it runs");
+
+    // SIGTERM is a clean exit, which is what `warden kill` does: it stays stopped, however long the
+    // supervisor keeps looking (200 ms here).
+    unsafe { libc::kill(second, libc::SIGTERM) };
+    let t0 = Instant::now();
+    while wardend_pid(&f, &ALWAYS_ON).is_some() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "wardend did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(wardend_pid(&f, &ALWAYS_ON).is_none(), "a clean stop is not undone");
+    assert!(!f.home.join("run/wardend.sock").exists(), "a clean exit removes the socket");
+
+    // `resurrect` (and `start`) start it again, even with nothing saved to start; `kill` stops it
+    // with the apps.
+    let (_, out) = f.cli_env(&["resurrect"], &ALWAYS_ON);
+    assert!(wardend_pid(&f, &ALWAYS_ON).is_some(), "resurrect starts it again:\n{out}");
+    let out = f.ok(&["kill", "--yes"]);
+    assert!(out.contains("wardend: stopped"), "{out}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(wardend_pid(&f, &ALWAYS_ON).is_none(), "kill stops it for good");
+}
+
+/// With `WARDEN_NO_DAEMON=1` nothing starts it, and nothing brings it back.
+#[test]
+fn no_daemon_keeps_wardend_off() {
+    let f = Fleet::new("wd-none");
+    sleeper_config(&f, "api");
+    let env = [("WARDEN_NO_DAEMON", "1"), ("WARDEN_REVIVE_EVERY_MS", "200")];
+    let (code, out) = f.cli_env(&["start", "api"], &env);
+    assert_eq!(code, 0, "{out}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(wardend_pid(&f, &env).is_none(), "off means off");
+}
+
+/// Four saved apps that each take 1.5 s to count as up (`min_uptime`), killed, ready to resurrect.
+fn four_slow_apps(name: &str) -> (Fleet, [&'static str; 4]) {
+    let f = Fleet::new(name);
+    let names = ["a", "b", "c", "d"];
+    for n in names {
+        let cfg = format!(
+            "[app]\nname = \"{n}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\n[workers]\nmin_uptime = 1500\n"
+        );
+        std::fs::write(f.home.join(format!("{n}.toml")), cfg).unwrap();
+    }
+    f.ok(&["start", "all"]);
+    f.ok(&["save"]);
+    f.ok(&["kill", "--yes"]);
+    f.wait("all offline", |f| f.list().iter().all(|a| a["status"].is_null()));
+    (f, names)
+}
+
+/// `warden resurrect` starts the saved apps at the same time: apps that each take a while to
+/// count as up come up together, not one after the other.
+#[test]
+fn resurrect_starts_the_saved_apps_in_parallel() {
+    let (f, names) = four_slow_apps("resurrect-parallel");
+    let t0 = Instant::now();
+    // (`-j 4`: the default is one per core, and a CI runner may have one.)
+    let out = f.ok(&["resurrect", "-j", "4"]);
+    let took = t0.elapsed();
+    for n in names {
+        assert!(out.contains(&format!("{n}: online")), "{n}:\n{out}");
+    }
+    // One after another it takes 4 x 1.5 s of waiting; together, about 1.5 s plus the starts.
+    assert!(took < Duration::from_millis(4500), "the apps start one after another: {took:?}\n{out}");
+}
+
+/// A host with many apps is not asked to start them all at once: `--parallel N` (or
+/// `$WARDEN_PARALLEL`) starts N at a time, the next as one is up.
+#[test]
+fn resurrect_starts_no_more_apps_at_once_than_parallel_allows() {
+    let (f, names) = four_slow_apps("resurrect-limit");
+    // Two at a time: two rounds of about 1.5 s.
+    let t0 = Instant::now();
+    let out = f.ok(&["resurrect", "--parallel", "2"]);
+    let took = t0.elapsed();
+    for n in names {
+        assert!(out.contains(&format!("{n}: online")), "{n}:\n{out}");
+    }
+    assert!(took >= Duration::from_millis(2900), "two rounds, not one: {took:?}\n{out}");
+    assert!(took < Duration::from_millis(5800), "and not four: {took:?}\n{out}");
+
+    // The same from the environment (what a launchd or systemd job can set).
+    f.ok(&["kill", "--yes"]);
+    f.wait("all offline", |f| f.list().iter().all(|a| a["status"].is_null()));
+    let t0 = Instant::now();
+    let (code, out) = f.cli_env(&["resurrect"], &[("WARDEN_PARALLEL", "2")]);
+    assert_eq!(code, 0, "{out}");
+    assert!(t0.elapsed() >= Duration::from_millis(2900), "WARDEN_PARALLEL=2: {:?}\n{out}", t0.elapsed());
+
+    // And `--parallel` is refused where nothing starts.
+    let (code, out) = f.cli(&["stop", "a", "-j", "2"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("--parallel only applies"), "{out}");
+}
+
+/// `warden update`: save, kill, resurrect. Every supervisor and wardend are new processes, the apps
+/// that ran are running, and the one that was stopped stays stopped.
+#[test]
+fn update_restarts_every_supervisor_and_wardend() {
+    let f = Fleet::new("wd-update");
+    sleeper_config(&f, "one");
+    sleeper_config(&f, "two");
+    sleeper_config(&f, "idle");
+    let (code, out) = f.cli_env(&["start", "all"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    f.ok(&["stop", "idle"]);
+    let before = (supervisor_pid(&f, "one"), supervisor_pid(&f, "two"), supervisor_pid(&f, "idle"));
+    let wardend = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs");
+
+    let (code, out) = f.cli_env(&["update", "--yes"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    for step in
+        ["update: saving what runs", "update: stopping every supervisor and wardend", "update: starting them again"]
+    {
+        assert!(out.contains(step), "{step}:\n{out}");
+    }
+    f.wait("the apps are back", |f| f.app("one")["status"]["pid"].is_u64() && f.app("two")["status"]["pid"].is_u64());
+    assert_ne!(supervisor_pid(&f, "one"), before.0, "one has a new supervisor");
+    assert_ne!(supervisor_pid(&f, "two"), before.1, "two has a new supervisor");
+    let idle = f.app("idle");
+    assert_eq!(idle["status"]["stopped"], true, "an app that was stopped stays stopped: {idle}");
+    assert_ne!(idle["status"]["pid"].as_u64(), Some(before.2), "though its supervisor is new too");
+    let after = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs again");
+    assert_ne!(after, wardend, "a new wardend");
 }
 
 #[test]
@@ -3155,51 +3325,55 @@ min_interval = "15s"
 }
 
 #[test]
-fn wardend_alert_rules_are_checked_and_reloaded() {
+fn wardend_alert_rules_are_checked_and_read_again_when_the_file_changes() {
     let f = Fleet::new("wd-alert-rules");
     let file = f.home.join("wardend.toml");
-    // No file: nothing to check, no alerts.
-    let out = f.ok(&["daemon", "check"]);
-    assert!(out.contains("wardend sends no alerts"), "{out}");
+    let file_arg = file.to_str().unwrap();
+    // `warden check -c wardend.toml` is the check; no file: nothing to check.
+    let (code, out) = f.cli(&["check", "-c", file_arg]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("does not exist"), "{out}");
     // Every problem, with where it is and how to fix it.
     std::fs::write(&file, "[[alert]]\non = [\"crashes\"]\nwebhook = \"ftp://x/s3cr3t\"\n\n[[alert]]\non = [\"all\"]\n")
         .unwrap();
-    let (code, out) = f.cli(&["daemon", "check"]);
+    let (code, out) = f.cli(&["check", "-c", file_arg]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("has 3 problems"), "{out}");
     assert!(out.contains("alert #1 (line 1): unknown event \"crashes\""), "{out}");
     assert!(out.contains("alert #1 (line 1): webhook ftp://x/… must start with https://"), "{out}");
     assert!(out.contains("alert #2 (line 5): needs `command"), "{out}");
     assert!(!out.contains("s3cr3t"), "{out}");
+    // `warden doctor` says so too, for the file wardend reads.
+    let (_, out) = f.cli(&["doctor"]);
+    assert!(out.contains("alerts") && out.contains("3 problem(s)"), "{out}");
     let good = "[[alert]]\nname = \"ops\"\non = [\"gave_up\", \"died\"]\ncommand = [\"/bin/sh\"]\n";
     std::fs::write(&file, good).unwrap();
-    let out = f.ok(&["daemon", "check"]);
+    let out = f.ok(&["check", "-c", file_arg]);
     assert!(out.contains("ok, 1 alert rule"), "{out}");
     assert!(out.contains("ops: gave_up, died of every app → command /bin/sh (min_interval 5m)"), "{out}");
-    let other = f.home.join("other.toml.txt");
+    let elsewhere = f.home.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let other = elsewhere.join("wardend.toml");
     std::fs::write(&other, "[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\napps = [\"ghost\"]\n").unwrap();
-    let out = f.ok(&["daemon", "check", "-c", other.to_str().unwrap()]);
+    let out = f.ok(&["check", "-c", other.to_str().unwrap()]);
     assert!(out.contains("no app \"ghost\" on this host"), "{out}");
-    let (code, out) = f.cli(&["daemon", "reload"]);
-    assert_eq!(code, 1, "{out}");
-    assert!(out.contains("wardend is not running"), "{out}");
 
     let mut d = Wardend::start(&f, &[]);
     wait_log(&d, "alert rules read rules=1");
-    // A bad file: the running rules stay, and the reload says why.
+    // A bad file is noticed by itself: the running rules stay, and the log says why.
     std::fs::write(&file, "[[alert]]\non = [\"all\"]\ncommand = \"/bin/sh\"\n").unwrap();
-    let (code, out) = f.cli(&["daemon", "reload"]);
-    assert_eq!(code, 1, "{out}");
-    assert!(out.contains("keeps the 1 rule in force") && out.contains("line 3"), "{out}");
     wait_log(&d, "wardend.toml has errors; keeping the alert rules in force");
-    // Fixed, and read again on SIGHUP (which no longer stops wardend).
+    assert!(d.log().contains("on=\"the file changed\""), "{}", d.log());
+    // Fixed: read again by itself, no command and no signal.
     std::fs::write(&file, format!("{good}\n[[alert]]\non = [\"all\"]\ncommand = [\"/bin/sh\"]\n")).unwrap();
-    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
     wait_log(&d, "alert rules read rules=2 file=");
-    assert!(d.log().contains("on=SIGHUP"), "{}", d.log());
+    // SIGHUP (and the `reload` request) still read it at once, and no longer stop wardend.
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    std::thread::sleep(Duration::from_millis(300));
     assert!(d.child.try_wait().unwrap().is_none(), "still running after SIGHUP");
-    let out = f.ok(&["daemon", "reload"]);
-    assert!(out.contains("2 alert rules loaded from"), "{out}");
+    let r = d.request(r#"{"cmd":"reload"}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r["message"].as_str().unwrap().contains("2 alert rules loaded from"), "{r}");
 
     // The history answers at once, with the host's series on one grid.
     let h = d.request(r#"{"cmd":"history","app":"","step_s":60}"#);
@@ -4406,7 +4580,7 @@ fn startup_installs_system_units_and_wardend() {
     let runtime = format!("Environment=\"WARDEN_RUNTIME_DIR={}\"", f.home.join("run").display());
     assert!(unit.contains(&runtime), "{unit}");
     let wardend = fakes.read("units/wardend.service");
-    assert!(wardend.contains(&format!("ExecStart=\"{BIN}\" daemon\n")), "no --resurrect under systemd:\n{wardend}");
+    assert!(wardend.contains(&format!("ExecStart=\"{BIN}\" wardend\n")), "no --resurrect under systemd:\n{wardend}");
     assert!(wardend.contains("KillMode=process") && wardend.contains("Restart=always"), "{wardend}");
     assert!(f.home.join("sysctl/99-warden.conf").exists());
     assert!(out.contains("wardend.service: enabled and started"), "{out}");
@@ -4592,7 +4766,7 @@ fn startup_writes_a_launchd_job() {
         let p = fakes.read(plist);
         let flat: String = p.split_whitespace().collect();
         assert!(
-            flat.contains(&format!("<string>{BIN}</string><string>daemon</string><string>--resurrect</string>")),
+            flat.contains(&format!("<string>{BIN}</string><string>wardend</string><string>--resurrect</string>")),
             "{p}"
         );
         assert!(flat.contains("<key>RunAtLoad</key><true/>") && flat.contains("<key>KeepAlive</key>"), "{p}");
@@ -4623,6 +4797,52 @@ fn startup_writes_a_launchd_job() {
     assert!(!f.home.join(plist).exists(), "{out}");
 }
 
+/// `warden kill` stops wardend, and a wardend set up with `warden startup` stays stopped until
+/// the next login or boot (launchd restarts it only after a crash). `warden resurrect` and
+/// `warden start` must still bring it back, through launchd, not leave the window and the
+/// restarts of dead supervisors without it.
+#[test]
+fn resurrect_starts_wardend_through_launchd_after_kill() {
+    let f = Fleet::new("st-kickstart");
+    sleeper_config(&f, "api");
+    let fakes = Fakes::new(&f, &[]);
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/io.github.oceanwap.warden.daemon");
+    std::fs::write(f.home.join("launchd/io.github.oceanwap.warden.daemon.plist"), "<plist/>").unwrap();
+    // launchd's `kickstart` runs the job: here, wardend itself.
+    let fake = format!(
+        "#!/bin/sh\necho \"launchctl $*\" >> '{}'\ncase \"$1\" in kickstart) '{BIN}' wardend --background >/dev/null 2>&1;; esac\nexit 0\n",
+        f.home.join("calls.log").display()
+    );
+    let path = f.home.join("fakebin/launchctl");
+    std::fs::write(&path, fake).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut env = fakes.launchd_env();
+    env.push(("WARDEN_NO_DAEMON".into(), "0".into()));
+
+    let (code, out) = run_with(&f, &["start", "api"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("wardend started (launchd started {target}")), "{out}");
+    assert!(!out.contains("is set up as a service"), "{out}");
+    assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 0, "wardend answers");
+
+    let (code, out) = run_with(&f, &["save"], &env);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = run_with(&f, &["kill", "--yes"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("wardend: stopped"), "{out}");
+    assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 1, "kill stopped wardend");
+    let _ = fakes.take();
+
+    let (code, out) = run_with(&f, &["resurrect"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&format!("wardend started (launchd started {target}")), "{out}");
+    assert!(fakes.take().lines().any(|l| l == format!("launchctl kickstart {target}")));
+    assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 0, "wardend is back after resurrect");
+
+    let _ = run_with(&f, &["kill", "--yes"], &env);
+}
+
 #[test]
 fn startup_without_a_service_manager_says_what_to_run() {
     if std::path::Path::new("/run/systemd/system").exists() || cfg!(target_os = "macos") {
@@ -4632,7 +4852,7 @@ fn startup_without_a_service_manager_says_what_to_run() {
     let f = Fleet::new("st-none");
     let (code, out) = f.cli(&["startup"]);
     assert_eq!(code, 2, "{out}");
-    assert!(out.contains("warden resurrect") && out.contains("warden daemon --resurrect"), "{out}");
+    assert!(out.contains("warden resurrect") && out.contains("warden wardend --resurrect"), "{out}");
 }
 
 #[test]
@@ -4648,7 +4868,7 @@ fn wardend_resurrect_starts_the_saved_apps() {
     f.ok(&["start", "two"]);
     let two = supervisor_pid(&f, "two");
 
-    let d = Wardend::start_args(&f, &["daemon", "--resurrect"], &[]);
+    let d = Wardend::start_args(&f, &["wardend", "--resurrect"], &[]);
     let a = d.wait_app("one resurrected", "one", |a| a["state"] == "running");
     assert_eq!(a["supervised_by"], "wardend", "{a:#}");
     f.wait("one online", |f| f.app("one")["status"]["workers_ready"] == 1);
@@ -4662,7 +4882,7 @@ fn wardend_resurrect_starts_the_saved_apps() {
     drop(d);
     f.ok(&["kill", "one", "--yes"]);
     f.wait("one offline", |f| f.app("one")["status"].is_null());
-    let d = Wardend::start_args(&f, &["daemon", "--resurrect"], &[]);
+    let d = Wardend::start_args(&f, &["wardend", "--resurrect"], &[]);
     f.wait("second resurrect skipped", |_| d.log().contains("already resurrected this boot"));
     std::thread::sleep(Duration::from_millis(500));
     assert!(f.app("one")["status"].is_null(), "stopped app came back:\n{}", d.log());

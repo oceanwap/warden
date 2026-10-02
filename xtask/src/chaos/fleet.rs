@@ -198,9 +198,9 @@ impl Fleet {
         self.list().ok()?.into_iter().find(|a| a["app"] == name).map(|a| a["status"].clone()).filter(|s| !s.is_null())
     }
 
-    /// `warden daemon status --json`, or None when wardend does not answer.
+    /// `warden wardend status --json`, or None when wardend does not answer.
     pub fn wardend(&self) -> Option<Value> {
-        let r = self.cli(&["daemon", "status", "--json"], Duration::from_secs(10));
+        let r = self.cli(&["wardend", "status", "--json"], Duration::from_secs(10));
         if !r.ok() {
             return None;
         }

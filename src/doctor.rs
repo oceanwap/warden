@@ -40,6 +40,8 @@ pub async fn run(args: &Args) -> i32 {
     out.push(runtime_dir());
     out.extend(pid_one());
     out.extend(apps(args).await);
+    out.push(wardend().await);
+    out.extend(alert_rules());
     out.extend(boot());
     out.extend(pm2());
     if args.json {
@@ -405,6 +407,63 @@ async fn apps(args: &Args) -> Vec<Finding> {
     v
 }
 
+/// wardend is always on: running, or the reason it is not.
+async fn wardend() -> Finding {
+    use crate::daemon::revive::{Probe, probe};
+    if crate::daemon::client::disabled() {
+        return f(Level::Info, "wardend", "off: WARDEN_NO_DAEMON=1", None);
+    }
+    let socket = crate::daemon::socket_path();
+    if let Some(pid) = crate::daemon::client::hello_pid(&socket).await {
+        return f(
+            Level::Ok,
+            "wardend",
+            format!("running (pid {pid}): it restarts supervisors that die, and they restart it if it dies"),
+            None,
+        );
+    }
+    let any_app = fleet::discover().iter().any(|a| a.socket.exists());
+    match probe(&socket).await {
+        Probe::Died => f(
+            Level::Warn,
+            "wardend",
+            "it died without a clean exit; a supervisor starts it again within seconds",
+            Some("if it stays down: the end of the wardend log in the state directory (logs/wardend.log) says why"),
+        ),
+        _ if any_app => f(
+            Level::Warn,
+            "wardend",
+            "not running (stopped with `warden kill`, or never started): the GUI and `warden events` get nothing from it, and nothing restarts a supervisor that dies",
+            Some("warden resurrect (or `warden start <app>`): either starts it"),
+        ),
+        _ => f(Level::Info, "wardend", "not running; `warden start` and `warden resurrect` start it", None),
+    }
+}
+
+/// `<config dir>/wardend.toml`, when there is one: does it check out?
+fn alert_rules() -> Option<Finding> {
+    use crate::daemon::alerts;
+    let path = alerts::path();
+    Some(match alerts::load(&path) {
+        Ok(None) => return None,
+        Ok(Some(cfg)) => {
+            let n = cfg.rules.len();
+            f(Level::Ok, "alerts", format!("{}: {n} alert rule{}", path.display(), if n == 1 { "" } else { "s" }), None)
+        }
+        Err(problems) => f(
+            Level::Warn,
+            "alerts",
+            format!(
+                "{} has {} problem(s), so wardend keeps the rules it had: {}",
+                path.display(),
+                problems.len(),
+                problems.join("; ")
+            ),
+            Some("fix the file (wardend reads it again by itself); `warden check -c wardend.toml` lists them"),
+        ),
+    })
+}
+
 fn boot() -> Option<Finding> {
     // Saved apps come back after a reboot through what `warden startup` installs.
     let saved = fleet::saved_names();
@@ -424,7 +483,7 @@ fn boot() -> Option<Finding> {
             Level::Info,
             "boot",
             format!("{n} saved app(s); no service manager here (no systemd)"),
-            Some("run `warden resurrect` or `warden daemon --resurrect` from your init system or entrypoint"),
+            Some("run `warden resurrect` or `warden wardend --resurrect` from your init system or entrypoint"),
         ),
     })
 }

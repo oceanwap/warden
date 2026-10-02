@@ -201,6 +201,45 @@ pub struct Status {
     /// an older Warden and when the OS cannot say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// The warden executable this supervisor was started from. A supervisor
+    /// outlives rebuilds and upgrades, so it keeps running the code it
+    /// started with: `replaced` says the file is not the one it started
+    /// from, and `warden list` says "restart me". Absent from a Warden that
+    /// did not send it yet (that one is older than any that does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<Build>,
+    /// The directory the workers run in: the pinned release, else `working_directory`, else
+    /// the directory the supervisor itself was started in (what `warden start` ran from).
+    /// Absent from a supervisor that does not send it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// An executable as the supervisor saw it at start: where it was and what
+/// it looked like (`size:modified-seconds`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Build {
+    pub path: String,
+    pub stamp: String,
+    /// Looked at again now: the file at `path` is another one (rebuilt,
+    /// upgraded) than the supervisor started from.
+    #[serde(default)]
+    pub replaced: bool,
+}
+
+impl Status {
+    /// Why this supervisor runs older code than the warden that asks (`mine`:
+    /// the asker's version), if it does: it keeps what it started with
+    /// until it is restarted, so a number added since (cpu and memory on
+    /// macOS, ports) shows `-` and a fix is not in it.
+    pub fn outdated(&self, mine: &str) -> Option<&'static str> {
+        match &self.build {
+            None => Some("was started by an older warden"),
+            Some(b) if b.replaced => Some("was started before warden was rebuilt or upgraded"),
+            _ if !self.version.is_empty() && self.version != mine => Some("runs a different warden version"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

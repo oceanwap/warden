@@ -278,9 +278,9 @@ fn kill_wardend(cx: &mut Ctx, f: &mut Fault) {
     f.detail = format!("kill -9 of wardend pid {pid}; started again after {down:.1}s (as systemd would)");
     kill9(cx, pid);
     sleep_s(down);
-    let r = cx.fleet.cli(&["daemon", "--background"], Duration::from_secs(30));
+    let r = cx.fleet.cli(&["wardend", "--background"], Duration::from_secs(30));
     if !r.ok() {
-        f.problems.push(format!("warden daemon --background: {}", r.brief()));
+        f.problems.push(format!("warden wardend --background: {}", r.brief()));
     }
     // From wardend's start: until then nothing was meant to restart it.
     recover(cx, f, Instant::now());

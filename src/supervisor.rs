@@ -245,6 +245,10 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         });
     }
 
+    // wardend restarts supervisors that die; this brings wardend back if it dies. Best effort:
+    // nothing here waits for it, and an app never depends on it.
+    tokio::task::spawn_local(crate::daemon::revive::watch());
+
     let mut sup = Supervisor::new(cfg, cfg_path, runtime_dir, (shim_path, host_path), tx, proc_tx);
 
     // `warden save` recorded a worker count / stopped state for this app:
@@ -746,6 +750,21 @@ impl Supervisor {
         // Set by `process::spawn` for every child.
         add("WARDEN_IPC_FD", process::IPC_FD.to_string());
         env
+    }
+
+    /// `Status.cwd`: where the workers run. For a static site that is the folder it serves
+    /// (`[static] root`, resolved against the working directory when relative), since a site
+    /// made by `warden serve` has no `working_directory` of its own.
+    fn shown_cwd(&self) -> Option<String> {
+        let base = self.worker_dir().or_else(|| std::env::current_dir().ok());
+        let dir = match &self.cfg.static_files {
+            Some(site) => {
+                let root = self.pinned_path(site.root.clone());
+                if root.is_absolute() { Some(root) } else { base.map(|b| b.join(root)) }
+            }
+            None => base,
+        };
+        dir.map(|d| d.display().to_string())
     }
 
     fn entry_path(&self) -> PathBuf {
@@ -2254,6 +2273,8 @@ impl Supervisor {
             draining,
             start_failed: self.start_failed(),
             user: Some(user),
+            build: crate::stamp::build(),
+            cwd: self.shown_cwd(),
         }
     }
 }

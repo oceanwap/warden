@@ -8,7 +8,7 @@ line, or a stream of event lines for `subscribe` and `logs --follow`.
 | Socket | Who listens | Path |
 |---|---|---|
 | App control socket | each app's supervisor | `<runtime dir>/<app>/control.sock` |
-| Daemon socket | `wardend` (`warden daemon`), optional | `<runtime dir>/wardend.sock` |
+| Daemon socket | `wardend` (always on; `warden wardend` is its internal entry point) | `<runtime dir>/wardend.sock` |
 
 The runtime directory is `$WARDEN_RUNTIME_DIR`, else `/run/warden` for root
 (`/var/run/warden` on macOS), else `$XDG_RUNTIME_DIR/warden`, else
@@ -374,8 +374,9 @@ watched, `wardend` was not running). CPU is rounded to 0.1, load to 0.01.
 `wardend` sends alerts by the rules in `<config dir>/wardend.toml`
 (`/etc/warden/wardend.toml` for root, `~/.config/warden/wardend.toml` for a
 user, `$WARDEN_HOME/wardend.toml`). The file is optional; without it no
-alert is sent. It is read at start, on SIGHUP and on the `reload` request
-(`warden daemon reload`), and checked with `warden daemon check [-c FILE]`.
+alert is sent. It is read at start, whenever the file changes (wardend looks every couple
+of seconds), on SIGHUP and on the `reload` request, and checked with
+`warden check -c wardend.toml` (also in `warden doctor`).
 A file with errors is reported (every problem, with its line) and the rules
 in force stay. App discovery ignores this file (it is not an app).
 
@@ -498,11 +499,14 @@ else would:
 - **`wardend` itself** runs under systemd (`contrib/wardend.service`,
   `Restart=always`, `KillMode=process`; `warden startup` installs it, and
   `warden kill` then stops the unit, not just the process), under launchd
-  (`warden daemon --resurrect`, restarted unless it exited cleanly) or
-  detached (`warden daemon --background`; `warden start` does this when it
-  launches a supervisor in the background, unless `WARDEN_NO_DAEMON=1` or a
-  service manager runs `wardend`, and `warden kill` stops it after the
-  apps). `--resurrect` first starts every app `warden save` recorded that
+  (`warden wardend --resurrect`, restarted unless it exited cleanly) or
+  detached (`warden start` and `warden resurrect` do this, unless
+  `WARDEN_NO_DAEMON=1` or a service manager runs `wardend`, and `warden kill`
+  stops it after the apps). It is always on: each supervisor looks every few
+  seconds at the socket, and one that refuses connections (a clean exit
+  removes it, a crash or `kill -9` leaves it) starts wardend again. Only a
+  clean stop, which is what `warden kill` does, keeps it down; the lock
+  `<runtime dir>/wardend.lock` makes sure two never run. `--resurrect` first starts every app `warden save` recorded that
   is not running; it is never used under systemd, where each app has its
   own unit. When it starts it finds every running supervisor
   (`found`); nothing is lost across its restarts because it holds no state
@@ -526,4 +530,4 @@ else would:
   opens, and its header for the host's last hour; then it adds the live
   `status` and `host` events to those series, the way `wardend` counts them
   (`events::Usage`, `events::restarts_since`).
-- `warden daemon check` and `warden daemon reload`: the [alert rules](#alerts).
+- `warden check -c wardend.toml`: the [alert rules](#alerts).

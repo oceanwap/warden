@@ -1,5 +1,6 @@
-//! The CLI side of wardend: `warden daemon [--background | status | stop]`,
-//! starting it along with `warden start`, and `warden events`.
+//! The CLI side of wardend: starting it (`warden start`, `resurrect`, the supervisors when it
+//! dies), stopping it (`warden kill`), the internal `warden wardend [--background | status]`, and
+//! `warden events`.
 
 use super::watcher::{self, WatchMsg};
 use super::{Frame, log_path, socket_path};
@@ -43,11 +44,11 @@ pub(crate) async fn hello_pid(path: &Path) -> Option<u32> {
     }
 }
 
-/// `warden daemon --background [--resurrect]`.
+/// `warden wardend --background [--resurrect]`.
 pub async fn start_background(resurrect: bool) -> i32 {
     let path = socket_path();
     if let Some(pid) = hello_pid(&path).await {
-        println!("wardend is already running (pid {pid}); `warden daemon status` shows it");
+        println!("wardend is already running (pid {pid})");
         return 0;
     }
     let mut child = match fleet::spawn_daemon(resurrect) {
@@ -77,33 +78,85 @@ pub async fn start_background(resurrect: bool) -> i32 {
     1
 }
 
-/// Called by `warden start` after it launched a supervisor in the
-/// background: start wardend too (like PM2's daemon), unless it runs
-/// already or `WARDEN_NO_DAEMON=1`.
+/// `WARDEN_NO_DAEMON=1`: never start wardend (tests, containers that run none).
+pub(crate) fn disabled() -> bool {
+    std::env::var("WARDEN_NO_DAEMON").is_ok_and(|v| v == "1")
+}
+
+/// Called by `warden start` and `warden resurrect`: wardend is always on, like PM2's
+/// daemon, so start it unless it runs already or `WARDEN_NO_DAEMON=1`.
 pub(crate) async fn autostart() {
-    if std::env::var("WARDEN_NO_DAEMON").is_ok_and(|v| v == "1") {
+    // Apps start together (`resurrect`, `start a b c`), and each asks: one at a time, so the
+    // first starts wardend and the others find it answering.
+    static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _turn = ONE_AT_A_TIME.lock().await;
+    if disabled() {
         return;
     }
     if hello_pid(&socket_path()).await.is_some() {
         return;
     }
-    // systemd or launchd runs it (`warden startup`): a second one would
-    // only fight it for the socket.
+    // systemd or launchd runs it (`warden startup`): a second one started by hand would
+    // only fight it for the socket, so the manager starts it. (After `warden kill` it
+    // is stopped and stays so until the next login or boot: `resurrect` must not
+    // leave the apps without it.)
     if crate::startup::wardend_managed() {
-        eprintln!(
-            "warden: wardend is set up as a service (`warden startup`) but is not running, so nothing restarts \
-             this supervisor if it dies; `warden startup` starts it again"
-        );
+        let started = tokio::task::spawn_blocking(crate::startup::start_wardend_managed)
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        match started {
+            Ok(what) => {
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(10) {
+                    if let Some(pid) = hello_pid(&socket_path()).await {
+                        println!("wardend started ({what}, pid {pid}): it restarts supervisors that die");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                eprintln!(
+                    "warden: {what}, but wardend does not answer yet (log {}); `warden doctor` says what it sees",
+                    log_path().display()
+                );
+            }
+            Err(e) => eprintln!(
+                "warden: wardend is set up as a service (`warden startup`) but is not running, so nothing restarts \
+                 this supervisor if it dies; starting it failed ({e}). `warden startup` sets it up again"
+            ),
+        }
         return;
     }
-    match fleet::spawn_daemon(false) {
-        Ok(c) => println!(
-            "wardend started in the background (pid {}): it restarts supervisors that die; `warden daemon stop` \
-             stops it (apps keep running), WARDEN_NO_DAEMON=1 skips it",
-            c.id()
-        ),
-        Err(e) => eprintln!("warden: could not start wardend ({e}); the app runs without it"),
+    let mut child = match fleet::spawn_daemon(false) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warden: could not start wardend ({e}); the app runs without it");
+            return;
+        }
+    };
+    // Wait until it answers: whatever comes next (the apps, `warden events`, a second command)
+    // finds it there, and a wardend that cannot start says so here, not later.
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        if let Ok(Some(st)) = child.try_wait() {
+            // Another one may have won the race for the socket: then it answers.
+            if hello_pid(&socket_path()).await.is_none() {
+                eprintln!(
+                    "warden: wardend exited ({st}) while starting (log {}); the app runs without it",
+                    log_path().display()
+                );
+            }
+            return;
+        }
+        if hello_pid(&socket_path()).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    println!(
+        "wardend started in the background (pid {}): it restarts supervisors that die, and they bring it \
+         back if it dies; `warden kill` stops it, WARDEN_NO_DAEMON=1 skips it",
+        child.id()
+    );
 }
 
 /// Stop wardend; `Ok(None)` when it was not running, else what was done.
@@ -155,34 +208,13 @@ pub(crate) async fn stop_daemon_process() -> Result<Option<u32>, String> {
     Err(format!("wardend (pid {pid}) is still answering 5 s after `shutdown`"))
 }
 
-/// `warden daemon stop`.
-pub async fn stop() -> i32 {
-    match stop_daemon().await {
-        Ok(Some(what)) => {
-            println!("wardend {what}; every app keeps running");
-            0
-        }
-        Ok(None) => {
-            println!("wardend was not running");
-            0
-        }
-        Err(e) => {
-            eprintln!("warden: {e}");
-            1
-        }
-    }
-}
-
-/// `warden daemon status`: exit 1 when wardend is not running.
+/// `warden wardend status [--json]`: exit 1 when wardend is not running.
 pub async fn status(json: bool) -> i32 {
     let path = socket_path();
     let hello = match request(&path, &DaemonRequest::Hello, Duration::from_secs(2)).await {
         Ok(r) => r.hello,
         Err(_) => {
-            eprintln!(
-                "wardend is not running (no answer on {}); `warden daemon --background` starts it",
-                path.display()
-            );
+            eprintln!("wardend is not running (no answer on {}); `warden resurrect` starts it", path.display());
             return 1;
         }
     };
@@ -236,7 +268,7 @@ pub async fn status(json: bool) -> i32 {
 
 // ------------------------------------------------------------------ alerts
 
-/// `warden daemon check [-c FILE]`: validate the alert rules
+/// `warden check -c wardend.toml`, and `warden doctor`: validate the alert rules
 /// (`<config dir>/wardend.toml`, or FILE). Exit 1 on any problem.
 pub fn check(file: Option<std::path::PathBuf>) -> i32 {
     use super::alerts;
@@ -263,7 +295,9 @@ pub fn check(file: Option<std::path::PathBuf>) -> i32 {
             for p in &problems {
                 eprintln!("  - {p}");
             }
-            eprintln!("A running wardend keeps the rules it has until the file is fixed (`warden daemon reload`).");
+            eprintln!(
+                "A running wardend keeps the rules it has until the file is fixed, then reads it again by itself."
+            );
             return 1;
         }
     };
@@ -298,25 +332,6 @@ pub fn check(file: Option<std::path::PathBuf>) -> i32 {
         println!("warning: {note}");
     }
     0
-}
-
-/// `warden daemon reload`: the running wardend reads wardend.toml again.
-pub async fn reload() -> i32 {
-    let path = socket_path();
-    match request(&path, &DaemonRequest::Reload, Duration::from_secs(5)).await {
-        Ok(r) if r.ok => {
-            println!("wardend: {}", r.message.unwrap_or_else(|| "rules read again".into()));
-            0
-        }
-        Ok(r) => {
-            eprintln!("warden: {}", r.message.unwrap_or_else(|| "wardend refused".into()));
-            1
-        }
-        Err(e) => {
-            eprintln!("warden: {e}; nothing to reload (`warden daemon check` validates the file without it)");
-            1
-        }
-    }
 }
 
 // ------------------------------------------------------------------ events

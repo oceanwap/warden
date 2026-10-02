@@ -193,7 +193,8 @@ impl Remote {
 
     fn start_wardend(&mut self) {
         let log = std::fs::File::create(self.dir.join("wardend.out")).unwrap();
-        let child = self.cmd().arg("daemon").stdout(Stdio::from(log.try_clone().unwrap())).stderr(log).spawn().unwrap();
+        let child =
+            self.cmd().arg("wardend").stdout(Stdio::from(log.try_clone().unwrap())).stderr(log).spawn().unwrap();
         self.wardend = Some(child);
         let t0 = Instant::now();
         while !Path::new(&self.socket()).exists() {
@@ -204,7 +205,7 @@ impl Remote {
 
     /// Stop whichever wardend runs there (ours, or one started over SSH).
     fn stop_wardend(&mut self) {
-        let _ = self.cmd().args(["daemon", "stop"]).output();
+        let _ = self.cmd().args(["kill", "--yes"]).output();
         if let Some(mut c) = self.wardend.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -424,7 +425,7 @@ async fn scenario(remote: &mut Remote) {
     let (error, not_running, _) = first_error(&mut feed).await;
     assert!(not_running, "{error}");
     assert!(error.contains("wardend is not running there") && error.contains(&rsock), "{error}");
-    assert!(error.contains("warden daemon --background") && error.contains("(ssh: channel "), "{error}");
+    assert!(error.contains("warden resurrect") && error.contains("(ssh: channel "), "{error}");
     let out = commands::start_wardend(&host).await.unwrap();
     assert!(out.ok && out.stdout.contains("wardend started in the background"), "{}", out.text());
     // The feed retries by itself (an attempt under way may fail once more).

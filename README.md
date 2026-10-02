@@ -325,7 +325,7 @@ has everything; the differences are in the right column.
 | `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | The same boxed table with an `id` column, ~2 ms instead of ~140-160 ms. One row per worker; colors on a terminal (`NO_COLOR` turns them off) |
 | `pm2 restart 0`, `pm2 stop 1 2` | `warden restart 0`, `warden stop 1,2` | Every command that takes an app takes its id from `warden list`, a name, a namespace or `all`, one or several: `warden start 0,1,2`, `warden stop 0-3`, `warden restart api web:2` (`:2`: one worker). Ids are numbered the first time Warden sees an app (alphabetically for the first batch, then in creation order), kept in `ids.json` in the state directory, and never change; only `warden delete` frees one. Use names in scripts |
 | | `warden ports` | The ports and Unix sockets each app listens on, read from the OS (wrapper processes like `npm run start` included): which interfaces they are on (`all interfaces`, `localhost only`) and, for a TCP port, an `http url` to try (a `curl --unix-socket` hint for a Unix socket). `warden list` has a `ports` column, `describe` and `status` a `ports` row, `--json` the same data. PM2 cannot tell you this: it knows only what the app printed |
-| `pm2 describe api` | `warden describe api` | A key \| value box and the workers' box, like PM2's; also the last exits and the last rollout. `status <app>`, `daemon status` and `doctor` are boxes too. Like PM2, `start`, `stop`, `restart`, `reload`, `delete`, `scale`, `reset`, `resurrect` and `serve` print the app table when they finish, on a terminal (set `WARDEN_TABLE=1` to get it in a log; a script's output is unchanged) |
+| `pm2 describe api` | `warden describe api` | A key \| value box and the workers' box, like PM2's; also the last exits and the last rollout. `status <app>` and `doctor` are boxes too. Like PM2, `start`, `stop`, `restart`, `reload`, `delete`, `scale`, `reset`, `resurrect` and `serve` print the app table when they finish, on a terminal (set `WARDEN_TABLE=1` to get it in a log; a script's output is unchanged) |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
 | `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files (every worker's with `per_worker_files`), pipe-friendly |
@@ -333,7 +333,7 @@ has everything; the differences are in the right column.
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server as fast as nginx, faster on small files (see Benchmarks) |
 | `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](#surviving-reboots-and-crashes) |
 | `pm2 monit` | `warden top`, `warden events` | `events`: every worker, rollout and supervisor event as it happens (`--json` for scripts, `--logs` for output) |
-| PM2's daemon | `warden daemon` (wardend) | Optional: live events for every app on one socket, and restarts dead supervisors. Apps never depend on it; killing it stops nothing. `warden start` starts it (`WARDEN_NO_DAEMON=1` doesn't) |
+| PM2's daemon | wardend (no command: always on) | Live events for every app on one socket, and restarts dead supervisors; a supervisor starts it again if it dies. `warden start` and `warden resurrect` start it and `warden kill` stops it (`WARDEN_NO_DAEMON=1` never starts it). Apps never depend on it; killing it stops nothing |
 | | `warden doctor` | Environment problems (kernel settings, limits, ports, permissions), each with its fix |
 
 ### Moving from PM2
@@ -452,8 +452,8 @@ crash, with the service manager the host has:
 |---|---|---|---|
 | Linux, root (`sudo warden startup`) | `warden@.service` (enabled for every saved app), `wardend.service`, the sysctl file | systemd starts each app's unit | systemd restarts the supervisor |
 | Linux, a user (`warden startup`, or `--user` as root) | the same two units in `~/.config/systemd/user`, and `loginctl enable-linger` so they run without a login | your user manager starts at boot and starts the units | your user manager restarts the supervisor |
-| macOS | a launchd job: `~/Library/LaunchAgents/io.github.oceanwap.warden.daemon.plist` (as root `/Library/LaunchDaemons/`: at boot, no login needed) running `warden daemon --resurrect` | launchd starts wardend, which starts the saved apps | wardend restarts dead supervisors; launchd restarts wardend |
-| Containers, other init systems | nothing (it says what to run instead) | `warden resurrect` in the entrypoint, or `warden daemon --resurrect` as the entrypoint | with `warden daemon --resurrect`, wardend restarts dead supervisors |
+| macOS | a launchd job: `~/Library/LaunchAgents/io.github.oceanwap.warden.daemon.plist` (as root `/Library/LaunchDaemons/`: at boot, no login needed) running `warden wardend --resurrect` | launchd starts wardend, which starts the saved apps | wardend restarts dead supervisors; launchd restarts wardend |
+| Containers, other init systems | nothing (it says what to run instead) | `warden resurrect` in the entrypoint, or `warden wardend --resurrect` as the entrypoint | with `warden wardend --resurrect`, wardend restarts dead supervisors |
 
 - Under systemd each app is its own unit (cgroup, limits, `journalctl -u
   warden@api`), and wardend never starts apps there: it would start them
@@ -482,14 +482,14 @@ crash, with the service manager the host has:
 - CI checks all of this against real systemd (system and user units, a
   restart of the user manager) and launchd (LaunchAgent, LaunchDaemon):
   `.github/workflows/service-managers.yml`.
-- In a container, run `warden daemon --resurrect` under an init
+- In a container, run `warden wardend --resurrect` under an init
   (`docker run --init`, tini) that reaps orphaned processes.
 - `--resurrect` runs once per boot: when launchd restarts a crashed wardend,
   apps you stopped since boot stay stopped (`warden resurrect` starts them).
 
 ### wardend: one socket for every app
 
-`warden daemon` (started by `warden start`, or by the units above) watches
+wardend (started by `warden start` and `warden resurrect`, by the units above, or by a supervisor when it died) watches
 every supervisor on the host and pushes what happens to `warden events` and
 the [GUI](#gui):
 
@@ -527,9 +527,9 @@ command = ["/usr/local/bin/notify", "--channel", "ops"]   # the alert as JSON on
 ```
 
 The kinds also include `died`, `unhealthy`, `recycled` and `recovered`
-(healthy again after an alert). `warden daemon check` validates the file
-with every problem and its line; `warden daemon reload` (or SIGHUP) applies
-it, and a broken file keeps the rules in force. Deliveries never hold
+(healthy again after an alert). `warden check -c wardend.toml` validates the file
+with every problem and its line; wardend reads it again by itself when it
+changes (or on SIGHUP), and a broken file keeps the rules in force. Deliveries never hold
 wardend up: a bounded queue, 10 s per try, one retry. Webhooks go through
 `curl` (Warden has no TLS stack of its own), with the URL on curl's stdin,
 never in a process list or a log line. Details:

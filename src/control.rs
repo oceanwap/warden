@@ -666,6 +666,8 @@ mod tests {
             draining: vec![],
             start_failed: None,
             user: None,
+            build: None,
+            cwd: None,
         }
     }
 

@@ -243,7 +243,7 @@ async fn connect(path: &Path) -> Result<UnixStream, (String, bool)> {
         Ok(Err(e)) => Err(connect_error(path, &e)),
         Err(_) => Err((
             format!(
-                "wardend did not accept the connection on {} within {} s: it may be stuck (`warden daemon status`)",
+                "wardend did not accept the connection on {} within {} s: it may be stuck (`warden doctor`)",
                 path.display(),
                 CONNECT_TIMEOUT.as_secs()
             ),
@@ -258,7 +258,7 @@ async fn send_line(w: &mut tokio::net::unix::OwnedWriteHalf, req: &DaemonRequest
     match tokio::time::timeout(CONNECT_TIMEOUT, w.write_all(&line)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("sending the request to wardend failed: {e}")),
-        Err(_) => Err("wardend did not read the request within 5 s: it may be stuck (`warden daemon status`)".into()),
+        Err(_) => Err("wardend did not read the request within 5 s: it may be stuck (`warden doctor`)".into()),
     }
 }
 
@@ -284,7 +284,7 @@ async fn read_line(r: &mut BufReader<tokio::net::unix::OwnedReadHalf>, buf: &mut
 pub async fn daemon_request(socket: &Path, req: &DaemonRequest, limit: Duration) -> Result<DaemonReply, String> {
     let exchange = async {
         let s = connect(socket).await.map_err(|(e, not_running)| {
-            if not_running { format!("{e}; start it with `warden daemon --background` (or Start wardend)") } else { e }
+            if not_running { format!("{e}; start it with Start wardend (or `warden resurrect`)") } else { e }
         })?;
         let (r, mut w) = s.into_split();
         send_line(&mut w, req).await?;
@@ -298,7 +298,7 @@ pub async fn daemon_request(socket: &Path, req: &DaemonRequest, limit: Duration)
         })
     };
     tokio::time::timeout(limit, exchange).await.map_err(|_| {
-        format!("wardend did not answer within {} s; it may be stuck (`warden daemon status`)", limit.as_secs())
+        format!("wardend did not answer within {} s; it may be stuck (`warden doctor`)", limit.as_secs())
     })?
 }
 
@@ -329,7 +329,7 @@ pub async fn history(socket: &Path, app: &str, since_ms: u64, step_s: u32) -> Re
         (true, Some(h), _) => Ok(h),
         (_, _, Some(m)) if m.contains("unknown variant") => {
             Err("this wardend keeps no history: it is older than this GUI. Update warden on that host, then restart \
-             wardend (`warden daemon stop`, `warden daemon --background`)"
+             wardend (`warden update`)"
                 .into())
         }
         (_, _, Some(m)) => Err(m),
@@ -595,7 +595,7 @@ async fn session(
                 return End::Failed {
                     error: format!(
                         "wardend accepted the connection on {} but sent nothing within {} s; it may be stuck \
-                         (`warden daemon status`)",
+                         (`warden doctor`)",
                         socket.display(),
                         HELLO_TIMEOUT.as_secs()
                     ),
@@ -614,11 +614,9 @@ fn ended(connected: bool, bye: Option<&str>) -> String {
     match (connected, bye) {
         (true, Some(reason)) => format!("wardend exited ({reason}); every app keeps running"),
         (true, None) => "wardend closed the connection without saying bye: it died or was killed. Apps keep \
-                         running; `warden daemon --background` (or Start wardend) starts it again"
+                         running; a supervisor starts it again within seconds (or Start wardend)"
             .into(),
-        (false, _) => {
-            "wardend closed the connection before answering; it may be exiting (`warden daemon status`)".into()
-        }
+        (false, _) => "wardend closed the connection before answering; it may be exiting (`warden doctor`)".into(),
     }
 }
 

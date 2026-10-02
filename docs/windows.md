@@ -15,8 +15,8 @@ be made with the costs in view. Nothing here is scheduled.
   behave differently across the 9P mount.
 - `warden startup` needs systemd inside the distribution: set
   `[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`. Without
-  systemd, start `warden daemon --resurrect` from a Windows Task Scheduler
-  entry that runs `wsl.exe -d <distro> --exec warden daemon --resurrect`.
+  systemd, start `warden wardend --resurrect` from a Windows Task Scheduler
+  entry that runs `wsl.exe -d <distro> --exec warden wardend --resurrect`.
 - A port an app listens on in WSL2 is reachable from Windows at
   `localhost:<port>` (WSL2's localhost forwarding).
 - The GUI: WSLg shows `warden-gui` on Windows 11; or run `warden-gui` on the
@@ -142,7 +142,7 @@ refused.
 ### Phase 4: boot, wardend and the GUI
 
 - `warden startup` installs a Windows Service (or a Task Scheduler entry) that
-  runs `warden daemon --resurrect`; `unstartup` removes it.
+  runs `warden wardend --resurrect`; `unstartup` removes it.
 - wardend's host stats (`GetSystemTimes`, `GlobalMemoryStatusEx`) so the GUI's
   host panel works.
 - The GUI: iced's Windows backend (winit) is already part of the toolkit; drop

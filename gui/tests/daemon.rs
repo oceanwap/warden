@@ -1,4 +1,4 @@
-//! The GUI's client layer (not the window) against a real `warden daemon`:
+//! The GUI's client layer (not the window) against a real `warden wardend`:
 //! apps and events arrive, a reload goes through and is followed to its
 //! end, log lines stream, and the feed reconnects when wardend restarts.
 //! Also Add app (with an env file) and Edit config's check and save, with
@@ -73,7 +73,8 @@ impl Host {
 
     fn start_wardend(&mut self) {
         let log = std::fs::File::create(self.home.join("wardend.out")).unwrap();
-        let child = self.cmd().arg("daemon").stdout(Stdio::from(log.try_clone().unwrap())).stderr(log).spawn().unwrap();
+        let child =
+            self.cmd().arg("wardend").stdout(Stdio::from(log.try_clone().unwrap())).stderr(log).spawn().unwrap();
         self.wardend = Some(child);
         let t0 = Instant::now();
         while !self.socket().exists() {
@@ -281,7 +282,7 @@ async fn no_wardend_means_not_running_with_the_path() {
         }
     }
     let err = client::app_request(&path, "api", Request::Reload { safe: false }).await.unwrap_err();
-    assert!(err.contains("not running") && err.contains("warden daemon --background"), "{err}");
+    assert!(err.contains("not running") && err.contains("Start wardend"), "{err}");
 }
 
 /// An app that prints as fast as it can (Warden keeps ~10,000 lines a

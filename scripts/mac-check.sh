@@ -58,7 +58,6 @@ rm -rf "$work"
 mkdir -p "$work/home" "$work/run"
 cleanup() {
     if [ -x "$bin" ]; then
-        WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run "$bin" daemon stop >/dev/null 2>&1
         WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" kill --yes >/dev/null 2>&1
     fi
     rm -rf "$work"
@@ -299,7 +298,7 @@ w env WARDEN_NO_DAEMON=1 "$bin" delete all >/dev/null 2>&1
 # was started with (read from the dead supervisor's process: sysctl, no /proc).
 w env WMC_MARK=kept-from-start "$bin" start /bin/sh --name idle --interpreter none -- -c 'sleep 600' >"$out/start-idle.log" 2>&1
 sleep 2
-if w "$bin" daemon status >"$out/daemon-status.txt" 2>&1; then result PASS "wardend runs"; else result FAIL "wardend runs" "see daemon-status.txt"; fi
+if w "$bin" wardend status >"$out/daemon-status.txt" 2>&1; then result PASS "wardend runs"; else result FAIL "wardend runs" "see daemon-status.txt"; fi
 
 w "$bin" events --json >"$out/events.ndjson" 2>"$out/events.err" &
 ev=$!
@@ -326,7 +325,7 @@ if [ -n "$sup" ]; then
     done
     if [ -z "$new" ]; then
         result FAIL "wardend restarts a killed supervisor" "no new supervisor within 40 s (see daemon logs under $work: kept only until exit)"
-        w "$bin" daemon status >>"$report" 2>&1
+        w "$bin" wardend status >>"$report" 2>&1
     else
         result PASS "wardend restarts a killed supervisor"
         # `ps -E` prints the environment of a process of ours (on Linux, /proc).

@@ -1,5 +1,7 @@
-//! wardend (`warden daemon`): the optional daemon (docs/protocol.md,
-//! "Daemon socket" and "Second-level supervision"). It
+//! wardend (`warden wardend`, run for you): the host daemon (docs/protocol.md,
+//! "Daemon socket" and "Second-level supervision"). It is always on: `warden start`
+//! and `warden resurrect` start it, a supervisor starts it again when it dies without a
+//! clean exit (`revive.rs`), and only `warden kill` (everything) stops it. It
 //!
 //! - serves one socket (`<runtime dir>/wardend.sock`) where the CLI and the
 //!   GUI get every app and live events, pushed as they happen;
@@ -24,6 +26,7 @@ mod history;
 mod host;
 mod notify;
 mod policy;
+pub(crate) mod revive;
 mod watcher;
 
 use crate::config;
@@ -49,7 +52,7 @@ pub fn socket_path() -> PathBuf {
     warden_protocol::paths::wardend_socket(&config::runtime_dir())
 }
 
-/// Where `warden daemon --background` logs.
+/// Where wardend logs when `warden` started it in the background.
 pub fn log_path() -> PathBuf {
     fleet::state_dir().join("logs").join("wardend.log")
 }
@@ -713,6 +716,8 @@ fn reply_err(msg: String) -> DaemonReply {
 // ------------------------------------------------------------ the daemon
 
 struct Daemon {
+    /// What `wardend.toml` looked like when it was read last (see `alerts_file_changed`).
+    alerts_seen: RefCell<alerts::FileStamp>,
     core: RefCell<Core>,
     bus: Bus,
     logs_bus: Bus,
@@ -747,10 +752,21 @@ impl Drop for WantsLogs {
 }
 
 impl Daemon {
-    /// Read `wardend.toml` (at start, SIGHUP, the `reload` request). On an
-    /// error the rules in force stay. Ok/Err: what to tell who asked.
+    /// Read `wardend.toml` again when it changed since it was read last: no command
+    /// needed (SIGHUP and the `reload` request still do it at once).
+    fn reload_alerts_if_changed(&self) {
+        let now = alerts::FileStamp::of(&alerts::path());
+        if *self.alerts_seen.borrow() != now {
+            let _ = self.load_alerts("the file changed");
+        }
+    }
+
+    /// Read `wardend.toml` (at start, SIGHUP, the `reload` request, a change to the
+    /// file). On an error the rules in force stay. Ok/Err: what to tell who asked.
     fn load_alerts(&self, why: &str) -> Result<String, String> {
         let path = alerts::path();
+        // Stamp first: a file saved while it is read is read again, not missed.
+        *self.alerts_seen.borrow_mut() = alerts::FileStamp::of(&path);
         let loaded = alerts::load(&path);
         let mut core = self.core.borrow_mut();
         match loaded {
@@ -779,7 +795,7 @@ impl Daemon {
                     kept_rules = kept,
                     on = why,
                     hint =
-                        "`warden daemon check` lists every problem; fix them, then `warden daemon reload` (or SIGHUP)",
+                        "`warden check -c wardend.toml` lists every problem; fix them and wardend reads the file again",
                 );
                 Err(format!(
                     "{} has errors; wardend keeps the {kept} rule{} in force:\n  {}",
@@ -867,6 +883,11 @@ impl Daemon {
                 return;
             }
         };
+        // A core's worth of apps at a time ($WARDEN_PARALLEL changes it): the next one starts
+        // when one is up, or stopped (saved so), or after a minute. Starting hundreds together
+        // would slow each of them, and the host, to a crawl.
+        let slots =
+            Arc::new(tokio::sync::Semaphore::new(fleet::parallel_limit(None).min(tokio::sync::Semaphore::MAX_PERMITS)));
         for s in saved {
             if !s.config.is_file() {
                 crate::warn!(
@@ -891,14 +912,36 @@ impl Daemon {
                 crate::debug!("saved app already running", app = app.name);
                 continue;
             }
-            let mut core = self.core.borrow_mut();
-            let name: Arc<str> = app.name.as_str().into();
-            core.apps.entry(name.clone()).or_insert_with(|| Rec::new(&app));
-            if let Ok(pid) = core.spawn(&name, &s.config, false) {
-                crate::info!("resurrected a saved app", app = name, pid = pid);
+            let Ok(slot) = slots.clone().acquire_owned().await else { return };
+            {
+                let mut core = self.core.borrow_mut();
+                let name: Arc<str> = app.name.as_str().into();
+                core.apps.entry(name.clone()).or_insert_with(|| Rec::new(&app));
+                if let Ok(pid) = core.spawn(&name, &s.config, false) {
+                    crate::info!("resurrected a saved app", app = name, pid = pid);
+                }
+                core.apps_changed();
             }
-            core.apps_changed();
+            let socket = app.socket.clone();
+            tokio::task::spawn_local(async move {
+                wait_until_up(socket).await;
+                drop(slot);
+            });
         }
+    }
+}
+
+/// Until the app's supervisor says its workers are ready (or that they are stopped on purpose),
+/// at most a minute.
+async fn wait_until_up(socket: PathBuf) {
+    let until = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < until {
+        if let Ok(st) = watcher::poll_status(socket.clone()).await {
+            if st.stopped || st.workers_ready >= st.workers_configured {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -934,7 +977,7 @@ async fn start_unit(scope: fleet::Scope, unit: &str) -> DaemonReply {
     }
 }
 
-/// `warden daemon`: run wardend in the foreground until SIGTERM, SIGINT or
+/// `warden wardend`: run wardend in the foreground until SIGTERM, SIGINT or
 /// a `shutdown` request. `resurrect`: first start the saved apps that are
 /// not running (launchd, containers; never under systemd, where each app
 /// has its own unit).
@@ -965,15 +1008,37 @@ pub fn main(rt: &tokio::runtime::Runtime, resurrect: bool) -> i32 {
     code
 }
 
+/// `<runtime dir>/wardend.lock`, held (advisory lock) for as long as this wardend lives. The
+/// kernel drops it when the process ends however it ends, so a killed wardend never leaves a
+/// lock behind, and a second wardend finds it taken instead of unlinking the first one's socket.
+fn lock_instance(socket: &std::path::Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = socket.parent().unwrap_or(std::path::Path::new("."));
+    control::ensure_private_dir(dir)?;
+    let lock = dir.join("wardend.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(&lock)
+        .map_err(|e| format!("opening {}: {e}", lock.display()))?;
+    match crate::sys::try_lock_exclusive(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(format!("wardend is already running: another one holds {}", lock.display())),
+        Err(e) => Err(format!("locking {}: {e}", lock.display())),
+    }
+}
+
 async fn run(resurrect: bool) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     let path = socket_path();
     if let Some(pid) = client::hello_pid(&path).await {
-        return Err(format!(
-            "wardend is already running (pid {pid}) on {}; `warden daemon status` shows it",
-            path.display()
-        ));
+        return Err(format!("wardend is already running (pid {pid}) on {}", path.display()));
     }
+    // Before the socket is touched: the lock is what makes one wardend of two that start at
+    // the same moment (supervisors reviving it, launchd or systemd beside a hand-started one).
+    let _instance = lock_instance(&path)?;
     let listener = control::bind(&path).await?;
     let mut term = signal(SignalKind::terminate()).map_err(|e| format!("installing signal handlers: {e}"))?;
     let mut int = signal(SignalKind::interrupt()).map_err(|e| format!("installing signal handlers: {e}"))?;
@@ -1004,6 +1069,7 @@ async fn run(resurrect: bool) -> Result<(), String> {
         saver,
     };
     let d = Rc::new(Daemon {
+        alerts_seen: RefCell::new(alerts::FileStamp::default()),
         core: RefCell::new(core),
         bus,
         logs_bus,
@@ -1026,7 +1092,10 @@ async fn run(resurrect: bool) -> Result<(), String> {
     crate::guard::spawn_essential("wardend host metrics", host_loop(d.clone()));
     if resurrect {
         d.discover();
-        d.resurrect().await;
+        // In the background: waiting for each batch of apps must not hold up the events, the
+        // socket's requests or the alerts.
+        let d = d.clone();
+        tokio::task::spawn_local(async move { d.resurrect().await });
     }
 
     let mut discover = tokio::time::interval(DISCOVER_EVERY);
@@ -1042,6 +1111,7 @@ async fn run(resurrect: bool) -> Result<(), String> {
             Some(m) = rx.recv() => d.core.borrow_mut().on_watch(m),
             _ = discover.tick() => {
                 d.discover();
+                d.reload_alerts_if_changed();
                 if watchdog {
                     crate::systemd::notify("WATCHDOG=1");
                 }

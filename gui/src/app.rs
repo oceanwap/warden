@@ -222,6 +222,16 @@ pub enum Modal {
     Settings,
 }
 
+/// Settings' "Restart everything".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartAll {
+    Idle,
+    /// Asked once; waiting for "Restart now".
+    Asking,
+    /// `warden update --yes` is running (the window loses wardend and gets it back).
+    Running,
+}
+
 /// A destructive action waiting for "yes".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -262,6 +272,8 @@ pub struct Gui {
     pub confirm: Option<Pending>,
     pub modal: Modal,
     pub starting_wardend: bool,
+    /// Settings' "Restart everything": asking first, then running `warden update --yes`.
+    pub restart_all: RestartAll,
     /// Actions in flight, per app (buttons show it).
     pub busy: Vec<(String, Act)>,
     /// The History tab's range (kept across apps).
@@ -319,6 +331,11 @@ pub enum Message {
     },
     StartWardend,
     WardendStarted(Result<Output, String>),
+    /// Settings: "Restart everything…" asks, "Restart now" runs it.
+    AskRestartAll,
+    CancelRestartAll,
+    RestartAll,
+    RestartedAll(Result<Output, String>),
     /// Open a dropdown, or close it when it is the one that is open.
     ToggleMenu(MenuKind),
     CloseMenu,
@@ -432,6 +449,7 @@ impl Gui {
             confirm: None,
             modal: Modal::None,
             starting_wardend: false,
+            restart_all: RestartAll::Idle,
             busy: Vec::new(),
             range: Range::Hour,
             chart: None,
@@ -715,6 +733,38 @@ impl Gui {
                         self.toast(false, format!("starting wardend failed: {} (`{}`)", out.text(), out.command))
                     }
                     Err(e) => self.toast(false, format!("starting wardend failed: {e}")),
+                }
+            }
+            Message::AskRestartAll => {
+                if self.restart_all == RestartAll::Idle {
+                    self.restart_all = RestartAll::Asking;
+                }
+                Task::none()
+            }
+            Message::CancelRestartAll => {
+                if self.restart_all == RestartAll::Asking {
+                    self.restart_all = RestartAll::Idle;
+                }
+                Task::none()
+            }
+            Message::RestartAll => {
+                if self.restart_all != RestartAll::Asking {
+                    return Task::none();
+                }
+                self.restart_all = RestartAll::Running;
+                let host = self.target.host.clone();
+                Task::perform(async move { commands::restart_everything(&host).await }, Message::RestartedAll)
+            }
+            Message::RestartedAll(r) => {
+                self.restart_all = RestartAll::Idle;
+                // wardend went away and came back: connect now, not at the next retry.
+                self.generation += 1;
+                match r {
+                    Ok(out) if out.ok => {
+                        self.toast(true, "Restarted every supervisor and wardend from the installed warden.".into())
+                    }
+                    Ok(out) => self.toast(false, format!("restart failed: {} (`{}`)", out.text(), out.command)),
+                    Err(e) => self.toast(false, format!("restart failed: {e}")),
                 }
             }
             Message::ToggleMenu(kind) => {
@@ -1449,6 +1499,55 @@ mod tests {
             at_ms: 0,
         }]));
         assert_eq!(g.host_spark.grid.series[crate::history::HOST_CPU].last(), Some(50.0));
+    }
+
+    #[test]
+    fn restarting_everything_asks_first_and_reconnects_after() {
+        let mut g = connected();
+        assert_eq!(g.restart_all, RestartAll::Idle);
+        // Nothing runs without the second click.
+        let _ = g.update(Message::RestartAll);
+        assert_eq!(g.restart_all, RestartAll::Idle, "a confirm without a question does nothing");
+        let _ = g.update(Message::AskRestartAll);
+        assert_eq!(g.restart_all, RestartAll::Asking);
+        let _ = g.update(Message::CancelRestartAll);
+        assert_eq!(g.restart_all, RestartAll::Idle);
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartAll);
+        assert_eq!(g.restart_all, RestartAll::Running);
+        // Asking again while it runs changes nothing.
+        let _ = g.update(Message::AskRestartAll);
+        assert_eq!(g.restart_all, RestartAll::Running);
+        // Done: connect to the new wardend now, and say so.
+        let before = g.generation;
+        let out = Output {
+            command: "warden update --yes".into(),
+            ok: true,
+            code: Some(0),
+            stdout: "x".into(),
+            stderr: String::new(),
+        };
+        let _ = g.update(Message::RestartedAll(Ok(out)));
+        assert_eq!(g.restart_all, RestartAll::Idle);
+        assert_eq!(g.generation, before + 1);
+        assert!(g.toasts.last().is_some_and(|t| t.ok && t.text.contains("Restarted")));
+        // A failure carries the command and what it said.
+        let _ = g.update(Message::AskRestartAll);
+        let _ = g.update(Message::RestartAll);
+        let bad = Output {
+            command: "warden update --yes".into(),
+            ok: false,
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "the save failed, so nothing was stopped".into(),
+        };
+        let _ = g.update(Message::RestartedAll(Ok(bad)));
+        let t = g.toasts.last().unwrap();
+        assert!(
+            !t.ok && t.text.contains("nothing was stopped") && t.text.contains("warden update --yes"),
+            "{}",
+            t.text
+        );
     }
 
     #[test]

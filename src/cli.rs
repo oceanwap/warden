@@ -60,32 +60,29 @@ APPS (familiar from PM2):
                      server, like `pm2 serve`: --name --spa --listing -i N
                      --basic-auth user:pass (or --basic-auth-username/-password)
     save             Remember the running apps, worker counts and stopped state
-    resurrect        Start what `save` remembered
+    resurrect        Start what `save` remembered (and wardend, if it is not running), the
+                     apps at the same time but no more than one per CPU core at once:
+                     --parallel N (-j N; `all`: no limit; $WARDEN_PARALLEL) changes it
+    update           Restart every supervisor and wardend from the warden binary on disk
+                     (save, kill, resurrect: like `pm2 update`). A supervisor keeps the code
+                     it started with, so this is what picks up a rebuild or an upgrade. The
+                     apps stop for a few seconds; asks first on a terminal  [--yes]
     startup          Bring the saved apps and wardend back after a reboot or a crash:
                      systemd units (root: system units; a user or --user: your own,
                      with lingering), a launchd job on macOS. Without a service
                      manager it says what to run at boot instead  [--user|--system]
     unstartup        Remove what `startup` installed (apps keep running)  [--user|--system]
-    kill [target]    Stop every app's supervisor (asks first on a terminal; --yes)
+    kill [target]    Stop every app's supervisor, and wardend when it is every one (asks
+                     first on a terminal; --yes)
     pm2-migrate      Import PM2's apps: a config, a 0600 .env file and a MIGRATION.md
                      report per app. --from jlist|dump|<ecosystem file>  --env <name>
                      --apps a,b  --out <dir>  --dry-run  --mode process|worker
                      --overwrite  --cutover overlap|same-port|new-port:<port>
                      (switch with rollback)  --finalize (remove them from PM2)
 
-WARDEND (optional daemon: restarts background supervisors that die, one socket
-for live events; apps never depend on it and keep running without it):
-    daemon           Run wardend in the foreground; --background detaches it (log in
-                     the state directory: logs/wardend.log). `warden start` starts it
-                     in the background for you unless WARDEN_NO_DAEMON=1.
-                     --resurrect: first start the apps `warden save` recorded (a
-                     container entrypoint; what launchd runs on macOS)
-    daemon status    wardend's pid and every app it watches  [--json]; exit 1 when
-                     it is not running
-    daemon stop      Stop wardend; every app keeps running (`warden kill` stops it too)
-    daemon check     Validate the alert rules in <config dir>/wardend.toml (or -c FILE)
-    daemon reload    Make the running wardend read wardend.toml again (as SIGHUP does);
-                     on an error it keeps the rules it had
+WARDEND (the host daemon, always on: `start` and `resurrect` start it, a crash or `kill -9`
+brings it back, `kill` of everything stops it; WARDEN_NO_DAEMON=1 never starts it. Apps never
+depend on it. Alert rules: <config dir>/wardend.toml, read again whenever it changes):
     events [target]  Live events, one line each: workers, rollouts, supervisors
                      [--json] (NDJSON)  [--logs] (log lines too)  [--interval MS]
                      From wardend when it runs, else from the apps' sockets
@@ -96,7 +93,7 @@ SUPERVISOR:
     shutdown         Stop the workers and exit the supervisor
     config <app>     Effective config as JSON (values hidden unless --show-secrets)
     log-level [target] [debug|info|warn|error]   Show or change it at runtime
-    check            Validate the config file and exit
+    check            Validate the config file and exit (-c wardend.toml: the alert rules)
     doctor           Check this host for the problems Warden knows about, with a fix
                      for each  [--json]
     version          Print the version
@@ -153,14 +150,18 @@ pub enum Command {
     },
     Save,
     Resurrect,
+    /// `warden update`: save, kill, resurrect: every supervisor and wardend start again from
+    /// the warden binary on disk.
+    Update,
     Startup(crate::startup::Want),
     Unstartup(crate::startup::Want),
     Kill,
     Top,
     Doctor,
     Pm2Migrate(Box<crate::migrate::MigrateOpts>),
-    /// wardend: run it, or ask the running one.
-    Daemon(DaemonCmd),
+    /// wardend, the internal entry point (not in `--help`): launchd, systemd, the
+    /// supervisors and the GUI start it; people use `start`, `resurrect` and `kill`.
+    Wardend(WardendCmd),
     /// `warden events [target]`: live events.
     Events {
         logs: bool,
@@ -169,18 +170,11 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DaemonCmd {
-    /// `warden daemon [--background] [--resurrect]`.
-    Run {
-        background: bool,
-        resurrect: bool,
-    },
+pub enum WardendCmd {
+    /// `warden wardend [--background] [--resurrect]`.
+    Run { background: bool, resurrect: bool },
+    /// `warden wardend status [--json]`: for scripts and tests (`warden doctor` is the human view).
     Status,
-    Stop,
-    /// `warden daemon check [-c FILE]`: validate wardend.toml.
-    Check,
-    /// `warden daemon reload`: the running wardend reads it again.
-    Reload,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +263,9 @@ pub struct Args {
     pub yes: bool,
     /// `workers`: only the worker table.
     pub table_only: bool,
+    /// `--parallel N` (`-j N`): how many apps `start`, `resurrect` and `update` start at once.
+    /// `None`: `$WARDEN_PARALLEL`, else the number of CPU cores.
+    pub parallel: Option<usize>,
 }
 
 fn parse_level(s: &str) -> Option<Level> {
@@ -278,6 +275,17 @@ fn parse_level(s: &str) -> Option<Level> {
         "warn" | "warning" => Some(Level::Warn),
         "error" => Some(Level::Error),
         _ => None,
+    }
+}
+
+/// `--parallel N` (at least 1), or `all` for no limit.
+fn parse_parallel(v: &str) -> Result<usize, String> {
+    match v.trim() {
+        "all" | "max" => Ok(usize::MAX),
+        n => match n.parse::<usize>() {
+            Ok(n) if n >= 1 => Ok(n),
+            _ => Err(format!("--parallel expects a number of apps (1 or more) or `all`, got {v:?}")),
+        },
     }
 }
 
@@ -312,6 +320,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut q = crate::logview::Query::default();
     let mut history = false;
     let (mut background, mut with_logs, mut resurrect) = (false, false, false);
+    let mut parallel: Option<usize> = None;
     let mut scope = crate::startup::Want::Auto;
     let mut interval_ms: Option<u64> = None;
     let mut so = StartOpts::default();
@@ -351,6 +360,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--interval" => interval_ms = Some(num(a, &value(a)?)?),
             "--json" => json = true,
             "--no-wait" => no_wait = true,
+            "-j" | "--parallel" => parallel = Some(parse_parallel(&value(a)?)?),
             "-y" | "--yes" => yes = true,
             "--hard" => hard = true,
             "--show-secrets" => show_secrets = true,
@@ -591,6 +601,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
         "save" | "dump" => Command::Save,
         "resurrect" => Command::Resurrect,
+        "update" => {
+            too_many(0)?;
+            Command::Update
+        }
         "startup" => {
             too_many(0)?;
             Command::Startup(scope)
@@ -611,17 +625,12 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             target = many(&rest);
             Command::Top
         }
-        "daemon" | "wardend" => {
+        "wardend" => {
             too_many(1)?;
-            Command::Daemon(match one(&rest).as_deref() {
-                None | Some("start") | Some("run") => DaemonCmd::Run { background, resurrect },
-                Some("status") => DaemonCmd::Status,
-                Some("stop") => DaemonCmd::Stop,
-                Some("check") => DaemonCmd::Check,
-                Some("reload") => DaemonCmd::Reload,
-                Some(other) => {
-                    return Err(format!("daemon {other:?}: expected `status`, `stop`, `check`, `reload` or nothing"));
-                }
+            Command::Wardend(match one(&rest).as_deref() {
+                None => WardendCmd::Run { background, resurrect },
+                Some("status") => WardendCmd::Status,
+                Some(other) => return Err(format!("wardend {other:?}: expected `status` or nothing")),
             })
         }
         "events" => {
@@ -630,15 +639,11 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
         other => return Err(format!("unknown command {other:?} (see `warden --help`)")),
     };
-    if background && !matches!(command, Command::Daemon(DaemonCmd::Run { .. })) {
-        return Err("--background only applies to `warden daemon` (`warden start` already runs apps in the \
-                    background)"
-            .into());
+    if background && !matches!(command, Command::Wardend(WardendCmd::Run { .. })) {
+        return Err("unknown option --background (`warden start` already runs apps in the background)".into());
     }
-    if resurrect && !matches!(command, Command::Daemon(DaemonCmd::Run { .. })) {
-        return Err(
-            "--resurrect only applies to `warden daemon` (`warden resurrect` starts the saved apps once)".into()
-        );
+    if resurrect && !matches!(command, Command::Wardend(WardendCmd::Run { .. })) {
+        return Err("unknown option --resurrect (`warden resurrect` starts the saved apps once)".into());
     }
     if scope != crate::startup::Want::Auto && !matches!(command, Command::Startup(_) | Command::Unstartup(_)) {
         return Err("--user and --system only apply to `warden startup` and `warden unstartup`".into());
@@ -655,7 +660,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     {
         return Err(format!("{cmd} takes no argument"));
     }
-    Ok(Args { command, target, config, socket, json, no_wait, yes, table_only })
+    if parallel.is_some() && !matches!(command, Command::Start { .. } | Command::Resurrect | Command::Update) {
+        return Err("--parallel only applies to `start`, `resurrect` and `update`".into());
+    }
+    Ok(Args { command, target, config, socket, json, no_wait, yes, table_only, parallel })
 }
 
 fn parse_migrate(argv: &[String]) -> Result<Args, String> {
@@ -700,6 +708,7 @@ fn empty_args() -> Args {
         no_wait: false,
         yes: false,
         table_only: false,
+        parallel: None,
     }
 }
 
@@ -985,6 +994,19 @@ fn health_cell(h: Option<bool>) -> Cell {
     )
 }
 
+/// A supervisor runs the code it started with: after a rebuild or an upgrade it
+/// is older than the `warden` that asks, and a number added since shows `-`.
+pub fn outdated_note(names: &[&str]) -> String {
+    let (what, it) = match names {
+        [one] => (format!("{one}'s supervisor runs"), "it restarts"),
+        _ => (format!("{}: their supervisors run", names.join(", ")), "they restart"),
+    };
+    format!(
+        "{what} an older warden than this one, so some numbers (cpu, mem, user, ports) may show `-` until {it}: \
+         `warden update`"
+    )
+}
+
 /// `warden list`: a boxed table like `pm2 list` with each app's id (what
 /// `warden start 0,1` takes), one row per worker; painted when `color` is on
 /// (a terminal).
@@ -996,6 +1018,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut notes = Vec::new();
     let mut offline: Vec<&crate::fleet::App> = Vec::new();
+    let mut outdated: Vec<&str> = Vec::new();
     for (app, st) in all {
         let id = app.id.map(|i| i.to_string()).unwrap_or_else(|| "-".into());
         // An app's later rows (more workers) repeat id and name, so every
@@ -1047,6 +1070,9 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 if let Some(n) = start_failed_note(s) {
                     notes.push(format!("{}: {n}", app.name));
                 }
+                if s.outdated(env!("CARGO_PKG_VERSION")).is_some() {
+                    outdated.push(&app.name);
+                }
             }
             Err(e) => {
                 let what = if e == "not running" { "offline" } else { "unreachable" };
@@ -1076,6 +1102,9 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
         };
         let (n, them) = (offline.len(), if offline.len() == 1 { "it" } else { "them" });
         notes.insert(0, format!("{n} offline: `warden start {which}` starts {them}"));
+    }
+    if !outdated.is_empty() {
+        notes.push(outdated_note(&outdated));
     }
     let mut o = boxed(
         Some(&[
@@ -1139,7 +1168,26 @@ pub fn render_describe(s: &Status, info: &serde_json::Value, id: Option<u32>, fm
     let args: Vec<String> =
         c("/app/args").as_array().map(|a| a.iter().map(|x| text(x.clone())).collect()).unwrap_or_default();
     row("command", format!("{} {}", text(c("/app/command")), args.join(" ")).trim().to_string());
-    row("cwd", text(c("/app/working_directory")));
+    // Where the workers run: what the supervisor reports; else the configured directory; else,
+    // for a supervisor too old to report it, the one it was started in (this host only).
+    // (A site made by `warden serve` has no working_directory: the folder it serves is
+    // `[static] root`, which is what its workers work in.)
+    let site = c("/static/root").as_str().map(String::from);
+    let configured = c("/app/working_directory").as_str().map(String::from);
+    let cwd = s
+        .cwd
+        .clone()
+        .or_else(|| configured.clone())
+        .or_else(|| site.clone())
+        .or_else(|| crate::platform::proc_cwd(s.pid).map(|p| p.display().to_string()));
+    row(
+        "cwd",
+        match (cwd, configured.or(site)) {
+            (Some(d), Some(_)) => d,
+            (Some(d), None) => format!("{d} (no [app] working_directory: where the supervisor was started)"),
+            (None, _) => "-".into(),
+        },
+    );
     row(
         "release",
         match (&s.release, c("/app/pin_release").as_bool()) {
@@ -1484,12 +1532,34 @@ mod tests {
     }
 
     #[test]
+    fn parallel_limits_how_many_apps_start_at_once() {
+        assert_eq!(p("resurrect").unwrap().parallel, None, "the default is the cores");
+        assert_eq!(p("resurrect --parallel 4").unwrap().parallel, Some(4));
+        assert_eq!(p("resurrect -j 2").unwrap().parallel, Some(2));
+        assert_eq!(p("start all -j 1").unwrap().parallel, Some(1));
+        assert_eq!(p("update --parallel all").unwrap().parallel, Some(usize::MAX));
+        for bad in ["resurrect --parallel 0", "resurrect --parallel many", "resurrect --parallel"] {
+            assert!(p(bad).is_err(), "{bad}");
+        }
+        assert!(p("stop api -j 2").is_err(), "only where apps are started");
+        assert!(USAGE.contains("--parallel N"), "in --help");
+    }
+
+    #[test]
+    fn update_restarts_everything_and_takes_no_app() {
+        assert_eq!(p("update").unwrap().command, Command::Update);
+        assert!(p("update --yes").unwrap().yes);
+        assert!(p("update api").is_err(), "it is every app's, like `kill`'s everything");
+        assert!(USAGE.contains("\n    update           "), "listed in --help");
+    }
+
+    #[test]
     fn daemon_and_events_commands() {
-        let run = |background, resurrect| Command::Daemon(DaemonCmd::Run { background, resurrect });
-        assert_eq!(p("daemon").unwrap().command, run(false, false));
-        assert_eq!(p("daemon --background").unwrap().command, run(true, false));
-        assert_eq!(p("daemon --resurrect").unwrap().command, run(false, true));
-        assert_eq!(p("daemon --background --resurrect").unwrap().command, run(true, true));
+        let run = |background, resurrect| Command::Wardend(WardendCmd::Run { background, resurrect });
+        assert_eq!(p("wardend").unwrap().command, run(false, false));
+        assert_eq!(p("wardend --background").unwrap().command, run(true, false));
+        assert_eq!(p("wardend --resurrect").unwrap().command, run(false, true));
+        assert_eq!(p("wardend --background --resurrect").unwrap().command, run(true, true));
         assert!(p("start app.js --resurrect").is_err());
         use crate::startup::Want;
         assert_eq!(p("startup").unwrap().command, Command::Startup(Want::Auto));
@@ -1497,17 +1567,16 @@ mod tests {
         assert_eq!(p("unstartup --system").unwrap().command, Command::Unstartup(Want::System));
         assert!(p("startup api").is_err());
         assert!(p("list --user").is_err(), "only for startup");
-        assert_eq!(p("daemon status").unwrap().command, Command::Daemon(DaemonCmd::Status));
-        assert!(p("daemon status --json").unwrap().json);
-        assert_eq!(p("daemon stop").unwrap().command, Command::Daemon(DaemonCmd::Stop));
-        assert_eq!(p("daemon check").unwrap().command, Command::Daemon(DaemonCmd::Check));
-        let a = p("daemon check -c /tmp/wardend.toml").unwrap();
-        assert_eq!((a.command, a.config), (Command::Daemon(DaemonCmd::Check), Some("/tmp/wardend.toml".into())));
-        assert_eq!(p("wardend reload").unwrap().command, Command::Daemon(DaemonCmd::Reload));
-        assert!(p("daemon reload --background").is_err());
-        assert!(p("daemon frobnicate").is_err());
-        assert!(p("daemon stop now").is_err());
-        assert!(p("start app.js --background").is_err(), "only for the daemon");
+        assert_eq!(p("wardend status").unwrap().command, Command::Wardend(WardendCmd::Status));
+        assert!(p("wardend status --json").unwrap().json);
+        assert!(p("wardend status --background").is_err());
+        assert!(p("wardend frobnicate").is_err());
+        assert!(p("start app.js --background").is_err(), "only for the internal entry point");
+        // The public command is gone: wardend starts with `start` / `resurrect` and stops with `kill`.
+        for gone in ["daemon", "daemon status", "daemon stop", "daemon check", "daemon reload", "daemon --background"] {
+            assert!(p(gone).is_err(), "{gone}");
+        }
+        assert!(!USAGE.contains("warden daemon") && !USAGE.contains("\n    daemon"), "not in --help");
         let a = p("events api --json --logs --interval 500").unwrap();
         assert_eq!(a.command, Command::Events { logs: true, interval_ms: Some(500) });
         assert_eq!((a.target.as_deref(), a.json), (Some("api"), true));
@@ -1704,6 +1773,38 @@ mod tests {
         assert!(narrow.contains("`warden config api`)"), "nothing is lost when wrapping:\n{narrow}");
     }
 
+    /// `cwd` is where the workers run: what the supervisor says, else the config's
+    /// working_directory, else (a site made by `warden serve`) the folder it serves.
+    #[test]
+    fn describe_shows_the_folder_a_static_site_serves_as_its_cwd() {
+        let mut s: Status = serde_json::from_value(serde_json::json!({
+            "app": "site", "namespace": "default", "mode": "process", "pid": 7, "uptime_secs": 9,
+            "workers_configured": 1, "workers_ready": 1, "healthy": null, "supervisor_rss_bytes": null,
+            "host": null, "reloading": false, "shutting_down": false, "workers": []
+        }))
+        .unwrap();
+        let cwd_of = |s: &Status, info: &serde_json::Value| {
+            let out = render_describe(s, info, Some(1), &Fmt::PLAIN);
+            out.lines().find(|l| l.starts_with("│ cwd ")).unwrap_or_else(|| panic!("no cwd row:\n{out}")).to_string()
+        };
+        // A site has no [app] working_directory; its folder is [static] root. An old
+        // supervisor does not report cwd: the config says it.
+        let site = serde_json::json!({"config_path": "/x/site.toml", "config": {"app": {"command": ""}, "static": {"root": "/srv/www/site"}}});
+        let row = cwd_of(&s, &site);
+        assert!(row.contains("/srv/www/site") && !row.contains("where the supervisor was started"), "{row}");
+        // A current supervisor reports it (a relative root joined to where it runs).
+        s.cwd = Some("/srv/www/site".into());
+        assert!(cwd_of(&s, &site).contains("/srv/www/site"));
+        // An app with a working_directory shows that, and one without says where it ran.
+        let app = serde_json::json!({"config_path": "/x/api.toml", "config": {"app": {"command": "bun", "working_directory": "/srv/api"}}});
+        s.cwd = None;
+        assert!(cwd_of(&s, &app).contains("/srv/api"));
+        s.cwd = Some("/Users/me/project".into());
+        let bare = serde_json::json!({"config_path": "/x/api.toml", "config": {"app": {"command": "bun"}}});
+        let row = cwd_of(&s, &bare);
+        assert!(row.contains("/Users/me/project") && row.contains("where the supervisor was started"), "{row}");
+    }
+
     fn listed_app(name: &str, id: Option<u32>) -> crate::fleet::App {
         crate::fleet::App {
             name: name.into(),
@@ -1895,6 +1996,49 @@ mod tests {
         // An offline app is counted, not an error.
         let off = ports::render(&[(listed_app("web", Some(1)), Err("not running".into()))], &Fmt::PLAIN);
         assert!(off.contains("1 app(s) offline"), "{off}");
+    }
+
+    /// A supervisor keeps the code it started with: after a rebuild or an upgrade the list
+    /// says so, and what to run, instead of leaving `-` where a newer warden has numbers.
+    #[test]
+    fn the_list_says_when_a_supervisor_is_older_than_the_warden_asking() {
+        use warden_protocol::control::Build;
+        let mine = env!("CARGO_PKG_VERSION");
+        let fresh = |name: &str| {
+            let mut s = api_status();
+            s.app = name.into();
+            s.version = mine.into();
+            s.build = Some(Build { path: "/usr/bin/warden".into(), stamp: "1:2".into(), replaced: false });
+            s.workers = vec![row(1, "RUNNING", 101)];
+            s
+        };
+        let list_of = |statuses: Vec<Status>| {
+            let all: Vec<_> =
+                statuses.into_iter().enumerate().map(|(i, s)| (listed_app(&s.app, Some(i as u32)), Ok(s))).collect();
+            render_list_with(&all, &Fmt::PLAIN)
+        };
+        // Current: no note.
+        assert!(!list_of(vec![fresh("api")]).contains("older warden"));
+        // Started before the field existed (a Warden older than any that sends it).
+        let mut old = fresh("api");
+        old.build = None;
+        let text = list_of(vec![old.clone(), fresh("web")]);
+        assert!(text.contains("api's supervisor runs an older warden"), "{text}");
+        assert!(text.contains("`warden update`"), "{text}");
+        assert!(!text.contains("web's"), "only the old one: {text}");
+        // The binary was replaced since it started, or it is another version.
+        let mut replaced = fresh("web");
+        replaced.build.as_mut().unwrap().replaced = true;
+        let mut other = fresh("jobs");
+        other.version = "0.0.1".into();
+        let text = list_of(vec![old, replaced, other]);
+        assert!(text.contains("api, web, jobs: their supervisors run an older warden"), "{text}");
+        for (s, why) in
+            [(fresh("a"), None), (Status { build: None, ..fresh("a") }, Some("was started by an older warden"))]
+        {
+            assert_eq!(s.outdated(mine), why);
+        }
+        assert_eq!(fresh("a").outdated("9.9.9"), Some("runs a different warden version"));
     }
 
     #[test]

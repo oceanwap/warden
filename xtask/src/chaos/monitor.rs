@@ -126,7 +126,7 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
                             .unwrap_or_default();
                         (Role::Supervisor, app)
                     }
-                    Some("daemon") if argv.len() == 2 => (Role::Wardend, "wardend".to_string()),
+                    Some("wardend") if argv.len() == 2 => (Role::Wardend, "wardend".to_string()),
                     _ => (Role::Other, String::new()),
                 }
             } else {

@@ -48,6 +48,8 @@ fn status(app: &str, workers: Vec<serde_json::Value>, ready: u64, rollout: serde
         "app": app, "namespace": "default", "mode": "process", "config_path": format!("/etc/warden/{app}.toml"),
         "launched": "background", "version": "0.1.0", "pid": 4208, "uptime_secs": 86_400 + 3_723,
         "workers_configured": workers.len(), "workers_ready": ready, "healthy": true,
+        "build": {"path": "/usr/local/bin/warden", "stamp": "5489384:1790925000", "replaced": false},
+        "cwd": format!("/srv/{app}/current"),
         "supervisor_rss_bytes": 4u64 << 20, "host": null, "reloading": !rollout.is_null(), "shutting_down": false, "user": "deploy",
         "rollout": rollout,
         "last_rollout": {"seq": 2, "kind": "reload", "ok": true, "message": "4 workers replaced", "duration_secs": 6.2},
@@ -355,6 +357,90 @@ fn settings_dialog_offers_colors_and_mode() {
     let _ = g.update(Message::SetColors(Colors::System));
     let mut ui = sim(&g);
     save_with(&mut ui, "settings-system", &theme(Source { colors: Colors::System, mode: Mode::Auto }, &mac));
+}
+
+/// Settings also restarts everything (`warden update`): one click asks, the second runs it, and
+/// nothing runs from the first.
+#[test]
+fn settings_restarts_everything_after_asking() {
+    let mut g = connected();
+    let _ = g.update(Message::OpenSettings);
+    let mut ui = sim(&g);
+    assert!(ui.find("RESTART EVERYTHING").is_ok() && ui.find("Restart every app now?").is_err());
+    let _ = ui.click("Restart everything\u{2026}").expect("the button");
+    assert!(matches!(messages(ui).as_slice(), [Message::AskRestartAll]));
+
+    let _ = g.update(Message::AskRestartAll);
+    let mut ui = sim(&g);
+    assert!(ui.find("Restart every app now?").is_ok());
+    save(&mut ui, "settings-restart");
+    let _ = ui.click("Restart now").expect("the confirm button");
+    assert!(matches!(messages(ui).as_slice(), [Message::RestartAll]));
+    let mut ui = sim(&g);
+    let _ = ui.click("Cancel").expect("cancel");
+    assert!(matches!(messages(ui).as_slice(), [Message::CancelRestartAll]));
+
+    let _ = g.update(Message::RestartAll);
+    let mut ui = sim(&g);
+    assert!(ui.find("Restarting\u{2026} the window reconnects when wardend is back.").is_ok());
+}
+
+/// A supervisor keeps the code it started with: after a rebuild it shows `-` for what a newer
+/// Warden knows, and the page says so, with the command that fixes it.
+#[test]
+fn an_older_supervisor_is_named_with_the_command_that_restarts_it() {
+    const COMMAND: &str = "warden update";
+    let mut g = connected();
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    assert!(ui.find("web").is_ok() && !text_has(&mut ui, "supervisor was"), "no banner for a current one");
+    drop(ui);
+    for (what, edit) in [
+        ("was started by an older warden", json!(null)),
+        ("was started before warden was rebuilt or upgraded", json!({"replaced": true})),
+    ] {
+        let mut g = connected();
+        let mut old = status("web", vec![worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None)], 1, json!(null));
+        if edit.is_null() {
+            old.as_object_mut().unwrap().remove("build");
+        } else {
+            old["build"]["replaced"] = edit["replaced"].clone();
+        }
+        let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": old})).unwrap();
+        let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+        let _ = g.update(Message::Select("web".into()));
+        let mut ui = sim(&g);
+        let line = format!("This app's supervisor {what}: CPU, memory and ports may show \u{2013}. Restart it:");
+        assert!(ui.find(line.as_str()).is_ok(), "the banner for {what:?} is missing");
+        assert!(ui.find(COMMAND).is_ok(), "and the command");
+        if edit.is_null() {
+            save(&mut ui, "older-supervisor");
+        }
+    }
+}
+
+/// The folder a project lives in sits under its name (the folder a static site serves, for
+/// one), and is not there for a supervisor that does not report it yet.
+#[test]
+fn the_project_folder_is_shown_under_its_name() {
+    let mut g = connected();
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    assert!(ui.find("/srv/web/current").is_ok(), "the folder under the name");
+    drop(ui);
+
+    let mut g = connected();
+    let mut old = status("web", vec![worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None)], 1, json!(null));
+    old.as_object_mut().unwrap().remove("cwd");
+    let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": old})).unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    assert!(ui.find("/srv/web/current").is_err(), "nothing to show without it");
+}
+
+fn text_has(ui: &mut Simulator<'_, Message>, needle: &str) -> bool {
+    ui.find(needle).is_ok()
 }
 
 /// Hot standbys (`status.standbys`) are listed after the workers, as `s1`

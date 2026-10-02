@@ -878,6 +878,7 @@ fn args_for(args: &Args, target: Option<&str>) -> Args {
         no_wait: args.no_wait,
         yes: true,
         table_only: false,
+        parallel: None,
     }
 }
 

@@ -43,7 +43,11 @@ const PAGE_PAD: f32 = 18.0;
 const GAP: f32 = 14.0;
 const HEAD_H: f32 = 44.0;
 const FACTS_H: f32 = 18.0;
+/// The folder line under the name.
+const CWD_H: f32 = 20.0;
 const BANNER_H: f32 = 40.0;
+/// The "older supervisor" banner: a sentence and the command under it.
+const OUTDATED_H: f32 = 74.0;
 const IDLE_H: f32 = 92.0;
 const PORTS_H: f32 = 24.0;
 const ACTIONS_H: f32 = 32.0;
@@ -127,6 +131,18 @@ fn clip(text: &str, max: usize) -> Cow<'_, str> {
     }
     let cut: String = text.chars().take(max.saturating_sub(1)).collect();
     Cow::Owned(format!("{}…", cut.trim_end()))
+}
+
+/// A path cut at the front, as the end of it is what tells projects apart: `…/Workspaces/api`.
+fn clip_start(path: &str, max: usize) -> Cow<'_, str> {
+    let n = path.chars().count();
+    if n <= max {
+        return Cow::Borrowed(path);
+    }
+    let tail: String = path.chars().skip(n - max.saturating_sub(1)).collect();
+    // Start at a whole directory name when there is one to start at.
+    let tail = tail.find('/').map_or(tail.as_str(), |i| &tail[i..]);
+    Cow::Owned(format!("…{tail}"))
 }
 
 fn menu_item<'a>(
@@ -438,15 +454,16 @@ fn not_running<'a>(g: &'a Gui, error: &'a str, attempt: u32) -> Element<'a, Mess
             icon(Icon::Power).size(36).style(muted),
             heading("wardend is not running").size(22),
             text(
-                "wardend is the optional host daemon that streams every app's state and events to this window; \
+                "wardend is the host daemon that streams every app's state and events to this window. \
+                 `warden start` and `warden resurrect` start it and `warden kill` stops it; \
                  your apps keep running without it."
             )
             .align_x(Center),
             text(error).size(13).style(muted),
-            row![start, small(format!("runs `warden daemon --background` {where_}"))].spacing(12).align_y(Center),
+            row![start, small(format!("starts it {where_}"))].spacing(12).align_y(Center),
             small(format!(
-                "Or run `warden daemon --background` yourself (`warden startup` keeps it running across reboots). \
-                 Trying to connect again every few seconds (attempt {attempt})."
+                "Or run `warden resurrect` (or `warden start <app>`) yourself; `warden startup` brings it back \
+                 after a reboot. Trying to connect again every few seconds (attempt {attempt})."
             )),
         ]
         .spacing(14)
@@ -587,7 +604,24 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             facts.push("health replacements suspended".into());
         }
     }
-    let mut c = column![head, small(facts.join(" · "))].spacing(8);
+    let mut c = column![head].spacing(8);
+    // Where the project lives: the directory its workers run in (the folder a static site
+    // serves). Click to copy it.
+    let cwd = a.status.as_ref().and_then(|s| s.cwd.as_deref());
+    if let Some(dir) = cwd {
+        c = c.push(tip(
+            button(
+                row![icon(Icon::Folder).size(13).style(muted), small(clip_start(dir, 90).into_owned())]
+                    .spacing(6)
+                    .align_y(Center),
+            )
+            .padding([2, 0])
+            .style(look::ghost)
+            .on_press(Message::Copy(dir.to_string())),
+            format!("{dir}\nClick to copy"),
+        ));
+    }
+    c = c.push(small(facts.join(" · ")));
     if let (AppState::GaveUp | AppState::Unreachable, Some(p)) = (e.state, &e.problem) {
         c = c.push(
             container(
@@ -600,11 +634,45 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             .style(look::banner(Tone::Bad)),
         );
     }
+    // A supervisor keeps the code it started with: after a rebuild or an upgrade the numbers
+    // a newer Warden has (CPU, memory, ports) show "-" until it is restarted.
+    let outdated = a.status.as_ref().and_then(|s| s.outdated(env!("CARGO_PKG_VERSION")));
+    if let Some(why) = outdated {
+        const RESTART: &str = "warden update";
+        c = c.push(
+            container(
+                row![
+                    icon(Icon::Info).size(16).style(Tone::Warn.style()),
+                    text(format!("This app's supervisor {why}: CPU, memory and ports may show \u{2013}. Restart it:"))
+                        .size(13),
+                    tip(
+                        button(text(RESTART).font(MONO).size(12))
+                            .padding([3, 10])
+                            .style(look::chip)
+                            .on_press(Message::Copy(RESTART.into())),
+                        "Copy the command",
+                    ),
+                ]
+                .spacing(10)
+                .align_y(Center)
+                .wrap(),
+            )
+            .padding([9, 12])
+            .width(Fill)
+            .style(look::banner(Tone::Warn)),
+        );
+    }
     // What sits above the bottom pane, in pixels (about; the page only needs to know
     // whether the pane keeps a usable height).
     let mut top = TOPBAR_H + PAGE_PAD + HEAD_H + 8.0 + FACTS_H + GAP;
+    if cwd.is_some() {
+        top += CWD_H + 8.0;
+    }
     if matches!(e.state, AppState::GaveUp | AppState::Unreachable) && e.problem.is_some() {
         top += BANNER_H + 8.0;
+    }
+    if outdated.is_some() {
+        top += OUTDATED_H + 8.0;
     }
     if a.status.is_none() {
         c = c.push(idle_card(g, a));
@@ -1443,6 +1511,7 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
             ),
         ]
         .spacing(8),
+        restart_all_section(g),
         small(format!("This desktop: {}.", g.system.describe())),
         row![
             space::horizontal(),
@@ -1455,6 +1524,48 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
     .spacing(18)
     .width(440)
     .into()
+}
+
+/// "Restart everything": a supervisor keeps the code it started with, so after an upgrade or a
+/// rebuild this is what makes every app and wardend run the installed `warden`.
+fn restart_all_section(g: &Gui) -> Element<'_, Message> {
+    use crate::app::RestartAll;
+    let where_ = if g.target.host.is_local() { "this machine".to_string() } else { g.target.describe() };
+    let mut c = column![
+        section("Restart everything"),
+        small(format!(
+            "Saves what runs on {where_}, stops every app's supervisor and wardend, and starts them again from the \
+             installed warden (like `warden update`). Use it after upgrading or rebuilding warden. Apps stop for a \
+             few seconds; stopped apps stay stopped."
+        )),
+    ]
+    .spacing(8);
+    c = match g.restart_all {
+        RestartAll::Idle => c.push(
+            button(labeled(Icon::Restart, "Restart everything\u{2026}"))
+                .padding([6, 14])
+                .style(look::quiet)
+                .on_press(Message::AskRestartAll),
+        ),
+        RestartAll::Asking => c.push(
+            row![
+                text("Restart every app now?").size(13),
+                space::horizontal(),
+                button(text("Cancel").size(13).font(MEDIUM))
+                    .padding([6, 14])
+                    .style(look::quiet)
+                    .on_press(Message::CancelRestartAll),
+                button(text("Restart now").size(13).font(MEDIUM))
+                    .padding([6, 14])
+                    .style(look::solid(Tone::Warn))
+                    .on_press(Message::RestartAll),
+            ]
+            .spacing(10)
+            .align_y(Center),
+        ),
+        RestartAll::Running => c.push(small("Restarting\u{2026} the window reconnects when wardend is back.")),
+    };
+    c.into()
 }
 
 fn machine_dialog(f: &MachineForm) -> Element<'_, Message> {

@@ -6,7 +6,7 @@
 #   macos.sh agent    warden startup as the runner user: a LaunchAgent (gui/<uid>)
 #   macos.sh daemon   sudo warden startup: a LaunchDaemon (system domain)
 #
-# The job runs `warden daemon --resurrect` with KeepAlive SuccessfulExit=false.
+# The job runs `warden wardend --resurrect` with KeepAlive SuccessfulExit=false.
 # Checked: the plist installs and loads, wardend from the job adopts the apps
 # already running (without starting them twice), restarts a SIGKILLed
 # supervisor; launchd restarts a SIGKILLed wardend (and leaves its
@@ -48,9 +48,9 @@ job_pid() { lc print "$TARGET" 2>/dev/null | awk '$1 == "pid" && $2 == "=" { pri
 app_field() { w list --json 2>/dev/null | jq -r --arg a "$1" ".[] | select(.app == \$a) | $2"; }
 app_ready() { [ "$(app_field "$1" '"\(.status.workers_ready)/\(.status.workers_configured)"')" = "$2/$2" ]; }
 sup_pid() { app_field "$1" '.status.pid // empty'; }
-wardend_pid() { w daemon status --json 2>/dev/null | jq -r '.hello.pid // empty'; }
+wardend_pid() { w wardend status --json 2>/dev/null | jq -r '.hello.pid // empty'; }
 wardend_sees() {
-  w daemon status --json | jq -e --arg a "$1" '.apps[] | select(.name == $a and .state == "running")' >/dev/null
+  w wardend status --json | jq -e --arg a "$1" '.apps[] | select(.name == $a and .state == "running")' >/dev/null
 }
 # wardend answers, and is the process launchd runs for the job.
 wardend_is_job() {
@@ -93,8 +93,8 @@ none_left() {
 diag() {
   echo "--- launchctl print $TARGET"
   lc print "$TARGET" 2>&1 | grep -E '^[[:space:]]*(state|pid|last exit code|runs|path|program) =' | head -8
-  echo "--- warden daemon status"
-  w daemon status 2>&1 | head -6 | cut -c1-160
+  echo "--- warden wardend status"
+  w wardend status 2>&1 | head -6 | cut -c1-160
   echo "--- warden list"
   w list 2>&1 | head -6 | cut -c1-160
   echo "--- processes"
@@ -155,7 +155,7 @@ run_ok "warden startup" w startup
 STARTUP_OUT=$OUT
 check "$PLIST written" test -f "$PLIST"
 check "the plist is valid (plutil -lint)" plutil -lint "$PLIST"
-check "the plist runs warden daemon --resurrect" grep -q "<string>--resurrect</string>" "$PLIST"
+check "the plist runs warden wardend --resurrect" grep -q "<string>--resurrect</string>" "$PLIST"
 contains "startup says the job is loaded" "$STARTUP_OUT" "$TARGET: loaded"
 check "launchd has the job ($TARGET)" lc print "$TARGET"
 wait_for "launchd runs wardend for the job" 20 wardend_is_job
@@ -222,7 +222,7 @@ note "warden unstartup"
 run_ok "warden unstartup" w unstartup
 check_not "$PLIST removed" test -e "$PLIST"
 check_not "launchd no longer has the job" lc print "$TARGET"
-wait_for "wardend stopped with the job" 15 bash -c "! $SUDO $W daemon status >/dev/null 2>&1"
+wait_for "wardend stopped with the job" 15 bash -c "! $SUDO $W wardend status >/dev/null 2>&1"
 check "$API keeps running after unstartup" http_ok "$PORT_API"
 run_ok "warden kill --yes (after unstartup)" w kill --yes
 wait_for "nothing left after warden kill" 40 none_left
