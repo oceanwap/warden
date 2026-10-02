@@ -292,6 +292,9 @@ jobs:
           cp gui/README.md "dist/$NAME/README-GUI.md"
           cp LICENSE-MIT LICENSE-APACHE "$CLI/THIRD-PARTY-LICENSES.txt" notices/THIRD-PARTY-LICENSES-GUI.txt "dist/$NAME/"
           cp -R "$CLI/contrib" "dist/$NAME/"
+          # The menu entry and icon: ~/.local/share/applications and ~/.local/share/icons/hicolor/256x256/apps.
+          cp assets/warden-gui.desktop "dist/$NAME/"
+          cp assets/icon/png/warden-256.png "dist/$NAME/warden.png"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
       - uses: actions/upload-artifact@v4

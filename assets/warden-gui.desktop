@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Warden
+GenericName=Process supervisor
+Comment=Every app on this host and its live monitoring, from wardend
+Exec=warden-gui
+Icon=warden
+Terminal=false
+Categories=Development;System;Monitor;
+StartupWMClass=warden-gui

@@ -258,6 +258,7 @@ for arch in $(echo "$archs" | tr ',' ' '); do
     cp README.md "$app/Contents/Resources/"
     cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf contrib/nginx.conf "$app/Contents/Resources/contrib/"
     cp gui/README.md "$app/Contents/Resources/README-GUI.md"
+    cp assets/icon/Warden.icns "$app/Contents/Resources/Warden.icns"
     cp LICENSE-MIT LICENSE-APACHE "$out/notices/THIRD-PARTY-LICENSES.txt" "$out/notices/THIRD-PARTY-LICENSES-GUI.txt" "$app/Contents/Resources/"
     cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -268,6 +269,7 @@ for arch in $(echo "$archs" | tr ',' ' '); do
   <key>CFBundleDisplayName</key><string>Warden</string>
   <key>CFBundleIdentifier</key><string>io.github.oceanwap.warden</string>
   <key>CFBundleExecutable</key><string>warden-gui</string>
+  <key>CFBundleIconFile</key><string>Warden</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>
