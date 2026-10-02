@@ -2,11 +2,10 @@
 
 A release is a tag `v<version>` on `main`, matching the version in
 `Cargo.toml`. The tag starts `.github/workflows/release.yml`, which builds and
-tests the Linux archives and publishes the GitHub Release. The macOS archives
-are built on a Mac instead (see "The macOS archives" below: macOS runner
-minutes cost ten times a Linux minute). One command, run on that Mac, does the
-part before the workflow, builds the macOS archives and then follows the
-workflow to the end:
+tests the Linux archives and packages and publishes the GitHub Release. The
+macOS archives are built on a Mac instead (see "The macOS archives" below).
+One command, run on that Mac, does the part before the workflow, builds the
+macOS archives and then follows the workflow to the end:
 
 ```sh
 cargo release 0.2.0 --dry-run   # every step printed, the read-only checks run, nothing changed
@@ -20,6 +19,27 @@ cargo dist-macos                # only the macOS archives (below)
 `cargo xtask release`, in `xtask/src/release.rs`. If the third-party
 `cargo-release` is installed, cargo warns that the alias shadows it; use
 `cargo xtask release`, the same command.
+
+Before it: put the release's section in `CHANGELOG.md` and push it (it becomes
+the release notes, see "Release notes"), and try the workflow once without
+publishing (next section).
+
+## A dry run first
+
+**Actions → Release → Run workflow**, on any branch, with **Publish the
+release** left unticked, builds everything the release has, exactly as a
+release would, and publishes nothing: no tag, no GitHub Release, no draft, no
+macOS archives (those need the Mac). The Linux archives and packages are built
+and tested (the packages installed in containers, `install.sh` against the
+archives), `SHA256SUMS` is written, and the files are kept for 14 days as the
+workflow artifacts `release-<version>` (every file) and `release-notes` (what
+the release page will say; also in the run's summary). Run it before tagging, and
+after any change to `release.yml`, `scripts/dist-linux-packages.sh` or
+`contrib/nfpm*.yaml`: the workflow itself is only checked for syntax (`actionlint`, in
+CI) until it runs.
+
+A pushed tag `v*` is always the real release; run by hand, only the ticked box
+is (below).
 
 ## From GitHub, without a checkout
 
@@ -39,11 +59,10 @@ with a message saying how to fix it: the run is on `main`; the tag
 `v<Cargo.toml version>` does not exist yet; the `CI` workflow has a passed
 run on this very commit (tick **Publish even without a green CI run** only
 if you are sure). Then it builds, packages and install-tests the Linux
-archives, takes the macOS ones from the draft release, and only when all of
-that passed does the last job publish the release and create the tag
-`v<version>` at that commit, with generated notes. A failed build leaves no
-tag behind. Run it without ticking the box for a dry run: the Linux archives
-are kept as workflow artifacts (no macOS ones, no release).
+archives and packages, takes the macOS ones from the draft release, and only
+when all of that passed does the last job publish the release and create the
+tag `v<version>` at that commit, with the notes from `CHANGELOG.md`. A failed
+build leaves no tag behind. Run it without ticking the box for a dry run (above).
 
 This path does not change the version: to release another number, commit
 the bump to `main` first (`cargo release <version>` does that and the tag
@@ -129,17 +148,30 @@ hour, enough to follow a release at a slower pace.
 
 ## What the Release workflow does
 
-`.github/workflows/release.yml`, on a pushed `v*` tag, or run by hand with
-**Publish the release** ticked (above). All on Linux runners:
+`.github/workflows/release.yml`, on a pushed `v*` tag (the release), or run by
+hand: a dry run, or with **Publish the release** ticked (above). All on Linux
+runners:
 
-- **meta**: the tag must match `Cargo.toml`'s version, or nothing is built.
-  By hand: the same, plus the checks above.
+- **meta**: the version in `Cargo.toml` must be `X.Y.Z` or `X.Y.Z-PRERELEASE`,
+  and a pushed tag must match it, or nothing is built. By hand with the box
+  ticked: the same, plus the checks above (on `main`, no such tag yet, a green
+  CI run). It also writes the release notes (below) and keeps them as the
+  artifact `release-notes`, on a dry run too.
 - **licenses**: the third-party notices (cargo-about); fails on a license
   `about.toml` doesn't accept.
 - **cli**: `warden` for Linux x86_64 and arm64 (glibc 2.28 baseline, built
   with cargo-zigbuild); checks the binary (stripped, glibc symbols,
   `--version`), then packages it.
 - **gui**: `warden-gui` with the CLI, for Linux x86_64 and arm64 (a `.tar.gz`).
+- **packages**: from those very binaries, `.deb` and `.rpm` for `warden` and
+  `warden-gui` ([`docs/packages.md`](packages.md)), built with nfpm by
+  `scripts/dist-linux-packages.sh` on a runner of the packages' own
+  architecture. `scripts/test-linux-packages.sh` then inspects every package
+  (what it holds, and that it holds no unit, no sysctl file and no script
+  that starts anything) and installs it in Debian, Ubuntu, Fedora and Rocky
+  Linux containers: `dpkg -i` / `rpm -i`, `warden --version`, `warden doctor`,
+  the GUI package, a reinstall and the removal. A missing tool or container
+  runtime fails the job (`--require`).
 - **macos** (a real release only): waits, up to an hour, for the macOS
   archives in the draft release for the tag, built on a Mac. It takes the four
   archives only when `macos-build-info.txt` names this very commit and a clean
@@ -148,28 +180,55 @@ hour, enough to follow a release at a slower pace.
   Mach-O binaries of the architecture in its name and the version in its
   `Info.plist`. It retries API errors, and prints what is missing every few
   minutes (an annotation on the run).
-- **checksums**: `SHA256SUMS` over every archive (macOS ones included) and
+- **checksums**: checks that every file a release holds is there (the list is
+  written out in the job: a job that produced less must not make a smaller
+  release), then `SHA256SUMS` over every archive, package (macOS ones included) and
   `install.sh`.
 - **install-test**: `install.sh` against those very files on Linux x86_64 and
   Linux arm64, as a user and as root; a tampered archive must be refused. (The
   macOS install is tested on the Mac by `scripts/dist-macos.sh`.)
-- **publish**: uploads every file to the draft (the macOS ones replaced by the
-  very bytes `SHA256SUMS` lists), writes generated notes and publishes it (the
-  tag is created there, in a run started by hand); a version with a `-`
-  (`0.2.0-rc.1`) is marked as a pre-release. It does nothing to a release that
-  is already published (a re-run). A last step downloads what was published and
-  checks it against `SHA256SUMS`, file for file.
+- **publish**: the only job that writes (with `macos`, which only reads the
+  draft). It uploads every file to the draft (the macOS ones replaced by the
+  very bytes `SHA256SUMS` lists), downloads the draft and checks it against
+  `SHA256SUMS`, file for file, **before** anything is public, then publishes it
+  with the notes (the tag is created there, in a run started by hand); a
+  version with a `-` (`0.2.0-rc.1`) is marked as a pre-release. It does
+  nothing to a release that is already published (a re-run). A last step
+  downloads what was published and checks it again.
 
-Nothing is published unless every build, the macOS check and the install
-tests passed. Manual runs without the box ticked do everything but the macOS
-archives and the publishing (the Linux files are kept as workflow artifacts for
-14 days).
+Nothing is published unless every build, the packages' tests, the macOS check
+and the install tests passed. Dry runs do everything but the macOS archives and
+the publishing; the files are kept as workflow artifacts for 14 days.
+
+Actions are named by major version (`actions/checkout@v5`); Dependabot
+(`.github/dependabot.yml`) proposes the bumps weekly. Only `publish` and
+`macos` have `contents: write`, and they run no third-party action. No job
+uses a cache (a release is built from the sources, not from what an earlier
+run left behind). Runners are `ubuntu-24.04` and `ubuntu-24.04-arm`, named
+rather than `-latest`, which GitHub moves to Ubuntu 26.04 between 2026-10-19 and
+2026-11-19; the GUI is built on `ubuntu-22.04` for its older glibc (see the
+TODO at the end).
+
+### Release notes
+
+The notes of the GitHub Release come from `CHANGELOG.md`
+(`.github/release-notes.sh`, which you can run yourself:
+`.github/release-notes.sh 0.2.0`): the section whose heading names the
+version, like `## [0.2.0] — 2026-11-02`; a pre-release has a section of its
+own. With none, the `## [Unreleased]` section (without its lead-in before the
+first `###`), and a warning on the run. With neither, only the footer, which
+points at [`docs/install.md`](install.md), [`docs/packages.md`](packages.md) and
+how to check `SHA256SUMS`. `cargo release` does not touch the changelog:
+before the release, rename the `[Unreleased]` heading to `[<version>]` with the
+date, commit it and push it (`cargo release` needs the branch level with origin
+and tags the commit you are on, or the one it makes on top of it for the
+version bump). A dry run shows what the notes will be.
 
 ## The macOS archives
 
 Built on a Mac by `scripts/dist-macos.sh` (`cargo dist-macos`; `cargo release`
 runs it after the push): `warden-<version>-macos-{arm64,x86_64}.tar.gz` and
-`warden-gui-<version>-macos-{arm64,x86_64}.zip` (an ad-hoc signed
+`warden-gui-<version>-macos-{arm64,x86_64}.zip` and `Warden-<version>-macos-{arm64,x86_64}.dmg` (an ad-hoc signed
 `Warden.app`), with the same contents the Linux archives have. Either kind of
 Mac builds both architectures.
 
@@ -201,10 +260,15 @@ the Mac tools (CI runs it); only a run on a Mac tests the real compilers and
 `codesign`. `--no-upload` builds without touching GitHub; `--help` lists the
 options.
 
-To build macOS on GitHub's runners again (for instance if the repository
-becomes public, where they are free), restore the macOS entries in the `cli`,
-`gui` and `install-test` matrices from this file's history, before commit
-"macOS archives are built on a Mac".
+The archives were put on a Mac to save runner minutes. The repository is
+public now and standard hosted runners (macOS too) are free for it, so that
+reason is gone; what stays on the Mac is the signing (the certificate lives in
+the owner's keychain, no secrets in CI; see the TODO below). To build macOS
+on GitHub's runners again, restore the macOS entries in the `cli`, `gui` and
+`install-test` matrices from `release.yml`'s history (before commit 9499857,
+"macOS archives are built on a Mac, not on GitHub's macOS runners"), use the
+Intel runner label GitHub offers now (`macos-15-intel`; `macos-13` is retired)
+and drop the `macos` job's waiting; `macos-latest` is Apple silicon.
 
 ## Where the artifacts land
 
@@ -213,12 +277,18 @@ becomes public, where they are free), restore the macOS entries in the `cli`,
 - `warden-<version>-<os>-<arch>.tar.gz`: the CLI (`linux-x86_64`,
   `linux-arm64`, `macos-arm64`, `macos-x86_64`);
 - `warden-gui-<version>-linux-<arch>.tar.gz` and
-  `warden-gui-<version>-macos-<arch>.zip`: the GUI with the CLI;
+  `warden-gui-<version>-macos-<arch>.zip` and
+  `Warden-<version>-macos-<arch>.dmg`: the GUI with the CLI;
+- `warden_<version>-1_<amd64|arm64>.deb`, `warden-gui_<version>-1_<amd64|arm64>.deb`,
+  `warden-<version>-1.<x86_64|aarch64>.rpm`, `warden-gui-<version>-1.<x86_64|aarch64>.rpm`:
+  the Linux packages ([`docs/packages.md`](packages.md)); `<version>` is the
+  release's, `0.2.0-rc.1` for a pre-release (inside the package it is
+  `0.2.0~rc.1`, which sorts before `0.2.0`);
 - `install.sh` and `SHA256SUMS`.
 
 `https://github.com/oceanwap/warden/releases/latest/download/install.sh`
-always serves the newest release that is not a pre-release (README,
-"Install").
+always serves the newest release that is not a pre-release
+([`docs/install.md`](install.md)).
 
 ## Push rights
 
@@ -231,22 +301,16 @@ environment that may push to branches but not tags, the release stops at
 step 7 with the commit and the tag kept: run the printed `git push --atomic …`
 where you can push tags, or use the workflow by hand.
 
-GitHub Actions must be able to run: with a failed payment or a spending limit
-reached, every job is refused ("recent account payments have failed…"), and
-so is a release (**Settings → Billing & plans**). A release needs only Linux
-minutes (a few cents), so a small spending limit is enough; the macOS archives
-need no Actions at all, and are uploaded even while Actions are blocked.
+## Which workflow runs when
 
-## Minutes
-
-On a private repository every runner minute is billed against the plan's
-included minutes (Free: 2,000 a month, no carry-over), and a macOS minute
-counts ten times a Linux one. So the workflows spend them where they matter:
+Standard GitHub-hosted runners are free for a public repository, so nothing
+here is rationed for cost; the ARM64 and macOS jobs skip a commit that only
+changes docs because they are slow, not because they are dear.
 
 | Workflow | Linux x86_64 | Linux ARM64 | macOS |
 |---|---|---|---|
 | **CI** | every push and pull request | main, pull requests, by hand | main, pull requests, by hand |
-| **Service managers** | every push | | main, pull requests, by hand |
+| **Service managers** | every push (also warden from the `.deb`) | | main, pull requests, by hand |
 | **Chaos** | main, daily, by hand | | by hand only |
 | **Bench** | `bench` branch, by hand | `bench` branch, by hand | |
 | **Release** | tag, by hand | tag, by hand | none: built on your Mac |
@@ -256,7 +320,7 @@ job but the Linux x86_64 ones (`.github/code-changed.sh` decides; Linux x86_64
 still runs so the commit has a green CI run to release). To test a scratch
 branch on macOS or ARM64, start CI by hand on it (**Actions → CI → Run
 workflow**). Run **Chaos** by hand, macOS ticked, before a release. A release
-costs about an hour of Linux minutes and no macOS ones.
+takes about an hour of Linux runner time, most of it the builds.
 
 ## When something fails
 
@@ -267,8 +331,8 @@ costs about an hour of Linux minutes and no macOS ones.
   `macos` job waits an hour. Fix what the script said, run `cargo dist-macos`
   (it replaces the draft's macOS files; run it on the released commit). If the
   hour is over, re-run the failed jobs.
-- **The workflow**: nothing is published. If it was flaky, re-run the failed
-  jobs (`gh run rerun <id> --failed`, or "Re-run failed jobs" on the run
+- **The workflow**: nothing is published (the draft is checked before it goes
+  public). If it was flaky, re-run the failed jobs (`gh run rerun <id> --failed`, or "Re-run failed jobs" on the run
   page). If the code must change: `git push --delete origin v<version>` and
   `git tag -d v<version>`, delete the draft release (its macOS files were built
   from the old commit), fix it on `main`, let CI pass, release again.
@@ -276,8 +340,25 @@ costs about an hour of Linux minutes and no macOS ones.
 
 ## TODO
 
+- **The GUI's runner.** The GUI is built on `ubuntu-22.04` (and
+  `ubuntu-22.04-arm`) so that it needs only glibc 2.35. GitHub began retiring
+  those images on 2026-09-17: brownouts (jobs that fail on purpose) on 2027-03-23,
+  03-30, 04-06 and 04-13, gone on 2027-04-17. Before then, build the GUI in a
+  `container: ubuntu:22.04` on the 24.04 runners (the container needs a C
+  toolchain, `jq`, `file` and `binutils` installed first), or accept glibc
+  2.39 as the baseline, which would stop the GUI on Ubuntu 22.04 and Debian 12.
+- **Package signing and a repository.** The `.deb` and `.rpm` files are
+  unsigned and are downloads, not an apt or dnf repository
+  ([`docs/packages.md`](packages.md)). Signing needs the owner's GPG key:
+  nfpm signs both formats (`signature:` in `contrib/nfpm*.yaml`, key and
+  passphrase as repository secrets), and the public key must be published
+  somewhere users can fetch it.
+- **The packages' maintainer.** Packages say `Warden authors
+  <https://github.com/oceanwap/warden>`. Set the repository variable
+  `WARDEN_PKG_MAINTAINER` (Settings → Secrets and variables → Actions →
+  Variables) to `Name <address>` for a real one.
 - **macOS notarization.** `Warden.app` is ad-hoc signed but not notarized,
-  so Gatekeeper refuses the first open (README, "Install", says how to open
+  so Gatekeeper refuses the first open (docs/install.md says how to open
   it anyway). It needs the owner's Apple Developer ID; the archives are now
   built on the owner's Mac, so the certificate can stay in its keychain and
   no secrets go to CI. The steps are in `scripts/dist-macos.sh`

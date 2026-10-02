@@ -1,13 +1,19 @@
 # Linux x86_64 and ARM64 are the production targets: everything runs there,
 # integration tests included. macOS is for development: build, lint, unit tests.
 #
-# Minutes cost money on a private repository, and a macOS minute counts ten
-# times: Linux x86_64 runs on every push and pull request; Linux ARM64 and
-# macOS run on pushes to main, on pull requests and by hand (Actions > CI >
-# Run workflow, on any branch), and only when something but documentation
-# changed (.github/code-changed.sh). A docs-only commit still gets a green
-# Linux x86_64 run, which is what `cargo release` and the Release workflow
-# look for.
+# Linux x86_64 runs on every push and pull request; Linux ARM64 and macOS run
+# on pushes to main, on pull requests and by hand (Actions > CI > Run
+# workflow, on any branch), and only when something but documentation changed
+# (.github/code-changed.sh), so a scratch branch or a docs-only commit does not
+# wait for them. A docs-only commit still gets a green Linux x86_64 run, which
+# is what `cargo release` and the Release workflow look for. (Hosted runners
+# are free for a public repository: nothing here is rationed for cost. To try
+# a branch on ARM64 or macOS, start CI by hand on it.)
+#
+# Runners are named (ubuntu-24.04), not `ubuntu-latest`: GitHub moves that
+# label to Ubuntu 26.04 between 2026-10-19 and 2026-11-19, and the move should
+# happen when someone has looked at a CI run on it, not by itself in the
+# middle of a release. macOS follows `macos-latest`.
 # The workspace also has protocol/ (the wire types) and gui/ (warden-gui):
 # every job builds and lints all of it; the GUI's tests run on linux-x86_64
 # (unit, headless rendering with iced_test, and against a real wardend).
@@ -35,11 +41,12 @@ env:
   # What the integration tests and the benchmarks run on.
   BUN_VERSION: "1.3.13"
   NODE_VERSION: "22"
+  ACTIONLINT_VERSION: "1.7.12"
 
 jobs:
   changes:
     name: what changed
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code: ${{ steps.diff.outputs.code }}
@@ -56,7 +63,7 @@ jobs:
         run: bash .github/code-changed.sh
 
   linux-x86_64:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -85,13 +92,15 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends openssh-server nginx
       - run: cargo fmt --all --check
-      - run: shellcheck install.sh scripts/*.sh .github/code-changed.sh
+      - run: shellcheck install.sh scripts/*.sh .github/code-changed.sh .github/release-notes.sh contrib/nfpm-preremove.sh
       # The macOS release script, with stubs for the Mac-only tools; and the
       # release tooling (xtask).
       - name: scripts/dist-macos.sh (stubbed) and xtask tests
         run: |
           bash scripts/test-dist-macos.sh
           cargo test -p xtask
+      - name: scripts/test-install.sh (install.sh against fake releases)
+        run: bash scripts/test-install.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --bin warden
         run: |
@@ -123,6 +132,20 @@ jobs:
       - name: annotate failing tests
         if: failure()
         run: python3 .github/annotate-test-failures.py unit.log gui.log integration.log
+
+  # The workflow files themselves (and the shell in their `run:` steps, through
+  # shellcheck). The Release workflow only ever runs for a release or a dry
+  # run: a typo in it is found here, not on release day.
+  workflows:
+    name: workflow files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: actionlint
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"
+          "$(go env GOPATH)/bin/actionlint"
 
   linux-arm64:
     needs: changes

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Does this push or pull request change anything but documentation?
 #
-# Used by the CI and Service managers workflows to skip the expensive jobs
-# (macOS minutes count ten times) for a commit that only touches docs, the
-# README or the benchmark result files. Prints `code=true` or `code=false`
+# Used by the CI and Service managers workflows to skip the slow jobs (ARM64,
+# macOS) for a commit that only touches docs, the README or the benchmark
+# result files. Prints `code=true` or `code=false`
 # (and appends it to $GITHUB_OUTPUT when that is set).
 #
 # Environment: EVENT (github.event_name), BEFORE (push: the previous tip),

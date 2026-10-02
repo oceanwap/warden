@@ -1,0 +1,19 @@
+# Keeps the actions the workflows use (checkout, upload-artifact, setup-bun,
+# ...) current: one pull request a week for all of them. Workflows name an
+# action by its major version (actions/checkout@v5), which Dependabot moves.
+# A bump to release.yml is worth a dry run before it is merged: Actions > Release
+# > Run workflow, "Publish the release" unticked (docs/releasing.md).
+#
+# Not for Cargo: the toolchain and the crates are bumped on purpose.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

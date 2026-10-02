@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 # Tests scripts/dist-macos.sh without a Mac (it runs on Linux, with GNU tools): macOS-only tools (uname, codesign,
-# plutil, ditto, arch, sw_vers), rustup, cargo and gh are stubs that record
-# what they were asked to do. What this proves: the control flow, the file
-# names and contents, the checks that stop a bad release, and the exact gh
-# calls. What it cannot prove: that the real compilers and codesign work on a
-# Mac, which only a run on a Mac does.
+# plutil, ditto, hdiutil, diskutil, arch, sw_vers), rustup, cargo and gh are stubs that record
+# what they were asked to do (the stub hdiutil makes a "disk image" out of a tar
+# archive and mounts it by unpacking it). What this proves: the control flow, the
+# file names and contents, the checks that stop a bad release (the disk image is
+# mounted, looked into and always detached), and the exact gh calls. What it
+# cannot prove: that the real compilers, codesign and hdiutil work on a Mac,
+# which only a run on a Mac does.
 #
 #   bash scripts/test-dist-macos.sh        (CI runs it on every code change)
 set -uo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+keep=0
+mp=""
+# Detaches the disk image this script mounted itself, whatever happens.
+cleanup() {
+    if [ -n "$mp" ]; then PATH="$T/bin:$PATH" hdiutil detach "$mp" >/dev/null 2>&1 || true; fi
+    if [ "$keep" = 0 ]; then rm -rf "$T"; fi
+}
+trap cleanup EXIT
 fails=0
 pass() { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
@@ -94,10 +103,46 @@ cat >"$bin/plutil" <<'EOF'
 EOF
 cat >"$bin/ditto" <<'EOF'
 #!/bin/sh
-# ditto -c -k --keepParent --norsrc SRC DST
+# ditto -c -k --keepParent --norsrc SRC DST.zip | ditto -x -k ZIP DIR | ditto SRC DST
 echo "ditto $*" >>"$FAKE_LOG"
-src=$5; dst=$6
-(cd "$(dirname "$src")" && zip -qr "$dst" "$(basename "$src")")
+case "$1" in
+  -c) src=$5; dst=$6; (cd "$(dirname "$src")" && zip -qr "$dst" "$(basename "$src")") ;;
+  -x) unzip -q "$3" -d "$4" ;;
+  *) cp -R "$1" "$2" ;;
+esac
+EOF
+cat >"$bin/hdiutil" <<'EOF'
+#!/bin/sh
+# create -volname V -srcfolder DIR -fs F -format UDZO -ov OUT | attach … -mountpoint DIR FILE | detach DIR
+# The "image" is a tar archive. FAKE_HDIUTIL: create-fail, attach-fail, no-link (no Applications link inside).
+echo "hdiutil $*" >>"$FAKE_LOG"
+verb=$1
+shift
+case "$verb" in
+  create)
+    src=
+    while [ $# -gt 1 ]; do
+      case "$1" in -srcfolder) src=$2; shift ;; -volname|-fs|-format) shift ;; esac
+      shift
+    done
+    [ "${FAKE_HDIUTIL:-}" = create-fail ] && exit 1
+    ex=--exclude=./nothing
+    [ "${FAKE_HDIUTIL:-}" = no-link ] && ex=--exclude=./Applications
+    tar -C "$src" "$ex" -czf "$1" . ;;
+  attach)
+    [ "${FAKE_HDIUTIL:-}" = attach-fail ] && exit 1
+    m=
+    while [ $# -gt 1 ]; do
+      case "$1" in -mountpoint) m=$2; shift ;; esac
+      shift
+    done
+    tar -xzf "$1" -C "$m" ;;
+esac
+exit 0
+EOF
+cat >"$bin/diskutil" <<'EOF'
+#!/bin/sh
+echo "   Volume Name:               ${FAKE_VOLNAME:-Warden}"
 EOF
 cat >"$bin/xattr" <<'EOF'
 #!/bin/sh
@@ -166,7 +211,8 @@ run "$R1" "$T/log1" -- --no-upload >"$T/out1" 2>&1
 check "build without upload exits 0" test $? -eq 0
 out=$R1/target/dist-macos
 for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz \
-    warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip macos-build-info.txt; do
+    warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip \
+    Warden-$version-macos-arm64.dmg Warden-$version-macos-x86_64.dmg macos-build-info.txt; do
     check "writes $f" test -s "$out/$f"
 done
 check "the build info names the commit" grep -qx "commit: $sha" "$out/macos-build-info.txt"
@@ -187,6 +233,17 @@ check "both targets were built, with the pinned toolchain" sh -c "
     grep -q 'cargo +[0-9.]* build --release --locked -p warden-gui --bin warden-gui --target x86_64-apple-darwin' '$T/log1'"
 check "the targets were added with rustup" grep -q 'rustup target add --toolchain [0-9.]* x86_64-apple-darwin' "$T/log1"
 check "install.sh verified the archive and refused a tampered one" sh -c "grep -q 'tampered archive is refused' '$T/out1' && grep -q 'installed: warden $version' '$T/out1'"
+check "the disk images are made with hdiutil: volume Warden, compressed (UDZO), from a staging folder" sh -c "
+    [ \"\$(grep -c '^hdiutil create -volname Warden -srcfolder .*/stage/dmg-[a-z0-9_]* -fs HFS+ -format UDZO -ov .*/Warden-$version-macos-[a-z0-9_]*.dmg\$' '$T/log1')\" = 2 ]"
+check "each disk image is signed ad hoc and verified" sh -c "
+    grep -q 'codesign --force --sign - .*/Warden-$version-macos-arm64.dmg' '$T/log1' &&
+    grep -q 'codesign --verify .*/Warden-$version-macos-x86_64.dmg' '$T/log1'"
+check "each image is mounted read-only at a folder of our own, and detached" sh -c "
+    [ \"\$(grep -c '^hdiutil attach -nobrowse -readonly -mountpoint .*/stage/mnt-' '$T/log1')\" = 2 ] &&
+    [ \"\$(grep -c '^hdiutil detach .*/stage/mnt-' '$T/log1')\" = 2 ]"
+check "Warden.app inside is verified on the mounted image" sh -c "grep -q 'codesign --verify --deep --strict .*/stage/mnt-' '$T/log1'"
+check "the bundled CLI of the mounted app is run" grep -q "warden $version" "$T/out1"
+check "install.sh put Warden.app in place from the zip, and from the disk image" sh -c "grep -q 'installed: Warden.app (from the zip)' '$T/out1' && grep -q 'installed: Warden.app (from the disk image)' '$T/out1' && grep -q 'uninstalled again' '$T/out1'"
 check "no gh call without upload" sh -c "! grep -q '^gh ' '$T/log1'"
 check "scratch files are removed" test ! -e "$out/stage"
 
@@ -195,7 +252,9 @@ run "$R1" "$T/log2" -- >"$T/out2" 2>&1
 check "upload (no release yet) exits 0" test $? -eq 0
 check "a draft release is created at the branch, with the archives" sh -c "
     grep -q '^gh release create v$version --draft --target main --title Warden $version --notes .*macos-arm64.tar.gz' '$T/log2' &&
-    grep '^gh release create' '$T/log2' | grep -q 'warden-gui-$version-macos-x86_64.zip'"
+    grep '^gh release create' '$T/log2' | grep -q 'warden-gui-$version-macos-x86_64.zip' &&
+    grep '^gh release create' '$T/log2' | grep -q 'Warden-$version-macos-arm64.dmg' &&
+    grep '^gh release create' '$T/log2' | grep -q 'Warden-$version-macos-x86_64.dmg'"
 check "the build info is uploaded last" sh -c "grep '^gh release' '$T/log2' | tail -1 | grep -q '^gh release upload v$version .*/macos-build-info.txt --clobber\$'"
 check "the build info is not part of the create call" sh -c "! grep '^gh release create' '$T/log2' | grep -q '/macos-build-info.txt'"
 
@@ -231,7 +290,7 @@ rm -f "$R1/stray.txt"
 run "$R1" "$T/log7" FAKE_ARCH=x86_64 -- --no-upload --arch x86_64 --no-gui >"$T/out7" 2>&1
 check "--arch x86_64 --no-gui exits 0" test $? -eq 0
 check "…builds one CLI archive and nothing else" sh -c "
-    [ \"\$(ls '$R1/target/dist-macos' | grep -Ec 'macos-.*\.(tar\.gz|zip)\$')\" = 1 ] &&
+    [ \"\$(ls '$R1/target/dist-macos' | grep -Ec 'macos-.*\.(tar\.gz|zip|dmg)\$')\" = 1 ] &&
     test -s '$R1/target/dist-macos/warden-$version-macos-x86_64.tar.gz'"
 check "…and installs it on an x86_64 Mac" grep -q "installed: warden $version" "$T/out7"
 
@@ -247,7 +306,8 @@ check "…and the manifest is named" grep -q "gui/Cargo.toml is version 9.9.9" "
 
 # ------------------------------------------------ 9. the info file vouches for each archive
 run "$R1" "$T/log9" -- --no-upload >"$T/out9" 2>&1
-for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip; do
+for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip \
+    Warden-$version-macos-arm64.dmg Warden-$version-macos-x86_64.dmg; do
     want=$(sha256 "$R1/target/dist-macos/$f")
     check "the build info lists $f with its checksum" grep -qx "sha256 $want $f" "$R1/target/dist-macos/macos-build-info.txt"
 done
@@ -259,7 +319,10 @@ check "--arch without --no-upload is refused" test $? -ne 0
 check "…before building anything" sh -c "! grep -q ' build ' '$T/log10'"
 run "$R1" "$T/log10b" -- --no-gui >"$T/out10b" 2>&1
 check "--no-gui without --no-upload is refused" test $? -ne 0
-check "…and says why" grep -q "needs all four archives" "$T/out10b"
+check "…and says why" grep -q "needs every file" "$T/out10b"
+run "$R1" "$T/log10c" -- --no-dmg >"$T/out10c" 2>&1
+check "--no-dmg without --no-upload is refused" test $? -ne 0
+check "…before building anything" sh -c "! grep -q ' build ' '$T/log10c'"
 
 # ------------------------------------------------ 11. --out never empties anything outside target/
 run "$R1" "$T/log11" -- --no-upload --out src >"$T/out11" 2>&1
@@ -312,10 +375,60 @@ check "…and says what to check out" grep -q "check out the commit the tag name
 run "$R1" "$T/log16" FAKE_ARCH=x86_64 FAKE_TRANSLATED=1 -- --no-upload >"$T/out16" 2>&1
 check "under Rosetta the arm64 archive is the one installed" grep -q "install.sh on this Mac (the archive for arm64)" "$T/out16"
 
+# ------------------------------------------------ 17. the disk images, mounted by this test too
+run "$R1" "$T/log17" -- --no-upload >"$T/out17" 2>&1
+check "a full build for the disk image checks exits 0" test $? -eq 0
+for arch in arm64 x86_64; do
+    dmg=$R1/target/dist-macos/Warden-$version-macos-$arch.dmg
+    mp=$T/mnt-$arch
+    mkdir -p "$mp"
+    if PATH="$bin:$PATH" FAKE_LOG="$T/log17m" hdiutil attach -nobrowse -readonly -mountpoint "$mp" "$dmg" >/dev/null 2>&1; then
+        pass "the $arch image mounts read-only"
+    else
+        fail "the $arch image mounts read-only"
+    fi
+    check "$arch image: Warden.app has its Info.plist" test -f "$mp/Warden.app/Contents/Info.plist"
+    check "$arch image: the bundled CLI says warden $version" sh -c "[ \"\$('$mp/Warden.app/Contents/MacOS/warden' --version)\" = 'warden $version' ]"
+    check "$arch image: the GUI is there and runs" sh -c "[ \"\$('$mp/Warden.app/Contents/MacOS/warden-gui' --version)\" = 'warden-gui $version' ]"
+    check "$arch image: Warden.app passes codesign --verify" env PATH="$bin:$PATH" FAKE_LOG="$T/log17m" codesign --verify --deep --strict "$mp/Warden.app"
+    check "$arch image: Applications is a link to /Applications" sh -c "[ -L '$mp/Applications' ] && [ \"\$(readlink '$mp/Applications')\" = /Applications ]"
+    PATH="$bin:$PATH" FAKE_LOG="$T/log17m" hdiutil detach "$mp" >/dev/null 2>&1
+    mp=""
+done
+
+# ------------------------------------------------ 18. a bad disk image stops the build, and is detached
+count() { grep -c "$1" "$2" || true; }
+run "$R1" "$T/log18a" FAKE_HDIUTIL=no-link -- --no-upload >"$T/out18a" 2>&1
+check "an image without the Applications link is refused" test $? -ne 0
+check "…and says so" grep -q "no Applications link" "$T/out18a"
+check "…and it was detached" sh -c "[ \"\$(grep -c '^hdiutil attach' '$T/log18a')\" = 1 ] && [ \"\$(grep -c '^hdiutil detach' '$T/log18a')\" = 1 ]"
+check "…and nothing was uploaded or released" sh -c "! grep -q '^gh release' '$T/log18a'"
+run "$R1" "$T/log18b" FAKE_HDIUTIL=attach-fail -- --no-upload >"$T/out18b" 2>&1
+check "an image that cannot be mounted is refused" test $? -ne 0
+check "…and says so" grep -q "cannot mount Warden-$version-macos-" "$T/out18b"
+check "…and a failed attach is still followed by a detach (it may be half mounted)" test "$(count '^hdiutil detach' "$T/log18b")" -ge 1
+run "$R1" "$T/log18c" FAKE_HDIUTIL=create-fail DMG_RETRY_SLEEP=0 -- --no-upload >"$T/out18c" 2>&1
+check "hdiutil create failing is refused after three tries" test $? -ne 0
+check "…three tries" test "$(count '^hdiutil create' "$T/log18c")" = 3
+check "…and says so" grep -q "hdiutil could not make Warden-$version-macos-" "$T/out18c"
+run "$R1" "$T/log18d" FAKE_VOLNAME=Other -- --no-upload >"$T/out18d" 2>&1
+check "an image whose volume is not called Warden is refused" test $? -ne 0
+check "…and says so" grep -q "the volume is called 'Other'" "$T/out18d"
+check "…and it was detached" sh -c "[ \"\$(grep -c '^hdiutil attach' '$T/log18d')\" = \"\$(grep -c '^hdiutil detach' '$T/log18d')\" ]"
+
+# ------------------------------------------------ 19. --no-dmg
+run "$R1" "$T/log19" -- --no-upload --no-dmg >"$T/out19" 2>&1
+check "--no-dmg --no-upload exits 0" test $? -eq 0
+check "…builds no disk image and runs no hdiutil" sh -c "! ls '$R1/target/dist-macos' | grep -q '\.dmg\$' && ! grep -q '^hdiutil' '$T/log19'"
+check "…but still the zips" test -s "$R1/target/dist-macos/warden-gui-$version-macos-arm64.zip"
+check "…and Warden.app still installs from the zip" grep -q "installed: Warden.app (from the zip)" "$T/out19"
+run "$R1" "$T/log19b" -- --no-upload --no-gui >"$T/out19b" 2>&1
+check "--no-gui builds no disk image either" sh -c "! ls '$R1/target/dist-macos' | grep -q '\.dmg\$' && ! grep -q '^hdiutil' '$T/log19b'"
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "$fails check(s) failed. Output of the last run of each case: $T (kept)"
-    trap - EXIT
+    keep=1
     exit 1
 fi
 echo "all checks passed"

@@ -1,0 +1,134 @@
+# nfpm (https://nfpm.goreleaser.com) configuration for the `warden` package:
+# /usr/bin/warden (the CLI; wardend is `warden wardend`), the licenses and the
+# example files. One file for every format (deb, rpm, archlinux). The GUI is a
+# separate package: contrib/nfpm-gui.yaml.
+#
+# Not run by hand: scripts/dist-linux-packages.sh sets the variables below
+# (one nfpm run per format) and runs nfpm from the repository root.
+#
+#   ARCH           amd64 | arm64 (nfpm names it for each format)
+#   VERSION        the version in the format's own syntax (1.2.3, or 1.2.3~rc.1
+#                  in a deb and an rpm); the script converts, nfpm does not
+#   RELEASE        the package revision: 1, 2, ... (reset when VERSION changes)
+#   MAINTAINER     "Name <address>"
+#   BIN_DIR        holds the `warden` binary
+#   NOTICES_DIR    holds THIRD-PARTY-LICENSES.txt
+#
+# What is deliberately NOT here, and why (docs/packages.md has the long form):
+#   - no scripts that start, enable or configure anything: a package installs
+#     files, `sudo warden startup` is what sets a host up (see the preremove
+#     note below, which only prints);
+#   - no systemd units under /usr/lib/systemd/system: `warden startup` writes
+#     them to /etc/systemd/system with the real binary path and environment,
+#     and Warden (src/fleet.rs `has_unit`) treats a unit file in
+#     /usr/lib/systemd/system as "startup is set up", which would make
+#     `warden start` and `warden doctor` believe a service manager owns
+#     wardend. The units ship as examples under /usr/share/doc/warden/examples;
+#   - no sysctl file under /usr/lib/sysctl.d: a package must not change kernel
+#     settings by being installed. `warden startup` installs
+#     /etc/sysctl.d/99-warden.conf and applies it;
+#   - no shell completions or man page: Warden has none (`warden --help`).
+name: warden
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: none
+release: ${RELEASE}
+section: admin
+priority: optional
+maintainer: ${MAINTAINER}
+description: |
+  A small, boring supervisor for Bun/Node HTTP workers.
+  SO_REUSEPORT, graceful drain, rolling reload, a pm2-like command line, and
+  wardend, the control daemon (`warden wardend`) behind live events and the
+  GUI. Nothing is started or enabled by installing this package: run
+  `sudo warden startup` to bring apps back after a reboot.
+homepage: https://github.com/oceanwap/warden
+license: MIT OR Apache-2.0
+
+contents:
+  - src: ${BIN_DIR}/warden
+    dst: /usr/bin/warden
+    expand: true
+    file_info:
+      mode: 0755
+
+  # An rpm owns the directories it creates (a deb always does); without
+  # these two, removing the package would leave them behind, empty.
+  - dst: /usr/share/doc/warden
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /usr/share/doc/warden/examples
+    type: dir
+    file_info:
+      mode: 0755
+
+  # Licenses and notices, where Debian and Fedora tooling look for them.
+  - src: LICENSE-MIT
+    dst: /usr/share/doc/warden/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/doc/warden/LICENSE-APACHE
+    file_info:
+      mode: 0644
+  - src: ${NOTICES_DIR}/THIRD-PARTY-LICENSES.txt
+    dst: /usr/share/doc/warden/THIRD-PARTY-LICENSES.txt
+    expand: true
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/warden/README.md
+    file_info:
+      mode: 0644
+
+  # What `warden startup` writes (units, sysctl), the example config and the
+  # nginx site, to read and copy: documentation, never active.
+  - src: warden.example.toml
+    dst: /usr/share/doc/warden/examples/warden.example.toml
+    file_info:
+      mode: 0644
+  - src: contrib/wardend.service
+    dst: /usr/share/doc/warden/examples/wardend.service
+    file_info:
+      mode: 0644
+  - src: contrib/warden@.service
+    dst: /usr/share/doc/warden/examples/warden@.service
+    file_info:
+      mode: 0644
+  - src: contrib/99-warden.conf
+    dst: /usr/share/doc/warden/examples/99-warden.conf
+    file_info:
+      mode: 0644
+  - src: contrib/nginx.conf
+    dst: /usr/share/doc/warden/examples/nginx.conf
+    file_info:
+      mode: 0644
+
+# Removing the package leaves what `warden startup` wrote behind, pointing at a
+# binary that is gone: say so, and change nothing (rpm: 0 = last copy removed,
+# 1 = an upgrade; deb: "remove", not "upgrade").
+scripts:
+  preremove: contrib/nfpm-preremove.sh
+
+overrides:
+  deb:
+    # The binary is built against glibc 2.28 (Debian 10, Ubuntu 18.10, RHEL 8).
+    depends:
+      - libc6 (>= 2.28)
+  rpm:
+    depends:
+      - glibc >= 2.28
+  archlinux:
+    depends:
+      - glibc
+
+rpm:
+  # Not the machine that built it: the same inputs give the same package.
+  buildhost: localhost
+
+deb:
+  compression: xz
+  fields:
+    Bugs: https://github.com/oceanwap/warden/issues

@@ -1,0 +1,154 @@
+# nfpm (https://nfpm.goreleaser.com) configuration for the `warden-gui`
+# package: /usr/bin/warden-gui, its menu entry and its icon. It needs the
+# `warden` package (contrib/nfpm.yaml) of the same version: the GUI talks to
+# wardend through the `warden` binary, found next to it or on PATH. Run by
+# scripts/dist-linux-packages.sh, which sets:
+#
+#   ARCH, VERSION, RELEASE, MAINTAINER   as in contrib/nfpm.yaml
+#   BIN_DIR        holds the `warden-gui` binary
+#   NOTICES_DIR    holds THIRD-PARTY-LICENSES-GUI.txt
+#   WARDEN_DEP     the exact `warden` package this one needs, spelled for the
+#                  format (deb "warden (= 0.1.0-1)", rpm "warden = 0.1.0-1",
+#                  archlinux "warden=0.1.0-1")
+#
+# The menu entry is assets/warden-gui.desktop, the icons assets/icon/ (the
+# files the GUI tarball ships, too); change them there.
+#
+# glibc: the GUI is built on Ubuntu 22.04 (release.yml), so it may use
+# glibc 2.35 symbols, and links nothing else but libgcc. winit and softbuffer
+# load the display libraries when the window opens: libxkbcommon always, then
+# Wayland's client and cursor libraries or X11's (README.md, Install). A
+# shared-library scanner cannot see that, so they are Recommends (a desktop has
+# them; a headless host that installs the GUI would see the window fail).
+name: warden-gui
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: none
+release: ${RELEASE}
+section: x11
+priority: optional
+maintainer: ${MAINTAINER}
+description: |
+  Warden's native GUI: every app on a host and its live monitoring, from wardend.
+  Needs a desktop session (Wayland or X11). It draws on the CPU (no GPU driver)
+  and can also reach a remote host over SSH (`warden-gui --ssh`).
+homepage: https://github.com/oceanwap/warden
+license: MIT OR Apache-2.0
+
+contents:
+  - src: ${BIN_DIR}/warden-gui
+    dst: /usr/bin/warden-gui
+    expand: true
+    file_info:
+      mode: 0755
+
+  - src: assets/warden-gui.desktop
+    dst: /usr/share/applications/warden-gui.desktop
+    file_info:
+      mode: 0644
+
+  # The desktop entry says Icon=warden; hicolor is the fallback theme every
+  # desktop looks in. 1024 px is not a hicolor size: the PNGs stop at 512.
+  - src: assets/icon/png/warden-16.png
+    dst: /usr/share/icons/hicolor/16x16/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/png/warden-32.png
+    dst: /usr/share/icons/hicolor/32x32/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/png/warden-64.png
+    dst: /usr/share/icons/hicolor/64x64/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/png/warden-128.png
+    dst: /usr/share/icons/hicolor/128x128/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/png/warden-256.png
+    dst: /usr/share/icons/hicolor/256x256/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/png/warden-512.png
+    dst: /usr/share/icons/hicolor/512x512/apps/warden.png
+    file_info:
+      mode: 0644
+  - src: assets/icon/warden.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/warden.svg
+    file_info:
+      mode: 0644
+
+  # An rpm owns the directories it creates (a deb always does). The icon and
+  # applications directories belong to hicolor-icon-theme and the desktop.
+  - dst: /usr/share/doc/warden-gui
+    type: dir
+    file_info:
+      mode: 0755
+
+  - src: LICENSE-MIT
+    dst: /usr/share/doc/warden-gui/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/doc/warden-gui/LICENSE-APACHE
+    file_info:
+      mode: 0644
+  - src: ${NOTICES_DIR}/THIRD-PARTY-LICENSES-GUI.txt
+    dst: /usr/share/doc/warden-gui/THIRD-PARTY-LICENSES-GUI.txt
+    expand: true
+    file_info:
+      mode: 0644
+  - src: gui/assets/fonts/LICENSES.txt
+    dst: /usr/share/doc/warden-gui/FONT-LICENSES.txt
+    file_info:
+      mode: 0644
+  - src: gui/README.md
+    dst: /usr/share/doc/warden-gui/README.md
+    file_info:
+      mode: 0644
+
+overrides:
+  deb:
+    depends:
+      - ${WARDEN_DEP}
+      - libc6 (>= 2.35)
+      - hicolor-icon-theme
+    recommends:
+      - libxkbcommon0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libx11-6
+      - libx11-xcb1
+      - libxcursor1
+      - libxi6
+      - libxkbcommon-x11-0
+  rpm:
+    depends:
+      - ${WARDEN_DEP}
+      - glibc >= 2.35
+      - hicolor-icon-theme
+    recommends:
+      - libxkbcommon
+      - libwayland-client
+      - libwayland-cursor
+      - libX11
+      - libX11-xcb
+      - libXcursor
+      - libXi
+      - libxkbcommon-x11
+  archlinux:
+    depends:
+      - ${WARDEN_DEP}
+      - glibc
+      - hicolor-icon-theme
+    # Arch has no weak dependencies: optdepends is what pacman prints.
+    # nfpm's archlinux packager does not take recommends.
+
+rpm:
+  buildhost: localhost
+
+deb:
+  compression: xz
+  fields:
+    Bugs: https://github.com/oceanwap/warden/issues

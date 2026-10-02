@@ -6,5 +6,5 @@ Comment=Every app on this host and its live monitoring, from wardend
 Exec=warden-gui
 Icon=warden
 Terminal=false
-Categories=Development;System;Monitor;
+Categories=System;Monitor;
 StartupWMClass=warden-gui

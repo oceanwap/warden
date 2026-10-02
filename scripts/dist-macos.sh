@@ -7,9 +7,12 @@
 # Builds, for arm64 and x86_64 (either Mac can build both):
 #   warden-<version>-macos-<arch>.tar.gz       the CLI
 #   warden-gui-<version>-macos-<arch>.zip      Warden.app (GUI + CLI), ad-hoc signed
-# the same files, with the same names and contents, the Release workflow made
-# on macOS runners before. Then it checks the host's archive with install.sh
-# (checksum, tampered archive refused) and uploads everything to a DRAFT
+#   Warden-<version>-macos-<arch>.dmg          a disk image (volume "Warden", UDZO) with
+#                                              that Warden.app and a link to /Applications
+# the archives with the same names and contents the Release workflow made on
+# macOS runners before. It mounts each disk image to check what is inside, then
+# checks the host's files with install.sh (checksum, tampered archive refused,
+# Warden.app from the zip and from the image) and uploads everything to a DRAFT
 # GitHub Release for the tag v<version> (created if needed; never published
 # from here). The Release workflow (.github/workflows/release.yml) waits for
 # these files, adds the Linux archives, SHA256SUMS and install.sh, and
@@ -18,7 +21,8 @@
 #
 # Options:
 #   --no-upload        Build and check only: files stay in the output directory
-#   --no-gui           CLI archives only
+#   --no-gui           CLI archives only (no zip, no disk image)
+#   --no-dmg           No disk images
 #   --arch LIST        arm64, x86_64 or arm64,x86_64 (default: both)
 #   --branch NAME      The branch a new draft release points at (default: main)
 #   --out DIR          Output directory, inside target/ (default: target/dist-macos;
@@ -29,12 +33,13 @@
 #                      in): builds and uploads nothing
 #   -h, --help         This help
 #
-# --arch and --no-gui build part of a release: they need --no-upload, since a
-# release holds all four archives, built together from one commit.
+# --arch, --no-gui and --no-dmg build part of a release: they need --no-upload,
+# since a release holds every file, built together from one commit.
 #
 # Needs: a Mac with Xcode's command line tools, rustup (or the right Rust),
 # `cargo install cargo-about --locked --features cli` (third-party notices), and
 # for the upload the GitHub CLI: `gh auth login` with a right to write releases.
+# hdiutil (the disk images) comes with macOS.
 # (Run by hand or by `cargo release` on a Mac; not meant to be portable to
 # Linux: scripts/test-dist-macos.sh runs it there, against stubs.)
 set -euo pipefail
@@ -46,6 +51,7 @@ die() { printf '\ndist-macos: %s\n' "$*" >&2; exit 1; }
 
 upload=1
 gui=1
+dmg=1
 archs="arm64,x86_64"
 branch=main
 out=""
@@ -56,6 +62,7 @@ while [ $# -gt 0 ]; do
         -h|--help) usage; exit 0 ;;
         --no-upload) upload=0 ;;
         --no-gui) gui=0 ;;
+        --no-dmg) dmg=0 ;;
         --allow-dirty) allow_dirty=1 ;;
         --check) check=1 ;;
         --arch) [ $# -ge 2 ] || die "--arch needs arm64, x86_64 or arm64,x86_64"; archs=$2; shift ;;
@@ -69,11 +76,14 @@ case ",$archs," in
     ,arm64,|,x86_64,|,arm64,x86_64,|,x86_64,arm64,) ;;
     *) die "--arch $archs: use arm64, x86_64 or arm64,x86_64" ;;
 esac
+# A disk image holds Warden.app, so no GUI means no image.
+[ "$gui" = 1 ] || dmg=0
 full=1
 [ "$gui" = 1 ] || full=0
+[ "$dmg" = 1 ] || full=0
 case ",$archs," in ,arm64,x86_64,|,x86_64,arm64,) ;; *) full=0 ;; esac
 if [ "$full" = 0 ] && [ "$upload" = 1 ] && [ "$check" = 0 ]; then
-    die "--arch and --no-gui build part of a release, and a release needs all four archives from one build: add --no-upload"
+    die "--arch, --no-gui and --no-dmg build part of a release, and a release needs every file (the CLI archives, the app zips and the disk images) from one build: add --no-upload"
 fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -93,6 +103,9 @@ triple() { case "$1" in arm64) echo aarch64-apple-darwin ;; x86_64) echo x86_64-
 step "1. Preconditions"
 [ "$(uname -s)" = Darwin ] || die "this builds macOS binaries, so it needs a Mac (this is $(uname -s)). On another machine the Release workflow waits for the files: run this on a Mac."
 command -v git >/dev/null || die "git is not installed"
+if [ "$dmg" = 1 ]; then
+    command -v hdiutil >/dev/null || die "hdiutil is missing (it makes the disk images; it is part of macOS: is this a Mac with a normal PATH?). --no-dmg builds without them"
+fi
 sha=$(git rev-parse HEAD)
 version=""
 tag=""
@@ -214,6 +227,56 @@ check_version() { # target binary expected
     fi
 }
 
+# The disk image: Warden.app next to a link to /Applications, to drag one onto
+# the other. UDZO is zlib-compressed and read-only; HFS+ mounts on every macOS
+# the app runs on. hdiutil is sometimes "resource busy" right after something
+# else touched the folder (Spotlight): try again a few times.
+make_dmg() { # folder dmg
+    local try
+    rm -f "$2"
+    for try in 1 2 3; do
+        if hdiutil create -volname Warden -srcfolder "$1" -fs HFS+ -format UDZO -ov "$2" >/dev/null; then return 0; fi
+        say "hdiutil create failed (attempt $try of 3)"
+        sleep "${DMG_RETRY_SLEEP:-3}"
+    done
+    die "hdiutil could not make $(basename "$2")"
+}
+
+# Where a disk image is mounted right now. Always detached, also when the
+# script fails or is interrupted.
+mounted=""
+detach_dmg() {
+    [ -n "$mounted" ] || return 0
+    local m=$mounted
+    mounted=""
+    hdiutil detach "$m" >/dev/null 2>&1 || { sleep 2; hdiutil detach "$m" -force >/dev/null 2>&1; } || true
+}
+trap detach_dmg EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Mount a finished image the way a user's Mac does and look inside: the app,
+# its two programs (they must run), its signature, the link to /Applications.
+check_dmg() { # target dmg
+    local t=$1 dmg=$2 f vol
+    mounted="$out/stage/mnt-$t"
+    mkdir -p "$mounted"
+    hdiutil attach -nobrowse -readonly -mountpoint "$mounted" "$dmg" >/dev/null || die "cannot mount $(basename "$dmg")"
+    for f in warden-gui warden; do
+        [ -x "$mounted/Warden.app/Contents/MacOS/$f" ] || die "$(basename "$dmg"): Warden.app/Contents/MacOS/$f is missing or not executable"
+    done
+    grep -q "<string>$version</string>" "$mounted/Warden.app/Contents/Info.plist" || die "$(basename "$dmg"): Info.plist does not say version $version"
+    check_version "$t" "$mounted/Warden.app/Contents/MacOS/warden" "warden $version"
+    check_version "$t" "$mounted/Warden.app/Contents/MacOS/warden-gui" "warden-gui $version"
+    codesign --verify --deep --strict "$mounted/Warden.app" || die "$(basename "$dmg"): the Warden.app inside fails codesign --verify"
+    [ -L "$mounted/Applications" ] && [ "$(readlink "$mounted/Applications")" = /Applications ] ||
+        die "$(basename "$dmg"): there is no Applications link to /Applications"
+    # The volume name (best effort: diskutil may not say).
+    vol=$(diskutil info "$mounted" 2>/dev/null | sed -n 's/^ *Volume Name: *//p' | head -1)
+    if [ -n "$vol" ] && [ "$vol" != Warden ]; then die "$(basename "$dmg"): the volume is called '$vol', not Warden"; fi
+    detach_dmg
+}
+
 # ---------------------------------------------------------------- 3
 n=2
 for arch in $(echo "$archs" | tr ',' ' '); do
@@ -295,6 +358,26 @@ EOF
     #   xcrun stapler staple "$app"   (and zip again after stapling)
     ditto -c -k --keepParent --norsrc "$app" "$out/$gui_name.zip"
     say "$gui_name.zip"
+
+    [ "$dmg" = 1 ] || continue
+    dmg_name="Warden-$version-macos-$arch"
+    # Not named after $dmg_name: on a case-insensitive disk that is the CLI's staging folder.
+    dmg_stage="$out/stage/dmg-$arch"
+    mkdir -p "$dmg_stage"
+    # ditto keeps the signature and the attributes the way codesign left them.
+    ditto "$app" "$dmg_stage/Warden.app"
+    ln -s /Applications "$dmg_stage/Applications"
+    make_dmg "$dmg_stage" "$out/$dmg_name.dmg"
+    # TODO(signing): the image has only an ad-hoc signature and is not notarized,
+    # like the app (see above). With the owner's Developer ID certificate, sign the
+    # app inside first (the line above), then the image, notarize and staple it:
+    #   codesign --force --timestamp --sign "Developer ID Application: <name> (<team>)" "$out/$dmg_name.dmg"
+    #   xcrun notarytool submit "$out/$dmg_name.dmg" --keychain-profile <profile> --wait
+    #   xcrun stapler staple "$out/$dmg_name.dmg"
+    codesign --force --sign - "$out/$dmg_name.dmg"
+    codesign --verify "$out/$dmg_name.dmg"
+    check_dmg "$t" "$out/$dmg_name.dmg"
+    say "$dmg_name.dmg"
 done
 
 # ------------------------------------------------------------------ install.sh
@@ -304,7 +387,11 @@ step "$n. install.sh on this Mac (the archive for $host_arch)"
 url_out=$(printf '%s' "$out" | sed 's/%/%25/g; s/ /%20/g')
 mkdir -p "$out/check/files" "$out/check/tampered"
 cp "$out"/warden-"$version"-macos-*.tar.gz "$out/check/files/"
-(cd "$out/check/files" && shasum -a 256 -- warden-*.tar.gz > SHA256SUMS)
+if [ "$gui" = 1 ]; then cp "$out"/warden-gui-"$version"-macos-*.zip "$out/check/files/"; fi
+if [ "$dmg" = 1 ]; then cp "$out"/Warden-"$version"-macos-*.dmg "$out/check/files/"; fi
+# SHA256SUMS lists every file in the folder, the way the release's does.
+sums_of() { (cd "$1" && rm -f SHA256SUMS && shasum -a 256 -- * > SHA256SUMS); }
+sums_of "$out/check/files"
 cp "$out/check/files"/* "$out/check/tampered/"
 for f in "$out"/check/tampered/*.tar.gz; do printf 'x' >> "$f"; done
 if [ -f "$out/check/files/warden-$version-macos-$host_arch.tar.gz" ]; then
@@ -322,6 +409,33 @@ if [ -f "$out/check/files/warden-$version-macos-$host_arch.tar.gz" ]; then
     fi
     [ ! -e "$out/check/bin-tampered/warden" ] || die "install.sh left a binary behind after refusing a tampered archive"
     say "a tampered archive is refused"
+    # Warden.app: from the zip, then (the zip taken out of the release) from the
+    # disk image, then removed again.
+    zip_file="$out/check/files/warden-gui-$version-macos-$host_arch.zip"
+    if [ "$gui" = 1 ] && [ -f "$zip_file" ]; then
+        gui_install() { # label: install --gui into check/Applications
+            if ! WARDEN_DOWNLOAD_URL="file://$url_out/check/files" WARDEN_VERSION="v$version" \
+                WARDEN_INSTALL_DIR="$out/check/bin" WARDEN_APP_DIR="$out/check/Applications" \
+                sh install.sh --gui >"$out/check/install-gui.log" 2>&1; then
+                cat "$out/check/install-gui.log" >&2
+                die "install.sh --gui failed on the files just built ($1)"
+            fi
+            [ -x "$out/check/Applications/Warden.app/Contents/MacOS/warden-gui" ] || die "install.sh --gui ($1) left no Warden.app"
+            codesign --verify --deep --strict "$out/check/Applications/Warden.app" || die "the Warden.app install.sh put there ($1) fails codesign --verify"
+            say "installed: Warden.app ($1)"
+        }
+        gui_install "from the zip"
+        if [ "$dmg" = 1 ] && [ -f "$out/check/files/Warden-$version-macos-$host_arch.dmg" ]; then
+            rm -rf "$out/check/Applications" "$zip_file"
+            sums_of "$out/check/files"
+            gui_install "from the disk image"
+        fi
+        WARDEN_APP_DIR="$out/check/Applications" WARDEN_INSTALL_DIR="$out/check/bin" sh install.sh --uninstall --gui >/dev/null 2>&1 ||
+            die "install.sh --uninstall --gui failed"
+        [ ! -e "$out/check/Applications/Warden.app" ] || die "install.sh --uninstall --gui left Warden.app behind"
+        [ ! -e "$out/check/bin/warden" ] || die "install.sh --uninstall left warden behind"
+        say "uninstalled again"
+    fi
 else
     say "skipped: no $host_arch archive was built (--arch)"
 fi
@@ -331,7 +445,7 @@ rm -rf "$out/check" "$out/stage"
 n=$((n + 1))
 step "$n. Build information and upload"
 files=()
-for f in "$out"/warden-"$version"-macos-*.tar.gz "$out"/warden-gui-"$version"-macos-*.zip; do
+for f in "$out"/warden-"$version"-macos-*.tar.gz "$out"/warden-gui-"$version"-macos-*.zip "$out"/Warden-"$version"-macos-*.dmg; do
     if [ -f "$f" ]; then files+=("$f"); fi
 done
 [ "${#files[@]}" -gt 0 ] || die "no archive was built"

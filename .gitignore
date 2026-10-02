@@ -3,5 +3,6 @@ node_modules/
 bench/.run/
 *.sock
 bench/nest/dist/
+/dist/
 bench/results/*.json
 .DS_Store

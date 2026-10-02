@@ -21,7 +21,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/lib.sh"
 
 MODE=${1:?usage: linux.sh system|user}
-W=/usr/local/bin/warden
+# Where warden is installed: /usr/local/bin for a copied binary, /usr/bin for the .deb
+# (the workflow sets WARDEN_BIN); the unit `warden startup` writes must name it.
+W=${WARDEN_BIN:-/usr/local/bin/warden}
 ME=$(id -un)
 MY_UID=$(id -u)
 

@@ -8,7 +8,7 @@
 #
 # Results: the job summary (bench/results/latest.md), an artifact with the
 # raw JSON, and one notice annotation per suite (readable through the public
-# API without a login). README.md is not touched.
+# API without a login). docs/benchmarks.md is not touched.
 #
 # Run it: push to the `bench` branch, or "Run workflow" with the options
 # below. CPU pinning (`app_cpus`, `loadgen_cpus`: taskset lists like 0-1 and
@@ -64,7 +64,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             oha: oha-linux-amd64
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -113,7 +113,7 @@ jobs:
           IN_DURATION: ${{ inputs.duration }}
           IN_QUICK: ${{ inputs.quick }}
         run: |
-          args="--no-readme"
+          args="--no-docs"
           [ "$IN_QUICK" = true ] && args="$args --quick"
           [ -n "$IN_ONLY" ] && args="$args --only $IN_ONLY"
           [ -n "$IN_DURATION" ] && args="$args --duration $IN_DURATION"
@@ -125,7 +125,9 @@ jobs:
           echo "cargo xtask bench $args; $(nproc) CPUs: $(lscpu | grep -m1 'Model name' | sed 's/.*: *//')"
           true
       - name: cargo xtask bench
-        run: cargo xtask bench $BENCH_ARGS
+        run: |
+          # shellcheck disable=SC2086 # BENCH_ARGS is a list of words
+          cargo xtask bench $BENCH_ARGS
       - name: Job summary
         if: ${{ !cancelled() }}
         run: |

@@ -1,30 +1,39 @@
-# Release builds. Two products, published side by side:
+# Release builds. Three products, published side by side:
 #   warden-<version>-<os>-<arch>.tar.gz      the CLI: warden, README.md, contrib/
 #   warden-gui-<version>-<os>-<arch>.*       the GUI bundled with the CLI: warden-gui, warden,
 #                                            README.md, README-GUI.md, contrib/ (.tar.gz on
 #                                            Linux, a zipped Warden.app on macOS)
+#   warden[-gui]_<version>-1_<arch>.deb, warden[-gui]-<version>-1.<arch>.rpm
+#                                            Linux packages (docs/packages.md), amd64/arm64
 # plus install.sh and SHA256SUMS covering every file, and macos-build-info.txt.
 #
-# Linux is built, tested and packaged here. macOS is NOT: a macOS runner minute
-# costs ten Linux ones on a private repository, so the macOS archives are
+# Linux is built, tested and packaged here. macOS is NOT: the macOS archives are
 # built on the maintainer's Mac (scripts/dist-macos.sh, which `cargo release`
-# runs after pushing the tag) and uploaded to a DRAFT release for the tag.
-# The `macos` job waits for them (up to an hour), refuses any that were built
-# from another commit, and the release is published only with all of them. Every archive carries
-# LICENSE-MIT, LICENSE-APACHE and the third-party notices (cargo-about,
-# about.toml): THIRD-PARTY-LICENSES.txt, and THIRD-PARTY-LICENSES-GUI.txt in
-# the GUI bundles.
+# runs after pushing the tag), where Warden.app is signed and the signing
+# certificate stays in that Mac's keychain (no secrets in CI), and uploaded to
+# a DRAFT release for the tag. The `macos` job waits for them (up to an hour),
+# refuses any that were built from another commit, and the release is
+# published only with all of them. (Standard GitHub-hosted runners, macOS
+# included, are free for a public repository, so building them here is an
+# option: docs/releasing.md says what that would change.) Every archive
+# carries LICENSE-MIT, LICENSE-APACHE and the third-party notices
+# (cargo-about, about.toml): THIRD-PARTY-LICENSES.txt, and
+# THIRD-PARTY-LICENSES-GUI.txt in the GUI bundles.
 #
-# Two ways to publish a GitHub Release:
-#   - push a tag v<version> (matching Cargo.toml): `cargo release <version>`
-#     does that from a checkout;
-#   - no checkout at all: Actions > Release > Run workflow on `main`, with
-#     "Publish the release" ticked. The tag v<version> is created at that
-#     commit once everything is built and tested, so a failed build leaves no
-#     tag behind. Needs a green CI run on the commit (see docs/releasing.md).
-# Manual runs without the box ticked are dry runs: the Linux archives are
-# built, packaged, checksummed and install-tested, and uploaded as workflow
-# artifacts only (no macOS archives, no release).
+# What starts a run:
+#   - a pushed tag v<version> (matching Cargo.toml): the real release.
+#     `cargo release <version>` does that from a checkout;
+#   - Actions > Release > Run workflow, on any branch, with "Publish the
+#     release" UNTICKED (the default): a DRY RUN. Everything is built, packaged,
+#     checksummed and install-tested exactly as for a release and kept as
+#     workflow artifacts (release-<version>: every file, SHA256SUMS included;
+#     release-notes: the notes), but no macOS archives are taken, no tag is
+#     made and no GitHub Release is created or touched. Use it before tagging,
+#     and after changing this file;
+#   - the same, on `main`, with "Publish the release" TICKED: no checkout at
+#     all. The tag v<version> is created at that commit once everything is
+#     built and tested, so a failed build leaves no tag behind. Needs a green
+#     CI run on the commit (see docs/releasing.md).
 name: Release
 
 on:
@@ -33,7 +42,7 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Publish the release (tag v<Cargo.toml version> at this commit). Unticked: a dry run."
+        description: "Publish the release (main only: tags v<Cargo.toml version> at this commit). Unticked: a dry run, nothing is published."
         type: boolean
         default: false
       skip_ci_check:
@@ -60,10 +69,13 @@ env:
   ZIG_VERSION: "0.14.1"
   CARGO_ZIGBUILD_VERSION: "0.23.4"
   CARGO_ABOUT_VERSION: "0.9.2"
+  # Builds the .deb and .rpm (contrib/nfpm.yaml); installed with `go install`,
+  # which checks every module against Go's checksum database.
+  NFPM_VERSION: "2.47.0"
 
 jobs:
   meta:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       actions: read # the CI runs of this commit, for a release started by hand
@@ -79,10 +91,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - id: version
-        name: Version (the tag must match Cargo.toml)
+        name: Version (the tag must match Cargo.toml), and what this run is
         run: |
           cargo_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if ! [[ "$cargo_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error title=Bad version::Cargo.toml says version \"$cargo_version\", which is not X.Y.Z or X.Y.Z-PRERELEASE (the packages and the file names need that)."
+            exit 1
+          fi
+          # A pushed tag is the release. Run by hand, only "Publish the release"
+          # releases (even on a tag: re-run a tag's own run to retry it).
+          if [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
             if [ "$tag_version" != "$cargo_version" ]; then
               echo "::error title=Version mismatch::tag $GITHUB_REF_NAME is version $tag_version but Cargo.toml says $cargo_version. Nothing was built or published. Set [package] version = \"$tag_version\" in Cargo.toml (cargo updates Cargo.lock), commit, and move the tag to that commit; or tag v$cargo_version instead."
@@ -91,7 +109,7 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
             echo "Release v$cargo_version"
-          elif [ "$RELEASE" = "true" ]; then
+          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$RELEASE" = "true" ]; then
             # Started by hand with "Publish the release" ticked. Everything that
             # `cargo release` checks before it tags, checked here, before the
             # slow builds.
@@ -120,18 +138,34 @@ jobs:
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Dry run for version $cargo_version: artifacts only, no release"
+            echo "::notice title=Dry run::version $cargo_version is built, packaged and tested, and kept as workflow artifacts. No tag, no GitHub Release."
           fi
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
       - id: gui
         name: GUI crate present?
         if: hashFiles('gui/Cargo.toml') != ''
         run: echo "present=true" >> "$GITHUB_OUTPUT"
+      # CHANGELOG.md's section for this version (.github/release-notes.sh says
+      # which one it took). Also on a dry run, to read them before publishing.
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p notes
+          bash .github/release-notes.sh "$VERSION" > notes/RELEASE-NOTES.md
+          { echo "## Release notes for $VERSION"; echo; cat notes/RELEASE-NOTES.md; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes/RELEASE-NOTES.md
+          if-no-files-found: error
+          retention-days: 14
 
   # The third-party notices, once for all platforms (about.toml lists the
   # targets). Fails if a dependency uses a license not accepted there.
   licenses:
     needs: meta
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -167,7 +201,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: x86_64, runner: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: linux, arch: x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu }
           - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
     env:
       VERSION: ${{ needs.meta.outputs.version }}
@@ -235,6 +269,10 @@ jobs:
         include:
           # GUI toolkits link system libraries, so no zig here: an older
           # distro keeps the glibc baseline low (2.35).
+          # TODO(runner): GitHub deprecated the Ubuntu 22.04 runners on
+          # 2026-09-17 (brownouts in March 2027, gone on 2027-04-17), and
+          # 24.04 would raise the baseline to glibc 2.39. Before then, build in
+          # a `container: ubuntu:22.04` on the 24.04 runners (docs/releasing.md).
           - { os: linux, arch: x86_64, runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
           - { os: linux, arch: arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
     env:
@@ -305,16 +343,101 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The Linux packages (docs/packages.md): the same binaries as the archives,
+  # as .deb and .rpm, built and then installed in containers (Debian, Ubuntu,
+  # Fedora, Rocky) by scripts/test-linux-packages.sh. Each architecture runs on
+  # its own kind of runner, so the packages run where they were built.
+  packages:
+    needs: [meta, licenses, cli, gui]
+    # The gui job is skipped until gui/ exists.
+    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') }}
+    name: packages linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      WITH_GUI: ${{ needs.meta.outputs.gui }}
+      ARCH: ${{ matrix.arch }}
+      # TODO(owner): a repository variable (Settings > Secrets and variables >
+      # Actions > Variables) named WARDEN_PKG_MAINTAINER, "Name <address>", is
+      # the Maintainer of the packages; unset, scripts/dist-linux-packages.sh
+      # says "Warden authors <https://github.com/oceanwap/warden>".
+      WARDEN_PKG_MAINTAINER: ${{ vars.WARDEN_PKG_MAINTAINER }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        if: needs.meta.outputs.gui == 'true'
+        with:
+          name: gui-linux-${{ matrix.arch }}
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: licenses
+          path: notices
+      # From source, not a prebuilt binary: `go install` checks every module
+      # against Go's checksum database. Go is on the runner image.
+      - name: Install nfpm
+        run: |
+          go version
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build the packages
+        run: |
+          set -euo pipefail
+          cli="warden-$VERSION-linux-$ARCH"
+          mkdir -p bin pkg
+          tar -xzf "artifacts/$cli.tar.gz" -C bin --strip-components=1 "$cli/warden"
+          opts=()
+          if [ "$WITH_GUI" = true ]; then
+            gui="warden-gui-$VERSION-linux-$ARCH"
+            tar -xzf "artifacts/$gui.tar.gz" -C bin --strip-components=1 "$gui/warden-gui"
+            # The GUI archive carries the CLI too: the very same file.
+            tar -xzf "artifacts/$gui.tar.gz" -O "$gui/warden" | cmp - bin/warden
+          else
+            opts+=(--no-gui)
+          fi
+          bash scripts/dist-linux-packages.sh --notices notices --out pkg --no-sums "${opts[@]}" bin "$VERSION" "$ARCH"
+          ls -l pkg
+      # dpkg-deb for the .deb files, rpm for the .rpm ones, desktop-file-validate
+      # for the menu entry: the inspection of what is inside.
+      - name: Tools for the inspection
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends rpm desktop-file-utils
+      # Inspects every package (what it holds, what it must not), then in each
+      # image `dpkg -i` / `rpm -i`, warden --version, warden doctor, the GUI, a
+      # reinstall and the removal. --require: no runtime or tool is no pass.
+      - name: Inspect and install the packages in containers
+        run: bash scripts/test-linux-packages.sh --require --version "$VERSION" pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-linux-${{ matrix.arch }}
+          path: |
+            pkg/*.deb
+            pkg/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
   # The macOS archives, built on the maintainer's Mac and waiting in a draft
   # release for this tag (scripts/dist-macos.sh uploads them). Only a real
   # release needs them; a dry run has none. The files must have been built from
   # this very commit (macos-build-info.txt), and each is checked to be what its
-  # name says. A Linux runner, so this costs a Linux minute while it waits.
+  # name says. A Linux runner: it only waits and downloads.
   macos:
     needs: meta
     if: needs.meta.outputs.publish == 'true'
     name: macOS archives (from the draft release)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 65
     permissions:
       contents: write # a draft release is visible only with write access
@@ -326,9 +449,12 @@ jobs:
       - name: Wait for the archives built on a Mac
         run: |
           set -uo pipefail
+          # The .dmg files scripts/dist-macos.sh uploads are waited for and
+          # checked against macos-build-info.txt like the rest.
           archives=(
             "warden-$VERSION-macos-arm64.tar.gz" "warden-$VERSION-macos-x86_64.tar.gz"
             "warden-gui-$VERSION-macos-arm64.zip" "warden-gui-$VERSION-macos-x86_64.zip"
+            "Warden-$VERSION-macos-arm64.dmg" "Warden-$VERSION-macos-x86_64.dmg"
           )
           mkdir -p macos
           why=""
@@ -416,6 +542,9 @@ jobs:
             grep -q "<string>$VERSION</string>" Warden.app/Contents/Info.plist ||
               { echo "::error::$gui.zip: Info.plist does not say version $VERSION"; exit 1; }
             rm -rf "$cli" "$cli.list" Warden.app
+            # A .dmg cannot be opened on this Linux runner; dist-macos.sh mounted it on the Mac.
+            dmg="Warden-$VERSION-macos-$arch.dmg"
+            test -s "$dmg" || { echo "::error::$dmg is empty"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -425,17 +554,57 @@ jobs:
           retention-days: 14
 
   checksums:
-    needs: [meta, cli, gui, macos]
+    needs: [meta, cli, gui, packages, macos]
     # The gui job is skipped until gui/ exists, the macos job in a dry run.
-    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
-    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.cli.result == 'success' && (needs.gui.result == 'success' || needs.gui.result == 'skipped') && needs.packages.result == 'success' && (needs.macos.result == 'success' || needs.macos.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      PUBLISH: ${{ needs.meta.outputs.publish }}
+      WITH_GUI: ${{ needs.meta.outputs.gui }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
-          pattern: "{cli,gui,macos}-*"
+          pattern: "{cli,gui,packages,macos}-*"
           path: dist
           merge-multiple: true
+      # A job that silently produced fewer files must not make a smaller
+      # release: the list of what a release holds is written out here.
+      - name: Every file a release needs is there
+        run: |
+          set -euo pipefail
+          want=()
+          for a in x86_64 arm64; do
+            want+=("warden-$VERSION-linux-$a.tar.gz")
+            if [ "$WITH_GUI" = true ]; then want+=("warden-gui-$VERSION-linux-$a.tar.gz"); fi
+          done
+          # The packages (revision 1, as scripts/dist-linux-packages.sh names them).
+          for a in amd64 arm64; do
+            want+=("warden_$VERSION-1_$a.deb")
+            if [ "$WITH_GUI" = true ]; then want+=("warden-gui_$VERSION-1_$a.deb"); fi
+          done
+          for a in x86_64 aarch64; do
+            want+=("warden-$VERSION-1.$a.rpm")
+            if [ "$WITH_GUI" = true ]; then want+=("warden-gui-$VERSION-1.$a.rpm"); fi
+          done
+          if [ "$PUBLISH" = true ]; then
+            # Not in a dry run: they are built on a Mac.
+            for a in arm64 x86_64; do
+              want+=("warden-$VERSION-macos-$a.tar.gz")
+              want+=("Warden-$VERSION-macos-$a.dmg")
+              if [ "$WITH_GUI" = true ]; then want+=("warden-gui-$VERSION-macos-$a.zip"); fi
+            done
+            want+=(macos-build-info.txt)
+          fi
+          missing=0
+          for f in "${want[@]}"; do
+            [ -f "dist/$f" ] || { echo "::error title=Missing file::$f is not among the build outputs"; missing=1; }
+          done
+          have=$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          extra=$(comm -13 <(printf '%s\n' "${want[@]}" | sort) - <<<"$have")
+          if [ -n "$extra" ]; then echo "::warning title=Unlisted files::not in the list of a release (add them to this step, or find out why they are here): ${extra//$'\n'/ }"; fi
+          exit $missing
       - name: SHA256SUMS
         run: |
           cp install.sh dist/
@@ -461,7 +630,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
     env:
       VERSION: ${{ needs.meta.outputs.version }}
       URL: http://127.0.0.1:8765
@@ -496,15 +665,18 @@ jobs:
             echo "::error::install.sh installed an archive whose checksum does not match"; exit 1
           fi
           test ! -e "$RUNNER_TEMP/tampered/warden"
+      - name: scripts/test-install.sh (the install.sh being released, against fake releases)
+        run: INSTALL_SH="$PWD/dist/install.sh" bash scripts/test-install.sh
 
   # The draft release already holds the macOS archives (the macos job read
-  # them there): add the Linux archives, SHA256SUMS and install.sh, write the
-  # notes and publish it. A tag pushed by hand is what was built; started by
-  # hand, publishing creates the tag at the commit built.
+  # them there): add the Linux archives and packages, SHA256SUMS and
+  # install.sh, check the draft, write the notes (CHANGELOG.md) and publish it.
+  # A tag pushed by hand is what was built; started by hand, publishing creates
+  # the tag at the commit built. The only job besides `macos` that can write.
   publish:
     needs: [meta, checksums, install-test]
     if: needs.meta.outputs.publish == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
@@ -516,29 +688,53 @@ jobs:
         with:
           name: release-${{ needs.meta.outputs.version }}
           path: dist
-      - name: GitHub Release
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
+      # A re-run after the release went out must not touch it.
+      - id: draft
+        name: Is there a draft to publish?
         run: |
           set -euo pipefail
-          # A re-run after the release went out must not touch it.
           draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
           if [ "$draft" != true ]; then
-            echo "::notice::$TAG is already published: nothing to do here (the next step verifies it)"
-            exit 0
+            echo "::notice::$TAG is already published: nothing to upload or publish (the last step verifies it)"
           fi
+      # Everything, the macOS files too (the draft's copies are replaced by the
+      # very bytes SHA256SUMS lists): what is published is what was
+      # checksummed, whatever happened to the draft meanwhile.
+      - name: Upload to the draft
+        if: steps.draft.outputs.draft == 'true'
+        run: |
+          set -euo pipefail
           ls -l dist
-          # Everything, the macOS files too (the draft's copies are replaced by
-          # the very bytes SHA256SUMS lists): what is published is what was
-          # checksummed, whatever happened to the draft meanwhile.
           gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
-          notes_args=(-f tag_name="$TAG")
-          flags=(--draft=false --title "Warden $VERSION")
+      # Before it goes public: the draft holds exactly the files in SHA256SUMS,
+      # byte for byte, as GitHub stored them (a renamed or cut upload is caught
+      # here, with nothing out yet).
+      - name: Check the draft
+        if: steps.draft.outputs.draft == 'true'
+        run: |
+          set -euo pipefail
+          mkdir draft
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir draft
+          cd draft
+          sha256sum -c SHA256SUMS || { echo "::error::the draft's files do not match SHA256SUMS"; exit 1; }
+          listed=$(wc -l < SHA256SUMS | tr -d ' ')
+          files=$(find . -maxdepth 1 -type f ! -name SHA256SUMS | wc -l | tr -d ' ')
+          [ "$listed" = "$files" ] || { echo "::error::SHA256SUMS lists $listed files, the draft holds $files besides it"; exit 1; }
+          echo "all $files files of the draft match SHA256SUMS"
+      - name: Publish
+        if: steps.draft.outputs.draft == 'true'
+        run: |
+          set -euo pipefail
+          flags=(--draft=false --title "Warden $VERSION" --notes-file notes/RELEASE-NOTES.md)
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
             # Started by hand: publishing creates the tag, at the commit built.
-            notes_args+=(-f target_commitish="$GITHUB_SHA")
             flags+=(--target "$GITHUB_SHA")
           fi
-          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" "${notes_args[@]}" --jq .body > notes.md
-          flags+=(--notes-file notes.md)
           if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease=true); else flags+=(--prerelease=false); fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
       # What users download must be what SHA256SUMS lists, file for file.

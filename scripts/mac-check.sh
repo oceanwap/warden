@@ -282,6 +282,7 @@ sport=$(free_port)
 w env WARDEN_NO_DAEMON=1 "$bin" serve "$work/site" "$sport" --name site >"$out/start-site.log" 2>&1
 sleep 2
 for f in "small.html 1507" "big.html 90007"; do
+    # shellcheck disable=SC2086 # split on purpose: "name size"
     set -- $f
     line=$(python3 "$work/lat.py" "$sport" "$1" "$2" 2>&1 | tail -n 1)
     verdict=$(printf '%s' "$line" | cut -f1)

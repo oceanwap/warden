@@ -173,7 +173,7 @@ run $SUDO kill -9 "$OLD"
 wait_for "wardend restarted $API's supervisor and the app answers" 40 sup_restarted "$API" "$OLD" "$PORT_API"
 wait_for "$API 1/1 ready again" 30 app_ready "$API" 1
 if [ -n "$OLD_WORKER" ] && $SUDO kill -0 "$OLD_WORKER" 2>/dev/null; then
-  # Documented (README, Platforms): no parent-death signal on macOS, so the
+  # Documented (docs/platforms.md): no parent-death signal on macOS, so the
   # dead supervisor's worker lives on. Stop it so the checks below see only
   # the new one.
   note "the killed supervisor's worker (pid $OLD_WORKER) outlived it (no PDEATHSIG on macOS); stopping it"

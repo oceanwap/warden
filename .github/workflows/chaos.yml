@@ -7,9 +7,8 @@
 #   release build. Pushes to main, daily, and by hand.
 # - macOS: what macOS supports (no namespace, tmpfs, cgroup or /proc: the
 #   run lists what it leaves out), release build too. By hand only (Actions >
-#   Chaos > Run workflow, "Also run on macOS"; ticked by default): a macOS
-#   minute counts ten times, and a daily run would use up a Free plan's
-#   included minutes by itself. Run it before a release.
+#   Chaos > Run workflow, "Also run on macOS"; ticked by default), not on the
+#   daily schedule. Run it before a release.
 #
 # Job logs need a login to read, so the verdict, recovery per fault and the
 # request counts are notice annotations, and each violation an error one.
@@ -29,7 +28,7 @@ on:
         description: "Seed"
         default: "20261001"
       macos:
-        description: "Also run on macOS (ten times the minutes)"
+        description: "Also run on macOS"
         type: boolean
         default: true
 
@@ -55,7 +54,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.macos && '["linux","macos"]' || '["linux"]') }}
-    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.os == 'macos' && 'macos-latest' || 'ubuntu-24.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
