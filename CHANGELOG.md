@@ -31,6 +31,13 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   (kept in the state directory's `ids.json`), and ids, lists and ranges as
   targets for every command: `warden start 0,1,2`, `warden stop 0-3`,
   `warden restart api web:2`.
+- `warden describe`, `status <app>`, `daemon status` and `doctor` print boxed
+  tables like PM2's, and `start`, `stop`, `restart`, `reload`, `delete`,
+  `scale`, `reset`, `resurrect` and `serve` print the app table afterwards
+  (on a terminal, or with `WARDEN_TABLE=1`). Wide cells wrap at spaces when
+  the terminal width is known.
+- [`docs/windows.md`](docs/windows.md): why Warden does not run natively on
+  Windows, how to use it under WSL2, and the plan for a native build.
 - `pm2-migrate` leaves out environment names an env file cannot hold (PM2
   records one named after the app) and lists them in `MIGRATION.md`, instead
   of writing an env file Warden refuses to read.

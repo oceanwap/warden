@@ -99,6 +99,17 @@ pub fn try_lock_exclusive(file: &std::fs::File) -> io::Result<bool> {
     if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
 }
 
+/// Width in columns of the terminal on this descriptor; `None` for anything
+/// that is not a terminal (a pipe, a file) or reports no width.
+pub fn terminal_width(fd: RawFd) -> Option<usize> {
+    let mut ws = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCGWINSZ only writes a `winsize` through the pointer, which
+    // is valid and exclusively borrowed for the call; a descriptor that is not
+    // a terminal makes it fail with ENOTTY and write nothing.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    (rc == 0 && ws.ws_col > 0).then_some(usize::from(ws.ws_col))
+}
+
 /// Memory page size in bytes (cached).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // for /proc metrics
 pub fn page_size() -> u64 {
@@ -667,6 +678,34 @@ mod tests {
         drop(a);
         assert!(try_lock_exclusive(&b).unwrap(), "free once the first is closed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pipe, a file and a closed descriptor have no width; a pseudo-terminal
+    /// reports the size it was given (skipped where there is no pty).
+    #[test]
+    fn terminal_width_is_none_off_a_terminal_and_the_size_on_one() {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(terminal_width(null.as_raw_fd()), None);
+        assert_eq!(terminal_width(-1), None);
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty fills the two descriptors we pass pointers to; the
+        // other arguments are optional and null.
+        let rc = unsafe {
+            libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if rc != 0 {
+            return; // no pty here
+        }
+        let mut ws = libc::winsize { ws_row: 24, ws_col: 77, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: TIOCSWINSZ reads a `winsize` from a valid pointer.
+        let set = unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut ws) };
+        assert_eq!(set, 0);
+        assert_eq!(terminal_width(slave), Some(77));
+        // SAFETY: both descriptors are ours and still open.
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
     }
 
     fn open_fds() -> usize {

@@ -324,7 +324,7 @@ has everything; the differences are in the right column.
 | `pm2 start app.js -i 4 --name api` | `warden start app.js -i 4 --name api` | Waits until the app is up and says so if it isn't (`--no-wait` returns at once). An app that can't start (every worker crashes before one is ready: a syntax error, a missing module, a port in use) fails at once with exit 1, its last error output and a hint; its workers are stopped and it stays listed as `errored`, as PM2 leaves it, until `warden start` again. Any program or command line works, as with PM2 |
 | `pm2 list`, `pm2 jlist` | `warden list`, `warden list --json` | The same boxed table with an `id` column, ~2 ms instead of ~140-160 ms. One row per worker; colors on a terminal (`NO_COLOR` turns them off) |
 | `pm2 restart 0`, `pm2 stop 1 2` | `warden restart 0`, `warden stop 1,2` | Every command that takes an app takes its id from `warden list`, a name, a namespace or `all`, one or several: `warden start 0,1,2`, `warden stop 0-3`, `warden restart api web:2` (`:2`: one worker). Ids are numbered the first time Warden sees an app (alphabetically for the first batch, then in creation order), kept in `ids.json` in the state directory, and never change; only `warden delete` frees one. Use names in scripts |
-| `pm2 describe api` | `warden describe api` | Also the last exits and the last rollout |
+| `pm2 describe api` | `warden describe api` | A key \| value box and the workers' box, like PM2's; also the last exits and the last rollout. `status <app>`, `daemon status` and `doctor` are boxes too. Like PM2, `start`, `stop`, `restart`, `reload`, `delete`, `scale`, `reset`, `resurrect` and `serve` print the app table when they finish, on a terminal (set `WARDEN_TABLE=1` to get it in a log; a script's output is unchanged) |
 | `pm2 reload api` | `warden restart api`, `warden reload api` | One worker at a time through health gates; a failure stops and rolls back. `restart --hard` is PM2's `restart` |
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
 | `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files (every worker's with `per_worker_files`), pipe-friendly |
@@ -358,18 +358,20 @@ Every problem Warden logs says what happened, why, what it did and how to fix
 it; [`docs/troubleshooting.md`](docs/troubleshooting.md) collects them by symptom.
 
 ```
-$ warden status
-Application: travelerwe-api
-Mode:        process
-Workers:     4
-Ready:       4
-PID:         8139
-Uptime:      27s
-Release:     /srv/apps/travelerwe/api/releases/2026-09-30
-Memory:      4.0 MB (supervisor)
-Last:        safe-reload FAILED - safe-reload failed at worker 1: new worker keeps failing
-             health checks: HTTP 503. Rolled back: every worker still runs the previous version. ...
-
+$ warden status travelerwe-api
+ travelerwe-api
+┌───────────┬──────────────────────────────────────────────┐
+│ status    │ online                                       │
+│ id        │ 0                                            │
+│ namespace │ default                                      │
+│ mode      │ process                                      │
+│ workers   │ 4 configured, 4 ready                        │
+│ pid       │ 8139                                         │
+│ uptime    │ 27s                                          │
+│ release   │ /srv/apps/travelerwe/api/releases/2026-09-30 │
+│ memory    │ 4.0 MB (supervisor)                          │
+└───────────┴──────────────────────────────────────────────┘
+ Workers
 ┌────────┬─────────┬──────┬────────┬───┬──────┬─────────┬──────────┬────────┬───────────┐
 │ worker │ status  │ pid  │ uptime │ ↺ │ cpu  │ mem     │ loop p99 │ health │ last exit │
 ├────────┼─────────┼──────┼────────┼───┼──────┼─────────┼──────────┼────────┼───────────┤
@@ -840,7 +842,13 @@ Flood: 1 worker writing 200 MB to stdout as fast as it is read
     sends no `host` events, and it restarts a supervisor with its own
     environment (the launchd job's `PATH`) instead of the one it was started
     with.
-- **Windows**: not supported. WSL2 works as Linux.
+- **Windows**: not supported, and not planned for 0.1. Warden is built on
+  Unix sockets, signals, process groups and `SO_REUSEPORT`, none of which
+  Windows has in the same form. **WSL2 works as Linux** (it is a real Linux
+  kernel): follow the Linux instructions inside the distribution, and keep
+  the app on the Linux filesystem. [docs/windows.md](docs/windows.md) has the
+  tips and the plan for a native build, with the one hard problem (sharing a
+  port between workers) spelled out.
 
 ## Development
 

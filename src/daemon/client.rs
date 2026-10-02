@@ -205,18 +205,32 @@ pub async fn status(json: bool) -> i32 {
         println!("no apps yet: `warden start server.js --name api`");
         return 0;
     }
-    let mut rows = vec![["App", "State", "Supervised by", "PID", "Restarts", "Problem"].map(String::from).to_vec()];
-    for a in &apps {
-        rows.push(vec![
-            a.name.clone(),
-            state_name(a.state).into(),
-            a.supervised_by.clone(),
-            a.supervisor_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            a.supervisor_restarts.to_string(),
-            a.problem.clone().unwrap_or_else(|| "-".into()),
-        ]);
-    }
-    print!("{}", crate::cli::table(&rows));
+    use crate::table::{Cell, DIM, GREEN, KEY, NAME, RED, YELLOW};
+    let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+    let ids = crate::ids::lookup(&fleet::state_dir(), &names);
+    let rows: Vec<Vec<Cell>> = apps
+        .iter()
+        .map(|a| {
+            let state = state_name(a.state);
+            let style = match state {
+                "running" | "ok" => GREEN,
+                "stopped" | "offline" => DIM,
+                "lost" | "failed" | "dead" | "crashed" => RED,
+                _ => YELLOW,
+            };
+            vec![
+                Cell::styled(ids.get(&a.name).map_or("-".to_string(), |i| i.to_string()), KEY),
+                Cell::styled(a.name.clone(), NAME),
+                Cell::styled(state, style),
+                Cell::plain(a.supervised_by.clone()),
+                Cell::plain(a.supervisor_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
+                Cell::plain(a.supervisor_restarts.to_string()),
+                Cell::plain(a.problem.clone().unwrap_or_else(|| "-".into())),
+            ]
+        })
+        .collect();
+    let header = ["id", "name", "state", "supervised by", "pid", "↺", "problem"];
+    print!("{}", crate::table::boxed(Some(&header), &rows, &crate::table::Fmt::stdout(), Some(6)));
     0
 }
 

@@ -1348,8 +1348,20 @@ fn pm2_style_fleet_workflow() {
     assert_eq!(api2[0], api1[0]);
     assert_ne!(api2[1], api1[1]);
 
-    // Namespaces as targets: stop both, start one.
-    f.ok(&["stop", "backend"]);
+    // describe: PM2's title, then a key | value box and the workers' box.
+    let d = f.ok(&["describe", "0"]);
+    assert!(d.starts_with(" Describing app with id 0 - name api\n┌"), "{d}");
+    assert!(d.contains("│ namespace") && d.contains("backend") && d.contains("\n Workers\n┌"), "{d}");
+    assert!(f.ok(&["status", "api"]).contains("│ status "), "one app: the same box");
+
+    // Namespaces as targets: stop both, start one. A script's output has no
+    // table after it; with WARDEN_TABLE=1 (or on a terminal) it does, as in PM2.
+    let (code, out) = f.cli_env(&["stop", "backend"], &[("WARDEN_TABLE", "1")]);
+    assert_eq!(code, 0, "{out}");
+    let stopped = |id: &str, name: &str| {
+        out.lines().filter(|l| l.starts_with(&format!("│ {id} ")) && l.contains(name) && l.contains("stopped")).count()
+    };
+    assert_eq!((stopped("0", " api "), stopped("1", " web ")), (2, 1), "the table after stop:\n{out}");
     f.wait("both stopped", |f| {
         f.list().iter().all(|a| {
             a["status"]["stopped"] == true
@@ -1392,7 +1404,8 @@ fn pm2_style_fleet_workflow() {
 
     // describe / env: secrets hidden unless asked.
     let out = f.ok(&["describe", "api"]);
-    assert!(out.contains("namespace backend") && out.contains("restart") && out.contains("worker"), "{out}");
+    assert!(out.contains("│ namespace") && out.contains("backend") && out.contains("│ restart "), "{out}");
+    assert!(out.contains("│ worker │"), "the workers' own box: {out}");
     assert!(!out.contains("s3cret") && out.contains("NODE_ENV=production"), "{out}");
     let out = f.ok(&["env", "api"]);
     assert!(out.contains("API_TOKEN=(hidden") && !out.contains("s3cret"), "{out}");
@@ -2223,7 +2236,7 @@ fn doctor_reports_problems_with_fixes() {
         .unwrap();
     let (code, out) = f.cli(&["doctor"]);
     assert_eq!(code, 1, "{out}");
-    assert!(out.contains("FAIL  app broken"), "{out}");
+    assert!(out.contains("│ FAIL  │ app broken"), "{out}");
     assert!(out.contains(&format!("port {port} is taken")) && out.contains(&format!("sport = :{port}")), "{out}");
     let (_, json) = f.cli(&["doctor", "--json"]);
     let v: Value = serde_json::from_str(&json).unwrap();
@@ -2637,7 +2650,10 @@ fn wardend_runs_reports_and_stops() {
     assert_eq!(code, 0, "{out}");
     assert!(autostarted.0.is_some() && out.contains("api: online"), "{out}");
     let out = f.ok(&["daemon", "status"]);
-    assert!(out.lines().any(|l| l.starts_with("api ") && l.contains("running") && l.contains("wardend")), "{out}");
+    assert!(
+        out.lines().any(|l| l.starts_with("│ 0  │ api ") && l.contains("running") && l.contains("wardend")),
+        "{out}"
+    );
     let out = f.ok(&["kill", "--yes"]);
     assert!(out.contains("api: stopped") && out.contains("wardend: stopped"), "{out}");
     assert_eq!(f.cli(&["daemon", "status"]).0, 1);
@@ -4135,7 +4151,7 @@ fn start_fails_fast_when_every_worker_crashes() {
     assert_eq!(restarts(&f), before, "no restart loop");
     // One app: `list` shows its detail view; the crash, not the stop, is the last exit.
     let list = f.ok(&["list"]);
-    assert!(list.contains("State:       errored: its last start failed"), "{list}");
+    assert!(list.contains("│ status    │ errored") && list.contains("errored: its last start failed"), "{list}");
     assert!(list.lines().filter(|l| l.contains("STOPPED") && l.contains("exit code 3")).count() == 2, "{list}");
     // Warden's own log says it once, with a hint.
     let events = f.ok(&["logs", "broken", "--events", "--nostream", "-n", "200"]);
@@ -5800,7 +5816,7 @@ fn pinned_release_survives_a_symlink_swap_until_reload() {
     assert_eq!(releases_seen(port, true), ["v1".to_string()].into(), "cwd and script both in the pinned release");
     assert!(w.log().contains("release pinned"));
     let (_, out) = w.cli(&["status"]);
-    assert!(out.contains("Release:") && out.contains("releases/v1"), "{out}");
+    assert!(out.contains("│ release ") && out.contains("releases/v1"), "{out}");
 
     // Deploy, step 1: the symlink is swapped, and a worker crashes before the
     // reload. It comes back on the release the others run.
@@ -6235,7 +6251,7 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
     }
     let (_, out) = w.cli(&["status"]);
     assert!(
-        out.contains("Standby:     1/1 ready") && out.lines().any(|l| l.starts_with("│ s1 ") && l.contains("STANDBY")),
+        out.contains("│ standby   │ 1/1 ready") && out.lines().any(|l| l.starts_with("│ s1 ") && l.contains("STANDBY")),
         "{out}"
     );
     assert_eq!(s["workers"].as_array().map(Vec::len), Some(1), "standbys are not workers");

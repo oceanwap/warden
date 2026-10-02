@@ -5,6 +5,7 @@
 
 use crate::cli::Args;
 use crate::fleet;
+use crate::table::{Cell, DIM, Fmt, GREEN, NAME, RED, YELLOW, boxed};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -43,26 +44,30 @@ pub async fn run(args: &Args) -> i32 {
     if args.json {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     } else {
-        print!("{}", render(&out));
+        print!("{}", render(&out, &Fmt::stdout()));
     }
     if out.iter().any(|x| x.level == Level::Fail) { 1 } else { 0 }
 }
 
-pub fn render(findings: &[Finding]) -> String {
-    let width = findings.iter().map(|x| x.check.len()).max().unwrap_or(0);
-    let mut s = String::new();
-    for x in findings {
-        let tag = match x.level {
-            Level::Ok => "ok  ",
-            Level::Info => "info",
-            Level::Warn => "WARN",
-            Level::Fail => "FAIL",
-        };
-        s += &format!("{tag}  {:<width$}  {}\n", x.check, x.detail);
-        if let Some(fix) = &x.fix {
-            s += &format!("      {:<width$}  fix: {fix}\n", "");
-        }
-    }
+pub fn render(findings: &[Finding], fmt: &Fmt) -> String {
+    let rows: Vec<Vec<Cell>> = findings
+        .iter()
+        .map(|x| {
+            let (tag, style) = match x.level {
+                Level::Ok => ("ok", GREEN),
+                Level::Info => ("info", DIM),
+                Level::Warn => ("WARN", YELLOW),
+                Level::Fail => ("FAIL", RED),
+            };
+            // The fix sits under the detail, in the same cell.
+            let detail = match &x.fix {
+                Some(fix) => format!("{}\nfix: {fix}", x.detail),
+                None => x.detail.clone(),
+            };
+            vec![Cell::styled(tag, style), Cell::styled(x.check.clone(), NAME), Cell::plain(detail)]
+        })
+        .collect();
+    let mut s = boxed(Some(&["level", "check", "detail"]), &rows, fmt, Some(2));
     let count = |l| findings.iter().filter(|x| x.level == l).count();
     let (fails, warns) = (count(Level::Fail), count(Level::Warn));
     s += &match (fails, warns) {
@@ -83,7 +88,7 @@ fn kernel() -> Vec<Finding> {
             "kernel",
             "not Linux: fine for development, but SO_REUSEPORT does not balance connections across workers \
              (use count = 1), no parent-death signal (workers outlive a SIGKILLed supervisor), \
-             no /proc readiness or CPU/RSS metrics",
+             no /proc readiness (CPU and memory come from libproc)",
             Some("run production on Linux"),
         ));
         v.push(f(
@@ -380,14 +385,22 @@ mod tests {
 
     #[test]
     fn report_counts_and_fixes() {
-        let out = render(&[
-            f(Level::Ok, "kernel", "fine", None),
-            f(Level::Warn, "tcp_migrate_req", "0", Some("sysctl -w net.ipv4.tcp_migrate_req=1")),
-        ]);
-        assert!(out.contains("WARN  tcp_migrate_req  0\n"), "{out}");
-        assert!(out.contains("fix: sysctl -w net.ipv4.tcp_migrate_req=1"), "{out}");
+        let out = render(
+            &[
+                f(Level::Ok, "kernel", "fine", None),
+                f(Level::Warn, "tcp_migrate_req", "0", Some("sysctl -w net.ipv4.tcp_migrate_req=1")),
+            ],
+            &Fmt::PLAIN,
+        );
+        // One box: a row per check, the fix on its own line under the detail.
+        assert!(out.starts_with('┌') && out.contains("│ level │ check "), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("│ WARN  │ tcp_migrate_req │ 0 ")), "{out}");
+        assert!(
+            out.lines().any(|l| l.starts_with("│       │ ") && l.contains("fix: sysctl -w net.ipv4.tcp_migrate_req=1")),
+            "{out}"
+        );
         assert!(out.contains("1 warning(s)"), "{out}");
-        let out = render(&[f(Level::Fail, "pid 1", "bad", None)]);
+        let out = render(&[f(Level::Fail, "pid 1", "bad", None)], &Fmt::PLAIN);
         assert!(out.contains("1 problem(s)"), "{out}");
     }
 }

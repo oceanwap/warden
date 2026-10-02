@@ -30,6 +30,7 @@ mod supervisor;
 #[allow(unsafe_code)]
 mod sys;
 mod systemd;
+mod table;
 mod worker;
 
 use cli::Command;

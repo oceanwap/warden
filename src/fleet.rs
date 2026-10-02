@@ -11,6 +11,7 @@
 use crate::cli::{self, Action, Args, ScaleArg, StartOpts};
 use crate::config::{self, Config};
 use crate::control::{self, Request, Response, Status};
+use crate::table::Fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -458,8 +459,59 @@ pub async fn statuses(apps: &[App]) -> Vec<(App, Result<Status, String>)> {
 
 // ----------------------------------------------------------------- commands
 
+/// PM2 prints the app table after start, stop, restart and the like: what
+/// the command left things as. So do we on a terminal, or anywhere with
+/// `WARDEN_TABLE=1` (into a log, say); a script's output stays as it was.
+fn table_after() -> bool {
+    crate::sys::isatty(1) || std::env::var_os("WARDEN_TABLE").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Is any worker between states (stopping, starting, draining an old process)?
+fn in_transition(all: &[(App, Result<Status, String>)]) -> bool {
+    all.iter().filter_map(|(_, s)| s.as_ref().ok()).any(|s| {
+        s.workers
+            .iter()
+            .chain(&s.draining)
+            .any(|w| matches!(w.state.as_str(), "STOPPING" | "STARTING" | crate::control::DRAINING))
+    })
+}
+
+/// Print the table of every app now (see `table_after`). Not for `--json` or
+/// a single app named with `-c`. `settle`: for commands that return before
+/// the workers have finished (`stop` only asks them to), wait a few seconds
+/// for them to, so the table shows `stopped` and not `STOPPING`, as PM2's does.
+async fn show_apps(args: &Args, settle: bool) {
+    if args.json || !table_after() {
+        return;
+    }
+    let ctx = context(args);
+    if ctx.single {
+        return;
+    }
+    let deadline = Instant::now() + SETTLE_MAX;
+    let mut all = statuses(&ctx.apps).await;
+    while settle && in_transition(&all) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        all = statuses(&ctx.apps).await;
+    }
+    print!("{}", cli::render_list_with(&all, &Fmt::stdout()));
+}
+
+/// The longest `show_apps` waits for workers to finish stopping or starting.
+const SETTLE_MAX: Duration = Duration::from_secs(6);
+
 /// Commands that act on running apps.
 pub async fn act(args: &Args, action: &Action) -> i32 {
+    let code = act_inner(args, action).await;
+    match action {
+        Action::Stop | Action::Reset | Action::Scale(_) => show_apps(args, true).await,
+        Action::Restart { .. } | Action::Reload { .. } => show_apps(args, false).await,
+        _ => {}
+    }
+    code
+}
+
+async fn act_inner(args: &Args, action: &Action) -> i32 {
     let ctx = context(args);
     let need = !matches!(action, Action::List | Action::Logs { .. } | Action::LogLevel(_));
     let sels = match resolve(&ctx, args.target.as_deref(), need) {
@@ -492,7 +544,7 @@ async fn list(sels: &[Sel], args: &Args, ctx: &Ctx) -> i32 {
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(st).unwrap_or_default());
                 } else {
-                    print!("{}", cli::render_status(st, args.table_only));
+                    print!("{}", cli::render_status_with(st, args.table_only, ctx.apps[0].id, &Fmt::stdout()));
                 }
                 0
             }
@@ -525,12 +577,12 @@ async fn list(sels: &[Sel], args: &Args, ctx: &Ctx) -> i32 {
     if all.len() == 1 && sels.first().is_some_and(|s| s.worker.is_none()) {
         if let (_, Ok(st)) = &all[0] {
             // One app: the detailed view, as before.
-            print!("{}", cli::render_status(st, args.table_only));
+            print!("{}", cli::render_status_with(st, args.table_only, all[0].0.id, &Fmt::stdout()));
             return 0;
         }
     }
     // Offline apps are a state to show, not an error (as with `pm2 list`).
-    print!("{}", cli::render_list_with(&all, cli::use_color(1)));
+    print!("{}", cli::render_list_with(&all, &Fmt::stdout()));
     if let Some(w) = &ctx.ids_warning {
         eprintln!("warden: {w}");
     }
@@ -553,7 +605,8 @@ async fn describe(sels: &[Sel], args: &Args) -> i32 {
                     let v = serde_json::json!({"status": st, "info": info.info});
                     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
                 } else {
-                    print!("{}", cli::render_describe(&st, info.info.as_ref().unwrap_or(&serde_json::Value::Null)));
+                    let info = info.info.as_ref().unwrap_or(&serde_json::Value::Null);
+                    print!("{}", cli::render_describe(&st, info, s.app.id, &Fmt::stdout()));
                 }
             }
             (Err(e), _) | (_, Err(e)) => {
@@ -1191,6 +1244,12 @@ fn is_selector_list(what: &str) -> bool {
 
 /// `warden start <app | id | config.toml | script>`.
 pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
+    let code = start_inner(args, what, opts).await;
+    show_apps(args, false).await;
+    code
+}
+
+async fn start_inner(args: &Args, what: &str, opts: &StartOpts) -> i32 {
     let ctx = context(args);
     // 1. Apps we know: a name, an id, a namespace, `all`, or a list of them.
     match resolve(&ctx, Some(what), true) {
@@ -1280,6 +1339,12 @@ pub async fn start(args: &Args, what: &str, opts: &StartOpts) -> i32 {
 
 /// `warden serve <dir> [port]`: an app whose workers are Warden's static server.
 pub async fn serve(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
+    let code = serve_inner(args, dir, port, o).await;
+    show_apps(args, false).await;
+    code
+}
+
+async fn serve_inner(args: &Args, dir: &Path, port: u16, o: &StartOpts) -> i32 {
     let ctx = context(args);
     let root = match std::fs::canonicalize(dir) {
         Ok(r) if r.is_dir() => r,
@@ -2061,6 +2126,12 @@ async fn shutdown_directly(app: &App) -> Result<String, String> {
 }
 
 pub async fn delete(args: &Args, target: &str) -> i32 {
+    let code = delete_inner(args, target).await;
+    show_apps(args, true).await;
+    code
+}
+
+async fn delete_inner(args: &Args, target: &str) -> i32 {
     let ctx = context(args);
     let sels = match resolve(&ctx, Some(target), true) {
         Ok(s) => s,
@@ -2267,6 +2338,12 @@ fn stopped_note(s: &Saved) -> &'static str {
 }
 
 pub async fn resurrect(args: &Args) -> i32 {
+    let code = resurrect_inner(args).await;
+    show_apps(args, false).await;
+    code
+}
+
+async fn resurrect_inner(args: &Args) -> i32 {
     let dump = match read_dump() {
         Ok(Some(d)) => d,
         Ok(None) => {
@@ -2315,7 +2392,7 @@ pub async fn top(args: &Args) -> i32 {
             out += "\x1b[2J\x1b[H";
         }
         out += &format!("warden top - {} (Ctrl-C to quit)\n\n", crate::logging::timestamp_now());
-        out += &cli::render_list_with(&all, tty && cli::use_color(1));
+        out += &cli::render_list_with(&all, &if tty { Fmt::stdout() } else { Fmt::PLAIN });
         print!("{out}");
         if !tty {
             return 0;
