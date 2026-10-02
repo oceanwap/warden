@@ -476,9 +476,9 @@ fn app_list(g: &Gui) -> Element<'_, Message> {
             spacing: 8.0,
             side: text_input::Side::Left,
         });
-    let mut rows = Column::new().spacing(6);
+    let mut rows = Column::new();
     for a in &shown {
-        rows = rows.push(app_row(g, a));
+        rows = rows.push(app_row(g, a)).push(look::hairline());
     }
     if shown.is_empty() {
         rows = rows.push(container(small(format!("No app matches “{}”.", g.filter.trim()))).padding([10, 8]));
@@ -486,7 +486,8 @@ fn app_list(g: &Gui) -> Element<'_, Message> {
     container(
         column![
             column![search, small(summary)].spacing(8).padding([12, 12]),
-            scrollable(rows.padding([0, 8]).width(Fill))
+            look::hairline(),
+            scrollable(rows.width(Fill))
                 .direction(scrollable::Direction::Vertical(thin()))
                 .height(Fill)
                 .style(look::scroll),
@@ -531,22 +532,17 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     if let (AppState::GaveUp | AppState::Unreachable, Some(p)) = (a.entry.state, &a.entry.problem) {
         c = c.push(small(clip(p, 80).into_owned()));
     }
-    // What needs attention is washed with its color (the list is read for it).
-    let attention = match a.entry.state {
-        AppState::GaveUp | AppState::Unreachable => Some(Tone::Bad),
-        AppState::Starting => Some(Tone::Warn),
-        AppState::Running if a.is_unwell() => Some(Tone::Warn),
-        _ => None,
-    };
-    let mut inner = Row::new().spacing(10);
-    if selected {
-        inner = inner.push(look::marker());
-    }
-    let inner = inner.push(container(dot(tone, 8.0)).padding([6, 0])).push(c.width(Fill));
+    // The same layout for every row: the bar's place (filled on the shown app), then
+    // the dot and the text.
+    let body = row![container(dot(tone, 8.0)).padding([6, 0]), c.width(Fill)].spacing(10);
+    let inner = row![
+        look::marker(selected.then_some(tone)),
+        container(body).padding(iced::Padding { top: 11.0, right: 14.0, bottom: 11.0, left: 12.0 }).width(Fill)
+    ];
     button(inner)
         .width(Fill)
-        .padding([10, 12])
-        .style(look::list_row(selected, attention))
+        .padding(0)
+        .style(look::list_row(selected))
         .on_press(Message::Select(a.name().to_string()))
         .into()
 }

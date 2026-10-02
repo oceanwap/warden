@@ -73,8 +73,10 @@ palette of the author's habit tracker, in a light and a dark variant
 (`WARDEN_GUI_THEME=light` or `dark`; the dark one is the default).
 
 - Color means status and nothing else: the dot, the state label and a faint
-  wash of the row or pill. The app that is shown has its own marker, a bold
-  raised row with a bar at its left edge, which no status uses.
+  wash of a pill. The app list is flat rows with hairlines between them, and
+  the app that is shown has a veil over its row and a thick bar at its left
+  edge in its status color (the dot's); every row's content starts at the
+  same place, with or without the bar.
 - Boxes are see-through (a white veil over the page), so the page shows a
   little through cards and tiles.
 - Type: Plus Jakarta Sans for headings and figures, Inter for text,

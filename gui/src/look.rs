@@ -53,8 +53,6 @@ pub struct Pal {
     pub box_bg: Color,
     /// The fill of a tile or an input: a little stronger than a box.
     pub tile_bg: Color,
-    /// The fill of what is raised above the page: the selected row.
-    pub raised: Color,
     /// How much of its color a tone's wash takes (the rest is what is behind it).
     pub wash: f32,
     pub accent: Color,
@@ -77,7 +75,6 @@ static LIGHT: Pal = Pal {
     chip: color!(0xefeae1),
     box_bg: color!(0xffffff, 0.55),
     tile_bg: color!(0xefeae1, 0.6),
-    raised: color!(0xffffff, 0.95),
     wash: 0.10,
     accent: color!(0x1b6b45),
     on_accent: color!(0xffffff),
@@ -98,7 +95,6 @@ static DARK: Pal = Pal {
     chip: color!(0x242924),
     box_bg: color!(0xffffff, 0.035),
     tile_bg: color!(0xffffff, 0.055),
-    raised: color!(0xffffff, 0.11),
     wash: 0.13,
     accent: color!(0x4eae78),
     on_accent: color!(0x07140c),
@@ -501,58 +497,47 @@ pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// A row of the app list: a card of its own. Color means status only: what needs
-/// attention is washed and outlined with its color (amber, red). The app that is
-/// shown is raised (a stronger fill, a soft shadow, a thin neutral outline) and
-/// has a bar at its left edge (`marker`), which no status has, so it cannot be
-/// mistaken for one.
-pub fn list_row(selected: bool, attention: Option<Tone>) -> impl Fn(&Theme, button::Status) -> button::Style {
+/// A row of the app list: flat, edge to edge, with nothing around it. The app
+/// that is shown has a veil over the row and a thick bar at its left edge
+/// (`marker`), in the color of its status like the dot and the state label.
+pub fn list_row(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = pal(theme);
-        let rest = match (attention, selected) {
-            (Some(t), true) => Color { a: (t.soft(theme).a + 0.05).min(1.0), ..t.soft(theme) },
-            (Some(t), false) => t.soft(theme),
-            (None, true) => p.raised,
-            (None, false) => p.box_bg,
-        };
-        let bg = match status {
-            // Hovering a row makes it a little stronger (it is see-through, so
-            // a shade of black or white would not do).
-            button::Status::Hovered if !selected => Color { a: (rest.a + 0.05).min(1.0), ..rest },
-            button::Status::Pressed => Color { a: (rest.a + 0.09).min(1.0), ..rest },
-            _ => rest,
-        };
-        let color = match (attention, selected) {
-            (Some(t), _) => Color { a: if selected { 0.55 } else { 0.35 }, ..t.color(theme) },
-            (None, true) => Color { a: 0.22, ..p.ink },
-            (None, false) => p.line,
+        let bg = match (selected, status) {
+            (true, _) => Some(p.tile_bg),
+            (false, button::Status::Hovered | button::Status::Pressed) => Some(p.box_bg),
+            (false, _) => None,
         };
         button::Style {
-            background: Some(Background::Color(bg)),
+            background: bg.map(Background::Color),
             text_color: p.ink,
-            border: Border { radius: 14.0.into(), width: 1.0, color },
-            shadow: if selected {
-                iced::Shadow {
-                    color: Color { a: if p.dark { 0.45 } else { 0.10 }, ..Color::BLACK },
-                    offset: iced::Vector::new(0.0, 2.0),
-                    blur_radius: 8.0,
-                }
-            } else {
-                iced::Shadow::default()
-            },
+            border: Border::default(),
             ..button::Style::default()
         }
     }
 }
 
-/// The bar at the left edge of the selected row.
-pub fn marker<'a, Message: 'a>() -> Element<'a, Message> {
+/// The thick bar at the left edge of a row of the app list: on the shown app, in
+/// the color of its status (the dot's), and an empty space of the same width on
+/// the others, so every row's content starts at the same place.
+pub fn marker<'a, Message: 'a>(on: Option<Tone>) -> Element<'a, Message> {
     container(space())
-        .width(3)
+        .width(4)
         .height(Length::Fill)
+        .style(move |theme: &Theme| container::Style {
+            background: on.map(|t| Background::Color(t.color(theme))),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A line across a list, between its rows.
+pub fn hairline<'a, Message: 'a>() -> Element<'a, Message> {
+    container(space())
+        .width(Length::Fill)
+        .height(1)
         .style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(Color { a: 0.85, ..pal(theme).ink })),
-            border: border::rounded(PILL),
+            background: Some(Background::Color(pal(theme).line)),
             ..container::Style::default()
         })
         .into()
