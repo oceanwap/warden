@@ -15,6 +15,11 @@ trap 'rm -rf "$T"' EXIT
 fails=0
 pass() { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
+# SHA-256 of a file: sha256sum on Linux, shasum on a Mac.
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
 check() { # description command...
     local d=$1
     shift
@@ -104,8 +109,10 @@ echo "${FAKE_TRANSLATED:-0}"
 EOF
 cat >"$bin/shasum" <<'EOF'
 #!/bin/sh
+# Linux has sha256sum; a Mac has the real shasum (this one shadows it on PATH).
 [ "$1" = -a ] && shift 2
-exec sha256sum "$@"
+if command -v sha256sum >/dev/null 2>&1; then exec sha256sum "$@"; fi
+exec /usr/bin/shasum -a 256 "$@"
 EOF
 cat >"$bin/gh" <<'EOF'
 #!/bin/sh
@@ -224,14 +231,15 @@ rm -f "$R1/stray.txt"
 run "$R1" "$T/log7" FAKE_ARCH=x86_64 -- --no-upload --arch x86_64 --no-gui >"$T/out7" 2>&1
 check "--arch x86_64 --no-gui exits 0" test $? -eq 0
 check "…builds one CLI archive and nothing else" sh -c "
-    [ \"\$(ls '$R1/target/dist-macos' | grep -c 'macos-.*\.\(tar.gz\|zip\)\$')\" = 1 ] &&
+    [ \"\$(ls '$R1/target/dist-macos' | grep -Ec 'macos-.*\.(tar\.gz|zip)\$')\" = 1 ] &&
     test -s '$R1/target/dist-macos/warden-$version-macos-x86_64.tar.gz'"
 check "…and installs it on an x86_64 Mac" grep -q "installed: warden $version" "$T/out7"
 
 # ------------------------------------------------ 8. versions out of step
 R8=$T/r8
 mkrepo "$R8"
-sed -i 's/^version = ".*"/version = "9.9.9"/' "$R8/gui/Cargo.toml"
+# No `sed -i`: its argument differs between GNU and BSD (macOS) sed.
+sed 's/^version = ".*"/version = "9.9.9"/' "$R8/gui/Cargo.toml" >"$R8/gui/Cargo.toml.new" && mv "$R8/gui/Cargo.toml.new" "$R8/gui/Cargo.toml"
 (cd "$R8" && git -c user.email=t@t -c user.name=t commit -qam skew)
 run "$R8" "$T/log8" -- --no-upload >"$T/out8" 2>&1
 check "versions out of step are refused" test $? -ne 0
@@ -240,7 +248,7 @@ check "…and the manifest is named" grep -q "gui/Cargo.toml is version 9.9.9" "
 # ------------------------------------------------ 9. the info file vouches for each archive
 run "$R1" "$T/log9" -- --no-upload >"$T/out9" 2>&1
 for f in warden-$version-macos-arm64.tar.gz warden-$version-macos-x86_64.tar.gz warden-gui-$version-macos-arm64.zip warden-gui-$version-macos-x86_64.zip; do
-    want=$(sha256sum "$R1/target/dist-macos/$f" | cut -d' ' -f1)
+    want=$(sha256 "$R1/target/dist-macos/$f")
     check "the build info lists $f with its checksum" grep -qx "sha256 $want $f" "$R1/target/dist-macos/macos-build-info.txt"
 done
 check "the app's attributes are cleared before signing" sh -c "grep -q '^xattr -cr ' '$T/log9' && grep -q '^ditto .*--norsrc' '$T/log9'"
@@ -286,11 +294,11 @@ check "replacing a draft deletes the old info file before the archives" sh -c "[
 run "$R1" "$T/log14" FAKE_GH=draft-then-published -- >"$T/out14" 2>&1
 check "a release published during the build is not touched" test $? -ne 0
 check "…and says so" grep -q "was published while this was building" "$T/out14"
-check "…nothing was uploaded" sh -c "! grep -q '^gh release \\(upload\\|create\\)' '$T/log14'"
+check "…nothing was uploaded" sh -c "! grep -Eq '^gh release (upload|create)' '$T/log14'"
 run "$R1" "$T/log14b" FAKE_MOVE_HEAD=1 -- >"$T/out14b" 2>&1
 check "a commit made during the build stops the upload" test $? -ne 0
 check "…and says so" grep -q "HEAD moved during the build" "$T/out14b"
-check "…nothing was uploaded" sh -c "! grep -q '^gh release \\(upload\\|create\\)' '$T/log14b'"
+check "…nothing was uploaded" sh -c "! grep -Eq '^gh release (upload|create)' '$T/log14b'"
 
 # ------------------------------------------------ 15. a tag on another commit
 R15=$T/r15
