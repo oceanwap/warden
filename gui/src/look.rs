@@ -33,7 +33,10 @@ pub const PILL: f32 = 999.0;
 
 // ------------------------------------------------------------------ colors
 
-/// The colors of one appearance.
+/// The colors of one appearance. Six come with the theme (`Palette`: the page,
+/// the text, the accent, good, warning and danger); the rest is derived from
+/// them, so the same styles serve the Warden palette and the system's.
+#[derive(Debug, Clone, Copy)]
 pub struct Pal {
     pub dark: bool,
     /// Text.
@@ -44,7 +47,7 @@ pub struct Pal {
     pub line: Color,
     /// The page.
     pub paper: Color,
-    /// What sits on the page.
+    /// What sits on the page (and over it: dialogs, menus).
     pub card: Color,
     /// A resting field of the page: tiles, the track of a segmented control.
     pub chip: Color,
@@ -55,8 +58,15 @@ pub struct Pal {
     pub tile_bg: Color,
     /// How much of its color a tone's wash takes (the rest is what is behind it).
     pub wash: f32,
+    /// The accent as a fill (the main button, a progress bar, a focus ring), and
+    /// what is written on it.
     pub accent: Color,
     pub on_accent: Color,
+    /// The accent as text or an icon: the fill, moved until it can be read on the page.
+    pub accent_text: Color,
+    /// What is well, and what is written on it as a fill.
+    pub good: Color,
+    pub on_good: Color,
     pub warn: Color,
     pub danger: Color,
     pub on_danger: Color,
@@ -65,63 +75,119 @@ pub struct Pal {
     pub on_pill: Color,
 }
 
-static LIGHT: Pal = Pal {
-    dark: false,
-    ink: color!(0x12110f),
-    muted: color!(0x6d675e),
-    line: color!(0xece7df),
-    paper: color!(0xf7f4ee),
-    card: color!(0xffffff),
-    chip: color!(0xefeae1),
-    box_bg: color!(0xffffff, 0.55),
-    tile_bg: color!(0xefeae1, 0.6),
-    wash: 0.10,
-    accent: color!(0x1b6b45),
-    on_accent: color!(0xffffff),
-    warn: color!(0x8a5310),
-    danger: color!(0xa8362e),
-    on_danger: color!(0xffffff),
-    pill: color!(0xffffff),
-    on_pill: color!(0x12110f),
-};
-
-static DARK: Pal = Pal {
-    dark: true,
-    ink: color!(0xf1f0ea),
-    muted: color!(0x9ca39a),
-    line: color!(0x2a2f2b),
-    paper: color!(0x121510),
-    card: color!(0x191d1b),
-    chip: color!(0x242924),
-    box_bg: color!(0xffffff, 0.035),
-    tile_bg: color!(0xffffff, 0.055),
-    wash: 0.13,
-    accent: color!(0x4eae78),
-    on_accent: color!(0x07140c),
-    warn: color!(0xe2b15a),
-    danger: color!(0xe07a70),
-    on_danger: color!(0x1f0b09),
-    pill: color!(0xe8e2d6),
-    on_pill: color!(0x12110f),
-};
-
-pub fn pal(theme: &Theme) -> &'static Pal {
-    if theme.extended_palette().is_dark { &DARK } else { &LIGHT }
+impl Pal {
+    pub fn from_palette(p: Palette, dark: bool) -> Pal {
+        let (paper, ink) = (p.background, p.text);
+        let chip = mix(paper, ink, if dark { 0.09 } else { 0.045 });
+        let veil = |a: f32| Color { a, ..Color::WHITE };
+        let readable_on_page = |c: Color| ensure_contrast(c, paper, 3.0);
+        Pal {
+            dark,
+            ink,
+            paper,
+            muted: mix(ink, paper, if dark { 0.38 } else { 0.40 }),
+            line: mix(paper, ink, if dark { 0.12 } else { 0.07 }),
+            card: if dark { mix(paper, Color::WHITE, 0.045) } else { Color::WHITE },
+            chip,
+            box_bg: veil(if dark { 0.035 } else { 0.55 }),
+            tile_bg: if dark { veil(0.055) } else { Color { a: 0.6, ..chip } },
+            wash: if dark { 0.13 } else { 0.10 },
+            accent: p.primary,
+            on_accent: readable(p.primary),
+            accent_text: readable_on_page(p.primary),
+            good: readable_on_page(p.success),
+            on_good: readable(p.success),
+            warn: readable_on_page(p.warning),
+            danger: readable_on_page(p.danger),
+            on_danger: readable(p.danger),
+            pill: if dark { mix(ink, paper, 0.05) } else { Color::WHITE },
+            on_pill: if dark { paper } else { ink },
+        }
+    }
 }
 
-pub fn theme(light: bool) -> Theme {
-    let (name, p) = if light { ("Warden light", &LIGHT) } else { ("Warden dark", &DARK) };
-    Theme::custom(
-        name,
+/// `a` moved toward `b`: 0 is `a`, 1 is `b`.
+pub fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t, a: 1.0 }
+}
+
+/// The relative luminance of a color (WCAG).
+pub fn luminance(c: Color) -> f32 {
+    let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+}
+
+/// The contrast ratio of two colors (WCAG): 1 to 21.
+pub fn contrast(a: Color, b: Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// White when it reads well enough on `fill` (the desktops put white on their blues,
+/// purples and reds), else near-black.
+pub fn readable(fill: Color) -> Color {
+    const DARK: Color = Color { r: 0.05, g: 0.06, b: 0.05, a: 1.0 };
+    if contrast(Color::WHITE, fill) >= WHITE_ENOUGH || contrast(Color::WHITE, fill) >= contrast(DARK, fill) {
+        Color::WHITE
+    } else {
+        DARK
+    }
+}
+
+const WHITE_ENOUGH: f32 = 3.0;
+
+/// `fg` as it is when it reads on `bg` (a ratio of `min`), else moved toward
+/// the end of the scale that reads (white on a dark page, black on a light one).
+pub fn ensure_contrast(fg: Color, bg: Color, min: f32) -> Color {
+    if contrast(fg, bg) >= min {
+        return fg;
+    }
+    let end = if luminance(bg) < 0.5 { Color::WHITE } else { Color::BLACK };
+    for step in 1..=20 {
+        let c = mix(fg, end, step as f32 * 0.05);
+        if contrast(c, bg) >= min {
+            return c;
+        }
+    }
+    end
+}
+
+pub fn pal(theme: &Theme) -> Pal {
+    Pal::from_palette(theme.palette(), theme.extended_palette().is_dark)
+}
+
+/// The Warden palette: warm paper, one forest green, brick red and amber.
+pub fn warden_palette(light: bool) -> Palette {
+    if light {
         Palette {
-            background: p.paper,
-            text: p.ink,
-            primary: p.accent,
-            success: p.accent,
-            warning: p.warn,
-            danger: p.danger,
-        },
-    )
+            background: color!(0xf7f4ee),
+            text: color!(0x12110f),
+            primary: color!(0x1b6b45),
+            success: color!(0x1b6b45),
+            warning: color!(0x8a5310),
+            danger: color!(0xa8362e),
+        }
+    } else {
+        Palette {
+            background: color!(0x121510),
+            text: color!(0xf1f0ea),
+            primary: color!(0x4eae78),
+            success: color!(0x4eae78),
+            warning: color!(0xe2b15a),
+            danger: color!(0xe07a70),
+        }
+    }
+}
+
+/// The Warden theme, light or dark.
+pub fn theme(light: bool) -> Theme {
+    custom(if light { "Warden light" } else { "Warden dark" }, warden_palette(light))
+}
+
+/// A theme of a palette; the name tells themes apart (widgets compare it to
+/// notice a change), so give each palette its own.
+pub fn custom(name: impl Into<String>, palette: Palette) -> Theme {
+    Theme::custom(name.into(), palette)
 }
 
 // ------------------------------------------------------------------- tones
@@ -143,7 +209,8 @@ impl Tone {
         match self {
             Tone::Plain => p.ink,
             Tone::Muted => p.muted,
-            Tone::Good | Tone::Accent => p.accent,
+            Tone::Good => p.good,
+            Tone::Accent => p.accent_text,
             Tone::Warn => p.warn,
             Tone::Bad => p.danger,
         }
@@ -264,7 +331,10 @@ pub fn tip<'a, Message: 'a>(
 
 /// An icon, then a label: the content of a button.
 pub fn labeled<'a, Message: 'a>(i: Icon, label: impl Into<String>) -> Element<'a, Message> {
-    row![icon(i).size(14), text(label.into()).size(13).font(SEMIBOLD)].spacing(7).align_y(Center).into()
+    row![icon(i).size(14), text(label.into()).size(13).font(SEMIBOLD).wrapping(Wrapping::None)]
+        .spacing(7)
+        .align_y(Center)
+        .into()
 }
 
 /// A figure with a title above and a line below, on a resting field.
@@ -388,8 +458,9 @@ fn solid_with(tone: Tone, theme: &Theme, status: button::Status, radius: border:
     let (base, text_color) = match tone {
         Tone::Plain | Tone::Muted => (p.ink, p.paper),
         Tone::Bad => (p.danger, p.on_danger),
-        Tone::Warn => (p.warn, if p.dark { p.on_accent } else { Color::WHITE }),
-        Tone::Good | Tone::Accent => (p.accent, p.on_accent),
+        Tone::Warn => (p.warn, readable(p.warn)),
+        Tone::Good => (p.good, p.on_good),
+        Tone::Accent => (p.accent, p.on_accent),
     };
     let bg = match status {
         button::Status::Active => base,

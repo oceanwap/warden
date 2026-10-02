@@ -1,4 +1,5 @@
-//! The remote machines the window knows (the connection menu), kept in
+//! The remote machines the window knows (the connection menu) and the Settings
+//! choice of colors, kept in
 //! `~/.config/warden/gui.json` so they are there next time. This machine is
 //! never listed: it needs no configuration, and the window always starts on it.
 //!
@@ -22,6 +23,9 @@ pub struct Machine {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Saved {
     pub machines: Vec<Machine>,
+    /// The Settings choice of colors and mode.
+    #[serde(default)]
+    pub appearance: crate::system::Source,
 }
 
 impl Saved {

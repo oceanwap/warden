@@ -268,6 +268,95 @@ fn main_screen_with_fake_data() {
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
 }
 
+/// The window in the desktop's own colors: macOS and GNOME/Ubuntu, light and dark,
+/// with their accents. Each is drawn and saved (`native-*`), and the texts that
+/// matter are still on it; the theme is what the desktop said, nothing else.
+#[test]
+fn the_desktop_colors_draw_the_main_screen() {
+    use warden_gui::system::{Accent, Colors, Flavor, Mode, Source, System, theme};
+    let desktop = Source { colors: Colors::System, mode: Mode::Auto };
+    let g = connected();
+    for (name, flavor, dark, accent) in [
+        ("native-mac-light", Flavor::Mac, false, Accent::Blue),
+        ("native-mac-dark", Flavor::Mac, true, Accent::Purple),
+        ("native-ubuntu-light", Flavor::Gnome, false, Accent::Orange),
+        ("native-gnome-dark", Flavor::Gnome, true, Accent::Teal),
+    ] {
+        let system = System { flavor, dark: Some(dark), accent };
+        let t = theme(desktop, &system);
+        let mut ui = sim(&g);
+        for text in ["api", "gave up", "Restart", "RUNNING", "LISTENING"] {
+            assert!(ui.find(text).is_ok(), "{name}: {text:?} is not on the screen");
+        }
+        save_with(&mut ui, name, &t);
+    }
+}
+
+/// The charts take the accent of the desktop, and keep their series apart.
+#[test]
+fn the_charts_follow_the_desktop_accent() {
+    use warden_gui::system::{Accent, Colors, Flavor, Mode, Source, System, theme};
+    let desktop = Source { colors: Colors::System, mode: Mode::Auto };
+    let mut g = connected();
+    let _ = g.update(Message::Tab(Tab::History));
+    let _ = g.update(Message::HistoryLoaded {
+        app: "api".into(),
+        range: Range::Hour,
+        result: Ok(fake_history("api", Range::Hour)),
+    });
+    let t = theme(desktop, &System { flavor: Flavor::Mac, dark: Some(true), accent: Accent::Purple });
+    let mut ui = Simulator::with_size(warden_gui::settings(), (1280.0, 1100.0), warden_gui::view::view(&g));
+    assert!(ui.find("Workers ready").is_ok());
+    save_with(&mut ui, "native-mac-dark-history", &t);
+    // Four series, four colors, in every look.
+    for t in [
+        theme(desktop, &System { flavor: Flavor::Mac, dark: Some(true), accent: Accent::Purple }),
+        theme(desktop, &System { flavor: Flavor::Gnome, dark: Some(false), accent: Accent::Green }),
+        warden_gui::look::theme(true),
+        warden_gui::look::theme(false),
+    ] {
+        use warden_gui::charts::Hue;
+        let c = [Hue::Blue, Hue::Aqua, Hue::Orange, Hue::Violet].map(|h| h.color(&t));
+        for i in 0..4 {
+            for j in i + 1..4 {
+                let d = (c[i].r - c[j].r).abs() + (c[i].g - c[j].g).abs() + (c[i].b - c[j].b).abs();
+                assert!(d > 0.15, "{t}: series {i} and {j} are alike: {c:?}");
+            }
+        }
+    }
+}
+
+/// Settings: Colors (Warden or System) and Mode (Auto, Light or Dark), the gear in the top
+/// bar. The window is drawn in each choice, with the dialog over it.
+#[test]
+fn settings_dialog_offers_colors_and_mode() {
+    use warden_gui::system::{Accent, Colors, Flavor, Mode, Source, System, theme};
+    let mut g = connected();
+    let mut ui = sim(&g);
+    let _ = ui.click(warden_gui::icons::Icon::Settings.glyph().to_string().as_str());
+    assert!(matches!(messages(ui).as_slice(), [Message::OpenSettings]), "the gear opens Settings");
+
+    let _ = g.update(Message::OpenSettings);
+    let mac = System { flavor: Flavor::Mac, dark: Some(true), accent: Accent::Purple };
+    let _ = g.update(Message::System(mac));
+    let mut ui = sim(&g);
+    for t in ["Settings", "COLORS", "MODE", "System", "Auto", "Light", "Dark", "Done"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in Settings");
+    }
+    assert!(ui.find("This desktop: macOS, dark, purple accent.").is_ok());
+    save(&mut ui, "settings");
+    let _ = ui.click("System").expect("the System choice");
+    let _ = ui.click("Light").expect("the Light choice");
+    let msgs = messages(ui);
+    assert!(matches!(&msgs[0], Message::SetColors(Colors::System)), "{msgs:?}");
+    assert!(matches!(&msgs[1], Message::SetMode(Mode::Light)), "{msgs:?}");
+
+    // And with the desktop's colors chosen.
+    let _ = g.update(Message::SetColors(Colors::System));
+    let mut ui = sim(&g);
+    save_with(&mut ui, "settings-system", &theme(Source { colors: Colors::System, mode: Mode::Auto }, &mac));
+}
+
 /// Hot standbys (`status.standbys`) are listed after the workers, as `s1`
 /// (the name `warden status`, the logs and the events give them); old
 /// processes still draining after a rollout (`status.draining`) come

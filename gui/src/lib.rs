@@ -32,6 +32,7 @@ pub mod look;
 pub mod model;
 pub mod ring;
 pub mod ssh;
+pub mod system;
 pub mod view;
 
 pub use warden_protocol as protocol;
@@ -62,11 +63,6 @@ pub fn settings() -> iced::Settings {
     }
 }
 
-/// Dark, unless `WARDEN_GUI_THEME=light`.
-pub fn theme() -> iced::Theme {
-    look::theme(std::env::var("WARDEN_GUI_THEME").as_deref() == Ok("light"))
-}
-
 /// The window icon (assets/icon/build.py makes it): 128 x 128 raw RGBA.
 /// macOS shows an app's icon from its bundle (Warden.app), not from the window.
 fn window_icon() -> Option<iced::window::Icon> {
@@ -75,11 +71,10 @@ fn window_icon() -> Option<iced::window::Icon> {
 
 /// Open the window and run until it closes.
 pub fn run(opts: app::Options) -> iced::Result {
-    let theme = theme();
     iced::application(move || app::Gui::new(opts.clone()), app::Gui::update, view::view)
         .title(app::Gui::title)
         .subscription(app::Gui::subscription)
-        .theme(move |_: &app::Gui| theme.clone())
+        .theme(|g: &app::Gui| g.theme.clone())
         .settings(settings())
         .window(iced::window::Settings {
             size: app::WINDOW,

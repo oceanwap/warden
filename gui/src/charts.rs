@@ -34,20 +34,28 @@ pub enum Hue {
 }
 
 impl Hue {
+    /// The window's own colors: the accent, the warning amber, the danger red,
+    /// and the good green (a dusty blue when the accent already is the green, so
+    /// the two series stay apart).
     pub fn color(self, theme: &Theme) -> Color {
-        let dark = theme.extended_palette().is_dark;
-        // The accent green, amber, terracotta and a dusty blue: the window's own colors.
-        let hex = match (self, dark) {
-            (Hue::Blue, false) => 0x1b6b45,
-            (Hue::Blue, true) => 0x4eae78,
-            (Hue::Aqua, false) => 0xb7791f,
-            (Hue::Aqua, true) => 0xe2b15a,
-            (Hue::Orange, false) => 0xc2410c,
-            (Hue::Orange, true) => 0xe07a5f,
-            (Hue::Violet, false) => 0x3a6ea5,
-            (Hue::Violet, true) => 0x7aa7d9,
-        };
-        Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+        let p = crate::look::pal(theme);
+        match self {
+            Hue::Blue => p.accent_text,
+            Hue::Aqua => p.warn,
+            Hue::Orange => p.danger,
+            Hue::Violet => {
+                let close = (p.accent_text.r - p.good.r).abs()
+                    + (p.accent_text.g - p.good.g).abs()
+                    + (p.accent_text.b - p.good.b).abs()
+                    < 0.15;
+                if close {
+                    let hex: u32 = if p.dark { 0x7aa7d9 } else { 0x3a6ea5 };
+                    Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
+                } else {
+                    p.good
+                }
+            }
+        }
     }
 }
 

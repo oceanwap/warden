@@ -63,6 +63,7 @@ pub fn view(g: &Gui) -> Element<'_, Message> {
         Modal::Machine(f) => layers.push(overlay(machine_dialog(f), Some(Message::CloseModal))),
         Modal::Add(a) => layers.push(overlay(add_dialog(g, a), None)),
         Modal::Editor(e) => layers.push(overlay(editor_dialog(e), None)),
+        Modal::Settings => layers.push(overlay(settings_dialog(g), Some(Message::CloseModal))),
     }
     if let Some(p) = &g.confirm {
         layers.push(overlay(confirm_dialog(p), Some(Message::Cancelled)));
@@ -222,12 +223,16 @@ fn topbar(g: &Gui) -> Element<'_, Message> {
         space::horizontal(),
         host,
         machines_button(g),
+        tip(
+            button(icon(Icon::Settings).size(17)).padding([6, 8]).style(look::quiet).on_press(Message::OpenSettings),
+            "Settings",
+        ),
         button(labeled(Icon::Plus, "Add app"))
             .padding([7, 16])
             .style(look::solid(Tone::Plain))
             .on_press(Message::OpenAdd),
     ]
-    .spacing(14)
+    .spacing(12)
     .padding([11, 18])
     .align_y(Center)
     .into()
@@ -426,7 +431,7 @@ fn not_running<'a>(g: &'a Gui, error: &'a str, attempt: u32) -> Element<'a, Mess
     };
     let start = button(labeled(Icon::Play, if g.starting_wardend { "Starting wardend…" } else { "Start wardend" }))
         .padding([8, 16])
-        .style(look::solid(Tone::Good))
+        .style(look::solid(Tone::Accent))
         .on_press_maybe((!g.starting_wardend).then_some(Message::StartWardend));
     center(
         column![
@@ -669,7 +674,7 @@ fn idle_card<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let busy = g.busy.iter().any(|(n, x)| n == a.name() && *x == Act::Start);
     let start = button(labeled(Icon::Play, if busy { "Starting…" } else { "Start" }))
         .padding([8, 18])
-        .style(look::solid(Tone::Good))
+        .style(look::solid(Tone::Accent))
         .on_press_maybe((g.connected() && !busy).then(|| Message::Act(a.name().to_string(), Act::Start)));
     let mut c = column![heading(title).size(16), text(what).size(13)].spacing(4);
     if let (AppState::NotStarted | AppState::Stopped, Some(p)) = (a.entry.state, &a.entry.problem) {
@@ -849,7 +854,7 @@ fn actions<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             button(container(labeled(Icon::Play, if busy(Act::Start) { "Starting…" } else { "Start" })).center_y(32))
                 .height(32)
                 .padding([0, 14])
-                .style(look::solid(Tone::Good))
+                .style(look::solid(Tone::Accent))
                 .on_press_maybe(press(Act::Start)),
         );
     }
@@ -1392,6 +1397,66 @@ fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
     .into()
 }
 
+/// A row of choices, one lit: the same control as the History ranges.
+fn segmented<'a, T: Copy + PartialEq + 'a>(
+    options: &[(T, &'a str)],
+    current: T,
+    on: fn(T) -> Message,
+) -> Element<'a, Message> {
+    container(
+        Row::with_children(options.iter().map(|&(value, name)| {
+            button(text(name).size(13).font(SEMIBOLD))
+                .style(look::tab(current == value))
+                .padding([5, 16])
+                .on_press(on(value))
+                .into()
+        }))
+        .spacing(2),
+    )
+    .padding(3)
+    .style(look::track)
+    .into()
+}
+
+fn settings_dialog(g: &Gui) -> Element<'_, Message> {
+    use crate::system::{Colors, Mode};
+    column![
+        heading("Settings").size(18),
+        column![
+            section("Colors"),
+            segmented(&[(Colors::Warden, "Warden"), (Colors::System, "System")], g.source.colors, Message::SetColors),
+            small(
+                "Warden: warm paper, forest green, brick red. System: the desktop's own surfaces, text, accent and \
+                 status colors, so the window looks native (macOS, GNOME and Ubuntu).",
+            ),
+        ]
+        .spacing(8),
+        column![
+            section("Mode"),
+            segmented(
+                &[(Mode::Auto, "Auto"), (Mode::Light, "Light"), (Mode::Dark, "Dark")],
+                g.source.mode,
+                Message::SetMode,
+            ),
+            small(
+                "Auto follows the desktop's light or dark setting as it changes (dark when the desktop does not say)."
+            ),
+        ]
+        .spacing(8),
+        small(format!("This desktop: {}.", g.system.describe())),
+        row![
+            space::horizontal(),
+            button(text("Done").size(13).font(MEDIUM))
+                .padding([6, 16])
+                .style(look::solid(Tone::Accent))
+                .on_press(Message::CloseModal),
+        ],
+    ]
+    .spacing(18)
+    .width(440)
+    .into()
+}
+
 fn machine_dialog(f: &MachineForm) -> Element<'_, Message> {
     let mut c = column![
         heading(if f.editing.is_some() { "Edit SSH machine" } else { "Add SSH machine" }).size(18),
@@ -1575,7 +1640,7 @@ fn editor_dialog(e: &Editor) -> Element<'_, Message> {
         buttons = buttons.push(
             button(labeled(Icon::Reload, "Reload now"))
                 .padding([6, 14])
-                .style(look::solid(Tone::Good))
+                .style(look::solid(Tone::Accent))
                 .on_press(Message::ReloadAfterSave),
         );
     }

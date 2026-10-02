@@ -9,6 +9,7 @@ use crate::hosts::{self, Machine, Saved};
 use crate::logs::{self, LogPane, Scroll};
 use crate::model::Model;
 use crate::ssh;
+use crate::system;
 use iced::widget::{Id, operation, text_editor};
 use iced::{Subscription, Task};
 use std::path::PathBuf;
@@ -217,6 +218,8 @@ pub enum Modal {
     Machine(MachineForm),
     Add(AddForm),
     Editor(Editor),
+    /// Colours and mode.
+    Settings,
 }
 
 /// A destructive action waiting for "yes".
@@ -235,6 +238,9 @@ pub struct Options {
     pub remote_warden: Option<String>,
     /// The local `warden` CLI (default: next to warden-gui, else on PATH).
     pub warden: Option<PathBuf>,
+    /// What the colors follow for this run (default: `WARDEN_GUI_THEME`, else what
+    /// Settings saved).
+    pub theme: Option<crate::system::Source>,
 }
 
 pub struct Gui {
@@ -276,6 +282,10 @@ pub struct Gui {
     pub auto_local: bool,
     /// The window's size: the top bar and the worker table fit themselves to it.
     pub window: iced::Size,
+    /// What the colors follow, what the desktop says, and the theme they make.
+    pub source: crate::system::Source,
+    pub system: crate::system::System,
+    pub theme: iced::Theme,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +338,15 @@ pub enum Message {
     Copy(String),
     /// The window was resized.
     Resized(iced::Size),
+    /// The desktop's look changed (GNOME told us), or was read again.
+    System(system::System),
+    /// Read the desktop's look again (the window was focused, or the mode changed).
+    ProbeSystem,
+    SystemProbed(Option<system::System>),
+    /// The gear: colours and mode.
+    OpenSettings,
+    SetColors(system::Colors),
+    SetMode(system::Mode),
     CloseModal,
     OpenAdd,
     AddWhat(String),
@@ -380,6 +399,12 @@ impl Gui {
         if let Some(p) = &g.saved_path {
             g.saved = hosts::load(p);
         }
+        // The flag and the variable win for this run; else what Settings saved.
+        g.source = opts.theme.or_else(system::Source::from_env).unwrap_or(g.saved.appearance);
+        if g.source.follows_system() {
+            g.system = system::detect();
+        }
+        g.theme = system::theme(g.source, &g.system);
         let task = match error {
             Some(e) => g.toast(false, format!("--ssh: {e}; connecting to this machine instead")),
             None => Task::none(),
@@ -417,6 +442,44 @@ impl Gui {
             saved_path: None,
             auto_local: false,
             window: WINDOW,
+            source: system::Source::default(),
+            system: system::System::UNKNOWN,
+            theme: system::theme(system::Source::default(), &system::System::UNKNOWN),
+        }
+    }
+
+    /// Ask the desktop for its look (when the window follows it).
+    fn probe_system(&self) -> Task<Message> {
+        if !self.source.follows_system() {
+            return Task::none();
+        }
+        Self::read_system()
+    }
+
+    fn read_system() -> Task<Message> {
+        Task::perform(async { tokio::task::spawn_blocking(system::detect).await.ok() }, Message::SystemProbed)
+    }
+
+    /// A choice in Settings: the new theme at once, kept with the machines.
+    fn set_source(&mut self, source: system::Source) -> Task<Message> {
+        if source == self.source {
+            return Task::none();
+        }
+        self.source = source;
+        self.saved.appearance = source;
+        self.theme = system::theme(source, &self.system);
+        let save = self.persist();
+        Task::batch([save, self.probe_system()])
+    }
+
+    /// What the desktop says now: a new theme when its look changed.
+    fn set_system(&mut self, system: system::System) {
+        if system == self.system {
+            return;
+        }
+        self.system = system;
+        if self.source.follows_system() {
+            self.theme = system::theme(self.source, &system);
         }
     }
 
@@ -519,6 +582,20 @@ impl Gui {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::System(s) | Message::SystemProbed(Some(s)) => {
+                self.set_system(s);
+                Task::none()
+            }
+            Message::SystemProbed(None) => Task::none(),
+            Message::ProbeSystem => self.probe_system(),
+            Message::OpenSettings => {
+                self.menu = None;
+                self.modal = Modal::Settings;
+                // Settings tells what the desktop is, even when the window does not follow it.
+                Self::read_system()
+            }
+            Message::SetColors(colors) => self.set_source(system::Source { colors, ..self.source }),
+            Message::SetMode(mode) => self.set_source(system::Source { mode, ..self.source }),
             Message::Feed(m) => self.on_feed(m),
             Message::LogFeed(m) => self.on_log_feed(m),
             Message::Select(name) => {
@@ -889,7 +966,7 @@ impl Gui {
         let Some(path) = self.saved_path.clone() else { return Task::none() };
         match hosts::save(&path, &self.saved) {
             Ok(()) => Task::none(),
-            Err(e) => self.toast(false, format!("could not save the list of machines in {}: {e}", path.display())),
+            Err(e) => self.toast(false, format!("could not save the settings in {}: {e}", path.display())),
         }
     }
 
@@ -919,6 +996,10 @@ impl Gui {
             filter: std::mem::take(&mut self.filter),
             auto_local: self.auto_local,
             window: self.window,
+            // The window's look is the person's, not the host's.
+            source: self.source,
+            system: self.system,
+            theme: self.theme.clone(),
             ..Gui::with_target(t)
         };
     }
@@ -1091,7 +1172,18 @@ impl Gui {
             _ => Subscription::none(),
         };
         let size = iced::window::resize_events().map(|(_, size)| Message::Resized(size));
-        Subscription::batch([main, logs, size])
+        let mut all = vec![main, logs, size];
+        if self.source.follows_system() {
+            // The desktop's look: GNOME says when it changes; elsewhere it is read
+            // again when the window is focused or the mode changes.
+            all.push(Subscription::run(system::watch).map(Message::System));
+            all.push(iced::system::theme_changes().map(|_| Message::ProbeSystem));
+            all.push(iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::ProbeSystem),
+                _ => None,
+            }));
+        }
+        Subscription::batch(all)
     }
 }
 
@@ -1357,6 +1449,52 @@ mod tests {
             at_ms: 0,
         }]));
         assert_eq!(g.host_spark.grid.series[crate::history::HOST_CPU].last(), Some(50.0));
+    }
+
+    #[test]
+    fn settings_choose_the_colors_and_keep_them() {
+        use crate::system::{Accent, Colors, Flavor, Mode, Source, System};
+        let dir = std::env::temp_dir().join(format!("wg-app-settings-{}", std::process::id()));
+        let file = dir.join("gui.json");
+        let mut g = connected();
+        g.saved_path = Some(file.clone());
+        // Warden's green, as the desktop's mode says (dark when it says nothing).
+        assert_eq!((g.source, g.theme.to_string().as_str()), (Source::default(), "Warden dark"));
+        let _ = g.update(Message::OpenSettings);
+        assert!(matches!(g.modal, Modal::Settings));
+        let mac = System { flavor: Flavor::Mac, dark: Some(false), accent: Accent::Purple };
+        let _ = g.update(Message::System(mac));
+        assert_eq!(g.theme.to_string(), "Warden light", "Auto follows the desktop's mode");
+        // The desktop's colors.
+        let _ = g.update(Message::SetColors(Colors::System));
+        assert_eq!(g.theme.to_string(), "Mac light Purple");
+        let _ = g.update(Message::System(System { dark: Some(true), ..mac }));
+        assert_eq!(g.theme.to_string(), "Mac dark Purple");
+        // A pinned mode ignores the desktop's, the colors stay.
+        let _ = g.update(Message::SetMode(Mode::Light));
+        assert_eq!(g.theme.to_string(), "Mac light Purple");
+        let _ = g.update(Message::System(System { dark: Some(true), accent: Accent::Teal, ..mac }));
+        assert_eq!(g.theme.to_string(), "Mac light Teal", "the accent still follows");
+        // It is kept in gui.json, next to the machines, and a new window starts with it.
+        let kept = hosts::load(&file).appearance;
+        assert_eq!(kept, Source { colors: Colors::System, mode: Mode::Light });
+        assert_eq!(g.saved.appearance, kept);
+        // Back to Warden: no longer follows the desktop; its changes change nothing.
+        let _ = g.update(Message::SetColors(Colors::Warden));
+        let _ = g.update(Message::SetMode(Mode::Dark));
+        assert_eq!(g.theme.to_string(), "Warden dark");
+        let _ = g.update(Message::System(mac));
+        assert_eq!(g.theme.to_string(), "Warden dark");
+        // Choosing another machine keeps the look.
+        g.switch_target(Target::ssh("deploy@web-1", "/run/warden/wardend.sock", "warden").unwrap());
+        assert_eq!(g.theme.to_string(), "Warden dark");
+        assert_eq!(g.source, Source { colors: Colors::Warden, mode: Mode::Dark });
+        // Another desktop than macOS and GNOME: Warden's colors, whatever was asked.
+        let _ = g.update(Message::SetColors(Colors::System));
+        let _ = g.update(Message::SetMode(Mode::Auto));
+        let _ = g.update(Message::System(System { flavor: Flavor::Other, dark: Some(false), accent: Accent::Blue }));
+        assert_eq!(g.theme.to_string(), "Warden light");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

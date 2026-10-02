@@ -66,11 +66,44 @@ app, and it never talks to a supervisor directly.
 
 ## Look
 
-Warm paper and white cards, one forest green for what is good and for the main
-action, amber for what needs a look, a muted brick red for what is broken, and
-ink-black buttons; rounded corners and pills throughout. It follows the
-palette of the author's habit tracker, in a light and a dark variant
-(`WARDEN_GUI_THEME=light` or `dark`; the dark one is the default).
+Soft and rounded: pages with cards on them, pill-shaped controls and a heavy
+rounded face for the headings. The colors are Warden's own (warm paper, forest
+green, brick red, amber) until you choose the desktop's: the gear in the top bar
+opens **Settings**:
+
+- **Colors**: *Warden* (the default) or *System*. System takes the desktop's own
+  surfaces, text, accent and status colors, so the window looks native, on
+  **macOS** and **GNOME / Ubuntu**: the accent you chose there (macOS: System
+  Settings → Appearance → Accent color; GNOME 47 and Ubuntu 24.10: Settings →
+  Appearance → Accent color; older Ubuntu: the Yaru theme's color), Apple's
+  system colors or libadwaita's. The accent fills every button and bar, so it is
+  mixed a little with the window's own surface color (a fifth on a dark window,
+  a seventh on a light one): the same hue you chose, sitting in the window
+  instead of shouting from it. A color that would be hard to read is moved only
+  as far as it needs. On KDE, Xfce and the rest there is nothing to follow, and
+  the choice keeps Warden's colors.
+- **Mode**: *Auto* (the default), *Light* or *Dark*. Auto follows the desktop's
+  light or dark setting, **live** (a change shows as it happens), and is dark
+  when the desktop does not say.
+- The choice is kept in `gui.json` (next to the SSH machines) and is the same on
+  every machine the window connects to. Settings also says what it found:
+  *This desktop: macOS, dark, purple accent.*
+- `--theme system|warden|light|dark` (or `WARDEN_GUI_THEME`; the flag wins) sets
+  it for one run: `system` is System colors with Auto; `warden` is Warden colors
+  with Auto; `light` and `dark` are Warden colors in that mode.
+
+![Settings, over the main screen](../docs/gui-settings.png)
+
+![The main screen in System colors: macOS light and dark, Ubuntu light and GNOME dark](../docs/gui-system-colors.png)
+
+How it reads the desktop (only when the window follows it): `defaults read -g
+AppleInterfaceStyle` and `AppleAccentColor` on macOS; `gsettings` (`color-scheme`,
+`accent-color`, `gtk-theme`) on GNOME and Ubuntu, and `gsettings monitor` to hear a
+change at once. It asks again when the window is focused and when iced reports a
+change of mode: a few small programs run off the UI thread; no library for a
+desktop, no unsafe code.
+
+In every look:
 
 - Color means status and nothing else: the dot, the state label and a faint
   wash of a pill. The app list is flat rows with hairlines between them, and
@@ -89,7 +122,7 @@ palette of the author's habit tracker, in a light and a dark variant
   and when the window is too short for the events, logs or charts to keep a
   usable height the page scrolls instead of squeezing them.
 
-![The light theme](../docs/gui-main-screen-light.png)
+![Warden's colors, light](../docs/gui-main-screen-light.png)
 
 ## Run it
 
@@ -98,7 +131,7 @@ warden-gui                                    # this machine's wardend
 warden-gui --socket /run/warden/wardend.sock  # a given socket (root's wardend)
 warden-gui --ssh deploy@web-1                 # a remote host (below)
 warden-gui --warden ~/src/warden/target/release/warden   # the CLI to run here
-WARDEN_GUI_THEME=light warden-gui             # the light theme
+warden-gui --theme system                     # the desktop's colors, for this run (or: Settings)
 ```
 
 Start wardend, Add app and Edit config run the `warden` CLI: `--warden`,
@@ -233,14 +266,17 @@ cargo build --bin warden && cargo test -p warden-gui
 ```
 
 - Unit tests: every `update` path (feed, actions and confirmations,
-  toasts, logs, dialogs), event → state, the bounded buffers, batching and
+  toasts, logs, dialogs, Settings kept in `gui.json`), reading the desktop's
+  look (macOS, GNOME, Yaru, others: from fake `defaults` and `gsettings`
+  answers) and that every desktop palette is readable, event → state, the bounded buffers, batching and
   backoff, and the command lines for Add app and ssh (quoting included:
   quoted command lines are run through `sh` and must come back unchanged).
 - `tests/render.rs`: headless rendering with `iced_test` (tiny-skia): the
   main screen with fake wardend data (dark, light and a 900 px window), an
   app that gave up, standbys and draining workers, the worker table's
   columns, the Restart and Connection menus, the logs tab, a confirmation,
-  the Add app, Edit config and machine dialogs, the "wardend is not
+  the Add app, Edit config, machine and Settings dialogs, the main screen in the
+  desktop colors of macOS and Ubuntu (light and dark), the "wardend is not
   running" screen, and the History tab (`history-1h` with
   the crosshair over the memory chart, `history-24h-light`, and the error
   of a wardend without history). Each is searched for

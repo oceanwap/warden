@@ -5,11 +5,15 @@ use warden_gui::app::Options;
 const USAGE: &str = "\
 warden-gui: every app on a host and its live monitoring, from wardend.
 
-Usage: warden-gui [--socket PATH] [--warden PATH] [--ssh USER@HOST [--remote-socket PATH] [--remote-warden PATH]]
+Usage: warden-gui [--socket PATH] [--warden PATH] [--theme system|warden|light|dark]
+                  [--ssh USER@HOST [--remote-socket PATH] [--remote-warden PATH]]
 
   --socket PATH         wardend's socket on this machine (default: where `warden` puts it)
   --warden PATH         the warden CLI here, for Add app, Edit config, Start wardend
                         (default: next to warden-gui, else on PATH)
+  --theme NAME          system (default): the desktop's own colors on macOS and GNOME/Ubuntu,
+                        light or dark as it is; warden: Warden's palette, light or dark as the
+                        desktop is; light or dark: Warden's palette, fixed (or WARDEN_GUI_THEME)
   --ssh USER@HOST       a remote host, through `ssh -L` (your SSH agent and keys; never a password)
   --remote-socket PATH  wardend's socket there (default: /run/warden/wardend.sock, root's wardend)
   --remote-warden PATH  the warden CLI there (default: warden, on its PATH)
@@ -26,6 +30,13 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Option<Options>, String> 
         match a.as_str() {
             "--socket" => o.socket = Some(value("--socket")?.into()),
             "--warden" => o.warden = Some(value("--warden")?.into()),
+            "--theme" => {
+                let v = value("--theme")?;
+                o.theme = Some(
+                    warden_gui::system::Source::parse(&v)
+                        .ok_or_else(|| format!("--theme is system, warden, light or dark, not {v:?}"))?,
+                );
+            }
             "--ssh" => o.ssh = Some(value("--ssh")?),
             "--remote-socket" => o.remote_socket = Some(value("--remote-socket")?),
             "--remote-warden" => o.remote_warden = Some(value("--remote-warden")?),
@@ -75,6 +86,12 @@ mod tests {
     #[test]
     fn arguments() {
         assert_eq!(p("").unwrap(), Some(Options::default()));
+        let light = warden_gui::system::Source {
+            colors: warden_gui::system::Colors::Warden,
+            mode: warden_gui::system::Mode::Light,
+        };
+        assert_eq!(p("--theme light").unwrap().unwrap().theme, Some(light));
+        assert!(p("--theme pink").unwrap_err().contains("system, warden, light or dark"));
         let o = p("--ssh deploy@web-1 --remote-socket /run/user/1000/warden/wardend.sock").unwrap().unwrap();
         assert_eq!(o.ssh.as_deref(), Some("deploy@web-1"));
         assert_eq!(o.remote_socket.as_deref(), Some("/run/user/1000/warden/wardend.sock"));
