@@ -290,6 +290,7 @@ jobs:
           mkdir -p "dist/$NAME"
           cp "target/${{ matrix.target }}/release/$bin" "$CLI/warden" "$CLI/README.md" "dist/$NAME/"
           cp gui/README.md "dist/$NAME/README-GUI.md"
+          cp gui/assets/fonts/LICENSES.txt "dist/$NAME/FONT-LICENSES.txt"
           cp LICENSE-MIT LICENSE-APACHE "$CLI/THIRD-PARTY-LICENSES.txt" notices/THIRD-PARTY-LICENSES-GUI.txt "dist/$NAME/"
           cp -R "$CLI/contrib" "dist/$NAME/"
           # The menu entry and icon: ~/.local/share/applications and ~/.local/share/icons/hicolor/256x256/apps.

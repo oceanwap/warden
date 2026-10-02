@@ -13,7 +13,10 @@ use crate::format::{self, Severity};
 use crate::history::{self, Load, Range};
 use crate::icons::Icon;
 use crate::logs::{History, Scroll, Stream};
-use crate::look::{self, MEDIUM, MONO, SEMIBOLD, Tone, badge, dot, heading, icon, labeled, muted, tile, tip};
+use crate::look::{
+    self, DISPLAY, DISPLAY_BOLD, MEDIUM, MONO, SEMIBOLD, Tone, badge, dot, heading, icon, labeled, muted, section,
+    state_pill, tile, tip,
+};
 use crate::model::App;
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
@@ -27,8 +30,27 @@ use warden_protocol::events::AppState;
 
 /// Height of one row in the events and logs lists.
 pub const LINE_H: f32 = 19.0;
-const LIST_W: f32 = 300.0;
+const LIST_W: f32 = 320.0;
+
+/// A slim round scrollbar, so lists do not look like a file manager.
+fn thin() -> scrollable::Scrollbar {
+    scrollable::Scrollbar::new().width(6).scroller_width(6).margin(3)
+}
 const SMALL: f32 = 12.0;
+// The heights of the detail page's parts, to tell whether the bottom pane still fits.
+const TOPBAR_H: f32 = 55.0;
+const PAGE_PAD: f32 = 18.0;
+const GAP: f32 = 14.0;
+const HEAD_H: f32 = 44.0;
+const FACTS_H: f32 = 18.0;
+const BANNER_H: f32 = 40.0;
+const IDLE_H: f32 = 92.0;
+const PORTS_H: f32 = 24.0;
+const ACTIONS_H: f32 = 32.0;
+const ROLLOUT_H: f32 = 71.0;
+const TABS_H: f32 = 37.0;
+/// The bottom pane (events, logs, history) keeps at least this much, else the page scrolls.
+const PANE_MIN_H: f32 = 120.0;
 /// The top bar's sparklines.
 const SPARK_W: f32 = 56.0;
 const SPARK_H: f32 = 18.0;
@@ -137,9 +159,7 @@ fn menu_item<'a>(
 // ---------------------------------------------------------------- top bar
 
 fn topbar(g: &Gui) -> Element<'_, Message> {
-    let brand = row![icon(Icon::Shield).size(19).style(Tone::Accent.style()), heading("Warden").size(16)]
-        .spacing(8)
-        .align_y(Center);
+    let brand = row![look::brand_mark(30.0), heading("Warden").size(18)].spacing(10).align_y(Center);
     let daemon: Element<'_, Message> = match (&g.conn, &g.model.daemon) {
         (Conn::Connected, Some(d)) => {
             text(format!("wardend {} · pid {}", d.version, d.pid)).size(SMALL).style(muted).into()
@@ -203,12 +223,12 @@ fn topbar(g: &Gui) -> Element<'_, Message> {
         host,
         machines_button(g),
         button(labeled(Icon::Plus, "Add app"))
-            .padding([6, 12])
-            .style(look::solid(Tone::Accent))
+            .padding([7, 16])
+            .style(look::solid(Tone::Plain))
             .on_press(Message::OpenAdd),
     ]
     .spacing(14)
-    .padding([9, 14])
+    .padding([11, 18])
     .align_y(Center)
     .into()
 }
@@ -232,7 +252,7 @@ fn machines_button(g: &Gui) -> Element<'_, Message> {
         .spacing(8)
         .align_y(Center),
     )
-    .padding([6, 11])
+    .padding([7, 14])
     .style(look::quiet)
     .on_press(Message::ToggleMenu(MenuKind::Machines));
     Dropdown::new(main, machines_menu(g), open).on_dismiss(Message::CloseMenu).into()
@@ -252,7 +272,7 @@ fn machines_menu(g: &Gui) -> Element<'_, Message> {
         .width(20)
         .into()
     };
-    let mut c = column![label("MACHINE")].spacing(2).padding([4, 6]);
+    let mut c = column![section("Machine")].spacing(2).padding([4, 6]);
     c = c.push(
         button(
             row![
@@ -456,7 +476,7 @@ fn app_list(g: &Gui) -> Element<'_, Message> {
             spacing: 8.0,
             side: text_input::Side::Left,
         });
-    let mut rows = Column::new().spacing(2);
+    let mut rows = Column::new().spacing(6);
     for a in &shown {
         rows = rows.push(app_row(g, a));
     }
@@ -466,7 +486,10 @@ fn app_list(g: &Gui) -> Element<'_, Message> {
     container(
         column![
             column![search, small(summary)].spacing(8).padding([12, 12]),
-            scrollable(rows.padding([0, 8]).width(Fill)).height(Fill).style(look::scroll),
+            scrollable(rows.padding([0, 8]).width(Fill))
+                .direction(scrollable::Direction::Vertical(thin()))
+                .height(Fill)
+                .style(look::scroll),
         ]
         .spacing(0),
     )
@@ -474,6 +497,16 @@ fn app_list(g: &Gui) -> Element<'_, Message> {
     .height(Fill)
     .style(look::sidebar)
     .into()
+}
+
+/// The state of an app at the right of its row: a pill when it is in trouble (the
+/// sentence under it is plain, so the state is the one red thing to find), else a word.
+fn state_label<'a>(a: &App, tone: Tone) -> Element<'a, Message> {
+    if matches!(a.entry.state, AppState::GaveUp | AppState::Unreachable) {
+        badge(a.state_label(), tone)
+    } else {
+        text(a.state_label()).size(SMALL).font(MEDIUM).style(tone.style()).into()
+    }
 }
 
 fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
@@ -488,12 +521,7 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         parts.push(a.entry.supervised_by.clone());
     }
     let mut c = column![
-        row![
-            text(a.name()).size(14).font(MEDIUM),
-            space::horizontal(),
-            text(a.state_label()).size(SMALL).style(tone.style()),
-        ]
-        .align_y(Center)
+        row![text(a.name()).size(14).font(DISPLAY_BOLD), space::horizontal(), state_label(a, tone)].align_y(Center)
     ]
     .spacing(2);
     if !parts.is_empty() {
@@ -501,12 +529,19 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     }
     // A failing app says why; a stopped one needs no sentence in the list.
     if let (AppState::GaveUp | AppState::Unreachable, Some(p)) = (a.entry.state, &a.entry.problem) {
-        c = c.push(text(clip(p, 80).into_owned()).size(SMALL).style(Tone::Bad.style()));
+        c = c.push(small(clip(p, 80).into_owned()));
     }
-    button(row![container(dot(tone, 9.0)).padding([5, 0]), c.width(Fill)].spacing(10))
+    // What needs attention is washed with its color (the list is read for it).
+    let attention = match a.entry.state {
+        AppState::GaveUp | AppState::Unreachable => Some(Tone::Bad),
+        AppState::Starting => Some(Tone::Warn),
+        AppState::Running if a.is_unwell() => Some(Tone::Warn),
+        _ => None,
+    };
+    button(row![container(dot(tone, 8.0)).padding([6, 0]), c.width(Fill)].spacing(10))
         .width(Fill)
-        .padding([8, 10])
-        .style(look::list_row(selected))
+        .padding([10, 12])
+        .style(look::list_row(selected, attention))
         .on_press(Message::Select(a.name().to_string()))
         .into()
 }
@@ -517,11 +552,11 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let e = &a.entry;
     let tone = state_tone(a);
     let mut head =
-        row![heading(a.name()).size(22), badge(a.state_label(), tone), space::horizontal()].spacing(12).align_y(Center);
+        row![heading(a.name()).size(28), badge(a.state_label(), tone), space::horizontal()].spacing(12).align_y(Center);
     if let Some(cfg) = &e.config {
         head = head.push(tip(small(clip(cfg, 52).into_owned()), cfg.clone())).push(
             button(labeled(Icon::Edit, "Edit config"))
-                .padding([5, 11])
+                .padding([7, 14])
                 .style(look::quiet)
                 .on_press(Message::OpenEditor(e.name.clone())),
         );
@@ -559,36 +594,65 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             .style(look::banner(Tone::Bad)),
         );
     }
+    // What sits above the bottom pane, in pixels (about; the page only needs to know
+    // whether the pane keeps a usable height).
+    let mut top = TOPBAR_H + PAGE_PAD + HEAD_H + 8.0 + FACTS_H + GAP;
+    if matches!(e.state, AppState::GaveUp | AppState::Unreachable) && e.problem.is_some() {
+        top += BANNER_H + 8.0;
+    }
     if a.status.is_none() {
         c = c.push(idle_card(g, a));
+        top += IDLE_H + GAP;
     } else {
-        c = c.push(tiles(a));
+        c = c.push(tiles(g, a));
+        top += if g.window.width >= TILES_ONE_ROW_W { TILE_H } else { 2.0 * TILE_H + 10.0 } + GAP;
         if let Some(p) = ports_row(a) {
             c = c.push(p);
+            top += PORTS_H + GAP;
         }
         c = c.push(actions(g, a));
+        top += ACTIONS_H + GAP;
         if let Some(r) = rollout(a) {
             c = c.push(r);
+            top += ROLLOUT_H + GAP;
         }
         c = c.push(workers(g, a));
+        let rows = a.status.as_ref().map_or(0, |s| s.workers.len() + s.draining.len() + s.standbys.len());
+        top += if rows == 0 { 20.0 } else { table_height(g, rows) + 2.0 } + GAP;
     }
     let tab = |i: Icon, name: &'static str, t: Tab| {
-        button(labeled(i, name)).padding([5, 12]).style(look::tab(g.tab == t)).on_press(Message::Tab(t))
+        button(labeled(i, name)).padding([6, 16]).style(look::tab(g.tab == t)).on_press(Message::Tab(t))
     };
     c = c.push(
-        row![
-            tab(Icon::Activity, "Events", Tab::Events),
-            tab(Icon::Logs, "Logs", Tab::Logs),
-            tab(Icon::History, "History", Tab::History)
-        ]
-        .spacing(4),
+        container(
+            row![
+                tab(Icon::Activity, "Events", Tab::Events),
+                tab(Icon::Logs, "Logs", Tab::Logs),
+                tab(Icon::History, "History", Tab::History)
+            ]
+            .spacing(2),
+        )
+        .padding(4)
+        .style(look::track),
     );
-    c = c.push(match g.tab {
+    top += TABS_H + GAP;
+    let pane = match g.tab {
         Tab::Events => events(a, g.feed_scroll),
         Tab::Logs => logs_pane(g),
         Tab::History => history_pane(g),
-    });
-    c.spacing(12).padding([14, 16]).width(Fill).height(Fill).into()
+    };
+    if g.window.height - top - PAGE_PAD >= PANE_MIN_H {
+        return c.push(pane).spacing(14).padding([18, 22]).width(Fill).height(Fill).into();
+    }
+    // Too short for the pane to keep its height: the page scrolls instead, and the
+    // pane has a height of its own.
+    let pane_h = if g.tab == Tab::History { 460.0 } else { 220.0 };
+    scrollable(c.push(container(pane).height(pane_h)).spacing(14).padding([18, 22]).width(Fill))
+        .style(look::scroll)
+        .direction(scrollable::Direction::Vertical(thin()))
+        .width(Fill)
+        .height(Fill)
+        .into()
 }
 
 /// An app with no supervisor to talk to: what it is, and how to start it.
@@ -617,7 +681,12 @@ fn idle_card<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         .into()
 }
 
-fn tiles(a: &App) -> Element<'_, Message> {
+/// Under this window width the five tiles do not fit in a row.
+const TILES_ONE_ROW_W: f32 = 1100.0;
+/// A tile's height (two lines and the padding).
+const TILE_H: f32 = 98.0;
+
+fn tiles<'a>(g: &Gui, a: &'a App) -> Element<'a, Message> {
     let Some(s) = &a.status else { return space().into() };
     let (ready, configured) = (s.workers_ready, s.workers_configured);
     let (workers_sub, workers_tone) = match (ready, configured) {
@@ -626,7 +695,7 @@ fn tiles(a: &App) -> Element<'_, Message> {
         (r, c) => (format!("{} not ready", c - r), Tone::Warn),
     };
     let crashes: u64 = s.workers.iter().map(|w| w.crashes).sum();
-    row![
+    let all: Vec<Element<'a, Message>> = vec![
         tile(Icon::Workers, "Workers", format!("{ready} / {configured}"), workers_sub, workers_tone),
         tile(Icon::Cpu, "CPU", format::opt(a.cpu_percent(), format::percent), "all its processes".into(), Tone::Plain),
         tile(
@@ -634,14 +703,14 @@ fn tiles(a: &App) -> Element<'_, Message> {
             "Memory",
             format::opt(a.rss_bytes(), format::bytes),
             "workers + supervisor".into(),
-            Tone::Plain
+            Tone::Plain,
         ),
         tile(
             Icon::Clock,
             "Uptime",
             format::duration(s.uptime_secs),
             s.user.as_ref().map_or_else(String::new, |u| format!("as {u}")),
-            Tone::Plain
+            Tone::Plain,
         ),
         tile(
             Icon::Restart,
@@ -654,9 +723,18 @@ fn tiles(a: &App) -> Element<'_, Message> {
             },
             if crashes == 0 { Tone::Plain } else { Tone::Warn },
         ),
-    ]
-    .spacing(10)
-    .into()
+    ];
+    if g.window.width >= TILES_ONE_ROW_W {
+        return Row::with_children(all).spacing(10).into();
+    }
+    // Three and two: the last row keeps the tiles' width with an empty slot.
+    let mut all = all.into_iter();
+    let first = Row::with_children(all.by_ref().take(3)).spacing(10);
+    let second = Row::with_children(
+        all.chain(std::iter::once(space().width(Length::FillPortion(1)).into())).collect::<Vec<_>>(),
+    )
+    .spacing(10);
+    column![first, second].spacing(10).into()
 }
 
 /// The ports and sockets the app listens on; a click copies the address.
@@ -667,11 +745,7 @@ fn ports_row(a: &App) -> Option<Element<'_, Message>> {
         return None;
     }
     let mut r = Row::new().spacing(8).align_y(Center);
-    r = r.push(
-        row![icon(Icon::Network).size(14).style(muted), text("Listening").size(13).style(muted)]
-            .spacing(6)
-            .align_y(Center),
-    );
+    r = r.push(row![icon(Icon::Network).size(14).style(muted), section("Listening")].spacing(6).align_y(Center));
     if chips.is_empty() {
         r = r.push(small("nothing yet (a port shows a second or two after the app binds it)"));
     }
@@ -867,6 +941,15 @@ const SCROLLBAR_H: f32 = 12.0;
 /// The table is at least this wide; under it, the card scrolls sideways.
 const TABLE_MIN_W: f32 = 880.0;
 
+/// The height of the table's content: its rows and the header, and the sideways
+/// scrollbar when the card is narrower than the table.
+fn table_height(g: &Gui, rows: usize) -> f32 {
+    let lines = rows + 1; // and the header
+    // The card is the window less the app list, the page's padding and the card's border.
+    let scrolls_sideways = g.window.width - LIST_W - 1.0 - 32.0 - 2.0 < TABLE_MIN_W;
+    (lines as f32 * CELL_H + (lines - 1) as f32).min(TABLE_MAX_H) + if scrolls_sideways { SCROLLBAR_H } else { 0.0 }
+}
+
 fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let Some(s) = &a.status else { return space().into() };
     if s.workers.is_empty() {
@@ -881,11 +964,7 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         .chain(s.draining.iter().map(|w| (RowKind::Draining, w)))
         .chain(s.standbys.iter().map(|w| (RowKind::Standby, w)))
         .collect();
-    let lines = rows.len() + 1; // and the header
-    // The card is the window less the app list, the page's padding and the card's border.
-    let scrolls_sideways = g.window.width - LIST_W - 1.0 - 32.0 - 2.0 < TABLE_MIN_W;
-    let height = (lines as f32 * CELL_H + (lines - 1) as f32).min(TABLE_MAX_H)
-        + if scrolls_sideways { SCROLLBAR_H } else { 0.0 };
+    let height = table_height(g, rows.len());
     let can_restart = g.connected() && a.supervisor_up() && !s.stopped;
     let worker_mode = s.mode == "worker";
     let app = a.name().to_string();
@@ -901,7 +980,7 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         let cell_box =
             |e: Element<'a, Message>| -> Element<'a, Message> { container(e).height(CELL_H).center_y(CELL_H).into() };
         let h = move |t: &'static str| -> Element<'a, Message> {
-            container(text(t).size(SMALL).font(MEDIUM).style(muted)).height(CELL_H).center_y(CELL_H).into()
+            container(text(t).size(11).font(DISPLAY).style(muted)).height(CELL_H).center_y(CELL_H).into()
         };
         let plain = move |t: String| -> Element<'a, Message> { cell_box(text(t).size(13).into()) };
         let mono = move |t: String| -> Element<'a, Message> { cell_box(text(t).font(MONO).size(12).into()) };
@@ -920,27 +999,29 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
                     "FAILED" | "CRASHED" => Tone::Bad,
                     _ => Tone::Warn,
                 };
-                cell_box(
-                    row![dot(tone, 7.0), text(w.state.clone()).size(13).style(tone.style())]
-                        .spacing(7)
-                        .align_y(Center)
-                        .into(),
-                )
+                cell_box(state_pill(w.state.clone(), tone))
             }),
             table::column(h("PID"), move |(_, w): WorkerRow<'a>| mono(format::opt(w.pid, |p| p.to_string()))),
             table::column(h("Ports"), move |(_, w): WorkerRow<'a>| mono(format::ports_cell(&w.listening))),
             table::column(h("Uptime"), move |(_, w): WorkerRow<'a>| {
                 plain(format::opt(w.uptime_secs, format::duration))
-            }),
-            table::column(h("Restarts"), move |(_, w): WorkerRow<'a>| plain(w.restarts.to_string())),
-            table::column(h("CPU"), move |(_, w): WorkerRow<'a>| plain(format::opt(w.cpu_percent, format::percent))),
-            table::column(h("RSS"), move |(_, w): WorkerRow<'a>| plain(format::opt(w.rss_bytes, format::bytes))),
+            })
+            .align_x(iced::alignment::Horizontal::Right),
+            table::column(h("Restarts"), move |(_, w): WorkerRow<'a>| plain(w.restarts.to_string()))
+                .align_x(iced::alignment::Horizontal::Right),
+            table::column(h("CPU"), move |(_, w): WorkerRow<'a>| plain(format::opt(w.cpu_percent, format::percent)))
+                .align_x(iced::alignment::Horizontal::Right),
+            table::column(h("RSS"), move |(_, w): WorkerRow<'a>| plain(format::opt(w.rss_bytes, format::bytes)))
+                .align_x(iced::alignment::Horizontal::Right),
         ];
         if has_loop {
             // The event-loop delay's p99 over the last second, as `warden list` shows it.
-            columns.push(table::column(h("Loop p99"), move |(_, w): WorkerRow<'a>| {
-                plain(format::opt(w.loop_delay.map(|d| d.p99_ms), format::millis))
-            }));
+            columns.push(
+                table::column(h("Loop p99"), move |(_, w): WorkerRow<'a>| {
+                    plain(format::opt(w.loop_delay.map(|d| d.p99_ms), format::millis))
+                })
+                .align_x(iced::alignment::Horizontal::Right),
+            );
         }
         if has_health {
             columns.push(table::column(h("Health"), move |(_, w): WorkerRow<'a>| {
@@ -978,13 +1059,10 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             })
             .width(Fill),
         );
-        let t = table(columns, rows).width(width).padding_x(14).padding_y(0).separator_x(0).separator_y(1);
+        let t = table(columns, rows).width(width).padding_x(18).padding_y(0).separator_x(0).separator_y(1);
         scrollable(t)
             .style(look::scroll)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
+            .direction(scrollable::Direction::Both { vertical: thin(), horizontal: thin() })
             .width(Fill)
             .height(Fill)
             .into()
@@ -1052,6 +1130,7 @@ fn lines<'a>(
         }
         scrollable(col.padding([5, 10]))
             .style(look::scroll)
+            .direction(scrollable::Direction::Vertical(thin()))
             .id(Id::new(id))
             .anchor_bottom()
             .width(Fill)
@@ -1185,14 +1264,18 @@ const CHART_MIN_H: f32 = 150.0;
 
 fn history_content(g: &Gui, row_h: f32) -> Element<'_, Message> {
     let Some(c) = &g.chart else { return space().into() };
-    let ranges = Row::with_children(Range::ALL.map(|r| {
-        button(text(r.label()).size(13).font(MEDIUM))
-            .style(look::tab(c.range == r))
-            .padding([4, 14])
-            .on_press(Message::HistoryRange(r))
-            .into()
-    }))
-    .spacing(4);
+    let ranges = container(
+        Row::with_children(Range::ALL.map(|r| {
+            button(text(r.label()).size(13).font(SEMIBOLD))
+                .style(look::tab(c.range == r))
+                .padding([4, 14])
+                .on_press(Message::HistoryRange(r))
+                .into()
+        }))
+        .spacing(2),
+    )
+    .padding(3)
+    .style(look::track);
     let per_point = match c.grid.step_s {
         s if s < 60 => format!("{s} s per point"),
         s => format!("{} min per point", s / 60),
@@ -1518,9 +1601,11 @@ fn toasts(g: &Gui) -> Element<'_, Message> {
         .padding([9, 12])
         .width(460)
         .style(move |theme: &Theme| {
-            let mut s = look::tinted(tone, theme, 9.0);
+            let mut s = look::tinted(tone, theme, 14.0);
             // Opaque enough to read over the lists.
-            s.background = Some(theme.extended_palette().background.strong.color.into());
+            s.background = Some(look::pal(theme).card.into());
+            s.border =
+                iced::Border { radius: 14.0.into(), width: 1.0, color: iced::Color { a: 0.5, ..tone.color(theme) } };
             s
         })
         .into()

@@ -37,7 +37,7 @@ pub mod view;
 pub use warden_protocol as protocol;
 
 /// The embedded fonts (gui/assets/fonts/LICENSES.txt: OFL and ISC): Inter for
-/// text, JetBrains Mono for logs, Lucide for icons. Any other script falls
+/// text, Plus Jakarta Sans for headings, JetBrains Mono for logs, Lucide for icons. Any other script falls
 /// back to the system's fonts.
 fn fonts() -> Vec<std::borrow::Cow<'static, [u8]>> {
     use std::borrow::Cow::Borrowed;
@@ -45,6 +45,8 @@ fn fonts() -> Vec<std::borrow::Cow<'static, [u8]>> {
         Borrowed(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
         Borrowed(include_bytes!("../assets/fonts/Inter-Medium.ttf")),
         Borrowed(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")),
+        Borrowed(include_bytes!("../assets/fonts/PlusJakartaSans-Bold.ttf")),
+        Borrowed(include_bytes!("../assets/fonts/PlusJakartaSans-ExtraBold.ttf")),
         Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
         Borrowed(include_bytes!("../assets/fonts/lucide.ttf")),
     ]

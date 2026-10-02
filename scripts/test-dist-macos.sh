@@ -177,7 +177,7 @@ for f in warden README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-LICENSES.txt co
 done
 check "CLI archive has no AppleDouble files" sh -c "! grep -q '/\._' '$T/tar.lst'"
 unzip -Z1 "$out/warden-gui-$version-macos-arm64.zip" >"$T/zip.lst" 2>&1
-for f in Info.plist MacOS/warden-gui MacOS/warden Resources/README-GUI.md Resources/THIRD-PARTY-LICENSES-GUI.txt Resources/contrib/nginx.conf; do
+for f in Info.plist MacOS/warden-gui MacOS/warden Resources/README-GUI.md Resources/FONT-LICENSES.txt Resources/THIRD-PARTY-LICENSES-GUI.txt Resources/contrib/nginx.conf; do
     check "Warden.app holds $f" grep -qx "Warden.app/Contents/$f" "$T/zip.lst"
 done
 check "the app is signed and verified" sh -c "grep -q 'codesign --force --deep --sign - ' '$T/log1' && grep -q 'codesign --verify' '$T/log1'"

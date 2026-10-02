@@ -258,6 +258,7 @@ for arch in $(echo "$archs" | tr ',' ' '); do
     cp README.md "$app/Contents/Resources/"
     cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf contrib/nginx.conf "$app/Contents/Resources/contrib/"
     cp gui/README.md "$app/Contents/Resources/README-GUI.md"
+    cp gui/assets/fonts/LICENSES.txt "$app/Contents/Resources/FONT-LICENSES.txt"
     cp assets/icon/Warden.icns "$app/Contents/Resources/Warden.icns"
     cp LICENSE-MIT LICENSE-APACHE "$out/notices/THIRD-PARTY-LICENSES.txt" "$out/notices/THIRD-PARTY-LICENSES-GUI.txt" "$app/Contents/Resources/"
     cat > "$app/Contents/Info.plist" <<EOF

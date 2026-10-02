@@ -64,6 +64,31 @@ one ~8 MB binary, no web view, no GPU driver.
 It is a separate process and only a client: closing or killing it touches no
 app, and it never talks to a supervisor directly.
 
+## Look
+
+Warm paper and white cards, one forest green for what is good and for the main
+action, amber for what needs a look, a muted brick red for what is broken, and
+ink-black buttons; rounded corners and pills throughout. It follows the
+palette of the author's habit tracker, in a light and a dark variant
+(`WARDEN_GUI_THEME=light` or `dark`; the dark one is the default).
+
+- Color means status and nothing else: the dot, the state label and a faint
+  wash of the row or pill. The app that is shown has its own marker, a bold
+  ring of the ink color, which no status uses.
+- Boxes are see-through (a white veil over the page), so the page shows a
+  little through cards and tiles.
+- Type: Plus Jakarta Sans for headings and figures, Inter for text,
+  JetBrains Mono for pids, ports and logs, and the Lucide icons, all embedded
+  as subsets (about 310 KB). Their licenses (OFL for the fonts, ISC for the
+  icons) are in `assets/fonts/LICENSES.txt`, shipped as `FONT-LICENSES.txt`
+  in the tarball and the `.app`; `assets/fonts/build.py` rebuilds the subsets.
+- The window is laid out for 900 × 560 and up: the stat tiles wrap to two
+  rows under 1100 px, the worker table scrolls sideways under about 1240 px,
+  and when the window is too short for the events, logs or charts to keep a
+  usable height the page scrolls instead of squeezing them.
+
+![The light theme](../docs/gui-main-screen-light.png)
+
 ## Run it
 
 ```sh
@@ -210,9 +235,11 @@ cargo build --bin warden && cargo test -p warden-gui
   backoff, and the command lines for Add app and ssh (quoting included:
   quoted command lines are run through `sh` and must come back unchanged).
 - `tests/render.rs`: headless rendering with `iced_test` (tiny-skia): the
-  main screen with fake wardend data, an app that gave up, the logs tab, a
-  confirmation, the Add app, Edit config and Connection dialogs, the
-  "wardend is not running" screen, and the History tab (`history-1h` with
+  main screen with fake wardend data (dark, light and a 900 px window), an
+  app that gave up, standbys and draining workers, the worker table's
+  columns, the Restart and Connection menus, the logs tab, a confirmation,
+  the Add app, Edit config and machine dialogs, the "wardend is not
+  running" screen, and the History tab (`history-1h` with
   the crosshair over the memory chart, `history-24h-light`, and the error
   of a wardend without history). Each is searched for
   what it must show, clicked, and saved as a PNG in

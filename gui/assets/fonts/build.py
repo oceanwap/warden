@@ -6,6 +6,7 @@
 Sources (downloaded once into --cache, default a temp directory):
   Inter 4.1            https://github.com/rsms/inter                 SIL OFL 1.1
   JetBrains Mono 2.304 https://github.com/JetBrains/JetBrainsMono    SIL OFL 1.1
+  Plus Jakarta Sans 2.7.1 https://github.com/tokotype/PlusJakartaSans SIL OFL 1.1 (headings)
   Lucide (lucide-static 1.49.0 from npm, the icon font)               ISC
 
 The outputs are committed (building Warden needs no Python). Subsetting keeps
@@ -31,6 +32,7 @@ cache.mkdir(parents=True, exist_ok=True)
 
 INTER = "https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip"
 JETBRAINS = "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip"
+JAKARTA = "https://github.com/tokotype/PlusJakartaSans/releases/download/2.7.1/PlusJakartaSans-2.7.1.zip"
 LUCIDE = "https://registry.npmjs.org/lucide-static/-/lucide-static-1.49.0.tgz"
 
 # (Rust name, Lucide name). The Rust name is what the GUI's code says.
@@ -86,6 +88,12 @@ for weight in ("Regular", "Medium", "SemiBold"):
 jb = zipfile.ZipFile(io.BytesIO(fetch(JETBRAINS)))
 write_subset(jb.read("fonts/ttf/JetBrainsMono-Regular.ttf"), MONO_UNICODES, here / "JetBrainsMono-Regular.ttf")
 
+jakarta = zipfile.ZipFile(io.BytesIO(fetch(JAKARTA)))
+for weight in ("Bold", "ExtraBold"):
+    write_subset(
+        jakarta.read(f"PlusJakartaSans-2.7.1/ttf/PlusJakartaSans-{weight}.ttf"), TEXT_UNICODES, here / f"PlusJakartaSans-{weight}.ttf"
+    )
+
 lucide = tarfile.open(fileobj=io.BytesIO(fetch(LUCIDE)))
 codepoints = json.load(lucide.extractfile("package/font/codepoints.json"))
 wanted = sorted({codepoints[name] for _, name in ICONS})
@@ -95,9 +103,11 @@ licenses = [
     "Fonts embedded in warden-gui\n============================\n",
     "Inter (c) The Inter Project Authors, SIL Open Font License 1.1 (https://github.com/rsms/inter)\n"
     "JetBrains Mono (c) JetBrains s.r.o., SIL Open Font License 1.1 (https://github.com/JetBrains/JetBrainsMono)\n"
+    "Plus Jakarta Sans (c) The Plus Jakarta Sans Project Authors, SIL Open Font License 1.1 (https://github.com/tokotype/PlusJakartaSans)\n"
     "Lucide icons (c) Lucide Contributors, ISC License; parts (c) Cole Bemis 2013-2022, MIT License (https://lucide.dev)\n",
     "\n---- Inter: LICENSE.txt ----\n" + inter.read("LICENSE.txt").decode(),
     "\n---- JetBrains Mono: OFL.txt ----\n" + jb.read("OFL.txt").decode(),
+    "\n---- Plus Jakarta Sans: OFL.txt ----\n" + jakarta.read("PlusJakartaSans-2.7.1/OFL.txt").decode(),
     "\n---- Lucide: LICENSE ----\n" + lucide.extractfile("package/LICENSE").read().decode(),
 ]
 (here / "LICENSES.txt").write_text("\n".join(licenses))

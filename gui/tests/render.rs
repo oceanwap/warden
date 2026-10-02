@@ -217,6 +217,11 @@ fn save_with(ui: &mut Simulator<'_, Message>, name: &str, theme: &Theme) {
     eprintln!("snapshot: {}", png.display());
 }
 
+/// What the clicks sent, without the lists' own scroll reports.
+fn messages(ui: Simulator<'_, Message>) -> Vec<Message> {
+    ui.into_messages().filter(|m| !matches!(m, Message::FeedScrolled(_) | Message::LogsScrolled(_))).collect()
+}
+
 fn sim(g: &Gui) -> Simulator<'_, Message> {
     Simulator::with_size(warden_gui::settings(), SIZE, warden_gui::view::view(g))
 }
@@ -246,7 +251,7 @@ fn main_screen_with_fake_data() {
         "as deploy",
         "3000",
         "9229",
-        "Listening",
+        "LISTENING",
     ] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the main screen");
     }
@@ -257,7 +262,7 @@ fn main_screen_with_fake_data() {
     let _ = ui.click("Restart").expect("a Restart button");
     let _ = ui.click("Stop").expect("a Stop button");
     let _ = ui.click("jobs").expect("the jobs row");
-    let msgs: Vec<Message> = ui.into_messages().collect();
+    let msgs = messages(ui);
     assert!(matches!(&msgs[0], Message::Act(app, Act::SafeReload) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[1], Message::Act(app, Act::Stop) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
@@ -291,7 +296,7 @@ fn an_app_that_gave_up_shows_its_problem_and_start() {
     assert!(ui.find("Restart").is_err(), "only Start applies to an app that is not running");
     assert!(ui.find("api jobs supervisor gave up pid=6001 died 10 times in 10 minutes").is_err(), "lines have a clock");
     let _ = ui.click("Start").expect("Start is offered");
-    let msgs: Vec<Message> = ui.into_messages().collect();
+    let msgs = messages(ui);
     assert!(matches!(&msgs[..], [Message::Act(app, Act::Start)] if app == "jobs"), "{msgs:?}");
 }
 
@@ -471,7 +476,7 @@ fn restart_menu_lists_the_other_restarts() {
     }
     save(&mut ui, "restart-menu");
     let _ = ui.click("Rolling restart").expect("a menu entry");
-    let msgs: Vec<Message> = ui.into_messages().collect();
+    let msgs = messages(ui);
     assert!(matches!(&msgs[..], [Message::Act(app, Act::RollingRestart)] if app == "api"), "{msgs:?}");
 }
 
@@ -493,7 +498,7 @@ fn connection_menu_lists_this_machine_and_the_saved_ones() {
     }
     save(&mut ui, "connection-menu");
     let _ = ui.click("deploy@web-2").expect("a saved machine");
-    let msgs: Vec<Message> = ui.into_messages().collect();
+    let msgs = messages(ui);
     assert!(matches!(&msgs[..], [Message::UseMachine(d)] if d == "deploy@web-2"), "{msgs:?}");
 }
 

@@ -36,15 +36,16 @@ pub enum Hue {
 impl Hue {
     pub fn color(self, theme: &Theme) -> Color {
         let dark = theme.extended_palette().is_dark;
+        // The accent green, amber, terracotta and a dusty blue: the window's own colors.
         let hex = match (self, dark) {
-            (Hue::Blue, false) => 0x2a78d6,
-            (Hue::Blue, true) => 0x3987e5,
-            (Hue::Aqua, false) => 0x1baf7a,
-            (Hue::Aqua, true) => 0x199e70,
-            (Hue::Orange, false) => 0xeb6834,
-            (Hue::Orange, true) => 0xd95926,
-            (Hue::Violet, false) => 0x4a3aa7,
-            (Hue::Violet, true) => 0x9085e9,
+            (Hue::Blue, false) => 0x1b6b45,
+            (Hue::Blue, true) => 0x4eae78,
+            (Hue::Aqua, false) => 0xb7791f,
+            (Hue::Aqua, true) => 0xe2b15a,
+            (Hue::Orange, false) => 0xc2410c,
+            (Hue::Orange, true) => 0xe07a5f,
+            (Hue::Violet, false) => 0x3a6ea5,
+            (Hue::Violet, true) => 0x7aa7d9,
         };
         Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
     }
@@ -170,7 +171,7 @@ fn plot_area(size: Size) -> Rectangle {
 
 /// Text colors: secondary (labels) and muted (grid).
 fn ink(theme: &Theme, alpha: f32) -> Color {
-    Color { a: alpha, ..theme.extended_palette().background.base.text }
+    Color { a: alpha, ..crate::look::pal(theme).ink }
 }
 
 fn label(content: String, position: Point, color: Color, ax: alignment::Horizontal, ay: alignment::Vertical) -> Text {
@@ -340,7 +341,7 @@ impl Chart<'_> {
         };
         let hair = Path::line(Point::new(p.x, plot.y), Point::new(p.x, base));
         frame.stroke(&hair, Stroke::default().with_width(1.0).with_color(ink(theme, 0.45)));
-        let surface = theme.extended_palette().background.weakest.color;
+        let surface = crate::look::pal(theme).card;
         frame.fill(&Path::circle(*p, 6.0), surface);
         frame.fill(&Path::circle(*p, 4.0), color);
         let value = self.series.values.get(*i).copied().flatten().unwrap_or(0.0);
@@ -356,12 +357,12 @@ impl Chart<'_> {
         // At the top, unless the point is there: then at the bottom.
         let top = if p.y < plot.y + h + 12.0 { base - h - 2.0 } else { plot.y + 2.0 };
         let bx = Rectangle { x: left, y: top, width: w, height: h };
-        let pal = theme.extended_palette();
-        frame.fill(&Path::rounded_rectangle(bx.position(), bx.size(), 4.0.into()), pal.background.strong.color);
+        let pal = crate::look::pal(theme);
+        frame.fill(&Path::rounded_rectangle(bx.position(), bx.size(), 7.0.into()), pal.pill);
         frame.fill_text(Text {
             content: what,
             position: Point::new(bx.x + 8.0, bx.center_y()),
-            color: pal.background.base.text,
+            color: pal.on_pill,
             size: Pixels(12.0),
             font: iced::Font { weight: iced::font::Weight::Bold, ..iced::Font::default() },
             align_y: alignment::Vertical::Center,
