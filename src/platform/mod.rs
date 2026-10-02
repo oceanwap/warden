@@ -19,6 +19,10 @@
 //! degrade (an empty column, the connect-probe readiness check) and
 //! `warden doctor` says what is missing.
 //!
+//! [`orphans`] is the one part that is not an adapter: what a supervisor does
+//! on an OS without a parent-death signal, written once against the
+//! adapter's [`Platform::proc_identity`] and run on every OS in its tests.
+//!
 //! The adapters share one contract, tested by [`contract_tests`] against the
 //! real OS the tests run on, so Linux and macOS cannot drift apart: a new
 //! question is added to the trait, both adapters answer it, and the same test
@@ -33,6 +37,7 @@ pub(crate) mod linux;
 mod listeners;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
+pub(crate) mod orphans;
 #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 pub(crate) mod other;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -67,6 +72,20 @@ pub struct HostSnapshot {
 /// A process's environment, in the order the kernel kept it.
 pub type Environ = Vec<(OsString, OsString)>;
 
+/// Who a process is: its parent, its process group and when it started. The
+/// start time is what tells a process from another one that was given its pid
+/// later, so a pid is only ever trusted together with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcIdentity {
+    /// When it started, in the OS's own unit (microseconds since the epoch on
+    /// macOS, clock ticks since boot on Linux): equal for the same process at
+    /// any time, different for any later process with the same pid. Compared,
+    /// never interpreted.
+    pub start: u64,
+    pub ppid: u32,
+    pub pgid: u32,
+}
+
 /// What an adapter can do on its OS: for `warden doctor` and the docs, and
 /// for code that must know *why* a question answers `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +104,10 @@ pub struct Capabilities {
     /// A process killed by the kernel for memory is recognised as such
     /// (cgroup memory events).
     pub oom_attribution: bool,
+    /// Workers a killed supervisor left behind are found and stopped when
+    /// the app starts again (`orphans`), which is what an OS without a
+    /// parent-death signal has instead. Needs `proc_identity`.
+    pub orphan_sweep: bool,
 }
 
 /// What Warden asks the OS about processes and the host. `pid`s that do
@@ -103,6 +126,12 @@ pub trait Platform: Sync {
 
     /// The environment the process was started with.
     fn proc_environ(&self, pid: u32) -> Option<Environ>;
+
+    /// Who the process is (see [`ProcIdentity`]). `None` when there is no
+    /// such process, when it belongs to another user, and for one that has
+    /// exited and is waiting to be collected: nothing runs there any more, so
+    /// to a caller it is gone.
+    fn proc_identity(&self, pid: u32) -> Option<ProcIdentity>;
 
     /// The process's working directory.
     fn proc_cwd(&self, pid: u32) -> Option<PathBuf>;
@@ -172,6 +201,10 @@ pub fn proc_owner(pid: u32) -> Option<u32> {
 
 pub fn proc_environ(pid: u32) -> Option<Environ> {
     current().proc_environ(pid)
+}
+
+pub fn proc_identity(pid: u32) -> Option<ProcIdentity> {
+    current().proc_identity(pid)
 }
 
 pub fn proc_cwd(pid: u32) -> Option<PathBuf> {
@@ -274,6 +307,39 @@ pub(crate) mod contract_tests {
         }
         assert_eq!(c.reuseport_balances, want == "linux");
         assert_eq!(c.oom_attribution, want == "linux");
+        // An OS has a parent-death signal or the sweep for the lack of it, not both; `other` has neither.
+        assert_eq!(c.parent_death_signal, want == "linux");
+        assert_eq!(c.orphan_sweep, want == "macos");
+    }
+
+    #[test]
+    fn identity_tells_a_process_from_another_with_its_pid() {
+        use std::os::unix::process::CommandExt;
+        if current().name() == "other" {
+            assert_eq!(proc_identity(me()), None);
+            return;
+        }
+        let mine = proc_identity(me()).expect("identity of this process");
+        assert_eq!(proc_identity(me()), Some(mine), "the same every time");
+        assert_eq!(mine.ppid, std::os::unix::process::parent_id());
+        assert_eq!(proc_identity(0x7fff_fff0), None, "no such process");
+
+        // A child in a group of its own: its parent is this process, its group its pid.
+        let mut child = Command::new("sleep").arg("60").process_group(0).stdin(Stdio::null()).spawn().unwrap();
+        let id = proc_identity(child.id()).expect("identity of the child");
+        assert_eq!((id.ppid, id.pgid), (me(), child.id()), "{id:?}");
+        assert_ne!(id.start, mine.start, "another process, another start");
+        assert_eq!(proc_identity(child.id()), Some(id), "the same every time");
+
+        // Gone once it has exited, whether or not it was collected.
+        child.kill().unwrap();
+        let t0 = Instant::now();
+        while proc_identity(child.id()).is_some() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(proc_identity(child.id()), None, "exited");
+        child.wait().unwrap();
+        assert_eq!(proc_identity(child.id()), None, "collected");
     }
 
     #[test]

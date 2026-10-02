@@ -13,6 +13,7 @@ to tune it.
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |
 | Stop / shutdown | SIGTERM to each process group, drain (WebSockets closed with 1001 and SSE streams ended after `long_lived_timeout`), SIGKILL after `grace_period` | `[shutdown]` |
+| Supervisor killed | Linux: its workers get SIGTERM at once (parent-death signal), and wardend or systemd starts it again. macOS has no such signal: the workers keep running until the app starts again, and the new supervisor stops them first, so there are never two sets ([macOS](platforms.md#workers-a-killed-supervisor-leaves-behind-macos)) | |
 | Why it died | `last_exit` and the log line say who ended a worker: a crash (`SIGSEGV`, `SIGABRT`), the kernel's OOM killer (from its cgroup's `oom_kill` count; `probably …` when other workers of that cgroup died of SIGKILL at the same moment), Warden, or another process, with a hint for the fix | |
 
 Every problem Warden logs says what happened, why, what it did and how to fix

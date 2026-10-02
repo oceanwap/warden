@@ -215,6 +215,10 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     // fd 3: a socket, so Warden can also send to the worker (`Handle::send`).
     let (ipc_ours, ipc_child) = crate::sys::socketpair_cloexec()?;
     let child_fd = std::os::fd::AsRawFd::as_raw_fd(&ipc_child);
+    // `Handle::send` says "never a SIGPIPE" for a worker that is gone: on
+    // macOS that is this option (Linux sends with MSG_NOSIGNAL), once, here,
+    // not the runtime's ignoring SIGPIPE for the whole process.
+    let _ = crate::sys::set_nosigpipe(std::os::fd::AsFd::as_fd(&ipc_ours));
 
     let mut cmd = Command::new(&spec.program);
     // Direct mode: our own pipes (read end, file, stream), spliced into
@@ -258,16 +262,9 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     // How the supervisor was launched is not the workers' business (a
     // worker running `warden` itself would misreport).
     cmd.env_remove(crate::events::LAUNCH_ENV);
-    // SAFETY: the closure only calls the async-signal-safe helpers in
-    // `sys` (dup2, fcntl, prctl): no allocation or locking after fork.
-    #[allow(unsafe_code)]
-    unsafe {
-        cmd.pre_exec(move || {
-            crate::sys::child_dup_ipc(child_fd, IPC_FD)?;
-            // If Warden dies without cleaning up (SIGKILL), take the workers with it.
-            crate::sys::child_parent_death_signal(libc::SIGTERM)
-        });
-    }
+    // The IPC socket at fd 3; and, if Warden dies without cleaning up
+    // (SIGKILL), the workers go with it (where the OS can).
+    crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD);
     let mut child = cmd.spawn()?;
     // Our copies of the pipes' write ends (in `cmd`) and of the worker's end
     // of the IPC socket: only the worker's remain, so its exit is EOF.

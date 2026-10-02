@@ -161,6 +161,15 @@ impl Warden {
         unsafe { libc::kill(self.child.id() as i32, sig) };
     }
 
+    /// Warden stopped (SIGSTOP) until the returned guard is dropped (SIGCONT,
+    /// also when the test panics): nothing it would do meanwhile (reaping,
+    /// reading counters) happens, so what the test does in that time is one
+    /// instant to it.
+    fn freeze(&self) -> Frozen<'_> {
+        self.signal(libc::SIGSTOP);
+        Frozen(self)
+    }
+
     /// SIGTERM and wait; returns exit code and how long it took.
     fn terminate(&mut self, timeout: Duration) -> (Option<i32>, Duration) {
         let t0 = Instant::now();
@@ -172,6 +181,15 @@ impl Warden {
             std::thread::sleep(Duration::from_millis(20));
         }
         panic!("warden did not exit within {timeout:?}\n{}", self.log());
+    }
+}
+
+/// A frozen Warden ([`Warden::freeze`]); thawed when dropped.
+struct Frozen<'a>(&'a Warden);
+
+impl Drop for Frozen<'_> {
+    fn drop(&mut self) {
+        self.0.signal(libc::SIGCONT);
     }
 }
 
@@ -6367,9 +6385,18 @@ fn one_oom_kill_for_two_sigkill_deaths_is_reported_as_uncertain() {
     let w = Warden::start_env("oomtwo", port, &simple("oomtwo", port, 2, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
     let s = w.wait_for("ready", T, ready(2));
     let pids: Vec<u64> = (0..2).map(|i| s["workers"][i]["pid"].as_u64().unwrap()).collect();
-    std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
-    for p in &pids {
-        unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+    // "At the same moment" has to be made true, not hoped for: a Warden that
+    // runs between the two kill(2) calls handles the first death alone, and
+    // is right to call it a certain OOM kill (the second, later, is then
+    // someone else's kill -9). So Warden is frozen while the counter moves
+    // and both workers get their SIGKILL, and sees both deaths at once when
+    // it thaws, however loaded the machine and however far apart the calls.
+    {
+        let _frozen = w.freeze();
+        std::fs::write(&events, "low 0\nhigh 0\nmax 9\noom 3\noom_kill 4\noom_group_kill 0\n").unwrap();
+        for p in &pids {
+            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+        }
     }
     let s = w.wait_for("both restarted", T, |s| {
         (0..2).all(|i| {
@@ -6604,21 +6631,33 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
     );
     assert_eq!(s["workers"].as_array().map(Vec::len), Some(1), "standbys are not workers");
 
+    // The stream is live once Warden has said hello: it subscribed before it
+    // answered. Events from before that are never replayed, so the kill must
+    // wait for it (on a loaded machine Warden may take the subscription later
+    // than the kill, and the story below would start in the middle).
     let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);
+    assert_eq!(ev.next()["type"], "hello");
+    assert_eq!(ev.next()["type"], "status");
     let (who, took) = kill_and_wait_for(port, victim, "/whoami", |b| !b.starts_with(&format!("{victim}:")));
     eprintln!(
         "standby promotion (Bun.serve): the port answered again {} after kill -9 (promote → listening: {} ms)",
         ms(took),
         promote_ms(&w)
     );
+    // The behaviour, not a stopwatch (which load can break): the process that
+    // answered after the kill is the standby that was already initialized,
+    // not a worker started cold (that would be a new pid), and (events
+    // below) it served before Warden started another process. How fast is
+    // measured by the printed time and `promote_ms`, in docs/benchmarks.md.
     assert!(who.starts_with(&format!("{standby}:")), "the standby took over: {who}");
-    // ~5-15 ms on an idle machine; generous for loaded CI runners (the pid
-    // check above already proves the standby, not a cold start, answered).
-    assert!(took < Duration::from_secs(1), "promotion took {took:?}\n{}", w.log());
 
     // Events: the usual story of worker 1, the new process marked as promoted.
     let events = ev.until("worker 1 ready", |e| is_worker(e, 1, "ready"));
     assert_eq!(worker_story(&events, 1), ["crashed", "restarting", "starting", "ready"], "{events:#?}");
+    assert!(
+        !events.iter().any(|e| e["type"] == "worker" && e["standby"] == 1 && e["event"] == "starting"),
+        "no new process was started before the promoted standby was serving: {events:#?}"
+    );
     let promoted: Vec<&Value> = events.iter().filter(|e| e["worker"] == 1 && e["pid"] == standby).collect();
     assert_eq!(promoted.len(), 2, "{events:#?}");
     assert!(promoted.iter().all(|e| e["detail"].as_str().unwrap().contains("promoted from standby s1")));
@@ -7285,4 +7324,372 @@ fn start_watch_flags_write_the_watch_section() {
     assert_eq!(f.pids("flagged"), before, "dist and *.map are ignored");
     std::fs::write(dir.join("src/main.js"), "version 2").unwrap();
     f.wait("the rolling restart", |f| replaced(f, "flagged", &before));
+}
+
+/// What Warden has logged for `name`, its own events included.
+fn watch_events(f: &Fleet, name: &str) -> String {
+    f.ok(&["logs", name, "--nostream", "--events", "--lines", "200"])
+}
+
+/// An app that only sleeps, watching its directory (looking every 100 ms, restarting 200 ms after
+/// the last change), with `extra` sections before `[watch]`.
+fn watched_sleeper(f: &Fleet, name: &str, extra: &str) -> PathBuf {
+    let dir = watch_app_dir(f, name);
+    let cfg = format!(
+        "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\
+         working_directory = {:?}\n{extra}[watch]\nenabled = true\ndebounce_ms = 200\ninterval_ms = 100\n",
+        dir.display().to_string()
+    );
+    std::fs::write(f.home.join(format!("{name}.toml")), cfg).unwrap();
+    dir
+}
+
+/// File watching is optional, so a panic in it (injected with `WARDEN_FAULT=watch:1`, a debug
+/// build's fault point) ends the watcher with an error line and leaves the app running. `status`
+/// and `list` say it is not watching, a save restarts nothing, and `warden reload` starts another.
+#[test]
+fn a_watcher_that_panics_is_reported_and_a_reload_starts_another() {
+    if !cfg!(debug_assertions) {
+        return; // the fault point is compiled out of release builds
+    }
+    let f = Fleet::new("watchfault");
+    let dir = watched_sleeper(&f, "faulty", "");
+    let (code, out) = f.cli_env(&["start", "faulty"], &[("WARDEN_FAULT", "watch:1")]);
+    assert_eq!(code, 0, "{out}");
+
+    f.wait("the supervisor to report the dead watcher", |f| {
+        watch_events(f, "faulty").contains("file watching has stopped")
+    });
+    let log = watch_events(&f, "faulty");
+    assert!(log.contains("file watching stopped: the scan panicked"), "{log}");
+    assert!(log.contains("injected fault at watch") && log.contains("`warden reload` starts watching again"), "{log}");
+    assert_eq!(f.app("faulty")["status"]["watching"], false, "the status says so");
+    // One app: `list` is the key-and-value box, with a `watching` row.
+    let list = f.ok(&["list"]);
+    assert!(
+        list.contains("online") && list.lines().any(|l| l.contains("watching") && l.contains("disabled")),
+        "{list}"
+    );
+    assert!(f.ok(&["describe", "faulty"]).contains("set, but not running"));
+
+    // Nothing watches: a save restarts nothing (and the dead watcher is not logged again and again).
+    let before = f.pids("faulty");
+    assert_eq!(before.len(), 1);
+    std::fs::write(dir.join("src/main.js"), "version 2").unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(f.pids("faulty"), before, "no watcher, no restart");
+    assert_eq!(watch_events(&f, "faulty").matches("file watching has stopped").count(), 1, "said once");
+
+    // `warden reload` is what the message promises: a watcher again, which restarts the app.
+    f.ok(&["reload", "faulty"]);
+    f.wait("watching again", |f| f.app("faulty")["status"]["watching"] == true);
+    watching_since_start(&f, "faulty");
+    f.wait("the workers to run", |f| {
+        f.app("faulty")["status"]["workers"].as_array().is_some_and(|w| w.iter().all(|x| x["state"] == "RUNNING"))
+    });
+    let reloaded = f.pids("faulty");
+    std::fs::write(dir.join("src/main.js"), "version 3").unwrap();
+    f.wait("the rolling restart", |f| replaced(f, "faulty", &reloaded));
+    assert!(f.ok(&["list"]).lines().any(|l| l.contains("watching") && l.contains("enabled")));
+}
+
+/// A control socket (so the runtime directory) in the watched directory used to hide the whole
+/// directory: "file watching started files=0", and no restart, ever. Only what Warden writes
+/// there is skipped, and a new file in it is a change.
+#[test]
+fn a_control_socket_in_the_watched_directory_does_not_hide_the_app() {
+    // `Warden::start` puts the socket (w.sock), the log and the config in this directory.
+    let name = "watchsock";
+    let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+    let toml = format!(
+        "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\
+         working_directory = {:?}\n[watch]\nenabled = true\ndebounce_ms = 200\ninterval_ms = 100\n",
+        dir.display().to_string()
+    );
+    let w = Warden::start(name, 0, &toml);
+    let pids = |s: &Value| -> Vec<u64> {
+        let all = s["workers"].as_array().cloned().unwrap_or_default();
+        if all.iter().all(|x| x["state"] == "RUNNING") {
+            all.iter().filter_map(|x| x["pid"].as_u64()).collect()
+        } else {
+            vec![]
+        }
+    };
+    let s = w.wait_for("the app to run", T, |s| !pids(s).is_empty());
+    let log = w.wait_log("file watching started", T);
+    let files: u64 = log
+        .split("file watching started files=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no file count in the log:\n{log}"));
+    assert!(files >= 1, "the config next to the socket is a file of the app, not Warden's: files={files}\n{log}");
+    assert!(!log.contains("found no files under the watched paths"), "{log}");
+
+    // Warden's own files in that directory (the socket, its scripts, its log) are not changes.
+    let before = pids(&s);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(pids(&w.status().unwrap()), before, "Warden's own files restarted the app:\n{}", w.log());
+
+    // Anything else in it is the app's.
+    std::fs::write(dir.join("app.js"), "version 2").unwrap();
+    w.wait_for("the rolling restart", T, |s| {
+        let now = pids(s);
+        now.len() == before.len() && now.iter().all(|p| !before.contains(p))
+    });
+    let log = w.wait_log("files changed: rolling restart", T);
+    assert!(log.contains("file=app.js"), "{log}");
+}
+
+/// Watching an app whose workers cannot run side by side (`[workers] overlap = false`) says at
+/// the start that a restart that fails cannot be rolled back; an app that can overlap hears
+/// nothing. The restart itself works for both.
+#[test]
+fn watching_an_app_that_cannot_roll_back_says_so() {
+    let f = Fleet::new("watchnoroll");
+    let dirs = [
+        ("serial", watched_sleeper(&f, "serial", "[workers]\noverlap = false\n")),
+        ("shared", watched_sleeper(&f, "shared", "")),
+    ];
+    for (name, _) in &dirs {
+        f.ok(&["start", name]);
+        watching_since_start(&f, name);
+    }
+    let serial = watch_events(&f, "serial");
+    assert!(serial.contains("file watching is on, but a failing restart cannot be rolled back"), "{serial}");
+    assert!(
+        serial.contains("[workers] overlap = false") && serial.contains("no old worker to roll back to"),
+        "{serial}"
+    );
+    assert!(!watch_events(&f, "shared").contains("cannot be rolled back"), "workers that overlap need no warning");
+
+    // Both restart when a file changes (the serial one stops first, then starts).
+    let (a, b) = (f.pids("serial"), f.pids("shared"));
+    for (_, dir) in &dirs {
+        std::fs::write(dir.join("src/main.js"), "version 2").unwrap();
+    }
+    f.wait("serial's restart", |f| replaced(f, "serial", &a));
+    f.wait("shared's rolling restart", |f| replaced(f, "shared", &b));
+}
+
+/// A watcher that has nothing to look at (every file ignored, or an empty directory) says so once
+/// instead of silently never restarting; a file that appears later is noticed all the same.
+#[test]
+fn watching_no_files_says_so() {
+    let f = Fleet::new("watchnone");
+    let dir = watch_app_dir(&f, "nothing");
+    std::fs::create_dir_all(dir.join("empty")).unwrap();
+    let cfg = format!(
+        "[app]\nname = \"nothing\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\
+         working_directory = {:?}\n[watch]\nenabled = true\npaths = [\"empty\"]\ndebounce_ms = 200\n\
+         interval_ms = 100\n",
+        dir.display().to_string()
+    );
+    std::fs::write(f.home.join("nothing.toml"), cfg).unwrap();
+    f.ok(&["start", "nothing"]);
+    watching_since_start(&f, "nothing");
+    let log = watch_events(&f, "nothing");
+    assert!(
+        log.contains("file watching found no files under the watched paths: nothing will restart the app"),
+        "{log}"
+    );
+    assert!(log.contains("paths=empty"), "it names what it looked at: {log}");
+
+    let before = f.pids("nothing");
+    std::fs::write(dir.join("empty/main.js"), "x").unwrap();
+    f.wait("the rolling restart", |f| replaced(f, "nothing", &before));
+}
+
+// ------------------------------------------------- workers a killed supervisor left behind
+
+/// Is `pid` a live process? A zombie, which only waits for its parent to
+/// collect it, is not (`kill(pid, 0)` says yes to it).
+fn running(pid: u64) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with(['Z', 'X'])))
+}
+
+/// `pid`'s start time as the kernel counts it (field 22 of /proc/pid/stat,
+/// clock ticks after boot): what a record of workers keeps next to the pid.
+fn start_ticks(pid: u64) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let f: Vec<&str> = stat.rsplit_once(')').unwrap().1.split_whitespace().collect();
+    f[19].parse().unwrap()
+}
+
+fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < T, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Kills the `sleep <tag>` processes a failed test left running.
+struct Sleepers(String);
+
+impl Drop for Sleepers {
+    fn drop(&mut self) {
+        let want = format!("sleep\0{}\0", self.0).into_bytes();
+        let Ok(dir) = std::fs::read_dir("/proc") else { return };
+        for e in dir.flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+            if std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c == want) {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// A tag that tells this test's `sleep` processes from anyone's, and from
+/// those of another test (`which`) running in the same process.
+fn sleep_tag(which: u32) -> String {
+    (600_000 + which * 100_000 + std::process::id() % 100_000).to_string()
+}
+
+/// macOS has no parent-death signal, so a worker outlives a supervisor
+/// killed with SIGKILL; the next supervisor of the app stops it before
+/// starting new ones (src/platform/orphans.rs). A debug build on Linux can
+/// behave that way (`WARDEN_TEST_MACOS_ORPHANS`), which runs the record, the
+/// sweep and the log against real processes.
+#[test]
+fn a_killed_supervisors_workers_are_stopped_when_the_app_starts_again() {
+    let tag = sleep_tag(0);
+    let _sleepers = Sleepers(tag.clone());
+    let f = Fleet::new("orphans");
+    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let cmd = format!("exec sleep {tag}");
+    let start = ["start", "/bin/sh", "--name", "orphan", "--interpreter", "none", "-i", "2", "--", "-c", &cmd];
+    let (code, out) = f.cli_env(&start, &env);
+    assert_eq!(code, 0, "{out}");
+    f.wait("two workers", |f| f.pids("orphan").len() == 2);
+    let old = f.pids("orphan");
+    let sup = supervisor_pid(&f, "orphan");
+
+    // The supervisor has written down who it is and who its workers are, each
+    // with a start time: a pid alone could be someone else's later.
+    let file = f.home.join(format!("state/orphans/orphan.{sup}.json"));
+    let record = || -> Option<Value> { serde_json::from_str(&std::fs::read_to_string(&file).ok()?).ok() };
+    let workers_of = |r: &Value| -> Vec<u64> {
+        let mut pids: Vec<u64> = r["workers"].as_array().unwrap().iter().filter_map(|w| w["pid"].as_u64()).collect();
+        pids.sort_unstable();
+        pids
+    };
+    let mut want = old.clone();
+    want.sort_unstable();
+    wait_until("the record to list both workers", || record().is_some_and(|r| workers_of(&r) == want));
+    let rec = record().unwrap();
+    assert_eq!((rec["v"].as_u64(), rec["app"].as_str()), (Some(1), Some("orphan")), "{rec:#}");
+    assert_eq!(rec["supervisor"]["pid"].as_u64(), Some(sup), "{rec:#}");
+    assert_eq!(rec["supervisor"]["start"].as_u64(), Some(start_ticks(sup)), "{rec:#}");
+    for w in rec["workers"].as_array().unwrap() {
+        assert_eq!(w["start"].as_u64(), Some(start_ticks(w["pid"].as_u64().unwrap())), "{rec:#}");
+    }
+    let labels: Vec<&str> = rec["workers"].as_array().unwrap().iter().filter_map(|w| w["label"].as_str()).collect();
+    assert!(labels.contains(&"1") && labels.contains(&"2"), "worker labels as in the logs: {rec:#}");
+
+    // kill -9: the workers keep running, as they do on macOS.
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    wait_until("the supervisor to be gone", || !running(sup));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(old.iter().all(|p| running(*p)), "the workers outlive the killed supervisor: {old:?}");
+    assert!(file.exists(), "a killed supervisor does not clean up its record");
+
+    // The app starts again: the old workers are stopped first, and the new
+    // ones are not among them.
+    let (code, out) = f.cli_env(&["start", "orphan"], &env);
+    assert_eq!(code, 0, "{out}");
+    f.wait("two new workers", |f| {
+        let now = f.pids("orphan");
+        now.len() == 2 && now.iter().all(|p| !old.contains(p))
+    });
+    assert!(old.iter().all(|p| !running(*p)), "the old workers were stopped: {old:?}");
+    assert!(!file.exists(), "the record of the dead supervisor is dropped");
+    let new_sup = supervisor_pid(&f, "orphan");
+    assert_ne!(new_sup, sup);
+    let log_file = f.home.join("state/logs/orphan.log");
+    wait_until("the log to say what was stopped", || {
+        std::fs::read_to_string(&log_file)
+            .is_ok_and(|l| l.contains("stopped workers left behind by a previous supervisor"))
+    });
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    let warned = log
+        .lines()
+        .find(|l| l.contains("workers of a previous supervisor of this app are still running"))
+        .unwrap_or("");
+    assert!(warned.contains(&format!("previous_supervisor={sup}")), "{log}");
+    for p in &old {
+        assert!(warned.contains(&p.to_string()), "pid {p} is named: {warned}");
+    }
+    assert!(warned.contains(" WARN ") && warned.contains(" hint="), "{warned}");
+    assert!(!log.contains("did not exit within the grace period"), "SIGTERM was enough:\n{log}");
+    every_warning_has_a_hint(&log);
+
+    // A normal stop leaves nothing to sweep.
+    let new_file = f.home.join(format!("state/orphans/orphan.{new_sup}.json"));
+    assert!(new_file.exists(), "the new supervisor keeps its own record");
+    f.ok(&["shutdown", "orphan"]);
+    wait_until("the supervisor to be gone", || !running(new_sup));
+    assert!(!new_file.exists(), "a supervisor that stops its workers removes its record");
+}
+
+/// What the sweep must not touch: a pid that a record lists but that is
+/// another process now (the worker died and the pid was handed out again),
+/// and the workers of a supervisor that is still alive.
+#[test]
+fn records_of_processes_that_are_not_orphans_are_left_alone() {
+    let tag = sleep_tag(1);
+    let _sleepers = Sleepers(tag.clone());
+    let f = Fleet::new("orphans-safe");
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap().trim().to_string();
+    let sleeper = || Command::new("sleep").arg(&tag).stdout(Stdio::null()).spawn().unwrap();
+    let (mut bystander, mut live_sup, mut live_worker) = (sleeper(), sleeper(), sleeper());
+    let mut gone = Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    let rec_dir = f.home.join("state/orphans");
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(&rec_dir).unwrap();
+    let member = |pid: u32, start: u64, label: &str| serde_json::json!({ "pid": pid, "start": start, "label": label });
+    let write = |name: String, sup: Value, workers: Vec<Value>| {
+        let rec = serde_json::json!({ "v": 1, "app": "safe", "boot": boot, "written_ms": 1, "supervisor": sup, "workers": workers });
+        std::fs::write(rec_dir.join(name), rec.to_string()).unwrap();
+    };
+    // 1. The supervisor is gone, and so is the worker: the pid is the
+    //    bystander's now, started at another time.
+    let reused = format!("safe.{}.json", gone.id());
+    write(
+        reused.clone(),
+        member(gone.id(), 1, ""),
+        vec![member(bystander.id(), start_ticks(bystander.id() as u64) + 1, "1")],
+    );
+    // 2. The supervisor is alive (another one of the app), and its worker is
+    //    exactly the process recorded.
+    let busy = format!("safe.{}.json", live_sup.id());
+    write(
+        busy.clone(),
+        member(live_sup.id(), start_ticks(live_sup.id() as u64), ""),
+        vec![member(live_worker.id(), start_ticks(live_worker.id() as u64), "1")],
+    );
+
+    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let (code, out) = f.cli_env(&["start", "sleep 300", "--name", "safe"], &env);
+    assert_eq!(code, 0, "{out}");
+    f.wait("the worker", |f| f.pids("safe").len() == 1);
+    for (name, c) in
+        [("bystander", &mut bystander), ("live supervisor", &mut live_sup), ("its worker", &mut live_worker)]
+    {
+        assert!(c.try_wait().unwrap().is_none() && running(c.id() as u64), "the {name} was left alone");
+    }
+    assert!(!rec_dir.join(&reused).exists(), "a record with nothing left to stop is dropped");
+    assert!(rec_dir.join(&busy).exists(), "the record of a live supervisor is kept");
+    let log_file = f.home.join("state/logs/safe.log");
+    wait_until("the log to name the other supervisor", || {
+        std::fs::read_to_string(&log_file).is_ok_and(|l| l.contains("another supervisor of this app is running"))
+    });
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    assert!(!log.contains("workers of a previous supervisor"), "{log}");
+    every_warning_has_a_hint(&log);
+    for mut c in [bystander, live_sup, live_worker] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
 }

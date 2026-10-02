@@ -137,8 +137,14 @@ pub struct Supervisor {
     watch: Option<(watch::Spec, watch::Handle)>,
     /// Told apart from an earlier watcher's late events.
     watch_token: u64,
-    /// The settings that could not start a watcher (not retried every tick).
+    /// The settings that could not start a watcher, or whose watcher died (not
+    /// retried every tick: `warden reload` or a start of the workers tries again).
     watch_failed: Option<watch::Spec>,
+    /// Said that `[watch]` cannot say where to look (once, not every tick).
+    watch_blocked: bool,
+    /// The directory Warden was started in, for what is relative (it may be
+    /// deleted later: asking again would answer "/" or fail).
+    launch_cwd: Option<PathBuf>,
     /// Files changed and the restart has not started yet (a rollout is in
     /// progress, or the gap after the last watch restart has not passed).
     watch_pending: Option<watch::Change>,
@@ -165,6 +171,10 @@ pub struct Supervisor {
     /// ready: the slots that crashed meanwhile. Every slot in it = the app
     /// can't start (`Status.start_failed`; `warden start` fails fast on it).
     start_attempt: Option<StartAttempt>,
+    /// macOS, where a worker is not stopped when its supervisor is killed:
+    /// this supervisor's record of its workers, which the next supervisor of
+    /// the app reads to stop the ones left running (`platform::orphans`).
+    orphans: Option<crate::platform::orphans::Registry>,
 }
 
 /// How many times each worker has to crash before one is ready for the app
@@ -310,6 +320,17 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         Some(p) => debug!("OOM kills are told apart through the cgroup's counter", file = p.display()),
         None => debug!("no cgroup OOM kill counter found: a SIGKILL's sender can't be told apart from an OOM kill"),
     }
+    // Workers a killed supervisor of this app left running are stopped before
+    // new ones start (macOS: no parent-death signal); then this one's workers
+    // are recorded as they start.
+    let app = sup.cfg.app.name.clone();
+    sup.orphans = crate::platform::orphans::start(crate::platform::orphans::Settings {
+        app: &app,
+        stop_signal: sup.cfg.stop_signal(),
+        grace: sup.cfg.grace_period(),
+        dir: crate::platform::orphans::dir(&crate::fleet::state_dir()),
+    })
+    .await;
     sup.schedule_next();
     if saved.as_ref().is_some_and(|s| s.stopped) {
         info!("workers stay stopped, as saved by `warden save`", hint = "`warden start <app>` starts them");
@@ -334,6 +355,10 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         if sup.shutting_down && sup.insts.is_empty() {
             break;
         }
+    }
+    // Every worker has exited: nothing for a next supervisor to sweep.
+    if let Some(o) = sup.orphans.as_mut() {
+        o.close();
     }
     info!("stopped", app = sup.cfg.app.name);
     // From now on control requests are answered "shutting down" at once: a
@@ -468,6 +493,8 @@ impl Supervisor {
             watch: None,
             watch_token: 0,
             watch_failed: None,
+            watch_blocked: false,
+            launch_cwd: std::env::current_dir().ok(),
             watch_pending: None,
             watch_held: false,
             watch_retry: None,
@@ -479,6 +506,7 @@ impl Supervisor {
             release: None,
             oom: process::exit::OomTracker::new(),
             start_attempt: None,
+            orphans: None,
             cfg,
             cfg_path,
         }
@@ -486,6 +514,19 @@ impl Supervisor {
 
     fn is_worker_mode(&self) -> bool {
         self.cfg.workers.mode == Mode::Worker
+    }
+
+    /// The processes this supervisor has now, for the record that lets the
+    /// next supervisor stop them if this one is killed (`platform::orphans`;
+    /// nothing where the OS stops workers with their supervisor).
+    fn note_workers(&mut self) {
+        if self.orphans.is_none() {
+            return;
+        }
+        let workers: Vec<(u32, String)> = self.insts.values().map(|i| (i.handle.pid, self.inst_label(i))).collect();
+        if let Some(o) = self.orphans.as_mut() {
+            o.note(&workers);
+        }
     }
 
     fn slot_ids(&self) -> Vec<usize> {
@@ -594,7 +635,9 @@ impl Supervisor {
         }
         // Standbys follow once the workers listen (`fill_pool` waits for them).
         self.fill_pool();
-        // `[watch]` looks at the files from the moment the workers have read them.
+        // `[watch]` looks at the files from the moment the workers have read them
+        // (a watcher that died is tried again with the workers).
+        self.watch_failed = None;
         self.sync_watch();
     }
 
@@ -649,6 +692,7 @@ impl Supervisor {
             st.instance = instance;
         }
         self.insts.insert(inst_id, inst);
+        self.note_workers();
         if self.is_worker_mode() {
             info!("host starting", pid = pid, workers = self.count, role = role_name(role));
         } else if let Some(n) = number {
@@ -1198,6 +1242,7 @@ impl Supervisor {
         sent: process::exit::Sent,
     ) {
         let Some(inst) = self.insts.remove(&inst_id) else { return };
+        self.note_workers();
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
         }
@@ -1836,24 +1881,70 @@ impl Supervisor {
 
     // ---------------------------------------------------------------- watch
 
-    /// What `[watch]` asks for now, or None: off, or nothing to restart.
-    fn watch_spec(&self) -> Option<watch::Spec> {
+    /// What `[watch]` asks for now: None when it is off or the workers do not
+    /// run (nothing to restart), an error when it cannot say where to look.
+    fn watch_spec(&self) -> Result<Option<watch::Spec>, String> {
         let w = &self.cfg.watch;
         if !w.enabled || self.stopped || self.shutting_down {
-            return None;
+            return Ok(None);
         }
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-        let abs = |p: &Path| if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-        // Relative paths are relative to where the workers run.
-        let base = abs(self.cfg.app.working_directory.as_deref().unwrap_or(Path::new(".")));
-        // What Warden writes itself is never a change to restart for: its
-        // log files (and their rotations) and its sockets and scripts.
+        // Relative paths are relative to where Warden was started, as they are for the workers.
+        let abs = |p: &Path, what: &str| -> Result<PathBuf, String> {
+            if p.is_absolute() {
+                return Ok(p.to_path_buf());
+            }
+            match &self.launch_cwd {
+                Some(cwd) => Ok(cwd.join(p)),
+                None => Err(format!(
+                    "{what} {} is relative to the directory Warden was started in, which cannot be read (deleted?)",
+                    p.display()
+                )),
+            }
+        };
+        let base = abs(self.cfg.app.working_directory.as_deref().unwrap_or(Path::new(".")), "the working directory")?;
+        // What Warden writes itself is never a change to restart for: its log
+        // files (and their rotations, and each worker's with per_worker_files),
+        // its control socket, scripts and health sockets.
         let l = &self.cfg.logging;
-        let mut skip: Vec<PathBuf> =
-            [&l.file, &l.out_file, &l.err_file].into_iter().flatten().map(|p| abs(p)).collect();
-        skip.push(abs(&self.cfg.socket_path()));
-        skip.push(abs(&self.runtime_dir));
-        Some(watch::Spec::new(w, base, skip))
+        let mut skip: Vec<watch::Skip> = Vec::new();
+        for p in [&l.file, &l.out_file, &l.err_file].into_iter().flatten() {
+            skip.extend(skip_entries(abs(p, "the log file")?, l.per_worker_files));
+        }
+        skip.extend(skip_entries(abs(&self.cfg.socket_path(), "the control socket")?, false));
+        // The runtime directory as written, and by its real path when that differs (a symlink).
+        let runtime = abs(&self.runtime_dir, "the runtime directory")?;
+        let mut runtimes = vec![runtime.clone()];
+        runtimes.extend(std::fs::canonicalize(&runtime).ok().filter(|real| *real != watch::clean(&runtime)));
+        let watched: Vec<PathBuf> =
+            [base.clone()].into_iter().chain(w.paths.iter().map(|p| base.join(p))).map(|p| watch::clean(&p)).collect();
+        for runtime in runtimes {
+            let runtime_clean = watch::clean(&runtime);
+            if watched.iter().any(|p| p.starts_with(&runtime_clean)) {
+                // The runtime directory is, or is above, what is watched (`socket =
+                // "/tmp/app.sock"` with the app under /tmp): skipping it all would
+                // skip the app. Only what Warden writes in it is skipped.
+                let app = &self.cfg.app.name;
+                for (start, end) in
+                    [(format!("{app}-shim."), ""), (format!("{app}-host."), ""), (format!("{app}.h"), ".sock")]
+                {
+                    skip.push(watch::Skip::Prefix(runtime.join(start), end.into()));
+                }
+            } else {
+                skip.push(watch::Skip::Path(runtime));
+            }
+        }
+        Ok(Some(watch::Spec::new(w, base, skip)))
+    }
+
+    /// What a watcher that starts could not do, as a warning: with workers that
+    /// cannot run side by side, a restart stops the old worker first, so a
+    /// version that fails to start takes that worker down.
+    fn watch_start_warning(&self) -> Option<String> {
+        let why = self.cfg.no_overlap_reason()?;
+        Some(format!(
+            "a restart stops each worker before starting its replacement ({why}), so a version that fails to start \
+             leaves that worker down until the files are fixed: there is no old worker to roll back to"
+        ))
     }
 
     /// Start, replace or stop the watcher so that it matches `[watch]` (a
@@ -1861,7 +1952,39 @@ impl Supervisor {
     /// watcher starts from the files as they are: what changed while the
     /// workers were stopped is what they start with.
     fn sync_watch(&mut self) {
-        let want = self.watch_spec();
+        // A watcher that died (its panic is logged): nothing watches until
+        // `warden reload`, a start of the workers or a change of `[watch]`.
+        if let Some((spec, _)) = self.watch.take_if(|(_, h)| h.is_finished()) {
+            error!(
+                "file watching has stopped: changes to files restart nothing until it is started again",
+                hint = "the error above says why; `warden reload` starts watching again",
+            );
+            self.watch_failed = Some(spec);
+            self.watch_pending = None;
+            self.watch_token += 1;
+        }
+        let want = match self.watch_spec() {
+            Ok(want) => {
+                self.watch_blocked = false;
+                want
+            }
+            Err(e) => {
+                if !self.watch_blocked {
+                    self.watch_blocked = true;
+                    error!(
+                        "file watching cannot start: it does not know where the app's files are",
+                        reason = e,
+                        hint = "set [app] working_directory (an absolute path) and `warden reload`",
+                    );
+                }
+                // Not watching "/" instead: the watcher goes until it can say where to look.
+                if self.watch.take().is_some() {
+                    self.watch_pending = None;
+                    self.watch_token += 1;
+                }
+                return;
+            }
+        };
         if want.is_none() {
             // Off, or the workers are not running: a later start tries afresh.
             self.watch_failed = None;
@@ -1889,6 +2012,14 @@ impl Supervisor {
                     interval_ms = spec.interval.as_millis(),
                     max_files = spec.max_files,
                 );
+                if let Some(w) = self.watch_start_warning() {
+                    warn!(
+                        "file watching is on, but a failing restart cannot be rolled back",
+                        reason = w,
+                        hint = "let the workers share the port (Bun or Node through the shim, port_strategy = \"shared\") \
+                                so a restart starts the new worker next to the old one",
+                    );
+                }
                 self.watch = Some((spec, handle));
             }
             Err(e) => {
@@ -2001,7 +2132,7 @@ impl Supervisor {
                         hint = "a deploy may be halfway through swapping `current`; check working_directory if it \
                                 keeps failing",
                     );
-                    self.watch_retry = Some((failures, now + Self::WATCH_RETRY));
+                    self.watch_retry = Some((failures, crate::restart::later(now, Self::WATCH_RETRY)));
                     self.watch_pending = Some(change);
                 } else {
                     self.watch_retry = None;
@@ -2022,6 +2153,8 @@ impl Supervisor {
         if self.stopped {
             return Response::err("workers are stopped; use `warden restart`");
         }
+        // A watcher that died or could not start is tried again by the next tick.
+        self.watch_failed = None;
         let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
         let kind = if safe { Kind::SafeReload } else { Kind::Reload };
         match self.begin_rollout(kind, ids, String::new(), false) {
@@ -2497,7 +2630,7 @@ impl Supervisor {
             user: Some(user),
             build: crate::stamp::build(),
             cwd: self.shown_cwd(),
-            watching: self.cfg.watch.enabled,
+            watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
         }
     }
 }
@@ -2573,6 +2706,24 @@ fn role_name(r: Role) -> &'static str {
         Role::Retiring => "retiring",
         Role::Standby => "standby",
     }
+}
+
+/// A path Warden writes (a log file, the socket), as the watcher must not
+/// see it: lexically clean (done by `Spec::new`), and also by its real path
+/// when its directory is reached through a symlink. `log`: the file is a log
+/// that may be written per worker (`out-1.log`).
+fn skip_entries(path: PathBuf, log: bool) -> Vec<watch::Skip> {
+    let make = |p: PathBuf| if log { watch::Skip::Log(p) } else { watch::Skip::Path(p) };
+    let mut v = vec![make(path.clone())];
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(real) = std::fs::canonicalize(dir) {
+            let real = real.join(name);
+            if real != watch::clean(&path) {
+                v.push(make(real));
+            }
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -2733,6 +2884,16 @@ mod watch_tests {
 
     /// The same for any `[workers]` keys and worker script.
     async fn rig_of(name: &str, workers: &str, app: &str, watch: &str) -> (Rig, PathBuf) {
+        let (mut r, dir) = bare(name, workers, app, watch);
+        r.sup.start_all();
+        r.until("every worker running", all_running).await;
+        (r, dir)
+    }
+
+    /// A supervisor whose workers are not started, for what `[watch]` asks for. `watch` is the
+    /// rest of the config after `[watch] enabled = true` (more keys, then more sections). Relative
+    /// paths in it are relative to the scratch directory, as if Warden had been started there.
+    fn bare(name: &str, workers: &str, app: &str, watch: &str) -> (Rig, PathBuf) {
         let dir = std::env::temp_dir().join(format!("warden-watchrig-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2742,14 +2903,35 @@ mod watch_tests {
             dir.display().to_string()
         );
         let mut r = Rig::new(&format!("watch-{name}"), &sections, app);
-        r.sup.start_all();
-        r.until("every worker running", all_running).await;
+        r.sup.launch_cwd = Some(dir.clone());
         (r, dir)
+    }
+
+    /// How many files a watcher with these settings looks at (a first scan).
+    fn files_seen(spec: &watch::Spec) -> usize {
+        let mut w = watch::Watcher::new(spec).unwrap();
+        let scanned = w.scan(&std::sync::atomic::AtomicBool::new(false));
+        w.apply(scanned, Instant::now()).baseline.unwrap()
+    }
+
+    fn write(dir: &Path, rel: &str) {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, "1").unwrap();
+    }
+
+    /// Remove a `bare` scratch directory and the runtime directory of its rig.
+    fn tidy(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        let name = dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("warden-watchrig-"));
+        if let Some(name) = name {
+            let _ = std::fs::remove_dir_all(dir.with_file_name(format!("warden-rig-watch-{name}")));
+        }
     }
 
     async fn finish(r: Rig, dir: PathBuf) {
         r.shutdown().await;
-        let _ = std::fs::remove_dir_all(dir);
+        tidy(&dir);
     }
 
     /// The whole way: a file written in the working directory is noticed by
@@ -2866,12 +3048,14 @@ mod watch_tests {
             assert_eq!(r.sup.watch_token, token, "nothing changed: the same watcher keeps its baseline");
 
             // Stopped workers are not watched; started ones are, from the files as they are.
+            assert!(r.sup.status().watching);
             r.sup.stopped = true;
             r.sup.sync_watch();
             assert!(r.sup.watch.is_none() && r.sup.watch_token > token);
+            assert!(!r.sup.status().watching, "status says what runs, not what the config asks for");
             r.sup.stopped = false;
             r.sup.sync_watch();
-            assert!(r.sup.watch.is_some());
+            assert!(r.sup.watch.is_some() && r.sup.status().watching);
 
             // A reload that changed [watch].
             let token = r.sup.watch_token;
@@ -2897,17 +3081,33 @@ mod watch_tests {
         .await;
     }
 
-    /// A slot that gave up is tried again by the watch restart, as by `warden restart`.
+    /// A slot that gave up (FAILED: it crashed too often) is tried again by the
+    /// watch restart, as by `warden restart`: fixing the file that crashed it
+    /// is the point. The worker crashes while `crash` exists in its directory.
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_slot_is_tried_again() {
         local(async {
-            let (mut r, dir) = rig("failed", 1, "").await;
-            r.sup.slots.get_mut(&1).unwrap().failed_at = Some(Instant::now());
+            const CRASHER: &str = "[ -e crash ] && exit 5\n\
+                echo '{\"ev\":\"listening\",\"port\":1}' >&3\nexec sleep 60\n";
+            let (mut r, dir) = bare(
+                "failed",
+                "count = 1\n",
+                CRASHER,
+                "[restart]\nmax_restarts = 1\nrestart_window = 60\nbackoff_initial = 10\nbackoff_max = 20\n",
+            );
+            write(&dir, "crash");
+            r.sup.start_all();
+            r.until("the slot gave up", |s| s.slots[&1].state == State::Failed).await;
+            assert!(r.sup.slots[&1].current.is_none() && r.sup.status().workers[0].state == "FAILED");
+            // The fix: the file that crashed it goes away, and Warden notices the change.
+            std::fs::remove_file(dir.join("crash")).unwrap();
             let token = r.sup.watch_token;
-            r.sup.on_watch(token, change("fix.js"));
-            assert!(r.sup.roll.is_some());
-            assert!(r.sup.slots[&1].failed_at.is_none());
+            r.sup.on_watch(token, change("crash"));
+            assert!(r.sup.roll.is_some() && r.sup.slots[&1].failed_at.is_none());
             r.until("the restart ends", |s| s.roll.is_none()).await;
+            let o = r.sup.last_rollout.clone().unwrap();
+            assert!(o.ok, "{o:?}");
+            assert!(all_running(&r.sup), "the slot serves again: {:?}", r.sup.status().workers);
             finish(r, dir).await;
         })
         .await;
@@ -2948,6 +3148,186 @@ exec sleep 60
             finish(r, dir).await;
         })
         .await;
+    }
+
+    /// F1: what Warden writes itself is not a change, however the paths in
+    /// `[logging]` are written (`./x`, `a/../x`) and for per-worker files
+    /// (`out-1.txt`): else each restart's own log lines would start the next.
+    #[test]
+    fn the_log_files_are_never_a_change() {
+        let (r, dir) = bare(
+            "own-logs",
+            "count = 2\n",
+            APP,
+            "ignore = []\n[logging]\nfile = \"./warden.out\"\nout_file = \"logs/../out.txt\"\nper_worker_files = true\n",
+        );
+        // `..` out of the directory and back in: the path the scanner sees is the clean one.
+        let name = dir.file_name().unwrap().to_str().unwrap().to_string();
+        let mut r = r;
+        r.sup.cfg.logging.err_file = Some(PathBuf::from(format!("../{name}/err.txt")));
+        for f in [
+            "app.js",
+            "warden.out",
+            "warden.out.1",
+            "out.txt",
+            "out-1.txt",
+            "out-2.txt",
+            "out-s1.txt",
+            "out-1.txt.2.gz",
+            "err.txt",
+            "err-2.txt",
+            "err-host.txt.1",
+        ] {
+            write(&dir, f);
+        }
+        let spec = r.sup.watch_spec().unwrap().unwrap();
+        assert_eq!(files_seen(&spec), 1, "only app.js: {:?}", spec.skip);
+        // Not per worker: out-1.txt is the app's own file then.
+        r.sup.cfg.logging.per_worker_files = false;
+        let spec = r.sup.watch_spec().unwrap().unwrap();
+        assert_eq!(files_seen(&spec), 7, "app.js and the six per-worker files, now the app's own");
+        tidy(&dir);
+    }
+
+    /// F2: a control socket in the watched tree, or above it (`/tmp/app.sock`
+    /// with the app in /tmp), must not hide the tree: only what Warden writes
+    /// there is skipped.
+    #[test]
+    fn a_control_socket_next_to_the_app_does_not_hide_it() {
+        let (mut r, dir) = bare("socket-in-tree", "count = 1\n", APP, "ignore = []\n");
+        let app = r.sup.cfg.app.name.clone();
+        r.sup.cfg.control.socket = Some(dir.join("warden.sock"));
+        r.sup.runtime_dir = dir.clone();
+        for f in [
+            "app.js".to_string(),
+            "lib/util.js".to_string(),
+            "warden.sock".to_string(),
+            format!("{app}-shim.mjs"),
+            format!("{app}-shim.tmp"),
+            format!("{app}-host.mjs"),
+            format!("{app}.h1-1.sock"),
+            // Neighbours in a shared directory are the app's.
+            format!("{app}.helpers.js"),
+            format!("{app}-shimmer.js"),
+        ] {
+            write(&dir, &f);
+        }
+        let spec = r.sup.watch_spec().unwrap().unwrap();
+        assert_eq!(files_seen(&spec), 4, "app.js, lib/util.js and the two neighbours: {:?}", spec.skip);
+
+        // The runtime directory above the working directory (`/tmp/app.sock`, the app in `/tmp/app`).
+        let work = dir.join("app");
+        write(&work, "main.js");
+        r.sup.cfg.app.working_directory = Some(work.clone());
+        assert_eq!(files_seen(&r.sup.watch_spec().unwrap().unwrap()), 1, "main.js, not the files next to it");
+
+        // Inside the tree, and only Warden's: skipped whole, whatever is in it.
+        let run = dir.join("app/run");
+        write(&run, "control.sock");
+        write(&run, "anything.else");
+        r.sup.runtime_dir = run.clone();
+        r.sup.cfg.control.socket = Some(run.join("control.sock"));
+        assert_eq!(files_seen(&r.sup.watch_spec().unwrap().unwrap()), 1, "main.js; run/ is Warden's");
+
+        // The same directory reached through a symlink (`/var/run` is one on some systems): the
+        // files are found under their real names, so the real name is skipped as well.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&run, &link).unwrap();
+        r.sup.runtime_dir = link.clone();
+        r.sup.cfg.control.socket = Some(link.join("control.sock"));
+        assert_eq!(files_seen(&r.sup.watch_spec().unwrap().unwrap()), 1, "main.js; link/ is run/, Warden's");
+        tidy(&dir);
+    }
+
+    /// F3: with no working directory and a directory Warden started in that is
+    /// gone, there is no place to look: not "/".
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deleted_starting_directory_does_not_make_the_watcher_look_at_the_root() {
+        local(async {
+            let (mut r, dir) = bare("no-cwd", "count = 1\n", APP, "");
+            let fresh = Rig::new("watch-cwd", "", APP);
+            assert_eq!(fresh.sup.launch_cwd, std::env::current_dir().ok(), "taken once, at the start");
+            drop(fresh);
+            let _ = std::fs::remove_dir_all(
+                std::env::temp_dir().join(format!("warden-rig-watch-cwd-{}", std::process::id())),
+            );
+            r.sup.cfg.app.working_directory = None;
+            r.sup.launch_cwd = None;
+            let e = r.sup.watch_spec().unwrap_err();
+            assert!(e.contains("working directory") && e.contains("cannot be read"), "{e}");
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none() && r.sup.watch_blocked && !r.sup.status().watching);
+            let token = r.sup.watch_token;
+            r.sup.sync_watch();
+            assert_eq!(r.sup.watch_token, token, "said once, not every tick");
+            // Absolute paths need no starting directory.
+            r.sup.cfg.app.working_directory = Some(dir.clone());
+            assert!(r.sup.watch_spec().unwrap().is_some());
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_some() && !r.sup.watch_blocked, "watching as soon as it can say where");
+            // A relative log file needs it.
+            r.sup.launch_cwd = None;
+            r.sup.cfg.logging.file = Some(PathBuf::from("warden.out"));
+            let e = r.sup.watch_spec().unwrap_err();
+            assert!(e.contains("the log file warden.out"), "{e}");
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none(), "a watcher that cannot be told where to look goes");
+            tidy(&dir);
+        })
+        .await;
+    }
+
+    /// F4: a watcher that died is noticed (not trusted), said once, not
+    /// restarted every tick, and started again by `warden reload`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_watcher_is_noticed_and_a_reload_starts_another() {
+        local(async {
+            let (mut r, dir) = rig("dead", 1, "debounce_ms = 0\ninterval_ms = 100\n").await;
+            // Instead of the real watcher: one that panics when it is told of a change.
+            let spec = r.sup.watch_spec().unwrap().unwrap();
+            r.sup.watch = Some((spec.clone(), watch::spawn(spec, |_| panic!("boom")).unwrap()));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            write(&dir, "x.js");
+            let t0 = Instant::now();
+            while !r.sup.watch.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+                assert!(t0.elapsed() < Duration::from_secs(5), "the watcher never died");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(!r.sup.status().watching, "a dead watcher is not watching");
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_none() && r.sup.watch_failed.is_some());
+            let token = r.sup.watch_token;
+            r.sup.sync_watch();
+            assert_eq!((r.sup.watch.is_none(), r.sup.watch_token), (true, token), "not started again every tick");
+            assert!(!r.sup.status().watching);
+            // What the log hint says.
+            assert!(r.sup.request_reload(false).ok);
+            r.until("the reload ends", |s| s.roll.is_none()).await;
+            r.sup.sync_watch();
+            assert!(r.sup.watch.is_some() && r.sup.status().watching, "watching again");
+            finish(r, dir).await;
+        })
+        .await;
+    }
+
+    /// F6: with workers that cannot run side by side a failing restart leaves
+    /// the app down: a watcher that starts says so.
+    #[test]
+    fn watching_an_app_that_cannot_roll_back_says_so() {
+        let (mut r, dir) = bare("no-overlap", "count = 1\n", APP, "");
+        assert_eq!(r.sup.watch_start_warning(), None, "workers overlap (overlap = true)");
+        r.sup.cfg.workers.overlap = None;
+        // `sh` on a port is no Bun or Node: no shim, no SO_REUSEPORT.
+        let w = r.sup.watch_start_warning().unwrap();
+        assert!(w.contains("without Warden's shim") && w.contains("leaves that worker down"), "{w}");
+        r.sup.cfg.workers.overlap = Some(false);
+        assert!(r.sup.watch_start_warning().unwrap().contains("overlap = false"));
+        r.sup.cfg.workers.overlap = None;
+        r.sup.cfg.app.port = None;
+        assert_eq!(r.sup.watch_start_warning(), None, "no port: nothing to collide on");
+        r.sup.cfg.workers.port_strategy = PortStrategy::Offset;
+        assert!(r.sup.watch_start_warning().unwrap().contains("offset"));
+        tidy(&dir);
     }
 
     /// A restart that cannot begin (the release does not resolve: a deploy

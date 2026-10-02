@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon/png/warden-256.png" alt="Warden" width="128"></p>
+
 # Warden
 
 A fast, crash-safe supervisor for Bun and Node apps. It runs N copies of your
@@ -110,7 +112,7 @@ or `$WARDEN_PARALLEL` changes that.
 | `pm2 stop api`, `pm2 delete api` | `warden stop api`, `warden delete api` |
 | `pm2 monit` | `warden top`, `warden events` |
 | `pm2 save`, `resurrect`, `startup`, `update` | `warden save`, `resurrect`, `startup`, `update` |
-| `pm2 start app.js --watch` | `warden start app.js --watch` (opt-in, a gated rolling restart: [docs/watch.md](docs/watch.md)) |
+| `pm2 start app.js --watch` | `warden start app.js --watch` (opt-in, a gated rolling restart where workers can overlap: [docs/watch.md](docs/watch.md)) |
 | `pm2 serve dist 8080` | `warden serve dist 8080` |
 
 To move your running apps:
@@ -124,6 +126,11 @@ warden pm2-migrate --finalize                  # remove the migrated apps from P
 
 Env values go to a 0600 file, never into the config. The command-by-command
 differences, and what `pm2-migrate` carries over: [docs/comparison.md](docs/comparison.md).
+
+Coming from wattpm? `warden migrate-wattpm` turns a Platformatic Watt project
+into one Warden app per application and lists what has no equivalent (Gateway
+composition, the in-process `plt.local` mesh, framework integration). See
+[docs/wattpm.md](docs/wattpm.md).
 
 ## Configuration
 
@@ -160,6 +167,17 @@ small files. Details and the `[static]` keys: [docs/static-serving.md](docs/stat
 ## GUI
 
 ![Warden GUI: every app with its state, workers, CPU and memory](docs/gui-main-screen.png)
+
+<table>
+  <tr>
+    <td><img src="docs/gui-main-screen-light.png" alt="Light mode"><br><sub>Light mode, or follow the desktop</sub></td>
+    <td><img src="docs/gui-history.png" alt="History charts"><br><sub>1, 6 or 24 hour charts per app</sub></td>
+  </tr>
+  <tr>
+    <td><img src="docs/gui-settings.png" alt="Settings"><br><sub>Settings: Warden or the desktop's own colors</sub></td>
+    <td><img src="docs/gui-add-app.png" alt="Add an app"><br><sub>Add an app, or edit its config</sub></td>
+  </tr>
+</table>
 
 `warden-gui` is a native window on wardend: every app with its state, workers,
 CPU and memory, live; logs, events and 1, 6 or 24 hour charts per app; and the
@@ -199,6 +217,7 @@ and [bench/README.md](bench/README.md). `cargo xtask bench` re-runs everything.
 | [wardend](docs/wardend.md) | The host daemon: events, alerts, history |
 | [Static serving](docs/static-serving.md) | `warden serve` and `[static]` |
 | [File watching](docs/watch.md) | `[watch]`, `warden start --watch` |
+| [Coming from wattpm](docs/wattpm.md) | Command mapping, `warden migrate-wattpm`, who should move |
 | [Behind a proxy](docs/proxies.md) | nginx, AWS ALB/NLB, GCP, Cloudflare, no proxy |
 | [Troubleshooting](docs/troubleshooting.md) | Problems by symptom, each with a fix |
 | [Platforms](docs/platforms.md), [Windows](docs/windows.md) | Linux, macOS, Windows (WSL2), runtime requirements, the plan for a native build |
@@ -222,3 +241,6 @@ ship it, commercially too. Contributions are accepted under the same terms.
 Release archives list the licenses of the third-party crates compiled in
 (`THIRD-PARTY-LICENSES.txt`; `about.toml` keeps that list to permissive
 licenses).
+The GUI embeds Inter, Plus Jakarta Sans and JetBrains Mono (OFL) and Lucide
+icons (ISC); their licenses ship as `FONT-LICENSES.txt` in the macOS app, the
+Linux GUI archive and the `.deb`/`.rpm`.

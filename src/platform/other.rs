@@ -4,7 +4,7 @@
 //! host events; `warden doctor` says so. A real adapter for a new OS is a
 //! new file next to this one and one arm in `platform::current`.
 
-use super::{Capabilities, Environ, HostSnapshot, Listener, Platform, ProcStats};
+use super::{Capabilities, Environ, HostSnapshot, Listener, Platform, ProcIdentity, ProcStats};
 use std::path::PathBuf;
 
 pub(crate) struct Other;
@@ -20,6 +20,7 @@ pub(crate) fn none() -> Capabilities {
         reuseport_balances: false,
         parent_death_signal: false,
         oom_attribution: false,
+        orphan_sweep: false,
     }
 }
 
@@ -41,6 +42,10 @@ impl Platform for Other {
     }
 
     fn proc_environ(&self, _pid: u32) -> Option<Environ> {
+        None
+    }
+
+    fn proc_identity(&self, _pid: u32) -> Option<ProcIdentity> {
         None
     }
 
@@ -88,6 +93,7 @@ mod tests {
         assert_eq!(p.capabilities(), none());
         assert!(p.proc_stats(1).is_none() && p.proc_owner(1).is_none() && p.proc_environ(1).is_none());
         assert!(p.proc_cwd(1).is_none() && p.proc_name(1).is_none() && p.listening_ports(1).is_none());
+        assert!(p.proc_identity(1).is_none());
         assert!(p.listeners(1).is_none() && p.children(1).is_none());
         assert!(p.command_lines().is_empty() && p.host_snapshot().is_none() && p.boot_id().is_none());
     }

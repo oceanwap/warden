@@ -20,7 +20,7 @@ cargo xtask chaos           # chaos soak: a fleet under load, random faults, inv
 cargo release 0.2.0         # a release (see Releasing below); `cargo xtask release --help`
 cargo dist-macos            # the macOS release archives, built on this Mac (see Releasing below)
 scripts/mac-check.sh        # on a Mac: builds, runs the platform tests and drives a real supervisor and
-                            # wardend (CPU, memory, user, ports, environment, host events, static latency); the report
+                            # wardend (CPU, memory, user, ports, environment, host events, static bodies and latency); the report
                             # is target/mac-check/report.txt
 ```
 
@@ -28,12 +28,14 @@ The workspace: `warden` (the repository root), `protocol/` (the wire types, serd
 only, shared by `warden` and the GUI), `gui/` (`warden-gui`) and `xtask/`.
 Plain `cargo build` and `cargo test` here mean `warden` only.
 
-All `unsafe` code is in [`src/sys.rs`](../src/sys.rs) and its macOS half
-[`src/sys/darwin.rs`](../src/sys/darwin.rs) (`protocol/` and `gui/` have none:
-`#![forbid(unsafe_code)]`): system calls the standard library doesn't expose,
-and the few that measurably pay on a hot path (the static server and log
-capture), each with a SAFETY note and tests. The rest of the crate is
-`#![deny(unsafe_code)]`.
+All `unsafe` code of the program is in [`src/sys.rs`](../src/sys.rs) and its
+macOS half [`src/sys/darwin.rs`](../src/sys/darwin.rs) (`protocol/` and `gui/`
+have none: `#![forbid(unsafe_code)]`): system calls the standard library
+doesn't expose, the few that measurably pay on a hot path (the static server
+and log capture), and the two `Command::pre_exec` calls, which are behind safe
+wrappers there (`pre_exec_worker`, `pre_exec_new_session`), each with a SAFETY
+note and tests. The rest of the crate is `#![deny(unsafe_code)]`. (The tests
+under `tests/` make a few `unsafe` libc calls of their own, such as `kill`.)
 
 What differs per OS (reading a process's memory, owner, ports and
 environment, the host's load, the boot id) sits behind one trait with an

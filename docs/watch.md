@@ -12,16 +12,24 @@ enabled = true
 
 Warden looks at the app's files, and when they change it starts a rolling
 restart: the same gated restart `warden restart <app>` does, so the new
-workers must start and pass their health checks before they take over, and
-a version that fails is rolled back while the old workers keep serving.
+workers must start and pass their health checks before they take over. Where
+workers can run side by side (Bun and Node apps through Warden's shim, apps
+without a port; see [Rolling restarts and the gates](#rolling-restarts-and-the-gates)),
+a version that fails is rolled back while the old workers keep serving. Where
+they cannot, each old worker stops first, and a version that fails to start
+leaves the app down until the next change: Warden says so when it starts
+watching such an app.
 
 It is **off by default**. Production apps are deployed (a new release, then
 `warden reload` or `warden safe-reload`, see [`deploys.md`](deploys.md)), not
 edited in place, and a restart that nobody asked for is the last thing a
 production server needs. Watching is for development, staging and apps that
-really are edited where they run. When it is on, `warden list` shows
+really are edited where they run. While a watcher runs, `warden list` shows
 `enabled` in its `watching` column, `warden describe` has a `watch` row, and
-`warden status --json` has `"watching": true`.
+`warden status --json` has `"watching": true`. That is the watcher itself, not
+the config: it is `false` when `[watch]` is off, while the workers are
+stopped, and after the watcher failed (the log says why, and `warden reload`
+starts it again; see [What can go wrong](#what-can-go-wrong)).
 
 ## What happens
 
@@ -38,9 +46,9 @@ really are edited where they run. When it is on, `warden list` shows
      health_passes` health checks, `verify_command` and `min_ready`, if you set
      them (not `preflight` or `canary_soak`: those belong to `reload` and
      `safe-reload`);
-   - a version that fails a gate is rolled back: the old workers keep serving,
-     `warden status` shows the failed rollout and the reason, and the next
-     change tries again;
+   - a version that fails a gate is rolled back when the workers can overlap
+     (below): the old workers keep serving, `warden status` shows the failed
+     rollout and the reason, and the next change tries again;
    - hot standbys (`[workers] standby`) are replaced too, and a worker that
      had given up (`FAILED`) is tried again: fixing the file that crashed it is
      the point.
@@ -58,6 +66,13 @@ really are edited where they run. When it is on, `warden list` shows
 | `debounce_ms` | `500` | How long the files must stay unchanged before the restart starts (0 to 600000; PM2's `watch_delay`) |
 | `interval_ms` | `1000` | Time between two looks at the files (100 to 3600000). A slow scan stretches it (see Cost) |
 | `max_files` | `10000` | Most files and directories looked at (1 to 100000). The rest is not watched, and one warning says so |
+
+Relative paths start at `[app] working_directory`; without one, at the
+directory Warden was started in, which Warden records when it starts. If that
+directory has been deleted since, there is no place to look: Warden logs an
+error once (`file watching cannot start: it does not know where the app's files
+are`) and does not watch anything, rather than watching `/`. Set `working_directory`
+to an absolute path, then `warden reload`.
 
 `warden check -c app.toml` validates all of it. A `[watch]` section for an
 app with a `[static]` section is an error: Warden's file server reads the
@@ -84,10 +99,33 @@ regular expressions, braces or `!` negation: list what to skip, and narrow
 | `uploads/` | A trailing `/`: directories only, a file called `uploads` is still watched |
 | `/var/app/cache` | A leading `/`: an absolute path |
 
-Besides, Warden never watches what it writes itself: its own log files (`[logging]
-file`, `out_file`, `err_file`, and their rotations `app.log.1`,
-`app.log.2026-09-30`, `.gz`), its control socket and its runtime directory,
-wherever they are.
+Besides, Warden never watches what it writes itself, wherever that is and
+however the path is spelled (`./warden.out`, `a//b`, `../logs/app.log`; a
+symlink in the directory part is resolved too, so the file is skipped under its
+real name as well):
+
+- its own log files (`[logging] file`, `out_file`, `err_file`), their
+  rotations (`app.log.1`, `app.log.2026-09-30`, `.gz`) and, with
+  `per_worker_files`, each worker's file (`out.txt` is also `out-1.txt`,
+  `out-2.txt.1`, and so on);
+- its control socket, and its runtime directory: the sockets of the app's
+  workers, the shim and host scripts it writes. When the runtime directory is
+  the app's own (`[control] socket = "/srv/app/warden.sock"` puts the runtime
+  directory at `/srv/app`) or holds it (`/tmp/app.sock` with the app under
+  `/tmp`), only those files are skipped, not the directory: the rest of it is
+  the app.
+
+A file that Warden does not write is not skipped just for being next to one: a
+log file with another name in the same directory is watched unless `ignore`
+covers it (`*.log` does). Paths are compared as written, with the symlinks of
+those directories resolved; a `paths` entry that reaches Warden's files through
+a different symlink than the config names cannot be told apart, and `ignore`
+covers that.
+
+If the first look finds no files at all under `paths` (everything is skipped or
+ignored, or the directory is empty), nothing can restart the app until one
+appears, and Warden says so once: `file watching found no files under the
+watched paths` (a path that does not exist has its own warning, below).
 
 What counts as a change: a file created, removed, written, replaced (an
 editor's atomic save, `rsync`, `mv` over it), touched, or with changed
@@ -136,12 +174,31 @@ gated, and `[reload]` / `[shutdown]` in
   waits (`files changed: restart waits for the rollout in progress`) and is not
   lost: when the rollout is over, one restart covers everything that changed
   meanwhile. Waiting changes are looked at every second.
-- **A bad version is rolled back**, as in a reload. The files stay as they are
-  and nothing restarts again until they change again; fix the file and save.
+- **A bad version is rolled back, when workers can overlap.** The new worker
+  starts next to the old one, so one that fails a gate is dropped and the old
+  workers keep serving. The files stay as they are and nothing restarts again
+  until they change again; fix the file and save. Workers overlap when the app
+  can share its port (a Bun or Node app through Warden's shim: `port_strategy =
+  "shared"`, the default, with the shim on), when it has no `port`, or when
+  `[workers] overlap = true`. They do **not** when `[workers] overlap = false`,
+  with `port_strategy = "offset"`, and for an app that binds its port without
+  the shim (another runtime, `shim = false`): there a restart stops each old
+  worker, then starts its replacement, as `warden restart` does. A version that
+  fails to start leaves that worker down (an app with one worker is down), and
+  Warden starts it again from the files as they are, so it keeps failing until
+  you fix them; the workers not yet replaced keep running the old version.
+  Warden warns when it starts watching such an app (`file watching is on, but a
+  failing restart cannot be rolled back`, with the reason). For these apps,
+  keep `[watch]` to development, or let the workers share the port.
 - **Stopped apps are not restarted.** Watching runs while the workers run:
   `warden stop` ends it, `warden start` starts it again from the files as they
   are (what changed while the app was stopped is what it starts with), and a
-  change that arrives while Warden is shutting down is dropped.
+  change that arrives while Warden is shutting down is dropped. While it is
+  ended, `warden list` shows `disabled` and `warden describe` says `set, but not
+  running`.
+- **A watcher that failed is started again by `warden reload`** (or a `warden
+  start` after a stop, or a change to `[watch]`), not by a file change; see
+  [What can go wrong](#what-can-go-wrong).
 - **`pin_release`.** A restart of every worker moves the workers to the release
   `current` points to now. With watching on, swapping that symlink is itself a
   change (the files seen through it are other files), so a deploy that only
@@ -160,12 +217,28 @@ systems, containers and every OS, and it needs no per-directory resource
 (inotify watches run out on a big tree). The price is a `stat` per file at every
 look.
 
-- **CPU.** The pause between two looks is at least four times the last look's
-  duration, so a big tree on a slow disk costs at most a fifth of a core. When
-  that stretches the interval Warden says so once: `a scan of the watched files
+- **CPU.** The look at the files and its comparison with the last one both run
+  on a worker thread, never on the supervisor's event loop. The pause between
+  two looks is at least four times the last one's duration (both together), so
+  a big tree on a slow disk costs at most a fifth of a core. When that
+  stretches the interval Warden says so once: `a scan of the watched files
   takes long: changes are noticed later than interval_ms`, with `took_ms`.
 - **Memory.** One path and a small fingerprint per watched file, so it grows with
-  the number of files: at most `max_files`.
+  the number of files: at most `max_files`, and about 0.8 KB per file.
+- **What that adds up to.** Measured in a release build on a 2-core VM, with an
+  idle app, `interval_ms = 1000` and `max_files` raised to cover the tree:
+
+  | Files watched | Memory (Warden's resident set) | CPU |
+  |---|---|---|
+  | none (watching off) | 7.0 MB | not measured |
+  | about 9,000 | 15.2 MB | about 3% of a core |
+  | about 99,000 | 78 to 88 MB | about 18% of a core |
+
+  The comparison with the last look used to run on the supervisor's event loop
+  (about 8% of a core there at 100,000 files); it now runs on the same worker
+  thread as the look, so the event loop stays free for health checks, rollouts
+  and control requests. That moved the work; these figures were not measured
+  again after the move.
 - **`max_files`.** Files and directories are counted. Past the limit the rest is
   not watched, in a fixed order (directories sorted by name, depth first), so
   what is watched is the same at every look; one warning says so:
@@ -181,6 +254,28 @@ look.
 Watch the directories that hold the source, not the disk:
 `paths = ["src", "package.json"]` is much cheaper than `"."` in a repository
 with large data or build directories.
+
+## What can go wrong
+
+Watching is optional, so a failure in it ends the watcher and never the app.
+Every case below is one line in `warden logs <app> --events` (and in
+[`troubleshooting.md`](troubleshooting.md#file-watching-watch)):
+
+- **The watcher stopped** (`file watching stopped: the scan panicked`, or `its
+  task panicked`: a Warden bug, with the panic message). Changes restart
+  nothing from then on, and `warden list` shows `disabled` in `watching`
+  (`warden describe` says `set, but not running`). The supervisor notices within
+  a second and says so once (`file watching has stopped`); **`warden reload`
+  starts watching again**, as does a `warden stop` and `warden start`. A change
+  to `[watch]` followed by a reload does too.
+- **It cannot say where to look** (`file watching cannot start`): see
+  [Keys](#keys). Once, not every second.
+- **It finds nothing** (`file watching found no files under the watched paths`):
+  `paths` and `ignore` leave no file at the first look. Files created later are
+  noticed; if there should have been some, `warden describe` shows what is
+  watched and what is ignored.
+- **A restart that fails** is rolled back, or not, depending on whether the
+  workers can overlap: see [Rolling restarts and the gates](#rolling-restarts-and-the-gates).
 
 ## What happens to odd files and directories
 
@@ -214,9 +309,11 @@ Differences:
   or `.eslintrc` is watched. When you do set `ignore_watch` PM2 uses only your
   list, while `warden start --ignore-watch` and the migration add yours to
   the built-in one; in a config file `ignore` replaces it.
-- PM2 restarts the process; Warden does a gated rolling restart (a broken
-  build does not take the app down), and never starts one while another
-  rollout runs.
+- PM2 restarts the process; Warden does a gated rolling restart and never
+  starts one while another rollout runs. Where the workers can overlap, a
+  broken build is rolled back and the old workers keep serving; where they
+  cannot (no shim, `port_strategy = "offset"`, `overlap = false`), it is a
+  stop-then-start, and a broken build takes the worker down.
 - `warden start --watch` is accepted for a new app only; the flags
   `--ignore-watch` and `--watch-delay` need `--watch` (without it Warden says so
   instead of ignoring them).
@@ -227,9 +324,10 @@ The full list is in [`troubleshooting.md`](troubleshooting.md#file-watching-watc
 
 | You see | Why | Fix |
 |---|---|---|
-| Nothing restarts | `warden list` says `disabled` in the `watching` column, or the file is ignored, or outside `paths`, or beyond `max_files` | `warden describe <app>` shows the `watch` row; `warden logs <app> --events` has `file watching on paths=… ignore=…` and the warnings above |
+| Nothing restarts | `warden list` says `disabled` in the `watching` column (off, the workers are stopped, or the watcher failed: the log has `file watching has stopped`), or the file is ignored, or outside `paths`, or beyond `max_files` | `warden describe <app>` shows the `watch` row; `warden logs <app> --events` has `file watching on paths=… ignore=…` and the warnings above; after a failure, `warden reload <app>` |
 | It restarts again and again | Something writes into a watched directory: a log file with another extension, a database file, uploads, a build output the app triggers itself | The last file is in the `files changed` line; add it to `ignore`. Restarts are spaced out (up to 30 s apart) meanwhile |
 | It restarts late | Polling: `interval_ms` plus `debounce_ms`, and a slow scan stretches the interval | Lower both, or watch fewer files |
 | It never restarts while the build runs | By design: it waits for the files to stay unchanged for `debounce_ms` | `watched files keep changing` after 30 s names a file that never settles |
 | A new worker started but the old release still runs | The restart failed a gate and was rolled back | `warden status` shows the rollout and its reason; fix the code and save again |
+| After a save the app is down, or a worker keeps crashing | The workers cannot overlap (`file watching is on, but a failing restart cannot be rolled back` at start), so the old worker was stopped first and the new version failed to start | The crash output is in `warden logs <app>`; fix the code and save. To have a rollback, let the workers share the port ([`configuration.md`](configuration.md#workers)) |
 | An edit of `app.toml` or the `env_file` changed nothing | A watch restart does not read the config again | `warden reload <app>` |

@@ -121,6 +121,26 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   macOS `.dmg` with `Warden.app` next to the zip.
 - The Release workflow can be run as a dry run (build and check everything,
   publish nothing) and writes the release notes from this file.
+- `warden migrate-wattpm [dir|file]` imports a Platformatic Watt project
+  (checked against wattpm 3.71.0). It writes one config and one 0600 env file
+  per application, plus `MIGRATION-wattpm.md`, which lists every setting as
+  mapped, approximated, unsupported or to check. A Gateway and applications
+  without a runnable command are reported, not converted. Options: `--dry-run`,
+  `--apps`, `--out`, `--prefix`, `--command <id>=<line>`, `--overwrite`,
+  `--cutover overlap|new-port:<port>` (starts Warden's copy and never stops
+  wattpm). [`docs/wattpm.md`](docs/wattpm.md): what Watt and Warden each do,
+  the wattpm-to-warden command mapping, and who should and should not move.
+- macOS: a supervisor killed with SIGKILL no longer leaves a second set of
+  workers behind. The next start of the app stops the workers it left running
+  (recorded as pid and start time under the state directory; a reused pid is
+  never touched), and `warden doctor` lists them.
+- GUI: icons on buttons, tabs, state badges, chips, dialogs and Settings;
+  Settings scrolls in short windows. "Install command line tool" in Settings
+  (and a one-time banner on the first run from Warden.app) links `warden` into
+  `/usr/local/bin` (asking for the administrator password if needed, else
+  `~/.local/bin` with a PATH hint), and can remove the link; on Linux it links
+  into `~/.local/bin`.
+- CI runs `tests/static_perf.rs` (with strace on Linux).
 
 ### Changed
 
@@ -136,6 +156,13 @@ with `cargo release 0.1.0` on a Mac (see [`docs/releasing.md`](docs/releasing.md
   connection costs two fewer syscalls. On macOS `SO_NOSIGPIPE` is set once per
   connection and head plus body go out in one `sendfile` (not yet run on a
   Mac). Measured on a loaded 2-CPU VM: [`docs/benchmarks.md`](docs/benchmarks.md).
+- `Status.watching` (the `watching` column) says whether a watcher is running
+  now, not only that `[watch]` is enabled: it reads `disabled` for a stopped
+  app or a watcher that died (`describe` says "set, but not running").
+- All `unsafe` code is in `src/sys.rs` and `src/sys/darwin.rs`: the two
+  `pre_exec` blocks moved behind safe wrappers.
+- Two load-flaky integration tests (hot-standby takeover, OOM attribution of
+  two SIGKILL deaths) are deterministic: they were races in the tests.
 - `warden start --watch` is no longer rejected ("Warden is for production").
   `warden serve --watch` is an error: the file server reads from disk.
 

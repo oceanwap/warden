@@ -87,10 +87,10 @@ jobs:
       # The GUI's SSH test (gui/tests/ssh.rs) runs an sshd of its own, and the
       # proxy test (tests/integration.rs) an nginx of its own, each on a free
       # port with its own config; both skip without them.
-      - name: apt-get install openssh-server nginx
+      - name: apt-get install openssh-server nginx strace
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends openssh-server nginx
+          sudo apt-get install -y -q --no-install-recommends openssh-server nginx strace
       - run: cargo fmt --all --check
       - run: shellcheck install.sh scripts/*.sh .github/code-changed.sh .github/release-notes.sh contrib/nfpm-preremove.sh
       # The macOS release script, with stubs for the Mac-only tools; and the
@@ -127,11 +127,18 @@ jobs:
         run: |
           set -o pipefail
           cargo test --test integration 2>&1 | tee integration.log
+      - name: cargo test --test static_perf
+        if: ${{ !cancelled() }}
+        env:
+          WARDEN_REQUIRE_STRACE: "1"
+        run: |
+          set -o pipefail
+          cargo test --test static_perf 2>&1 | tee static_perf.log
       # Job logs need a login to read; annotations don't: name the failing
       # tests and their panic messages there.
       - name: annotate failing tests
         if: failure()
-        run: python3 .github/annotate-test-failures.py unit.log gui.log integration.log
+        run: python3 .github/annotate-test-failures.py unit.log gui.log integration.log static_perf.log
 
   # The workflow files themselves (and the shell in their `run:` steps, through
   # shellcheck). The Release workflow only ever runs for a release or a dry
@@ -181,11 +188,16 @@ jobs:
         run: |
           set -o pipefail
           cargo test --test integration 2>&1 | tee integration.log
+      - name: cargo test --test static_perf
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --test static_perf 2>&1 | tee static_perf.log
       # Job logs need a login to read; annotations don't: one per failed
       # test, with its captured output.
       - name: annotate failing tests
         if: failure()
-        run: python3 .github/annotate-test-failures.py unit.log integration.log
+        run: python3 .github/annotate-test-failures.py unit.log integration.log static_perf.log
 
   macos:
     needs: changes

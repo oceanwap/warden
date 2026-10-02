@@ -149,6 +149,43 @@ pub fn owner(pid: u32) -> io::Result<u32> {
     Ok(ne_u32(&buf, offset_of!(libc::proc_bsdshortinfo, pbsi_uid)))
 }
 
+/// A process's place in the process table: what tells it from the process
+/// that is given its pid later (`orphans`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BsdInfo {
+    /// The process has exited and waits for its parent to collect it (`SZOMB`).
+    pub zombie: bool,
+    pub ppid: u32,
+    pub pgid: u32,
+    /// When it started (`p_start`, set at fork and kept through exec), in
+    /// microseconds since the epoch.
+    pub start_us: u64,
+}
+
+/// `p_stat` of a process that exited and has not been waited for.
+const SZOMB: u32 = 5;
+
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`: parent, process group and start time.
+/// Like `owner`, only for the caller's own processes (EPERM for another
+/// user's), which is all a supervisor asks about.
+pub fn bsd_info(pid: u32) -> io::Result<BsdInfo> {
+    let mut buf = [0u8; size_of::<libc::proc_bsdinfo>()];
+    pidinfo_exact(pid, libc::PROC_PIDTBSDINFO, &mut buf)?;
+    // The pid the kernel answers for is the one asked about: a mismatch
+    // would be a struct layout this code does not know.
+    if ne_u32(&buf, offset_of!(libc::proc_bsdinfo, pbi_pid)) != pid {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "PROC_PIDTBSDINFO answered for another pid"));
+    }
+    let secs = ne_u64(&buf, offset_of!(libc::proc_bsdinfo, pbi_start_tvsec));
+    let usecs = ne_u64(&buf, offset_of!(libc::proc_bsdinfo, pbi_start_tvusec));
+    Ok(BsdInfo {
+        zombie: ne_u32(&buf, offset_of!(libc::proc_bsdinfo, pbi_status)) == SZOMB,
+        ppid: ne_u32(&buf, offset_of!(libc::proc_bsdinfo, pbi_ppid)),
+        pgid: ne_u32(&buf, offset_of!(libc::proc_bsdinfo, pbi_pgid)),
+        start_us: secs.saturating_mul(1_000_000).saturating_add(usecs),
+    })
+}
+
 /// The working directory: `proc_pidinfo(PROC_PIDVNODEPATHINFO)`.
 pub fn cwd(pid: u32) -> io::Result<PathBuf> {
     let mut buf = vec![0u8; size_of::<libc::proc_vnodepathinfo>()];
@@ -560,6 +597,45 @@ mod tests {
         let _ = spin.wait();
         let secs = c.cpu_ns as f64 / 1e9;
         assert!((0.3..2.0).contains(&secs), "{secs} s of CPU after 1 s of spinning");
+    }
+
+    #[test]
+    fn bsd_info_is_the_parent_group_and_start_time_of_a_process() {
+        let me_info = bsd_info(me()).unwrap();
+        assert!(!me_info.zombie);
+        assert_eq!(me_info.ppid, std::os::unix::process::parent_id());
+        assert!(me_info.pgid > 0);
+        // Started in the past, and not the epoch's microsecond count by accident.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64;
+        assert!(me_info.start_us > 1_600_000_000_000_000 && me_info.start_us <= now, "{me_info:?} at {now}");
+        assert_eq!(bsd_info(me()).unwrap(), me_info, "the same every time");
+
+        // A child: its parent is this process, and it is its own group leader
+        // when it asks to be.
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("sleep").arg("60").process_group(0).stdin(Stdio::null()).spawn().unwrap();
+        let s = Sleeper(child);
+        let info = bsd_info(s.0.id()).unwrap();
+        assert_eq!((info.ppid, info.pgid, info.zombie), (me(), s.0.id(), false), "{info:?}");
+        assert!(info.start_us >= me_info.start_us && info.start_us <= now + 5_000_000, "{info:?}");
+        assert_ne!(info.start_us, me_info.start_us);
+    }
+
+    #[test]
+    fn bsd_info_of_an_exited_child_is_a_zombie_or_nothing_and_of_a_missing_process_an_error() {
+        let mut child = Command::new("true").stdin(Stdio::null()).spawn().unwrap();
+        let pid = child.id();
+        // Exited, not collected yet (`true` takes a few ms): what the kernel
+        // answers for it must never look like a running process, the one
+        // thing the orphan sweep must not take it for.
+        std::thread::sleep(Duration::from_millis(300));
+        match bsd_info(pid) {
+            Ok(info) => assert!(info.zombie, "an exited child that is not collected is a zombie: {info:?}"),
+            Err(_) => {}
+        }
+        child.wait().unwrap();
+        assert!(bsd_info(pid).is_err(), "collected: no such process");
+        assert!(bsd_info(0x7fff_fff0).is_err());
     }
 
     #[test]

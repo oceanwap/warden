@@ -458,10 +458,22 @@ pub fn sendfile_head(
     } else if count == 0 {
         return Ok(0);
     }
-    match sendfile(out, input, offset, count) {
+    after_head(sent, sendfile(out, input, offset, count))
+}
+
+/// What `sendfile_head` returns once `sent` bytes of the head are out and
+/// `body` is what its sendfile call said. A body that could not start yet
+/// (the socket is full: WouldBlock; a signal: Interrupted) is not an error
+/// then: the head is progress and the caller goes on from there. Returning
+/// the error instead would make it send the head again, since it only learns
+/// what went out from an Ok. With nothing sent (an empty head, or a head
+/// that is not out) both errors stay errors: the caller retries with
+/// everything still to send.
+#[cfg(target_os = "linux")]
+fn after_head(sent: usize, body: io::Result<usize>) -> io::Result<usize> {
+    match body {
         Ok(n) => Ok(sent + n),
-        // The head is out; the body waits for the next writable event.
-        Err(e) if sent > 0 && e.kind() == io::ErrorKind::WouldBlock => Ok(sent),
+        Err(e) if sent > 0 && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => Ok(sent),
         Err(e) => Err(e),
     }
 }
@@ -498,6 +510,17 @@ pub fn sendfile_head(
             return Err(e);
         }
     }
+    // ASSUMPTION, not checked on a Mac from here (this is written on Linux):
+    // with an `sf_hdtr` header, the `len` that sendfile(2) hands back counts
+    // every byte sent, the header's included. Everything below rests on it:
+    // `split_head_body` takes the head's bytes off the front of `total`, the
+    // offset moves by what is left, and the caller drops the head once it is
+    // counted. If `len` counted only the file's bytes, the head would be
+    // sent again (a corrupt body, broken keep-alive framing). What `len`
+    // means on the way in does not matter: a short send is just progress
+    // and the caller asks for the rest. The check that settles it is
+    // `scripts/mac-check.sh`: it compares the bytes `warden serve` sends for
+    // a file with the file itself.
     let total = len.max(0) as usize;
     *offset += total.saturating_sub(head.len()) as i64;
     Ok(total)
@@ -831,13 +854,33 @@ pub fn child_dup_ipc(child_fd: RawFd, target: RawFd) -> io::Result<()> {
 /// The child gets `sig` when its parent thread (Warden) dies.
 #[cfg(target_os = "linux")]
 pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
+    // Tests of the macOS orphan sweep run on Linux with workers that outlive
+    // their supervisor (debug builds only). An atomic load: this runs between
+    // fork and exec.
+    #[cfg(debug_assertions)]
+    if WORKERS_OUTLIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
     // SAFETY: prctl(PR_SET_PDEATHSIG) takes the signal as an integer.
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, sig as libc::c_ulong) }).map(|_| ())
 }
 
+/// Set by [`test_workers_outlive_the_supervisor`].
+#[cfg(all(target_os = "linux", debug_assertions))]
+static WORKERS_OUTLIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on workers do not get SIGTERM when their supervisor dies, as on
+/// macOS: how a Linux test makes the orphans the sweep is for
+/// (`WARDEN_TEST_MACOS_ORPHANS`, `platform::orphans`). Debug builds only.
+#[cfg(all(target_os = "linux", debug_assertions))]
+pub fn test_workers_outlive_the_supervisor() {
+    WORKERS_OUTLIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Not Linux: there is no parent-death signal, so this is a no-op. On macOS
 /// workers survive a supervisor killed with SIGKILL (a normal stop still
-/// stops them); they keep running until killed by hand.
+/// stops them); the next start of the app stops them (`platform::orphans`),
+/// and until then they keep running.
 #[cfg(not(target_os = "linux"))]
 pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
     let _ = sig;
@@ -848,6 +891,39 @@ pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
 pub fn child_new_session() -> io::Result<()> {
     // SAFETY: setsid takes no arguments; async-signal-safe.
     check(unsafe { libc::setsid() }).map(|_| ())
+}
+
+/// Set up `cmd`'s child between fork and exec the way a worker needs: the
+/// IPC channel `ipc_fd` (the worker's end of the socketpair) at `target`
+/// (fd 3), and, where the OS can, SIGTERM when its parent dies. The safe
+/// face of `Command::pre_exec`, whose `unsafe` is only about the closure
+/// being async-signal-safe: this one calls nothing but the two helpers
+/// above, so it allocates and locks nothing after fork. `ipc_fd` must stay
+/// open until the command is spawned.
+pub fn pre_exec_worker(cmd: &mut std::process::Command, ipc_fd: RawFd, target: RawFd) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls `child_dup_ipc` (dup2, fcntl) and
+    // `child_parent_death_signal` (prctl or nothing; an atomic load in debug
+    // builds): all async-signal-safe, no allocation, no locks. It captures two
+    // integers.
+    unsafe {
+        cmd.pre_exec(move || {
+            child_dup_ipc(ipc_fd, target)?;
+            child_parent_death_signal(libc::SIGTERM)
+        });
+    }
+}
+
+/// Run `cmd`'s child in a new session (`child_new_session`): detached from
+/// our terminal and process group, so Ctrl-C here or closing the shell does
+/// not reach it. The safe face of `Command::pre_exec`.
+pub fn pre_exec_new_session(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure is `child_new_session`: setsid, async-signal-safe,
+    // no allocation, no locks.
+    unsafe {
+        cmd.pre_exec(child_new_session);
+    }
 }
 
 #[cfg(test)]
@@ -1521,6 +1597,31 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A signal (EINTR) or a full socket (EAGAIN) after the head went out is
+    /// progress, not an error: the caller (`sendfile_all`) retries on both, and
+    /// an error here would send the head a second time, corrupting the body
+    /// and the keep-alive framing. Before anything went out they stay errors,
+    /// so the retry sends it all.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_body_that_cannot_start_after_the_head_reports_the_head_as_sent() {
+        use io::ErrorKind::{BrokenPipe, Interrupted, WouldBlock};
+        let err = |k: io::ErrorKind| -> io::Result<usize> { Err(k.into()) };
+        for k in [WouldBlock, Interrupted] {
+            assert_eq!(after_head(253, err(k)).unwrap(), 253, "{k:?} after the head: the head is out");
+            let e = after_head(0, err(k)).unwrap_err();
+            assert_eq!(e.kind(), k, "{k:?} with nothing sent stays an error: the caller retries it all");
+        }
+        assert_eq!(after_head(253, Ok(1000)).unwrap(), 1253, "head and body bytes together");
+        assert_eq!(after_head(0, Ok(7)).unwrap(), 7);
+        assert_eq!(after_head(253, Ok(0)).unwrap(), 253, "end of file after the head");
+        // A real failure is one, whatever went out before it.
+        assert_eq!(after_head(253, err(BrokenPipe)).unwrap_err().kind(), BrokenPipe);
+        // The raw OS error counts the same as the kind.
+        let eintr = Err(io::Error::from_raw_os_error(libc::EINTR));
+        assert_eq!(after_head(10, eintr).unwrap(), 10);
+    }
+
     /// A file shorter than promised ends the response early: the caller sees
     /// Ok(0) once the head is out, never a hang or an invented body.
     #[test]
@@ -1703,6 +1804,33 @@ mod tests {
         let mut msg = String::new();
         std::fs::File::from(r).read_to_string(&mut msg).unwrap();
         assert_eq!(msg, "ok\n");
+    }
+
+    /// The safe wrappers over `pre_exec` do what the helpers do: the IPC fd
+    /// arrives on fd 3 and works both ways, a second descriptor is not
+    /// shared by accident, and the child leads its own process group.
+    #[test]
+    fn the_pre_exec_wrappers_set_up_the_child() {
+        let (ours, theirs) = socketpair_cloexec().unwrap();
+        let cfd = theirs.as_raw_fd();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "read -r line <&3; echo \"got $line\" >&3; echo $$; ps -o pgid= -p $$ >&3"])
+            .stdout(std::process::Stdio::piped());
+        pre_exec_worker(&mut cmd, cfd, 3);
+        pre_exec_new_session(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        drop(theirs); // only the child's copy remains: its exit is EOF here
+        let mut s = std::os::unix::net::UnixStream::from(ours);
+        s.write_all(b"promote\n").unwrap();
+        let mut over_ipc = String::new();
+        s.read_to_string(&mut over_ipc).unwrap();
+        let mut stdout = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut stdout).unwrap();
+        assert!(child.wait().unwrap().success());
+        let mut lines = over_ipc.lines();
+        assert_eq!(lines.next(), Some("got promote"), "the channel works both ways on fd 3");
+        let (pid, pgid): (i64, i64) = (stdout.trim().parse().unwrap(), lines.next().unwrap().trim().parse().unwrap());
+        assert_eq!(pid, pgid, "the new session made the child its own group leader");
     }
 
     #[cfg(target_os = "linux")]

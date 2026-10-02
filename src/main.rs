@@ -1,8 +1,8 @@
 //! warden: a fast, crash-safe supervisor for Bun and Node apps.
 //! See docs/architecture.md for the design and the findings behind it.
 
-// Unsafe code is confined to `sys` (syscall wrappers, each tested) and the
-// two `Command::pre_exec` call sites; everything else is checked by the compiler.
+// Unsafe code is confined to `sys` (syscall wrappers, each tested, and the
+// two `Command::pre_exec` helpers); everything else is checked by the compiler.
 #![deny(unsafe_code)]
 
 mod cli;
@@ -19,6 +19,7 @@ mod logging;
 mod logview;
 mod metrics;
 mod migrate;
+mod migrate_wattpm;
 mod networking;
 mod platform;
 mod process;
@@ -115,6 +116,7 @@ fn main() {
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
+        Command::WattpmMigrate(ref o) => rt.block_on(migrate_wattpm::run(&args, o)),
         Command::Wardend(cli::WardendCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
         Command::Wardend(cli::WardendCmd::Run { background: true, resurrect }) => {
             rt.block_on(daemon::client::start_background(resurrect))

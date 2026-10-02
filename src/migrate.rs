@@ -754,12 +754,12 @@ pub fn generate(a: &Pm2App, worker_mode: bool, env_file: &str) -> Result<(String
     Ok((out, env))
 }
 
-fn toml_str(s: &str) -> String {
+pub(crate) fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
 
 /// A value for the env file, quoted when it needs to be.
-fn env_quote(v: &str) -> String {
+pub(crate) fn env_quote(v: &str) -> String {
     let plain =
         !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@%+,=".contains(c)) && !v.contains(" #");
     if plain {
@@ -890,7 +890,7 @@ fn ask_mode(a: &Pm2App, o: &MigrateOpts) -> Result<bool, String> {
     Ok(answer.trim() == "2")
 }
 
-fn write_file(path: &Path, text: &str, mode: u32) -> Result<(), String> {
+pub(crate) fn write_file(path: &Path, text: &str, mode: u32) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(d) = path.parent() {
@@ -1008,12 +1008,12 @@ fn args_for(args: &Args, target: Option<&str>) -> Args {
     }
 }
 
-async fn warden_start(args: &Args, cfg: &Path) -> i32 {
+pub(crate) async fn warden_start(args: &Args, cfg: &Path) -> i32 {
     fleet::start(&args_for(args, None), &cfg.display().to_string(), &StartOpts::default()).await
 }
 
 /// Undo a failed start: workers and supervisor go away, the files stay.
-async fn warden_stop(args: &Args, name: &str) {
+pub(crate) async fn warden_stop(args: &Args, name: &str) {
     let _ = fleet::act(&args_for(args, Some(name)), &Action::Shutdown).await;
 }
 

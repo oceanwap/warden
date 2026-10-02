@@ -1214,15 +1214,27 @@ impl Config {
     /// port without Warden's shim (no SO_REUSEPORT: the new one would fail
     /// with EADDRINUSE). Then the old worker stops first.
     pub fn overlap(&self) -> bool {
+        self.no_overlap_reason().is_none()
+    }
+
+    /// Why a rolling restart stops the old worker before it starts the new
+    /// one (so a version that fails to start leaves that worker down, with
+    /// nothing to roll back to), or None when workers overlap.
+    pub fn no_overlap_reason(&self) -> Option<&'static str> {
         match self.workers.overlap {
-            Some(v) => v,
-            None => {
-                self.workers.port_strategy != PortStrategy::Offset
-                    && (self.app.port.is_none()
-                        || self.shim_enabled()
-                        || self.static_files.is_some()
-                        || self.workers.mode == Mode::Worker)
+            Some(true) => None,
+            Some(false) => Some("[workers] overlap = false"),
+            None if self.workers.port_strategy == PortStrategy::Offset => {
+                Some("port_strategy = \"offset\": each worker owns its port")
             }
+            None if self.app.port.is_none()
+                || self.shim_enabled()
+                || self.static_files.is_some()
+                || self.workers.mode == Mode::Worker =>
+            {
+                None
+            }
+            None => Some("the app binds its port without Warden's shim, so two workers cannot share it"),
         }
     }
 
@@ -1915,5 +1927,22 @@ level = "info"
         assert!(!c.overlap());
         assert!(Config::parse(&format!("{node}port = 8000\n")).unwrap().overlap());
         assert!(Config::parse(py).unwrap().overlap(), "no port: nothing to share");
+    }
+
+    /// `overlap()` and its reason agree: a rolling restart that stops the old
+    /// worker first has nothing to roll back to, and `[watch]` says why.
+    #[test]
+    fn a_restart_without_overlap_says_why() {
+        let py = "[app]\nname = \"a\"\ncommand = \"python3\"\nargs = [\"s.py\"]\nport = 8000\n";
+        let why = |extra: &str| Config::parse(&format!("{py}{extra}")).unwrap().no_overlap_reason();
+        assert!(why("").unwrap().contains("without Warden's shim"));
+        assert!(why("[workers]\noverlap = false\n").unwrap().contains("overlap = false"));
+        assert!(why("[workers]\nport_strategy = \"offset\"\n").unwrap().contains("offset"));
+        assert_eq!(why("[workers]\noverlap = true\n"), None, "asked for");
+        let node = "[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\nport = 8000\n";
+        assert_eq!(Config::parse(node).unwrap().no_overlap_reason(), None, "the shim shares the port");
+        let c = Config::parse(&format!("{node}[workers]\nport_strategy = \"offset\"\n")).unwrap();
+        assert!(c.no_overlap_reason().is_some() && !c.overlap());
+        assert!(Config::parse("[app]\nname = \"a\"\ncommand = \"python3\"\n").unwrap().overlap(), "no port");
     }
 }

@@ -81,6 +81,13 @@ APPS (familiar from PM2):
                      --apps a,b  --out <dir>  --dry-run  --mode process|worker
                      --overwrite  --cutover overlap|same-port|new-port:<port>
                      (switch with rollback)  --finalize (remove them from PM2)
+    migrate-wattpm   Import a Platformatic Watt project ([dir|file]: watt.json,
+                     platformatic.json): a config and a 0600 .env file per application, and a
+                     MIGRATION-wattpm.md listing what Warden cannot express (Watt's mesh,
+                     in-process routing, undici interceptors).  -c <config file>
+                     -e <env file>  --apps a,b  --out <dir>  --prefix <p>  --command <app>=<cmd>
+                     --dry-run  --overwrite  --cutover overlap|new-port:<port> (starts
+                     Warden's copy next to Watt; never stops wattpm)
 
 WARDEND (the host daemon, always on: `start` and `resurrect` start it, a crash or `kill -9`
 brings it back, `kill` of everything stops it; WARDEN_NO_DAEMON=1 never starts it. Apps never
@@ -162,6 +169,8 @@ pub enum Command {
     Top,
     Doctor,
     Pm2Migrate(Box<crate::migrate::MigrateOpts>),
+    /// `warden migrate-wattpm [dir|file]`: a Platformatic Watt project into Warden configs.
+    WattpmMigrate(Box<crate::migrate_wattpm::Opts>),
     /// wardend, the internal entry point (not in `--help`): launchd, systemd, the
     /// supervisors and the GUI start it; people use `start`, `resurrect` and `kill`.
     Wardend(WardendCmd),
@@ -342,6 +351,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     // Its options (--env NAME, --out DIR) differ from `start`'s.
     if argv.first().map(String::as_str) == Some("pm2-migrate") {
         return parse_migrate(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("migrate-wattpm") {
+        return crate::migrate_wattpm::parse_args(&argv[1..]);
     }
     let mut config: Option<PathBuf> = None;
     let mut socket = None;
@@ -739,7 +751,7 @@ fn parse_migrate(argv: &[String]) -> Result<Args, String> {
     Ok(Args { command: Command::Pm2Migrate(Box::new(o)), yes, ..empty_args() })
 }
 
-fn empty_args() -> Args {
+pub(crate) fn empty_args() -> Args {
     Args {
         command: Command::Help,
         target: None,
@@ -1186,8 +1198,11 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
 }
 
 /// The `watch` row of `warden describe`: what `[watch]` does, from the effective config.
-fn watch_text(on: bool, w: &serde_json::Value) -> String {
-    if !on {
+/// `running`: a watcher runs now (`status.watching`); it does not while the workers are
+/// stopped, or after it failed (its error is in the log).
+fn watch_text(running: bool, w: &serde_json::Value) -> String {
+    let configured = w["enabled"].as_bool().unwrap_or(false);
+    if !running && !configured {
         return "disabled (`[watch] enabled = true`, or `warden start <script> --watch`, restarts the app when its \
                 files change; docs/watch.md)"
             .into();
@@ -1198,8 +1213,13 @@ fn watch_text(on: bool, w: &serde_json::Value) -> String {
     };
     let n = |k: &str| w[k].as_u64().unwrap_or(0);
     format!(
-        "enabled: a rolling restart {} ms after the files in {} stop changing (ignoring {} patterns: {}); looked at \
+        "{}: a rolling restart {} ms after the files in {} stop changing (ignoring {} patterns: {}); looked at \
          every {} ms, at most {} files",
+        if running {
+            "enabled"
+        } else {
+            "set, but not running (workers stopped, or it failed: `warden logs --events`)"
+        },
         n("debounce_ms"),
         list("paths"),
         w["ignore"].as_array().map_or(0, Vec::len),
@@ -2049,7 +2069,10 @@ mod tests {
                 "debounce_ms": 500, "interval_ms": 1000, "max_files": 10000}}
         });
         let d = render_describe(&s, &info, Some(1), &Fmt::PLAIN);
-        assert!(d.contains("│ watch ") && d.contains("disabled (`[watch] enabled = true`"), "{d}");
+        assert!(d.contains("│ watch ") && d.contains("set, but not running (workers stopped, or it failed"), "{d}");
+        let off = serde_json::json!({"config": {"watch": {"enabled": false}}});
+        let d = render_describe(&s, &off, Some(1), &Fmt::PLAIN);
+        assert!(d.contains("disabled (`[watch] enabled = true`"), "{d}");
         s.watching = true;
         let d = render_describe(&s, &info, Some(1), &Fmt::PLAIN);
         assert!(

@@ -35,6 +35,13 @@ const MAX_DEPTH: usize = 64;
 /// duration, so a big tree on a slow disk costs at most a fifth of a core.
 const PACE: u32 = 4;
 
+/// How many directory entries one scan may list, ignored ones included:
+/// a directory of a million ignored files is not free, so it is bounded all
+/// the same (`max_files` only counts what is watched).
+const fn work_limit(max_files: usize) -> usize {
+    max_files.saturating_mul(16).saturating_add(100_000)
+}
+
 /// Waiting for a change to settle looks at least this often.
 const MIN_SETTLE: Duration = Duration::from_millis(50);
 
@@ -243,23 +250,91 @@ fn tokens_match(tokens: &[Tok], text: &[u8]) -> bool {
     dp[n]
 }
 
-/// What is never watched: the patterns of `watch.ignore`, and absolute paths
-/// Warden writes to itself (its log files and their rotations, its socket).
+/// A path Warden writes itself, which is never a change to restart for. The
+/// paths are absolute and clean (see [`clean`]): they are compared with
+/// the scanner's own, byte for byte.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Skip {
+    /// The path, what is under it, and its rotations: `out.log` also covers
+    /// `out.log.1`, `out.log.2026-09-30` and `out.log.2.gz`, not `out.logger.js`.
+    Path(PathBuf),
+    /// A log file that may be written per worker (`[logging] per_worker_files`):
+    /// like `Path`, and the files of each worker, standby and the worker-mode
+    /// host as well: `out.log` → `out-1.log`, `out-s1.log`, `out-host.log`
+    /// and their rotations.
+    Log(PathBuf),
+    /// What starts with this path and ends with the suffix (which may be
+    /// empty): the scripts and health sockets of an app, in a directory that
+    /// holds other things too (`/tmp`, or the app's own).
+    Prefix(PathBuf, String),
+}
+
+/// The files of each worker of a log: `<dir>/<stem>-<label><ext>[.<rotation>]`.
+#[derive(Debug, Clone)]
+struct WorkerLog {
+    /// `<dir>/<stem>-`
+    prefix: Vec<u8>,
+    /// `.log`, or empty
+    ext: Vec<u8>,
+}
+
+impl WorkerLog {
+    fn new(base: &Path) -> Option<WorkerLog> {
+        let dir = base.parent()?;
+        let stem = base.file_stem()?;
+        let mut prefix = dir.as_os_str().as_bytes().to_vec();
+        if !prefix.ends_with(b"/") {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(stem.as_bytes());
+        prefix.push(b'-');
+        let ext = base.extension().map(|e| [b".", e.as_bytes()].concat()).unwrap_or_default();
+        Some(WorkerLog { prefix, ext })
+    }
+
+    fn matches(&self, abs: &[u8]) -> bool {
+        let Some(rest) = abs.strip_prefix(self.prefix.as_slice()) else { return false };
+        // A label has no dot: what follows it is the extension, then maybe a rotation suffix.
+        let end = rest.iter().position(|&b| b == b'.' || b == b'/').unwrap_or(rest.len());
+        let (label, after) = rest.split_at(end);
+        let Ok(label) = std::str::from_utf8(label) else { return false };
+        let Some(after) = after.strip_prefix(self.ext.as_slice()) else { return false };
+        crate::logging::is_output_label(label) && (after.is_empty() || after[0] == b'.')
+    }
+}
+
+/// What is never watched: the patterns of `watch.ignore`, and what Warden
+/// writes to itself (its log files and their rotations, its socket and scripts).
 #[derive(Debug, Clone, Default)]
 pub struct Ignore {
     names: Vec<Glob>,
     paths: Vec<Glob>,
     skip: Vec<Vec<u8>>,
+    worker_logs: Vec<WorkerLog>,
+    prefixes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Ignore {
-    pub fn new(patterns: &[String], skip: &[PathBuf]) -> Result<Ignore, String> {
+    pub fn new(patterns: &[String], skip: &[Skip]) -> Result<Ignore, String> {
         let mut i = Ignore::default();
         for p in patterns {
             let g = Glob::new(p).map_err(|e| format!("{p:?}: {e}"))?;
             if g.is_path_rule() { i.paths.push(g) } else { i.names.push(g) }
         }
-        i.skip = skip.iter().map(|p| p.as_os_str().as_bytes().to_vec()).filter(|p| !p.is_empty()).collect();
+        for s in skip {
+            let bytes = |p: &Path| p.as_os_str().as_bytes().to_vec();
+            match s {
+                Skip::Path(p) => i.skip.push(bytes(p)),
+                Skip::Log(p) => {
+                    i.skip.push(bytes(p));
+                    i.worker_logs.extend(WorkerLog::new(p));
+                }
+                Skip::Prefix(p, suffix) => i.prefixes.push((bytes(p), suffix.as_bytes().to_vec())),
+            }
+        }
+        // An empty path would match everything.
+        i.skip.retain(|p| !p.is_empty());
+        i.prefixes.retain(|(p, _)| !p.is_empty());
         Ok(i)
     }
 
@@ -272,10 +347,12 @@ impl Ignore {
                 // `out.log` also covers `out.log.1` and `out.log.2026-09-30`, not `out.logger.js`.
                 abs.starts_with(s) && matches!(abs.get(s.len()), None | Some(b'.') | Some(b'/'))
             })
+            || self.prefixes.iter().any(|(p, suffix)| abs.starts_with(p) && abs.ends_with(suffix))
+            || self.worker_logs.iter().any(|w| w.matches(abs))
     }
 
     fn needs_paths(&self) -> bool {
-        !self.paths.is_empty() || !self.skip.is_empty()
+        !self.paths.is_empty() || !self.skip.is_empty() || !self.prefixes.is_empty() || !self.worker_logs.is_empty()
     }
 }
 
@@ -441,17 +518,26 @@ pub struct Spec {
     pub base: PathBuf,
     pub paths: Vec<String>,
     pub ignore: Vec<String>,
-    /// Absolute paths never watched (Warden's own log files and socket).
-    pub skip: Vec<PathBuf>,
+    /// What Warden writes itself (its log files, socket and scripts): never watched.
+    pub skip: Vec<Skip>,
     pub debounce: Duration,
     pub interval: Duration,
     pub max_files: usize,
 }
 
 impl Spec {
-    pub fn new(w: &crate::config::Watch, base: PathBuf, skip: Vec<PathBuf>) -> Spec {
+    pub fn new(w: &crate::config::Watch, base: PathBuf, skip: Vec<Skip>) -> Spec {
+        // The scanner's paths are clean (`.`, `..` and `//` gone): so are these.
+        let skip = skip
+            .into_iter()
+            .map(|s| match s {
+                Skip::Path(p) => Skip::Path(clean(&p)),
+                Skip::Log(p) => Skip::Log(clean(&p)),
+                Skip::Prefix(p, suffix) => Skip::Prefix(clean_prefix(&p), suffix),
+            })
+            .collect();
         Spec {
-            base: normalize(&base),
+            base: clean(&base),
             paths: w.paths.clone(),
             ignore: w.ignore.clone(),
             skip,
@@ -547,7 +633,7 @@ pub struct Watcher {
 impl Watcher {
     pub fn new(spec: &Spec) -> Result<Watcher, String> {
         let ignore = Ignore::new(&spec.ignore, &spec.skip)?;
-        let mut roots: Vec<PathBuf> = spec.paths.iter().map(|p| normalize(&spec.base.join(p))).collect();
+        let mut roots: Vec<PathBuf> = spec.paths.iter().map(|p| clean(&spec.base.join(p))).collect();
         roots.sort();
         roots.dedup();
         // `src` inside `.`: scanned once, as part of `.`.
@@ -577,9 +663,12 @@ impl Watcher {
 
     /// One look at the files. Runs on a blocking thread; `cancel` ends it early.
     pub fn scan(&self, cancel: &AtomicBool) -> Scanned {
-        // Work limit: ignored entries are listed too, so a directory of a
-        // million ignored files is not free; it is bounded all the same.
-        let work = self.spec.max_files.saturating_mul(16).saturating_add(100_000);
+        self.scan_with_work(cancel, work_limit(self.spec.max_files))
+    }
+
+    /// `scan` with the number of directory entries it may list, ignored ones
+    /// included, before it gives up (`truncated`).
+    fn scan_with_work(&self, cancel: &AtomicBool, work: usize) -> Scanned {
         let mut w = Walk {
             ignore: &self.ignore,
             cancel,
@@ -726,14 +815,23 @@ fn diff(old: &HashMap<PathBuf, Print>, new: &HashMap<PathBuf, Print>) -> (usize,
     (count, first.map(|(p, k)| (p.clone(), k)))
 }
 
-/// `path` without `.` and, where it can be told lexically, `..`.
-fn normalize(path: &Path) -> PathBuf {
+/// A path that is only the start of a name (`/tmp/api-shim.`): its directory cleaned, its last part as it is.
+fn clean_prefix(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => clean(dir).join(name),
+        _ => clean(path),
+    }
+}
+
+/// `path` without `.`, `//` and, where it can be told lexically, `..` (symlinks are not looked at).
+pub fn clean(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
         match c {
             Component::CurDir => {}
+            // The parent of `/` is `/`; of a relative path that has none left, `..`.
             Component::ParentDir => {
-                if !out.pop() {
+                if !out.pop() && !out.has_root() {
                     out.push("..");
                 }
             }
@@ -777,7 +875,7 @@ impl Throttle {
 
     /// How long a restart has to wait, if it has to.
     pub fn wait(&self, now: Instant) -> Option<Duration> {
-        let ready = self.last? + self.gap();
+        let ready = crate::restart::later(self.last?, self.gap());
         ready.checked_duration_since(now).filter(|d| !d.is_zero())
     }
 
@@ -805,6 +903,14 @@ pub struct Handle {
     task: tokio::task::AbortHandle,
 }
 
+impl Handle {
+    /// The task ended by itself (a panic, already logged): nothing watches
+    /// any more, and only a new watcher can.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
 impl Drop for Handle {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
@@ -815,48 +921,70 @@ impl Drop for Handle {
 /// Start watching. `send` hands a change to whoever restarts the app; it
 /// returns false when nobody listens any more, which ends the task. Must be
 /// called inside the supervisor's `LocalSet`.
+///
+/// Panic policy (guard.rs): file watching is an optional feature, so a panic
+/// anywhere in it ends the watcher with one ERROR line, never Warden or a
+/// worker; the owner sees [`Handle::is_finished`] and starts another.
 pub fn spawn(spec: Spec, send: impl Fn(Change) -> bool + 'static) -> Result<Handle, String> {
     let watcher = Watcher::new(&spec)?;
     let cancel = Arc::new(AtomicBool::new(false));
-    let flag = cancel.clone();
-    let task = tokio::task::spawn_local(async move {
-        let mut watcher = Some(watcher);
-        let mut slow_logged = false;
-        loop {
-            let Some(w) = watcher.take() else { return };
-            let cancel = flag.clone();
-            let started = Instant::now();
-            let job = tokio::task::spawn_blocking(move || {
-                let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.scan(&cancel)));
-                (w, scanned)
-            });
-            let (mut w, scanned) = match job.await {
-                Ok((w, Ok(s))) => (w, s),
-                Ok((_, Err(p))) => {
-                    crate::error!(
-                        "file watching stopped: the scan panicked",
-                        panic = crate::guard::panic_message(&*p),
-                        hint = "this is a Warden bug: please report it; `warden reload` starts watching again",
-                    );
-                    return;
-                }
-                // The runtime is shutting down.
-                Err(_) => return,
-            };
-            let took = started.elapsed();
-            let poll = w.apply(scanned, Instant::now());
-            log_notes(&poll, &w.spec, took, &mut slow_logged);
-            if let Some(c) = poll.change {
-                if !send(c) {
-                    return;
-                }
+    let task = tokio::task::spawn_local({
+        let cancel = cancel.clone();
+        async move {
+            if let Err(panic) = crate::guard::catch_unwind(run(watcher, cancel, send)).await {
+                crate::error!(
+                    "file watching stopped: its task panicked",
+                    panic = panic,
+                    hint = "this is a Warden bug: please report it; `warden reload` starts watching again",
+                );
             }
-            let wait = w.delay().max(took.saturating_mul(PACE));
-            watcher = Some(w);
-            tokio::time::sleep(wait).await;
         }
     });
     Ok(Handle { cancel, task: task.abort_handle() })
+}
+
+async fn run(watcher: Watcher, cancel: Arc<AtomicBool>, send: impl Fn(Change) -> bool) {
+    let spec = watcher.spec.clone();
+    let mut watcher = Some(watcher);
+    let mut slow_logged = false;
+    loop {
+        let Some(mut w) = watcher.take() else { return };
+        let flag = cancel.clone();
+        let started = Instant::now();
+        // The look and the comparison with the last one (a hash map of every
+        // file) both run off the event loop.
+        let job = tokio::task::spawn_blocking(move || {
+            let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::guard::fault("watch");
+                let scanned = w.scan(&flag);
+                w.apply(scanned, Instant::now())
+            }));
+            (w, polled)
+        });
+        let (w, poll) = match job.await {
+            Ok((w, Ok(poll))) => (w, poll),
+            Ok((_, Err(p))) => {
+                crate::error!(
+                    "file watching stopped: the scan panicked",
+                    panic = crate::guard::panic_message(&*p),
+                    hint = "this is a Warden bug: please report it; `warden reload` starts watching again",
+                );
+                return;
+            }
+            // The runtime is shutting down.
+            Err(_) => return,
+        };
+        let took = started.elapsed();
+        log_notes(&poll, &spec, took, &mut slow_logged);
+        if let Some(c) = poll.change {
+            if !send(c) {
+                return;
+            }
+        }
+        let wait = w.delay().max(took.saturating_mul(PACE));
+        watcher = Some(w);
+        tokio::time::sleep(wait).await;
+    }
 }
 
 fn log_notes(poll: &Poll, spec: &Spec, took: Duration, slow_logged: &mut bool) {
@@ -867,6 +995,16 @@ fn log_notes(poll: &Poll, spec: &Spec, took: Duration, slow_logged: &mut bool) {
             first_scan_ms = took.as_millis(),
             interval_ms = spec.interval.as_millis(),
         );
+        // Nothing to look at: the paths are empty, or ignored whole (a log or runtime directory
+        // that holds the tree is one way), or past reading; a missing path has its own warning.
+        if files == 0 && !poll.notes.iter().any(|n| matches!(n, Note::Missing(_))) {
+            crate::warn!(
+                "file watching found no files under the watched paths: nothing will restart the app",
+                paths = spec.paths.join(","),
+                base = spec.base.display(),
+                hint = "check [watch] paths and ignore (`warden describe` shows them); files created later are noticed",
+            );
+        }
     }
     // A scan that takes a good part of the interval is the tree's size talking.
     if !*slow_logged && took.saturating_mul(PACE) > spec.interval && poll.baseline.is_none() {
@@ -1063,7 +1201,7 @@ mod tests {
         d.write("out.txtx", "1");
         let mut s = spec(&d);
         s.ignore = vec!["src/gen".into(), "**/*.test.ts".into()];
-        s.skip = vec![d.path("out.txt")];
+        s.skip = vec![Skip::Path(d.path("out.txt"))];
         let mut w = Watcher::new(&s).unwrap();
         look(&mut w, Instant::now());
         assert_eq!(names(&w), ["lib/gen/y.ts", "out.txtx", "src/a.ts"]);
@@ -1406,6 +1544,153 @@ mod tests {
     }
 
     #[test]
+    fn paths_are_cleaned_lexically() {
+        let c = |p: &str| clean(Path::new(p));
+        assert_eq!(c("/a//b/./c/"), PathBuf::from("/a/b/c"));
+        assert_eq!(c("/a/b/../c"), PathBuf::from("/a/c"));
+        assert_eq!(c("/a/../.."), PathBuf::from("/"), "the parent of / is /");
+        assert_eq!(c("/.."), PathBuf::from("/"));
+        assert_eq!(c("a/../.."), PathBuf::from(".."));
+        assert_eq!(c("./a"), PathBuf::from("a"));
+    }
+
+    /// A path Warden writes is skipped however it was written in the config:
+    /// `./warden.out`, `a/../x.log` and `a//b` are not what the scanner sees.
+    #[test]
+    fn skipped_paths_match_however_they_are_written() {
+        let d = Dir::new("skip-clean");
+        d.write("src/a.ts", "1");
+        d.write("warden.out", "1");
+        d.write("warden.out.1", "1");
+        d.write("logs/x.log", "1");
+        d.write("data/y.txt", "1");
+        d.write("a/b/c.txt", "1");
+        let base = d.0.display().to_string();
+        let w = crate::config::Watch { ignore: vec![], ..Default::default() };
+        let skip = vec![
+            Skip::Path(PathBuf::from(format!("{base}/./warden.out"))),
+            Skip::Log(PathBuf::from(format!("{base}//logs/../logs/x.log"))),
+            Skip::Prefix(PathBuf::from(format!("{base}/data/../data/y")), String::new()),
+            Skip::Path(PathBuf::from(format!("{base}/a//b/"))),
+        ];
+        let s = Spec::new(&w, d.0.join("."), skip);
+        assert_eq!(s.skip[0], Skip::Path(d.path("warden.out")), "clean once it is a spec");
+        let mut watcher = Watcher::new(&s).unwrap();
+        look(&mut watcher, Instant::now());
+        assert_eq!(names(&watcher), ["src/a.ts"]);
+    }
+
+    /// `out.txt` with per_worker_files is written as `out-1.txt`, `out-2.txt`, standbys' `out-s1.txt`
+    /// and the host's `out-host.txt`, rotated too: all of them are Warden's.
+    #[test]
+    fn per_worker_log_files_are_skipped_with_their_rotations() {
+        let skipped =
+            |i: &Ignore, p: &str| i.is_ignored(p.rsplit('/').next().unwrap().as_bytes(), p.as_bytes(), &[], false);
+        let i = Ignore::new(&[], &[Skip::Log(PathBuf::from("/var/app/out.txt"))]).unwrap();
+        for p in [
+            "/var/app/out.txt",
+            "/var/app/out.txt.1",
+            "/var/app/out.txt.2.gz",
+            "/var/app/out.txt.2026-09-30T00-00-00",
+            "/var/app/out-1.txt",
+            "/var/app/out-12.txt.1",
+            "/var/app/out-s1.txt",
+            "/var/app/out-host.txt",
+            "/var/app/out-host.txt.3.gz",
+        ] {
+            assert!(skipped(&i, p), "{p}");
+        }
+        for p in [
+            "/var/app/out.txtx",
+            "/var/app/out-1.log",
+            "/var/app/out-x.txt",
+            "/var/app/out-.txt",
+            "/var/app/out-s.txt",
+            "/var/app/out-1.txtx",
+            "/var/app/outer.txt",
+            "/var/app/out-1",
+            "/var/app/sub/out-1.txt",
+            "/var/other/out-1.txt",
+        ] {
+            assert!(!skipped(&i, p), "{p}");
+        }
+        // No extension: `out`, `out-1`, `out-1.2` (rotated).
+        let i = Ignore::new(&[], &[Skip::Log(PathBuf::from("/var/app/out"))]).unwrap();
+        assert!(skipped(&i, "/var/app/out-1") && skipped(&i, "/var/app/out-1.2") && skipped(&i, "/var/app/out-host"));
+        assert!(!skipped(&i, "/var/app/out-1x") && !skipped(&i, "/var/app/output"));
+        // A plain `Path` is only that file and its rotations.
+        let i = Ignore::new(&[], &[Skip::Path(PathBuf::from("/var/app/out.txt"))]).unwrap();
+        assert!(skipped(&i, "/var/app/out.txt.1") && !skipped(&i, "/var/app/out-1.txt"));
+
+        // End to end, in a directory that holds the app too.
+        let d = Dir::new("worker-logs");
+        for f in
+            ["src/a.ts", "logs/out.txt", "logs/out-1.txt", "logs/out-2.txt.1", "logs/out-s1.txt", "logs/other-1.txt"]
+        {
+            d.write(f, "1");
+        }
+        let w = crate::config::Watch { ignore: vec![], ..Default::default() };
+        let s = Spec::new(&w, d.0.clone(), vec![Skip::Log(d.path("./logs/out.txt"))]);
+        let mut watcher = Watcher::new(&s).unwrap();
+        look(&mut watcher, Instant::now());
+        assert_eq!(names(&watcher), ["logs/other-1.txt", "src/a.ts"]);
+    }
+
+    /// Entries that are ignored still cost a listing: the work of one scan is
+    /// bounded by `work_limit`, however few files `max_files` lets through.
+    #[test]
+    fn the_work_of_one_scan_is_limited_even_when_everything_is_ignored() {
+        assert_eq!(work_limit(10_000), 260_000);
+        assert_eq!(work_limit(usize::MAX), usize::MAX);
+        let d = Dir::new("work");
+        for i in 0..200 {
+            d.write(&format!("junk/{i}.tmp"), "x");
+        }
+        d.write("a.ts", "1");
+        d.write("z/b.ts", "1");
+        let mut s = spec(&d);
+        s.ignore = vec!["*.tmp".into()];
+        let mut w = Watcher::new(&s).unwrap();
+        let all = w.scan_with_work(&NEVER, 10_000);
+        assert!(!all.truncated && all.files.len() == 2, "room enough: {all:?}");
+        // 50 entries: the 200 ignored files use them up; the scan stops there and says so.
+        let cut = w.scan_with_work(&NEVER, 50);
+        assert!(cut.truncated, "{cut:?}");
+        assert!(cut.files.len() == 1 && !cut.files.keys().any(|p| p.ends_with("z/b.ts")), "{:?}", cut.files);
+        let p = w.apply(cut, Instant::now());
+        assert!(p.notes.iter().any(|n| matches!(n, Note::Truncated { .. })), "{p:?}");
+        // The same limit twice: the same files (the cut is deterministic).
+        let again = w.scan_with_work(&NEVER, 50);
+        assert_eq!(again.files.len(), 1);
+    }
+
+    /// A panic in the task (here in what is done with a change) ends the
+    /// watcher with one error line, and the handle says so: the supervisor
+    /// starts another instead of trusting a dead one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_panic_ends_the_watcher_and_the_handle_says_so() {
+        let d = Dir::new("task-panic");
+        d.write("a.ts", "1");
+        let mut s = spec(&d);
+        s.interval = Duration::from_millis(50);
+        s.debounce = Duration::ZERO;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let h = spawn(s, |_| panic!("boom")).unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(!h.is_finished(), "alive while nothing changes");
+                d.write("b.ts", "x");
+                let t0 = Instant::now();
+                while !h.is_finished() {
+                    assert!(t0.elapsed() < Duration::from_secs(5), "the watcher never ended");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+    }
+
+    #[test]
     fn many_ignored_files_are_bounded_work() {
         let d = Dir::new("flood");
         for i in 0..300 {
@@ -1507,7 +1792,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 d.write("b.ts", "x");
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                assert!(h.task.is_finished(), "the send failed, so the task returned");
+                assert!(h.is_finished(), "the send failed, so the task returned");
             })
             .await;
     }

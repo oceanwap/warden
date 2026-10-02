@@ -136,6 +136,7 @@ Filters: `--grep TEXT`, `--exclude TEXT`, `--ignore-case`, `--since 2h`,
 | `unstartup` | Remove what `startup` installed (apps keep running); `--user` or `--system` |
 | `kill [target]` | Stop every app's supervisor, and wardend when it is every one (asks first on a terminal; `--yes`) |
 | `pm2-migrate` | Import PM2's apps: a config, a 0600 `.env` file and a `MIGRATION.md` report per app. See [`comparison.md`](comparison.md#moving-from-pm2) |
+| `migrate-wattpm [dir\|file]` | Import a Platformatic Watt project: a config and a 0600 `.env` file per application and a `MIGRATION-wattpm.md` report of what Warden cannot express. `--dry-run`, `--cutover overlap\|new-port:<port>`. See [`wattpm.md`](wattpm.md) |
 
 What `startup` installs on each OS, and how apps come back:
 [`production.md`](production.md).

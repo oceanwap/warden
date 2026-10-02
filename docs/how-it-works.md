@@ -75,6 +75,8 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   the statics. `[shutdown] long_lived_timeout = 0` leaves both untouched.
 - If Warden is SIGKILLed, workers are signalled via `PR_SET_PDEATHSIG` (direct
   children only). Under systemd the cgroup takes care of the rest.
+  macOS has no parent-death signal: the next start of the app stops the
+  workers a SIGKILLed supervisor left behind (docs/platforms.md).
 - Don't run Warden as PID 1 in a container; use `tini`, or `docker run --init`, to reap orphans.
 - A log consumer that can't keep up (a stuck journald, a full disk) costs
   log lines, never supervision: lines past the queue bounds are dropped,

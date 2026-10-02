@@ -34,6 +34,7 @@ pub async fn run(args: &Args) -> i32 {
     let mut out = Vec::new();
     out.extend(kernel());
     out.extend(platform_check());
+    out.extend(orphans());
     out.push(runtime("bun", &["--version"], None));
     out.push(runtime("node", &["--version"], Some((22, 12))));
     out.push(file_limit());
@@ -272,12 +273,16 @@ fn platform_check() -> Vec<Finding> {
     if p.boot_id().is_none() {
         missing.push("the boot id");
     }
+    if caps.orphan_sweep && p.proc_identity(me).is_none_or(|id| id.start == 0) {
+        missing.push("a process's start time (workers left by a killed supervisor cannot be recognised)");
+    }
     if missing.is_empty() {
         vec![f(
             Level::Ok,
             "platform",
             format!(
-                "{name} adapter reads memory, CPU, owner, environment, listening ports, host numbers and the boot id"
+                "{name} adapter reads memory, CPU, owner, environment, listening ports, host numbers and the boot id{}",
+                if caps.orphan_sweep { ", and a process's start time" } else { "" }
             ),
             None,
         )]
@@ -306,7 +311,11 @@ fn platform_findings(os: &str, c: crate::platform::Capabilities) -> Vec<Finding>
         gaps.push("SO_REUSEPORT does not balance connections across workers (use count = 1)");
     }
     if !c.parent_death_signal {
-        gaps.push("a worker is not stopped when its supervisor is killed");
+        gaps.push(if c.orphan_sweep {
+            "a worker outlives a supervisor that is killed, until the app starts again and Warden stops it (see \"orphan sweep\")"
+        } else {
+            "a worker is not stopped when its supervisor is killed"
+        });
     }
     if !c.oom_attribution {
         gaps.push("an out-of-memory kill is not recognised as one");
@@ -340,6 +349,69 @@ fn platform_findings(os: &str, c: crate::platform::Capabilities) -> Vec<Finding>
             None,
         ),
     ]
+}
+
+/// The sweep of workers a killed supervisor left behind (macOS): what it
+/// does and cannot do, and the workers that are running orphaned right now.
+fn orphans() -> Vec<Finding> {
+    use crate::platform::orphans;
+    orphan_findings(
+        crate::platform::current().capabilities(),
+        &orphans::dir(&fleet::state_dir()),
+        &orphans::Os,
+        crate::platform::boot_id().as_deref(),
+        std::process::id(),
+    )
+}
+
+fn orphan_findings(
+    caps: crate::platform::Capabilities,
+    dir: &Path,
+    procs: &dyn crate::platform::orphans::Procs,
+    boot: Option<&str>,
+    me: u32,
+) -> Vec<Finding> {
+    use crate::platform::orphans;
+    if !caps.orphan_sweep {
+        return Vec::new();
+    }
+    let check = "orphan sweep";
+    let mut v = Vec::new();
+    if let Err(e) = check_private_dir(dir) {
+        v.push(f(
+            Level::Warn,
+            check,
+            format!("the record of each app's workers cannot be kept: {e}"),
+            Some("make it a directory only you can write, or remove it; without it a killed supervisor's workers are not stopped at the next start"),
+        ));
+    }
+    for (app, supervisor, workers) in orphans::running_orphans(dir, procs, boot, me) {
+        let list: Vec<String> = workers.iter().map(|o| o.member.pid.to_string()).collect();
+        v.push(f(
+            Level::Warn,
+            check,
+            format!(
+                "app {app}: {} worker(s) (pid {}) outlived their supervisor (pid {supervisor}), which is gone, and still hold the app's port",
+                workers.len(),
+                list.join(", ")
+            ),
+            Some(&format!("`warden start {app}` stops them first (or `kill {}`)", list.join(" "))),
+        ));
+    }
+    if v.is_empty() {
+        v.push(f(
+            Level::Info,
+            check,
+            format!(
+                "macOS has no parent-death signal, so a supervisor's workers are recorded in {} and, when the app starts \
+                 again, the ones a killed supervisor left running are stopped first. They keep serving, and hold the \
+                 port, until then; `warden stop` or SIGTERM ends a supervisor and its workers together",
+                dir.display()
+            ),
+            None,
+        ));
+    }
+    v
 }
 
 fn pid_one() -> Option<Finding> {
@@ -521,6 +593,7 @@ mod tests {
             reuseport_balances: false,
             parent_death_signal: false,
             oom_attribution: false,
+            orphan_sweep: true,
         };
         let v = platform_findings("macos", mac);
         assert_eq!(v[0].level, Level::Warn);
@@ -530,6 +603,19 @@ mod tests {
             v[0].detail
         );
         assert!(!v[0].detail.contains("cannot read"), "macOS reads everything: {}", v[0].detail);
+        // No parent-death signal, but the sweep: the finding says what covers it, and what it cannot.
+        assert!(
+            v[0].detail.contains("a worker outlives a supervisor that is killed, until the app starts again")
+                && v[0].detail.contains("orphan sweep"),
+            "{}",
+            v[0].detail
+        );
+        let no_sweep = platform_findings("macos", Capabilities { orphan_sweep: false, ..mac });
+        assert!(
+            no_sweep[0].detail.contains("a worker is not stopped when its supervisor is killed"),
+            "{}",
+            no_sweep[0].detail
+        );
         assert_eq!(v[0].fix.as_deref(), Some("run production on Linux"));
         let none = Capabilities {
             proc_stats: false,
@@ -537,6 +623,7 @@ mod tests {
             listening_ports: false,
             proc_environ: false,
             host_stats: false,
+            orphan_sweep: false,
             ..mac
         };
         let v = platform_findings("other", none);
@@ -554,6 +641,63 @@ mod tests {
         assert_eq!(v.len(), 1, "{v:?}");
         assert_eq!(v[0].level, Level::Ok, "{}", v[0].detail);
         assert_eq!(v[0].check, "platform");
+    }
+
+    #[test]
+    fn the_sweep_says_what_it_does_and_lists_workers_a_dead_supervisor_left() {
+        use crate::platform::orphans::{self, Member, Os, Record};
+        use crate::platform::{Capabilities, current};
+        use std::os::unix::fs::PermissionsExt;
+        let caps = Capabilities { orphan_sweep: true, ..current().capabilities() };
+        let me = std::process::id();
+        let dir = std::env::temp_dir().join(format!("warden-doctor-orphans-{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Where the OS has the parent-death signal there is nothing to say.
+        assert!(orphan_findings(Capabilities { orphan_sweep: false, ..caps }, &dir, &Os, None, me).is_empty());
+        // Nothing recorded: what it does, and what it cannot do.
+        let v = orphan_findings(caps, &dir, &Os, None, me);
+        assert_eq!((v.len(), v[0].level), (1, Level::Info), "{v:?}");
+        assert!(
+            v[0].detail.contains("no parent-death signal") && v[0].detail.contains("until then"),
+            "{}",
+            v[0].detail
+        );
+
+        // A worker of a supervisor that is gone, still running (a real process).
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let start = crate::platform::proc_identity(child.id()).expect("the child").start;
+        let rec = Record {
+            v: 1,
+            app: "api".into(),
+            boot: None,
+            written_ms: 1,
+            supervisor: Member { pid: 0x7fff_ff00, start: 1, label: String::new() },
+            workers: vec![Member { pid: child.id(), start, label: "1".into() }],
+        };
+        let file = dir.join(orphans::file_name("api", 0x7fff_ff00));
+        std::fs::write(&file, serde_json::to_string(&rec).unwrap()).unwrap();
+        let v = orphan_findings(caps, &dir, &Os, None, me);
+        assert_eq!((v.len(), v[0].level), (1, Level::Warn), "{v:?}");
+        assert!(
+            v[0].detail.starts_with(&format!("app api: 1 worker(s) (pid {}) outlived", child.id())),
+            "{}",
+            v[0].detail
+        );
+        assert!(v[0].fix.as_deref().is_some_and(|x| x.contains("`warden start api`")), "{:?}", v[0].fix);
+        assert!(child.try_wait().unwrap().is_none(), "the doctor only reads");
+        assert!(file.exists());
+
+        // A record directory others can write to: the sweep would not trust it.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let v = orphan_findings(caps, &dir, &Os, None, me);
+        assert!(v.iter().any(|x| x.level == Level::Warn && x.detail.contains("cannot be kept")), "{v:?}");
+        let _ = child.kill();
+        let _ = child.wait();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

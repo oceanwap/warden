@@ -213,9 +213,11 @@ pub struct Status {
     /// Absent from a supervisor that does not send it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// `[watch] enabled`: the app restarts by itself, through the rollout
-    /// gates, when its files change (PM2's `watching`). Always sent; an older
-    /// supervisor does not send it, and reads as `false`: it cannot watch.
+    /// A file watcher is running now: the app restarts by itself, through the
+    /// rollout gates, when its files change (PM2's `watching`). `false` when
+    /// `[watch]` is off, while the workers are stopped, and after a watcher
+    /// failed (its error is in the log). Always sent; an older supervisor does
+    /// not send it, and reads as `false`: it cannot watch.
     #[serde(default)]
     pub watching: bool,
 }

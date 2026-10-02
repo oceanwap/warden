@@ -13,7 +13,10 @@
     reload, which starts the new worker next to the old one, fails: use
     `warden restart --hard`, or `port_strategy = "offset"`. Warden says so
     at start. Bun apps share the port as on Linux.
-  - No parent-death signal: workers outlive a supervisor killed with SIGKILL.
+  - No parent-death signal: workers outlive a supervisor killed with
+    SIGKILL (or one that crashed, or that launchd killed in the middle of a
+    shutdown). Warden stops them the next time the app starts, before it
+    starts new ones: [below](#workers-a-killed-supervisor-leaves-behind-macos).
   - `warden serve` checks static paths with realpath instead of `openat2`
     (same confinement, slower).
   - No out-of-memory attribution: a worker the kernel killed for memory
@@ -33,6 +36,73 @@
   the app on the Linux filesystem. [windows.md](windows.md) has the
   tips and the plan for a native build, with the one hard problem (sharing a
   port between workers) spelled out.
+
+## Workers a killed supervisor leaves behind (macOS)
+
+On Linux a worker gets SIGTERM the moment its supervisor dies
+(`PR_SET_PDEATHSIG`). macOS has no such thing, so a supervisor that is killed
+(`kill -9`, a crash, launchd's timeout in the middle of a shutdown; a normal
+`warden stop` or SIGTERM stops its workers first) leaves them running, still
+holding the app's port. The next supervisor of the app would start a second
+set next to them, and where `SO_REUSEPORT` lets two processes share the
+port, silently double the workers while the old set keeps answering.
+
+Warden covers this with a sweep at the start of the app:
+
+- Each supervisor keeps a record of its processes in the state directory
+  (`~/.local/state/warden/orphans/<app>.<supervisor pid>.json`, or under
+  `$WARDEN_HOME/state`; `/var/lib/warden` for root): the supervisor and each
+  worker as a pid and the time that process started (libproc,
+  `PROC_PIDTBSDINFO`). It is rewritten, atomically (a file renamed over the
+  old one, so a reader sees the old or the new, never half), whenever a
+  worker starts or exits, and removed when the supervisor has stopped its
+  workers and exits.
+- When a supervisor starts, before it starts any worker, it reads the records
+  of its app and stops a recorded worker only if all of these hold: the
+  record is from this boot; its supervisor is not running (no process has
+  that pid, or the process that has it started at another time); a process
+  with the worker's pid exists **and started at the recorded time**; and
+  that process's parent is not the recorded supervisor. A pid that has been
+  given to another process since is never touched: the start time is what
+  tells them apart. Workers of other apps and of a supervisor that is still
+  running are never candidates.
+- It stops them as a normal shutdown does: `shutdown.signal` (SIGTERM unless
+  set) to the worker's process group, SIGKILL after `shutdown.grace_period`
+  to what is still there. A worker that is no longer the leader of its own
+  process group (it moved itself to another) is signalled alone: that group
+  is not Warden's to stop.
+- The log says what it did: a WARN naming the workers and the supervisor
+  they belonged to before it stops them, an INFO with the count after, a WARN
+  if SIGKILL was needed, an ERROR with the `kill -9` to run for one that would
+  not die. A record that cannot be read is removed with a WARN; a record
+  written by a newer Warden is left alone.
+- `warden doctor` lists, on a Mac, the workers that are running right now
+  after their supervisor was killed (`warden start <app>` then stops them),
+  and checks that the record directory is private to you.
+
+`parent_death_signal` stays false in the OS capabilities: the sweep is not a
+parent-death signal, only the cure for its absence, and it has limits:
+
+- It acts at the next start of the app, not when the supervisor dies. Until
+  then the orphans keep serving, holding the port and their memory. With
+  wardend that is seconds (it restarts a dead supervisor); without it, until
+  you `warden start` the app or kill them by hand (`warden doctor` names them).
+- A supervisor whose orphans ignore the stop signal does not answer commands
+  until they are gone: at most `shutdown.grace_period` plus 3 s. It logs first.
+- Processes a worker started that outlived it are stopped with its group while
+  the worker is still running at the next start. If the worker itself exited
+  before that, its group is not touched: the number of an empty group may
+  belong to someone else by then, and nothing proves it does not. The same
+  for a worker that left its group: what it started stays.
+- A worker started in the instant before the record was rewritten (a
+  supervisor killed within a millisecond of a spawn) is not in it.
+- Between reading a process and signalling it there is a gap in which it
+  could exit and its pid go to another process; macOS gives out pids in
+  sequence, so it takes the whole pid space (99999) being used within microseconds.
+- Nothing survives a reboot, and nothing needs to: a record from an earlier
+  boot is ignored.
+- If the state directory cannot be written Warden says so (WARN) and runs
+  without the protection.
 
 ## Release archives and what they need
 

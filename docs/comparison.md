@@ -61,7 +61,7 @@ list is in [`commands.md`](commands.md).
 | | `warden deploy api` | Preflight, canary with soak, then the rest, with rollback |
 | `pm2 logs api` | `warden logs api` | `--history --grep --since 2h --json` over rotated and gzipped files (every worker's with `per_worker_files`), pipe-friendly |
 | `pm2 flush api` | `warden flush api` | The same: empties the in-memory buffer and the current log files (Warden's, each worker's out and err file), lists them, keeps rotated ones; safe while workers write |
-| `pm2 start app.js --watch` | `warden start app.js --watch` | Opt-in, and a gated rolling restart instead of a plain restart: a version that fails its health checks is rolled back. `ignore_watch` and `watch_delay` map to `--ignore-watch` and `--watch-delay`; see [`watch.md`](watch.md) |
+| `pm2 start app.js --watch` | `warden start app.js --watch` | Opt-in, and a gated rolling restart instead of a plain restart: a version that fails its health checks is rolled back where workers can overlap (see `watch.md`). `ignore_watch` and `watch_delay` map to `--ignore-watch` and `--watch-delay`; see [`watch.md`](watch.md) |
 | `pm2 serve dist 8080` | `warden serve dist 8080` | A static server as fast as nginx, faster on small files (see [`benchmarks.md`](benchmarks.md) and [`static-serving.md`](static-serving.md)) |
 | `pm2 save`, `resurrect`, `startup` | `warden save`, `resurrect`, `startup` | One systemd unit per app (root or `--user`), a launchd job on macOS; see [Surviving reboots and crashes](production.md#surviving-reboots-and-crashes) |
 | `pm2 update` | `warden update` | Saves, kills and resurrects: restarts every supervisor and wardend from the binary on disk, which is what picks up a rebuild or an upgrade |
@@ -113,3 +113,38 @@ Node app (PSS 478 vs 106 MB) and 2-3 % idle CPU. Warden's worker mode
 (experimental, Bun only) is the thread variant: about half the memory of
 process mode, but one crash takes all workers down. The measurements, for
 the same apps on the same machine, are in [`benchmarks.md`](benchmarks.md).
+
+Watt is an application server, not only a process manager: it composes several
+applications into one runtime with one entry point and calls between them in
+the process. Warden supervises independent programs, so they overlap on running
+N copies of a Node.js app, restarting them and scaling, and not on composition.
+The commands that mean the same:
+
+| wattpm | Warden |
+|---|---|
+| `wattpm start [root]` | `warden start <app>` (one app, in the background) |
+| `wattpm stop` (the whole runtime) | `warden stop <app>`, `warden kill` |
+| `wattpm restart` | `warden restart <app>`: one worker at a time through health gates |
+| `wattpm reload` (stops, then starts again) | `warden reload <app>`, `warden deploy <app>`: gated, no downtime |
+| `wattpm ps`, `applications` | `warden list`, `warden describe <app>` |
+| `wattpm logs`, `env`, `config` | `warden logs`, `env`, `config` |
+| `wattpm build`, `dev`, `inject`, `scheduler`, `pprof` | no equivalent |
+
+Where the two overlap, who should move and who should not, and what is lost
+(the Gateway, the `plt.local` mesh, framework integration), is in
+[`wattpm.md`](wattpm.md), with the full command mapping.
+
+### Moving from wattpm
+
+```sh
+warden migrate-wattpm --dry-run                 # what it would write, for the project in this directory
+warden migrate-wattpm ~/shop                    # <app>.toml + <app>.env (0600) + MIGRATION-wattpm.md
+warden migrate-wattpm ~/shop --cutover overlap  # start Warden's copy next to the running Watt
+```
+
+One Warden app per Watt application, with the environment in a 0600 file and a
+report that lists every setting as mapped, approximated, unsupported or to
+check. A Gateway is not converted, an internal application gets no port, and
+the `plt.local` calls between applications are listed for you to replace; see
+[`wattpm.md`](wattpm.md#warden-migrate-wattpm). Unlike `pm2-migrate` it never
+stops the old side: `wattpm stop` would take the whole runtime down.

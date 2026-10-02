@@ -602,6 +602,9 @@ async fn sendfile_all(
                 }
                 None => return Err(std::io::Error::other("sendfile reported more bytes than were asked for")),
             },
+            // Nothing of this call went out (`sendfile_head` reports a head that
+            // did as an Ok, also when the body then met EAGAIN or EINTR), so
+            // trying again cannot send the head twice.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),

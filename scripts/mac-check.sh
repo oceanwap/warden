@@ -3,7 +3,10 @@
 # macOS adapter, then drives a real supervisor and wardend and checks what the
 # macOS adapter (src/platform/macos.rs) is there to provide: CPU and memory,
 # the process owner, listening-port readiness, a process's environment, the
-# host's numbers, the boot id, and how fast `warden serve` answers.
+# host's numbers, the boot id, and how fast `warden serve` answers. It also
+# kills a supervisor with kill -9, as macOS has no parent-death signal, and
+# checks that the next start of the app stops the workers left running
+# (src/platform/orphans.rs) instead of starting a second set next to them.
 #
 #   scripts/mac-check.sh [--quick] [--no-build]
 #
@@ -60,6 +63,8 @@ cleanup() {
     if [ -x "$bin" ]; then
         WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" kill --yes >/dev/null 2>&1
     fi
+    # The orphan check's workers, if it stopped half way.
+    if [ -n "${tag:-}" ]; then pkill -f "^sleep $tag\$" >/dev/null 2>&1; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -152,6 +157,31 @@ for a in apps:
     s = a.get("status") or {}
     if s.get("app") == sys.argv[1] and s.get("pid") and (len(sys.argv) < 3 or str(s["pid"]) != sys.argv[2]):
         print(s["pid"])
+PY
+
+# workers.py <app>: the pids of the app's workers once every one is RUNNING.
+cat >"$work/workers.py" <<'PY'
+import json, sys
+try:
+    apps = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for a in apps:
+    s = a.get("status") or {}
+    if s.get("app") == sys.argv[1]:
+        ws = s.get("workers") or []
+        if ws and all(w.get("state") == "RUNNING" for w in ws):
+            print(" ".join(str(w["pid"]) for w in ws))
+PY
+# orphan-doctor.py <doctor.json> <app>: exit 0 when `warden doctor` warns of
+# workers of that app that outlived their supervisor.
+cat >"$work/orphan-doctor.py" <<'PY'
+import json, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if any(r["check"] == "orphan sweep" and r["level"] == "warn" and ("app %s:" % sys.argv[2]) in r["detail"] for r in rows) else 1)
 PY
 
 # ------------------------------------------------------------------ the Mac
@@ -258,41 +288,121 @@ WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" de
 # requests from python, so the time is the server's and the kernel's (no
 # browser). A Mac opens files through the realpath fallback; this shows what
 # that costs.
+#
+# The bytes are compared with the file, not just counted: files above 16 KB
+# go out through the macOS-only path (one sendfile(2) with an `sf_hdtr` header,
+# src/sys.rs `sendfile_head`), which assumes that the length sendfile reports
+# back counts the header too. If it counted only the file, the head would be
+# sent twice and the next response on the connection would start in the wrong
+# place: a wrong body or a broken keep-alive connection, which comparing every
+# response of a reused connection shows. multi.bin is 3 MB: three pieces of the
+# server's 1 MiB `sendfile` chunks, so the same holds across calls.
 cat >"$work/lat.py" <<'PY'
 import http.client, sys, time
-port, name, size = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+port, name, path, rounds = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
+want = open(path, "rb").read()
 c = http.client.HTTPConnection("127.0.0.1", port)
 times = []
-for i in range(300):
+for i in range(rounds):
     t = time.perf_counter()
     c.request("GET", "/" + name)
     r = c.getresponse()
     body = r.read()
     times.append((time.perf_counter() - t) * 1000)
-    if r.status != 200 or len(body) != size:
-        print("FAIL\t%s\tstatus %s, %d bytes (want %d)" % (name, r.status, len(body), size))
+    if r.status != 200 or body != want:
+        at = next((k for k, (x, y) in enumerate(zip(body, want)) if x != y), min(len(body), len(want)))
+        print("FAIL\t%s\tresponse %d: status %s, %d bytes (want %d), first difference at byte %d"
+              % (name, i + 1, r.status, len(body), len(want), at))
         sys.exit(0)
-times = sorted(times[20:])
+times = sorted(times[min(20, rounds // 10):])
 med, p99 = times[len(times) // 2], times[int(len(times) * 0.99)]
-print("%s\t%s\tmedian %.2f ms, p99 %.2f ms" % ("PASS" if med < 25 else "FAIL", name, med, p99))
+print("%s\t%s\tbytes equal in %d responses, median %.2f ms, p99 %.2f ms" % ("PASS" if med < 25 else "FAIL", name, rounds, med, p99))
 PY
 mkdir -p "$work/site"
-python3 -c 'open("'"$work"'/site/small.html","w").write("<p>" + "x" * 1500 + "</p>"); open("'"$work"'/site/big.html","w").write("<p>" + "y" * 90000 + "</p>")'
+python3 -c '
+import os
+d = "'"$work"'/site/"
+open(d + "small.html", "w").write("<p>" + os.urandom(750).hex() + "</p>")
+open(d + "big.html", "w").write("<p>" + os.urandom(45000).hex() + "</p>")
+open(d + "multi.bin", "wb").write(os.urandom(3000000))'
 sport=$(free_port)
 w env WARDEN_NO_DAEMON=1 "$bin" serve "$work/site" "$sport" --name site >"$out/start-site.log" 2>&1
 sleep 2
-for f in "small.html 1507" "big.html 90007"; do
-    # shellcheck disable=SC2086 # split on purpose: "name size"
+for f in "small.html 300" "big.html 300" "multi.bin 30"; do
+    # shellcheck disable=SC2086 # split on purpose: "name rounds"
     set -- $f
-    line=$(python3 "$work/lat.py" "$sport" "$1" "$2" 2>&1 | tail -n 1)
+    line=$(python3 "$work/lat.py" "$sport" "$1" "$work/site/$1" "$2" 2>&1 | tail -n 1)
     verdict=$(printf '%s' "$line" | cut -f1)
     detail=$(printf '%s' "$line" | cut -f3-)
     case "$verdict" in
-        PASS) result PASS "static serve $1 (keep-alive)" "$detail" ;;
-        *) result FAIL "static serve $1 (keep-alive)" "$detail" ;;
+        PASS) result PASS "static serve $1 (keep-alive, bytes compared)" "$detail" ;;
+        *) result FAIL "static serve $1 (keep-alive, bytes compared)" "$detail" ;;
     esac
 done
 w env WARDEN_NO_DAEMON=1 "$bin" delete all >/dev/null 2>&1
+
+# ------------------------------------------- smoke: a supervisor kill -9'd
+# macOS has no parent-death signal: kill -9 on a supervisor leaves its workers
+# running, still holding the app's port. The next start of the app must stop
+# them before it starts new ones (src/platform/orphans.rs); without that, two
+# sets of workers would share the port. Two workers that are `sleep` with a
+# number only this run uses, so pgrep counts exactly them.
+tag=$((600000 + $$ % 100000))
+sleepers() { pgrep -f "^sleep $tag\$" | sort -n | tr '\n' ' '; }
+words() { printf '%s' "$1" | wc -w | tr -d ' '; }
+nd() { w env WARDEN_NO_DAEMON=1 "$@"; }
+nd "$bin" start /bin/sh --name orphan --interpreter none -i 2 -- -c "exec sleep $tag" >"$out/start-orphan.log" 2>&1
+sleep 2
+before=$(sleepers)
+sup=$(nd "$bin" list --json 2>/dev/null | python3 "$work/pid.py" orphan)
+if [ -z "$sup" ] || [ "$(words "$before")" != 2 ]; then
+    result FAIL "orphan sweep: two workers of the app are running" "supervisor '${sup:-none}', workers: ${before:-none} (see start-orphan.log)"
+else
+    kill -9 "$sup"
+    sleep 1
+    left=$(sleepers)
+    if [ -z "$left" ]; then
+        result SKIP "orphan sweep" "this macOS stopped the workers with the killed supervisor: nothing to sweep"
+    else
+        result PASS "workers outlive a supervisor killed with kill -9 (no parent-death signal)" "$(words "$left") of 2 still running"
+        nd "$bin" doctor --json >"$out/doctor-orphan.json" 2>"$out/doctor-orphan.err"
+        if python3 "$work/orphan-doctor.py" "$out/doctor-orphan.json" orphan; then
+            result PASS "warden doctor lists the workers that outlived their supervisor"
+        else
+            result FAIL "warden doctor lists the workers that outlived their supervisor" "see doctor-orphan.json"
+        fi
+        # The next start of the app: new workers, after the old ones are stopped.
+        nd "$bin" start orphan >"$out/restart-orphan.log" 2>&1
+        now=""
+        i=0
+        while [ $i -lt 40 ]; do
+            now=$(nd "$bin" list --json 2>/dev/null | python3 "$work/workers.py" orphan)
+            [ -n "$now" ] && break
+            sleep 1
+            i=$((i + 1))
+        done
+        after=$(sleepers)
+        old_alive=""
+        for p in $before; do
+            if kill -0 "$p" 2>/dev/null; then old_alive="$old_alive $p"; fi
+        done
+        if [ -z "$now" ]; then
+            result FAIL "the app starts again after its supervisor was killed" "no running workers within 40 s (see restart-orphan.log)"
+        elif [ "$(words "$after")" = 2 ] && [ -z "$old_alive" ]; then
+            result PASS "the next start stopped the old workers first: 2 workers, none of the old ones" "was $before, now $after"
+        else
+            result FAIL "the next start stopped the old workers first" "$(words "$after") workers running ($after), old ones still alive:${old_alive:- none}"
+            { echo; echo "---- orphan check: log"; tail -n 40 "$work/home/state/logs/orphan.log" 2>/dev/null; } >>"$report"
+        fi
+        if grep -q "left behind by a previous supervisor" "$work/home/state/logs/orphan.log" 2>/dev/null; then
+            result PASS "the log says which workers were stopped, and why"
+        else
+            result FAIL "the log says which workers were stopped, and why" "no 'left behind by a previous supervisor' line in the app's log"
+        fi
+    fi
+fi
+nd "$bin" delete all >/dev/null 2>&1
+pkill -f "^sleep $tag\$" >/dev/null 2>&1
 
 # -------------------------------------------------------- smoke: wardend
 # wardend: host events, and a supervisor it restarts with the environment it

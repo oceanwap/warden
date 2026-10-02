@@ -13,7 +13,10 @@
 //! rounds. The counts are exact and their limits tight (one system call more
 //! per request fails); the ratios are a coarse net with room for a loaded
 //! machine. Linux only (they read /proc and TCP_INFO); the behaviour tests
-//! run everywhere.
+//! and the fairness test (a big download next to small requests) run
+//! everywhere. The tests that need `strace` print `SKIPPED ...` on stderr
+//! when it is missing or cannot attach, and fail instead when
+//! `WARDEN_REQUIRE_STRACE=1` is set (a CI job that installs it should).
 
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -580,6 +583,82 @@ fn slow_recv(c: &mut Client) -> Resp {
 }
 
 // ---------------------------------------------------------------------------
+// Fairness: a big download and everyone else
+// ---------------------------------------------------------------------------
+
+/// A big download must not keep the worker from its other connections. The
+/// worker is one thread: it sends a file in pieces of at most 1 MiB and lets
+/// the others in between (`yield_now`). With one long `sendfile` call, or
+/// pieces without the yield, a client asking for a small page next to a
+/// 128 MB download gets none or one answer until the download is over (the
+/// "static files take 3-10 ms" report: 5 ms next to 10 MB). Counted, not
+/// timed: how many small answers arrive before the download ends. One per
+/// piece is the ideal (about 128, measured 124); pieces without the yield
+/// gave 1 to 22 in twelve attempts (the runtime lets others in only when its
+/// budget runs out). The limit sits between, and the best of three attempts
+/// counts, so a loaded machine does not trip it.
+#[test]
+fn a_big_download_does_not_hold_up_other_requests() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const HUGE: u64 = 128 << 20;
+    const AT_LEAST: u32 = 40;
+
+    let tmp = Tmp::new("fair");
+    let site = make_site(&tmp);
+    // Sparse: the kernel serves the holes as zeros, no disk is written.
+    std::fs::File::create(site.join("huge.bin")).unwrap().set_len(HUGE).unwrap();
+    quiet();
+    let w = Worker::start(&tmp, &site, json!({}));
+
+    let mut counts = Vec::new();
+    for _ in 0..3 {
+        let mut small = Client::connect(w.port);
+        assert_eq!(small.get("/index.html", "").status, 200);
+        let (started, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (port, flags) = (w.port, (started.clone(), done.clone()));
+        let download = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            s.write_all(b"GET /huge.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut buf, mut total) = (vec![0u8; 1 << 20], 0u64);
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n as u64;
+                flags.0.store(true, Ordering::Release);
+            }
+            flags.1.store(true, Ordering::Release);
+            total
+        });
+        let t0 = Instant::now();
+        while !started.load(Ordering::Acquire) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the download never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut answered = 0u32;
+        while !done.load(Ordering::Acquire) {
+            assert_eq!(small.get("/index.html", "").status, 200);
+            answered += 1;
+        }
+        let total = download.join().unwrap();
+        assert!(total >= HUGE, "the download ended after {total} of {HUGE} bytes");
+        eprintln!("{answered} small answers while {} MB went out", HUGE >> 20);
+        counts.push(answered);
+        if answered >= AT_LEAST {
+            return;
+        }
+    }
+    panic!(
+        "next to a {} MB download the page was answered {counts:?} times (at least {AT_LEAST} wanted): \
+         the worker does not let other connections in between the pieces of a big file",
+        HUGE >> 20
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The speed guards (Linux: /proc, TCP_INFO)
 // ---------------------------------------------------------------------------
 
@@ -722,6 +801,27 @@ mod linux {
         }
     }
 
+    /// A test that needs `strace` cannot run: say so on stderr (`SKIPPED`,
+    /// visible with `--nocapture` and in the failure output of a run that
+    /// has other failures), or fail when `WARDEN_REQUIRE_STRACE=1`, which a
+    /// CI job that installs strace sets so that a missing or unusable one
+    /// cannot make these tests pass without checking anything.
+    fn skipped(test: &str, why: &str) {
+        if std::env::var("WARDEN_REQUIRE_STRACE").is_ok_and(|v| v == "1") {
+            panic!("{test}: {why}, and WARDEN_REQUIRE_STRACE=1 requires strace");
+        }
+        eprintln!("SKIPPED {test}: {why} (WARDEN_REQUIRE_STRACE=1 makes this a failure)");
+    }
+
+    /// Is there a `strace`? If not, the test says it was skipped (or fails).
+    fn have_strace(test: &str) -> bool {
+        let found = Command::new("strace").arg("-V").output().is_ok();
+        if !found {
+            skipped(test, "strace not found on PATH");
+        }
+        found
+    }
+
     /// What `strace` (with `args`) wrote about `pid` while `work` ran; None
     /// when strace is missing or cannot attach.
     fn strace(pid: u32, args: &[&str], work: impl FnOnce()) -> Option<String> {
@@ -770,8 +870,7 @@ mod linux {
     /// body of 1.25 MiB or more is corked, once, and uncorked at its end.
     #[test]
     fn big_bodies_go_out_in_chunks_and_are_corked() {
-        if Command::new("strace").arg("-V").output().is_err() {
-            eprintln!("skipping: strace not found on PATH");
+        if !have_strace("big_bodies_go_out_in_chunks_and_are_corked") {
             return;
         }
         let tmp = Tmp::new("chunks");
@@ -797,7 +896,7 @@ mod linux {
                 body = c.get(&format!("/{file}"), "").body;
             });
             let Some(text) = text else {
-                eprintln!("skipping: strace cannot attach here");
+                skipped("big_bodies_go_out_in_chunks_and_are_corked", "strace cannot attach to the worker");
                 return;
             };
             assert!(body == pattern(size), "{file}: the body differs");
@@ -827,8 +926,7 @@ mod linux {
 
     #[test]
     fn system_calls_per_request_stay_low() {
-        if Command::new("strace").arg("-V").output().is_err() {
-            eprintln!("skipping: strace not found on PATH");
+        if !have_strace("system_calls_per_request_stay_low") {
             return;
         }
         let tmp = Tmp::new("syscalls");
@@ -848,7 +946,7 @@ mod linux {
             }
         });
         let Some(keep) = keep else {
-            eprintln!("skipping: strace cannot attach here");
+            skipped("system_calls_per_request_stay_low", "strace cannot attach to the worker");
             return;
         };
         let fresh = count_syscalls(w.pid(), || {

@@ -1,6 +1,6 @@
 //! The Linux adapter: everything from `/proc`.
 
-use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcStats};
+use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcIdentity, ProcStats};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, Read};
@@ -28,6 +28,8 @@ impl Platform for Linux {
             reuseport_balances: true,
             parent_death_signal: true,
             oom_attribution: true,
+            // It has the parent-death signal: nothing is left behind to sweep.
+            orphan_sweep: false,
         }
     }
 
@@ -48,6 +50,10 @@ impl Platform for Linux {
     fn proc_environ(&self, pid: u32) -> Option<Environ> {
         let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
         Some(parse_environ(&raw))
+    }
+
+    fn proc_identity(&self, pid: u32) -> Option<ProcIdentity> {
+        parse_stat_identity(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
     }
 
     fn proc_cwd(&self, pid: u32) -> Option<PathBuf> {
@@ -239,6 +245,19 @@ fn children_by_parent() -> HashMap<u32, Vec<u32>> {
         kids.sort_unstable();
     }
     map
+}
+
+/// Parent (field 4), process group (5) and start time (22, in clock ticks
+/// since boot) from the contents of /proc/<pid>/stat; `None` for a process
+/// that has exited and not been collected (state Z, or X while it goes).
+pub(crate) fn parse_stat_identity(stat: &str) -> Option<ProcIdentity> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // f[0] is field 3 (state): field n is f[n - 3].
+    if matches!(f.first()?.chars().next()?, 'Z' | 'X' | 'x') {
+        return None;
+    }
+    Some(ProcIdentity { ppid: f.get(1)?.parse().ok()?, pgid: f.get(2)?.parse().ok()?, start: f.get(19)?.parse().ok()? })
 }
 
 /// The parent's pid (field 4) from the contents of /proc/<pid>/stat.
@@ -508,6 +527,49 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
     fn the_parent_is_field_four_of_stat() {
         assert_eq!(parse_stat_ppid("1234 (my (weird) app) S 77 1234 1234 0 -1 4194304"), Some(77));
         assert_eq!(parse_stat_ppid("garbage"), None);
+    }
+
+    #[test]
+    fn identity_is_parent_group_and_start_time_from_stat_and_a_zombie_has_none() {
+        // 52 fields: pid (comm with spaces and parens) state ppid pgrp session ... starttime (22) ...
+        let stat = |state: &str| {
+            format!(
+                "1234 (my (weird) app) {state} 77 1235 1234 0 -1 4194304 100 0 0 0 5 6 0 0 20 0 1 0 987654 1000 100 \
+                 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0"
+            )
+        };
+        assert_eq!(
+            parse_stat_identity(&stat("S")),
+            Some(ProcIdentity { ppid: 77, pgid: 1235, start: 987_654 }),
+            "fields 4, 5 and 22, after the last ')'"
+        );
+        assert!(parse_stat_identity(&stat("T")).is_some(), "stopped is alive");
+        assert_eq!(parse_stat_identity(&stat("Z")), None, "exited, not collected");
+        assert_eq!(parse_stat_identity(&stat("X")), None);
+        assert_eq!(parse_stat_identity("garbage"), None);
+        assert_eq!(parse_stat_identity("1 (x) S 1 1"), None, "too short for a start time");
+    }
+
+    #[test]
+    fn identity_of_a_child_follows_it_and_is_gone_with_it() {
+        use std::os::unix::process::CommandExt;
+        let me = std::process::id();
+        let mine = Linux.proc_identity(me).expect("this process");
+        assert_eq!(Linux.proc_identity(me), Some(mine), "the same every time");
+        let mut child = std::process::Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+        let id = Linux.proc_identity(child.id()).expect("the child");
+        assert_eq!((id.ppid, id.pgid), (me, child.id()));
+        assert!(id.start >= mine.start, "started later: {id:?} vs {mine:?}");
+        child.kill().unwrap();
+        // Killed, not collected: a zombie is gone to the caller.
+        let t0 = Instant::now();
+        while Linux.proc_identity(child.id()).is_some() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(Linux.proc_identity(child.id()), None, "a zombie");
+        child.wait().unwrap();
+        assert_eq!(Linux.proc_identity(child.id()), None, "collected");
+        assert_eq!(Linux.proc_identity(0x7fff_fff0), None);
     }
 
     #[test]

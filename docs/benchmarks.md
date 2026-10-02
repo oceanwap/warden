@@ -31,7 +31,11 @@ claim an optimisation the data doesn't show).
   **Re-measure on a quiet machine**, ideally the ARM64 target. The macOS
   code paths of that round (`sendfile` with `sf_hdtr`, `SO_NOSIGPIPE` once
   per connection) were cross-compiled and unit-tested where the logic is
-  portable, never run on a Mac.
+  portable, never run on a Mac. One assumption there is unchecked: that the
+  length `sendfile(2)` reports back with an `sf_hdtr` header counts the
+  header too (`src/sys.rs`, `sendfile_head`); `scripts/mac-check.sh` compares
+  the bytes `warden serve` sends for three files, one of 3 MB, with the
+  files, and is what settles it.
 
 ## What the data says
 
@@ -151,9 +155,13 @@ protocol allows, and no transfer keeps it from its other connections.
 `tests/static_perf.rs` guards this without wall-clock limits, which a loaded
 CI machine makes flaky: it counts data segments, threads, context switches
 and system calls (with `strace`), checks that no `sendfile` asks for more than
-1 MiB and that the cork goes on and off once, and compares CPU and latency
-with a trivial server in the same process, best of several rounds, with a
-coarse factor. Run it with `cargo test --test static_perf`; with
+1 MiB and that the cork goes on and off once, counts how many small answers
+a client gets while another downloads 128 MB from the same worker (about 124
+with the yield between pieces, 1-22 without it, 40 wanted), and compares CPU
+and latency with a trivial server in the same process, best of several
+rounds, with a coarse factor. The tests that need `strace` print `SKIPPED`
+when it is missing and fail instead with `WARDEN_REQUIRE_STRACE=1`. Run it
+with `cargo test --test static_perf`; with
 `WARDEN_PERF_BIN=<an older warden>` it shows what it catches: against the
 build before the 2026-10-02 round the segment, system-call, chunk and HEAD
 tests fail (the ratio and thread tests pass: they only catch a gross

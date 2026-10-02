@@ -1919,7 +1919,6 @@ fn spawn_detached(
     env: Option<(&str, &str)>,
     origin: Option<&Origin>,
 ) -> Result<std::process::Child, String> {
-    use std::os::unix::process::CommandExt;
     let exe = own_exe()?;
     if let Some(d) = log.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("creating {}: {e}", d.display()))?;
@@ -1948,13 +1947,9 @@ fn spawn_detached(
     if let Some((k, v)) = env {
         cmd.env(k, v);
     }
-    // SAFETY: the closure only calls setsid (async-signal-safe): it detaches
-    // from our terminal and process group, so Ctrl-C here or closing the
-    // shell does not reach the child.
-    #[allow(unsafe_code)]
-    unsafe {
-        cmd.pre_exec(crate::sys::child_new_session);
-    }
+    // Detached from our terminal and process group, so Ctrl-C here or
+    // closing the shell does not reach the child.
+    crate::sys::pre_exec_new_session(&mut cmd);
     cmd.spawn().map_err(|e| e.to_string())
 }
 

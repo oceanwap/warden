@@ -3,12 +3,13 @@
 //!
 //! What macOS cannot do is `false` in the capabilities: `SO_REUSEPORT` lets
 //! processes share a port but gives every connection to one of them, a child
-//! does not hear when its parent dies, and the kernel does not say which
+//! does not hear when its parent dies (`orphan_sweep` is what Warden does
+//! about that: `platform::orphans`), and the kernel does not say which
 //! process it killed for memory.
 
 use super::counter::Extend32;
 use super::procargs::parse_procargs;
-use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcStats};
+use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcIdentity, ProcStats};
 use crate::sys::darwin::{self, ListeningSocket};
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
@@ -34,6 +35,8 @@ impl Platform for Macos {
             reuseport_balances: false,
             parent_death_signal: false,
             oom_attribution: false,
+            // What it has instead of the parent-death signal.
+            orphan_sweep: true,
         }
     }
 
@@ -48,6 +51,11 @@ impl Platform for Macos {
 
     fn proc_environ(&self, pid: u32) -> Option<Environ> {
         parse_procargs(&darwin::procargs(pid).ok()?).map(|p| p.env)
+    }
+
+    fn proc_identity(&self, pid: u32) -> Option<ProcIdentity> {
+        let b = darwin::bsd_info(pid).ok().filter(|b| !b.zombie)?;
+        Some(ProcIdentity { start: b.start_us, ppid: b.ppid, pgid: b.pgid })
     }
 
     fn proc_cwd(&self, pid: u32) -> Option<PathBuf> {

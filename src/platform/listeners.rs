@@ -96,6 +96,9 @@ mod tests {
         fn proc_environ(&self, _: u32) -> Option<Environ> {
             None
         }
+        fn proc_identity(&self, _: u32) -> Option<super::super::ProcIdentity> {
+            None
+        }
         fn proc_cwd(&self, _: u32) -> Option<PathBuf> {
             None
         }
