@@ -538,7 +538,12 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         AppState::Running if a.is_unwell() => Some(Tone::Warn),
         _ => None,
     };
-    button(row![container(dot(tone, 8.0)).padding([6, 0]), c.width(Fill)].spacing(10))
+    let mut inner = Row::new().spacing(10);
+    if selected {
+        inner = inner.push(look::marker());
+    }
+    let inner = inner.push(container(dot(tone, 8.0)).padding([6, 0])).push(c.width(Fill));
+    button(inner)
         .width(Fill)
         .padding([10, 12])
         .style(look::list_row(selected, attention))

@@ -53,6 +53,8 @@ pub struct Pal {
     pub box_bg: Color,
     /// The fill of a tile or an input: a little stronger than a box.
     pub tile_bg: Color,
+    /// The fill of what is raised above the page: the selected row.
+    pub raised: Color,
     /// How much of its color a tone's wash takes (the rest is what is behind it).
     pub wash: f32,
     pub accent: Color,
@@ -75,6 +77,7 @@ static LIGHT: Pal = Pal {
     chip: color!(0xefeae1),
     box_bg: color!(0xffffff, 0.55),
     tile_bg: color!(0xefeae1, 0.6),
+    raised: color!(0xffffff, 0.95),
     wash: 0.10,
     accent: color!(0x1b6b45),
     on_accent: color!(0xffffff),
@@ -95,6 +98,7 @@ static DARK: Pal = Pal {
     chip: color!(0x242924),
     box_bg: color!(0xffffff, 0.035),
     tile_bg: color!(0xffffff, 0.055),
+    raised: color!(0xffffff, 0.11),
     wash: 0.13,
     accent: color!(0x4eae78),
     on_accent: color!(0x07140c),
@@ -499,14 +503,16 @@ pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
 
 /// A row of the app list: a card of its own. Color means status only: what needs
 /// attention is washed and outlined with its color (amber, red). The app that is
-/// shown is marked by a bold ring of the ink color, which no status has, so it
-/// cannot be mistaken for one.
+/// shown is raised (a stronger fill, a soft shadow, a thin neutral outline) and
+/// has a bar at its left edge (`marker`), which no status has, so it cannot be
+/// mistaken for one.
 pub fn list_row(selected: bool, attention: Option<Tone>) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = pal(theme);
         let rest = match (attention, selected) {
-            (Some(t), _) => t.soft(theme),
-            (None, true) => p.tile_bg,
+            (Some(t), true) => Color { a: (t.soft(theme).a + 0.05).min(1.0), ..t.soft(theme) },
+            (Some(t), false) => t.soft(theme),
+            (None, true) => p.raised,
             (None, false) => p.box_bg,
         };
         let bg = match status {
@@ -516,18 +522,40 @@ pub fn list_row(selected: bool, attention: Option<Tone>) -> impl Fn(&Theme, butt
             button::Status::Pressed => Color { a: (rest.a + 0.09).min(1.0), ..rest },
             _ => rest,
         };
-        let (color, width) = match (attention, selected) {
-            (_, true) => (Color { a: 0.9, ..p.ink }, 1.5),
-            (Some(t), false) => (Color { a: 0.35, ..t.color(theme) }, 1.0),
-            (None, false) => (p.line, 1.0),
+        let color = match (attention, selected) {
+            (Some(t), _) => Color { a: if selected { 0.55 } else { 0.35 }, ..t.color(theme) },
+            (None, true) => Color { a: 0.22, ..p.ink },
+            (None, false) => p.line,
         };
         button::Style {
             background: Some(Background::Color(bg)),
             text_color: p.ink,
-            border: Border { radius: 14.0.into(), width, color },
+            border: Border { radius: 14.0.into(), width: 1.0, color },
+            shadow: if selected {
+                iced::Shadow {
+                    color: Color { a: if p.dark { 0.45 } else { 0.10 }, ..Color::BLACK },
+                    offset: iced::Vector::new(0.0, 2.0),
+                    blur_radius: 8.0,
+                }
+            } else {
+                iced::Shadow::default()
+            },
             ..button::Style::default()
         }
     }
+}
+
+/// The bar at the left edge of the selected row.
+pub fn marker<'a, Message: 'a>() -> Element<'a, Message> {
+    container(space())
+        .width(3)
+        .height(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.85, ..pal(theme).ink })),
+            border: border::rounded(PILL),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// One choice of a segmented control: the chosen one is a raised pill.
