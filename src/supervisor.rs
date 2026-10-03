@@ -6,11 +6,13 @@
 //!   canary, restart N, recycling), preflight, rollback.
 //! - `upkeep.rs`: the 1 s maintenance tick (watchdog, per-worker health,
 //!   memory / lifetime recycling, FAILED cooldown).
+//! - `portwatch.rs`: `[watchdog] port_lost`, a worker that stopped listening.
 //! - `standby.rs`: hot standbys (`[workers] standby`), promoted into the
 //!   slot of a worker that died.
 //! - `release.rs`: release pinning (`[app] pin_release`).
 
 mod listening;
+mod portwatch;
 mod release;
 #[cfg(test)]
 mod rig;
@@ -85,6 +87,8 @@ enum Event {
         inst: u64,
         result: Result<(), String>,
     },
+    /// `[watchdog] port_lost`: what each watched worker was seen listening on.
+    Ports(Vec<(u64, portwatch::Seen)>),
 }
 
 struct HealthState {
@@ -119,6 +123,8 @@ pub struct Supervisor {
     shim_path: Option<PathBuf>,
     host_path: Option<PathBuf>,
     force_kill: bool,
+    /// `[watchdog] port_lost`: a look at the workers' sockets is running.
+    port_look_inflight: bool,
     supervisor_cpu_prev: Option<(Instant, f64)>,
     /// What each worker process listens on (a walk of its process tree
     /// reads `/proc`, or asks libproc, for each: see `listening.rs`).
@@ -524,6 +530,7 @@ impl Supervisor {
             shim_path,
             host_path,
             force_kill: false,
+            port_look_inflight: false,
             supervisor_cpu_prev: None,
             listeners: ListenerCache::default(),
             ticks: 0,
@@ -1092,6 +1099,7 @@ impl Supervisor {
                 }
             }
             Event::AppHealth(r) => self.on_app_health(r),
+            Event::Ports(seen) => self.on_ports(seen),
             Event::WorkerHealth { inst, result } => self.on_worker_health(inst, result),
             Event::Tick if self.sweep.is_some() => {
                 // No worker runs yet, and none may start (a standby would): only
@@ -1264,6 +1272,9 @@ impl Supervisor {
 
     fn mark_ready(&mut self, inst_id: u64) {
         let lifetime = self.cfg.limits.max_lifetime;
+        // Ready by listening on its port (found open, or the shim's report).
+        let port = self.cfg.app.port.filter(|_| !self.cfg.workers.wait_ready);
+        let strategy = self.cfg.workers.port_strategy;
         let Some(inst) = self.insts.get_mut(&inst_id) else { return };
         // A standby is ready once initialized (`standby_ready`), not here.
         if inst.ready_at.is_some() || inst.stopping || inst.role == Role::Standby {
@@ -1271,6 +1282,15 @@ impl Supervisor {
         }
         let now = Instant::now();
         inst.ready_at = Some(now);
+        // It listened, so `[watchdog] port_lost` watches it from now on, even
+        // if its server closes before the first look at its sockets.
+        if port.is_some() || !inst.listening.is_empty() {
+            inst.listen.seen_at = Some(now);
+            inst.listen.ports = match port {
+                Some(p) => vec![networking::worker_port(p, strategy, inst.slot.max(1))],
+                None => inst.listening.iter().copied().filter(|p| *p != 0).collect(),
+            };
+        }
         if lifetime > 0 {
             inst.recycle_at =
                 Some(crate::restart::later(now, upkeep::jittered(Duration::from_secs(lifetime), inst_id)));
@@ -1393,6 +1413,9 @@ impl Supervisor {
         let crash_hint = hint.unwrap_or(if inst.hung {
             "its event loop stopped (the `worker hung` line before it); Warden restarts it. Its last output is in \
              `warden logs <app> --worker N`"
+        } else if inst.port_lost {
+            "it stopped listening (the `worker stopped listening` line before it); Warden restarts it with backoff. \
+             Its last output is in `warden logs <app> --worker N`"
         } else if inst.timed_out {
             "it did not listen on its port within workers.ready_timeout (the `not ready in time` line before it); \
              Warden restarts it with backoff"
@@ -1412,6 +1435,12 @@ impl Supervisor {
             "not ready in time".to_string()
         } else if inst.hung {
             format!("hung: no heartbeat for {}s ({why})", self.cfg.watchdog.timeout)
+        } else if inst.port_lost {
+            format!(
+                "stopped listening: no listener on {} for {}s ({why})",
+                portwatch::ports_text(&inst.listen.ports),
+                self.cfg.watchdog.port_lost
+            )
         } else {
             why.clone()
         };
@@ -1475,6 +1504,7 @@ impl Supervisor {
         } else if is_current
             && signal.is_none()
             && code.is_some_and(|c| self.cfg.restart.stop_exit_codes.contains(&c))
+            && !inst.port_lost
             && !self.shutting_down
         {
             info!(

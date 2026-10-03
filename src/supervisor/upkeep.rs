@@ -9,6 +9,8 @@
 //!   `max_memory` and `max_lifetime` trigger a graceful replacement.
 //! - FAILED cooldown (Kubernetes CrashLoopBackOff): a FAILED worker is retried
 //!   after `failed_cooldown`, so a transient outage doesn't need a human.
+//! - Lost port (`portwatch.rs`, a TCP liveness probe from outside): a worker
+//!   that listened and holds no listening socket for `port_lost` is restarted.
 //!
 //! Graceful replacements are queued and run one at a time as `Replace` rollouts.
 
@@ -42,6 +44,9 @@ impl Supervisor {
             self.check_memory();
         }
         self.check_lifetime();
+        if self.ticks % portwatch::EVERY_TICKS == 0 {
+            self.check_ports();
+        }
         self.retry_failed();
         self.standby_tick();
         if self.cfg.health.enabled && self.ticks % self.cfg.health.interval.max(1) == 0 {

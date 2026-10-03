@@ -9,6 +9,7 @@ to tune it.
 | Crash, without the startup time | A hot standby (started, app initialized, not listening) takes the dead worker's slot in a few milliseconds; a new standby starts in the background | `[workers] standby` |
 | Unhealthy worker | Replaced gracefully (new worker ready first) after `failure_threshold` failed checks | `[health] on_failure = "replace"` |
 | Hung event loop | The shim's heartbeat stops, and the worker is killed and restarted | `[watchdog] timeout` |
+| A worker that stopped listening | It runs, but holds no listening TCP socket any more (its app crashed under a wrapper that stays up, like nodemon or a dev server waiting for a change, or it closed its server): seen from the kernel's socket tables, it is stopped and restarted like a crash, with the same backoff. A server that comes back within the time is left alone; a worker that never listened is not watched | `[watchdog] port_lost` |
 | Slow event loop | Each heartbeat carries the worker's event-loop delay over the last second (p50/p99/max, sampled natively every 100 ms: no cost per request). `warden list`/`top`/`describe` show p99 (`loop p99`), `status --json` all three (`loop_delay`), Prometheus `warden_worker_event_loop_delay_{p50,p99,max}_seconds`; a WARN when p99 stays high for 10 s | `[watchdog] loop_delay_warn` |
 | Memory leak | Graceful replacement when RSS stays above the limit | `[limits] max_memory` |
 | Slow degradation | Recycle every worker after a lifetime, ±10% jitter | `[limits] max_lifetime` |

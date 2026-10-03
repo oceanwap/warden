@@ -130,6 +130,7 @@ How the gates work: [`deploys.md`](deploys.md).
 | Key | Default | Meaning |
 |---|---|---|
 | `timeout` | `60` | Seconds without an event-loop heartbeat means hung (`0` = off) |
+| `port_lost` | `10` | Seconds a worker that listened on a TCP port may go without any listening socket while it runs; then it is restarted like a crash, with the same backoff (`0` = off). Alive but serving nothing: a dev server whose app crashed and that waits for a file change, a server closed by an error the app caught. Read from the kernel's socket tables (one netlink request for all workers on Linux), never from inside the process; a worker that never listened on a TCP port is not watched. Up to 3600 |
 | `loop_delay_warn` | `0.5` | Seconds (fractions ok). Warn when a worker's event-loop delay (p99, from the shim's heartbeat; the `loop p99` column of `warden list`) stays at least this high for 10 s; at most once per 10 min per worker (`0` = off) |
 
 ## `[limits]`

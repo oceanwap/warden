@@ -20,6 +20,8 @@
 //   /leak    allocate ~200 MB and keep it (max_memory)
 //   /reload-v2  the app swaps its own handler (server.reload): later answers
 //               start with "v2 "
+//   /unlisten   close the app's server and stay alive (port_lost)
+//   /relisten?ms=N  close it, and listen again after N ms (a server restarting itself)
 import { threadId } from "node:worker_threads";
 
 if (process.env.FIXTURE_EXIT) process.exit(Number(process.env.FIXTURE_EXIT));
@@ -90,6 +92,22 @@ function handler(tag: string) {
       case "/leak":
         for (let i = 0; i < 20; i++) hoard.push(new Uint8Array(10 * 1024 * 1024).fill(1));
         break;
+      case "/unlisten":
+      case "/relisten": {
+        const back = path === "/relisten" ? Number(new URL(req.url).searchParams.get("ms") ?? 0) : 0;
+        setInterval(() => {}, 1 << 30);
+        setTimeout(() => {
+          server.stop(true);
+          console.log(`fixture: stopped listening ${who}`);
+          if (back > 0) {
+            setTimeout(() => {
+              serveApp();
+              console.log(`fixture: listening again ${who}`);
+            }, back);
+          }
+        }, 50);
+        break;
+      }
     }
     return new Response(tag + who);
   };

@@ -482,6 +482,13 @@ fn surge_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Surge, D::Error
 pub struct Watchdog {
     /// Seconds. 0 disables the watchdog.
     pub timeout: u64,
+    /// Seconds a worker that listened on a TCP port may go without any while
+    /// it runs before it is restarted (0 = never): alive, but serving
+    /// nothing (a dev server whose app crashed and that waits for a change, a
+    /// server closed by an error the app caught). Read from the kernel's
+    /// socket tables, never from inside the process; a worker that never
+    /// listened is not watched.
+    pub port_lost: u64,
     /// Seconds (fractions ok): warn when a worker's event-loop delay (p99,
     /// from its heartbeats) stays at or above this for LOOP_WARN_AFTER
     /// heartbeats in a row. 0 = never.
@@ -844,7 +851,7 @@ impl Default for Reload {
 
 impl Default for Watchdog {
     fn default() -> Self {
-        Self { timeout: 60, loop_delay_warn: 0.5 }
+        Self { timeout: 60, port_lost: 10, loop_delay_warn: 0.5 }
     }
 }
 
@@ -1247,7 +1254,7 @@ impl Config {
     fn check_bounds(&self) -> Result<(), String> {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86_400;
-        let checks: [(&str, u64, u64); 26] = [
+        let checks: [(&str, u64, u64); 27] = [
             ("workers.ready_timeout", self.workers.ready_timeout, HOUR),
             ("workers.standby", self.workers.standby as u64, 1024),
             ("restart.max_restarts", self.restart.max_restarts as u64, 10_000),
@@ -1268,6 +1275,7 @@ impl Config {
             ("reload.pause", self.reload.pause, DAY),
             ("reload.timeout", self.reload.timeout, DAY),
             ("watchdog.timeout", self.watchdog.timeout, DAY),
+            ("watchdog.port_lost", self.watchdog.port_lost, HOUR),
             ("limits.max_memory", self.limits.max_memory, 1 << 20),
             ("limits.max_lifetime", self.limits.max_lifetime, 365 * DAY),
             ("logging.rotate.max_size", self.logging.rotate.max_size, 1 << 40),
@@ -1575,6 +1583,7 @@ mod tests {
             ("reload", "timeout"),
             ("reload", "max_draining"),
             ("watchdog", "timeout"),
+            ("watchdog", "port_lost"),
             ("limits", "max_memory"),
             ("limits", "max_lifetime"),
             ("watch", "debounce_ms"),

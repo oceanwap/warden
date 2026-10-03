@@ -710,6 +710,79 @@ fn watchdog_kills_a_hung_worker() {
     every_warning_has_a_hint(&w.log());
 }
 
+/// `[watchdog] port_lost`: a worker that closes its server and stays alive
+/// serves nothing; it is stopped and restarted like a crash.
+#[test]
+fn a_worker_that_stops_listening_is_restarted() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("portlost", port, 2, "").replace("[restart]", "[watchdog]\nport_lost = 2\n[restart]");
+    let w = Warden::start("portlost", port, &cfg);
+    let before = Warden::pids(&w.wait_for("ready", T, ready(2)));
+    let (one, two) = (before[0], before[1]);
+    let _ = get(port, "/unlisten");
+    // Whichever answered the request above stopped listening: wait for it to be replaced.
+    let s = w.wait_for("the worker that stopped listening restarted", T, |s| {
+        let pids = Warden::pids(s);
+        s["workers"].as_array().is_some_and(|ws| ws.iter().all(|w| w["state"] == "RUNNING"))
+            && pids.len() == 2
+            && (!pids.contains(&one) || !pids.contains(&two))
+    });
+    let gone: Vec<u64> = before.iter().copied().filter(|p| !Warden::pids(&s).contains(p)).collect();
+    assert_eq!(gone.len(), 1, "only the worker that stopped listening: {s:#?}");
+    let workers = s["workers"].as_array().unwrap();
+    assert!(workers.iter().any(|w| w["last_exit"].as_str().is_some_and(|e| e.contains("stopped listening"))), "{s:#?}");
+    assert!(!alive(gone[0]));
+    let log = w.log();
+    assert!(log.contains("worker stopped listening; restarting it"), "{log}");
+    every_warning_has_a_hint(&log);
+    // The app serves on all workers again.
+    assert!(get(port, "/whoami").is_some());
+}
+
+/// A server that restarts itself (closes, listens again) within port_lost is left alone.
+#[test]
+fn a_worker_that_listens_again_in_time_is_left_alone() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("relisten", port, 1, "").replace("[restart]", "[watchdog]\nport_lost = 4\n[restart]");
+    let w = Warden::start("relisten", port, &cfg);
+    let before = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    let _ = get(port, "/relisten?ms=1500");
+    std::thread::sleep(Duration::from_millis(6500));
+    let s = w.status().unwrap();
+    assert_eq!(Warden::pids(&s), vec![before], "{s:#?}");
+    assert_eq!(s["workers"][0]["restarts"], 0, "{s:#?}");
+    assert!(!w.log().contains("worker stopped listening"), "{}", w.log());
+    assert!(get(port, "/whoami").is_some_and(|who| who.starts_with(&format!("{before}:"))));
+}
+
+/// A worker that never listened on a TCP port is not watched: no port, no restart.
+#[test]
+fn a_worker_without_a_port_is_not_watched() {
+    if !have_bun() {
+        return;
+    }
+    let w = Warden::start(
+        "noport",
+        0,
+        &format!(
+            "[app]\nname = \"noport\"\nargs = [\"{}\"]\nenv = {{ FIXTURE_NO_LISTEN = \"1\" }}\n[workers]\nmin_uptime = 100\n\
+             [watchdog]\nport_lost = 1\n",
+            fixture("app.ts")
+        ),
+    );
+    let before = Warden::pids(&w.wait_for("ready", T, ready(1)))[0];
+    std::thread::sleep(Duration::from_secs(5));
+    let s = w.status().unwrap();
+    assert_eq!((Warden::pids(&s), s["workers"][0]["restarts"].as_u64()), (vec![before], Some(0)), "{s:#?}");
+    assert!(!w.log().contains("worker stopped listening"));
+}
+
 /// Found by `cargo xtask chaos` (stop-supervisor): Warden frozen (SIGSTOP)
 /// for longer than watchdog.timeout killed every healthy worker as hung when
 /// it resumed, because their heartbeats were still waiting unread. The

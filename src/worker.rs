@@ -169,6 +169,25 @@ pub const LOOP_DELAY_FRESH: std::time::Duration = std::time::Duration::from_secs
 /// One "event loop delay is high" warning per worker per this long.
 pub const LOOP_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// What a worker was seen listening on, for `[watchdog] port_lost`: the
+/// kernel's view of its process tree, looked at every two seconds.
+#[derive(Debug, Clone, Default)]
+pub struct ListenWatch {
+    /// The TCP listening sockets (inodes) last found in its tree; empty where
+    /// the OS gives no inodes (then the tree is walked each time).
+    pub inodes: Vec<u64>,
+    /// Their ports, for the log line.
+    pub ports: Vec<u16>,
+    /// When it was last seen listening: `None` until it first is, and a
+    /// worker that never listened is not watched.
+    pub seen_at: Option<Instant>,
+    /// Since when it has been seen listening on nothing.
+    pub lost_since: Option<Instant>,
+    /// Not seen listening yet: when to walk its tree again (more seldom as
+    /// it ages: a worker without ports would be walked for nothing).
+    pub next_walk: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ThreadInfo {
     pub listening: bool,
@@ -205,6 +224,10 @@ pub struct Instance {
     pub loop_delay: BTreeMap<usize, LoopState>,
     /// Killed by the watchdog.
     pub hung: bool,
+    /// `[watchdog] port_lost`: what its process tree was last seen listening on.
+    pub listen: ListenWatch,
+    /// Stopped for having stopped listening: its exit is restarted as a crash.
+    pub port_lost: bool,
     /// Per-worker health: consecutive failures, verdict, check in flight.
     pub health_fails: u32,
     pub healthy: Option<bool>,
@@ -252,6 +275,8 @@ impl Instance {
             heartbeats: BTreeMap::new(),
             loop_delay: BTreeMap::new(),
             hung: false,
+            listen: ListenWatch::default(),
+            port_lost: false,
             health_fails: 0,
             healthy: None,
             health_inflight: false,

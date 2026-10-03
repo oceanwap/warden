@@ -157,6 +157,18 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   existing env file unless `--overwrite`, and keep secrets out of reports, dry
   runs and error text (a `{SECRET}` in a shell command is read from the 0600
   env file; in other commands the config is written 0600).
+- `[watchdog] port_lost` (10 s by default, `0` = off): a worker that listened
+  on a TCP port and then holds no listening socket for that long while it runs
+  is stopped and restarted like a crash, with the same backoff, so one that
+  keeps losing its port ends FAILED. It covers an app that crashed under a
+  wrapper that stays up (nodemon, a dev server waiting for a change) and a
+  server closed by an error the app caught. A server that comes back within
+  the time is left alone, and a worker that never listened is not watched.
+  Read from outside, every 2 s: on Linux one netlink socket-diagnostics
+  request lists the TCP listeners, so a worker still holding the socket it was
+  seen with costs nothing more, however many connections the host has; only a
+  worker whose sockets are gone has its process tree walked, and only a whole
+  walk can conclude that nothing listens.
 
 ### Changed
 

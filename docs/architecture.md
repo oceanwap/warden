@@ -504,6 +504,7 @@ app-level check; their rollout gates fall back to it too.
 | Mechanism | Inspired by | Behaviour |
 |---|---|---|
 | Watchdog | systemd `WatchdogSec`, gunicorn `timeout` | The shim's heartbeat comes from the event loop; no heartbeat for `watchdog.timeout` s = hung. Process mode: SIGKILL, restarted by crash handling. Worker mode: replacement host first, then SIGKILL of the old one (a hung Worker's listener would black-hole connections). |
+| Lost port (`src/supervisor/portwatch.rs`) | Kubernetes TCP liveness probe, from outside | A worker that listened on a TCP port and holds no listening socket for `watchdog.port_lost` s (10) while it runs: SIGTERM (SIGKILL after the grace period), restarted by crash handling with its backoff. Read from the kernel every 2 s: on Linux one `NETLINK_SOCK_DIAG` request lists the namespace's TCP listeners, and a worker still holding a socket it was seen with costs nothing more; only a worker whose sockets are gone has its process tree walked (`/proc/<pid>/fd`), and only a whole walk can conclude that nothing listens (a tree bigger than a walk looks at, or a process that can't be read, decides nothing). Workers that never listened are not watched. |
 | Per-worker liveness | Kubernetes liveness probe | See 4.8. |
 | `limits.max_memory` | PM2 `max_memory_restart` | 3 samples (15 s) over the limit → graceful replacement. |
 | `limits.max_lifetime` | gunicorn `max_requests` + jitter | Recycle each worker after its lifetime ±10 %, so workers started together don't recycle together. |

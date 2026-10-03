@@ -93,6 +93,8 @@ max_draining = 4                             # old workers that may still be dra
 
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
+port_lost = 10                               # s a worker that listened on a TCP port may go without one before it is
+                                             # restarted (0 = off); read from the kernel, workers without ports are left alone
 loop_delay_warn = 0.5                        # s (fractions ok); warn when a worker's event-loop delay (p99, from the
                                              # shim's heartbeat; `warden list` column Loop) stays at least this high
                                              # for 10 s; at most once per 10 min per worker (0 = off)

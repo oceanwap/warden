@@ -39,7 +39,7 @@ pub(super) fn of_tree(p: &dyn Platform, root: u32) -> Option<Vec<Listener>> {
 }
 
 /// `root` and its descendants, parents before children, within the limits.
-fn tree(p: &dyn Platform, root: u32) -> Vec<u32> {
+pub(super) fn tree(p: &dyn Platform, root: u32) -> Vec<u32> {
     let mut pids = vec![root];
     let mut seen: HashSet<u32> = HashSet::from([root]);
     let mut level = vec![root];
@@ -62,6 +62,36 @@ fn tree(p: &dyn Platform, root: u32) -> Vec<u32> {
         level = next;
     }
     pids
+}
+
+/// The same walk, whole or not at all: `None` when the limits would cut it
+/// short (more processes, or more generations, than a walk looks at) or the
+/// children of a process in it cannot be read. Finding nothing below `root`
+/// then means nothing is there, not that it was not looked at.
+pub(super) fn tree_whole(p: &dyn Platform, root: u32) -> Option<Vec<u32>> {
+    let mut pids = vec![root];
+    let mut seen: HashSet<u32> = HashSet::from([root]);
+    let mut level = vec![root];
+    for depth in 0..=MAX_DEPTH {
+        let mut next = Vec::new();
+        for pid in &level {
+            for child in p.children(*pid)? {
+                if !seen.insert(child) {
+                    continue;
+                }
+                if depth == MAX_DEPTH || pids.len() >= MAX_PROCESSES {
+                    return None;
+                }
+                pids.push(child);
+                next.push(child);
+            }
+        }
+        if next.is_empty() {
+            return Some(pids);
+        }
+        level = next;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -187,6 +217,43 @@ mod tests {
         let got = of_tree(&f, 1).unwrap();
         // The root and MAX_DEPTH generations below it.
         assert_eq!(got.len(), MAX_DEPTH + 1, "{got:?}");
+    }
+
+    /// A walk that has to be whole (to conclude that nothing listens) gives
+    /// up where the ordinary one cuts the tree short or skips a process.
+    #[test]
+    fn a_whole_walk_is_none_where_the_tree_is_cut_short() {
+        let mut f = Fake::default();
+        f.tree.insert(1, (vec![2, 3], vec![]));
+        f.tree.insert(2, (vec![], vec![]));
+        f.tree.insert(3, (vec![1], vec![])); // a loop: asked once
+        assert_eq!(tree_whole(&f, 1), Some(vec![1, 2, 3]));
+        // A child whose children cannot be read (another user's, or gone).
+        f.tree.insert(2, (vec![9], vec![]));
+        assert_eq!(tree_whole(&f, 1), None);
+        // As deep as the limit: whole; one generation more: not.
+        let mut deep = Fake::default();
+        for pid in 1..=(MAX_DEPTH as u32 + 1) {
+            let kids = if pid <= MAX_DEPTH as u32 { vec![pid + 1] } else { vec![] };
+            deep.tree.insert(pid, (kids, vec![]));
+        }
+        assert_eq!(tree_whole(&deep, 1).map(|t| t.len()), Some(MAX_DEPTH + 1));
+        deep.tree.insert(MAX_DEPTH as u32 + 1, (vec![99], vec![]));
+        deep.tree.insert(99, (vec![], vec![]));
+        assert_eq!(tree_whole(&deep, 1), None);
+        // As wide as the limit: whole; one more: not.
+        let mut wide = Fake::default();
+        let kids: Vec<u32> = (2..=MAX_PROCESSES as u32).collect();
+        wide.tree.insert(1, (kids.clone(), vec![]));
+        for k in &kids {
+            wide.tree.insert(*k, (vec![], vec![]));
+        }
+        assert_eq!(tree_whole(&wide, 1).map(|t| t.len()), Some(MAX_PROCESSES));
+        let more = MAX_PROCESSES as u32 + 1;
+        wide.tree.get_mut(&1).unwrap().0.push(more);
+        wide.tree.insert(more, (vec![], vec![]));
+        assert_eq!(tree_whole(&wide, 1), None);
+        assert_eq!(tree_whole(&wide, 12345), None, "a root that cannot be read");
     }
 
     #[test]

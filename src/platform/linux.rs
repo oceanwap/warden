@@ -111,6 +111,14 @@ impl Platform for Linux {
         Some(found)
     }
 
+    fn socket_inodes(&self, pid: u32) -> Option<HashSet<u64>> {
+        socket_inodes(pid)
+    }
+
+    fn net_namespace(&self, pid: u32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/ns/net")).ok()
+    }
+
     fn children(&self, pid: u32) -> Option<Vec<u32>> {
         // The children of every thread: a child belongs to the thread that
         // forked it, and Node and Bun fork from whichever thread asked.

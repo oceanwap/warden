@@ -163,6 +163,19 @@ pub trait Platform: Sync {
     /// The processes this one started (its children, not their children).
     fn children(&self, pid: u32) -> Option<Vec<u32>>;
 
+    /// The inodes of the sockets the process holds open (`socket:[N]`), for
+    /// matching them with the kernel's socket tables. `None`: unreadable, or
+    /// no way to know on this OS.
+    fn socket_inodes(&self, _pid: u32) -> Option<std::collections::HashSet<u64>> {
+        None
+    }
+
+    /// The network namespace the process is in (sockets are per namespace);
+    /// `None` where there are none, or it cannot be read.
+    fn net_namespace(&self, _pid: u32) -> Option<PathBuf> {
+        None
+    }
+
     /// Every process the caller can read: its pid and its command line, the
     /// arguments joined by spaces.
     fn command_lines(&self) -> Vec<(u32, String)>;
@@ -225,6 +238,38 @@ pub fn listening_ports(pid: u32) -> Option<Vec<u16>> {
 /// process itself cannot be read.
 pub fn listeners(pid: u32) -> Option<Vec<Listener>> {
     listeners::of_tree(current(), pid)
+}
+
+/// The sockets (inodes) the process and the processes below it hold open.
+/// `None` unless every one of them was read: the tree was bigger than a walk
+/// looks at (as [`listeners`] limits it), a process in it could not be read,
+/// or the OS has no way to say. So an answer without a socket means none.
+pub fn socket_inodes_of_tree(pid: u32) -> Option<std::collections::HashSet<u64>> {
+    let p = current();
+    let mut all = std::collections::HashSet::new();
+    for pid in listeners::tree_whole(p, pid)? {
+        all.extend(p.socket_inodes(pid)?);
+    }
+    Some(all)
+}
+
+/// What the process and the processes below it listen on, the whole tree or
+/// `None` (the same conditions as [`socket_inodes_of_tree`]): an empty
+/// answer means nothing listens.
+pub fn listeners_whole(pid: u32) -> Option<Vec<Listener>> {
+    let p = current();
+    let mut found = Vec::new();
+    for pid in listeners::tree_whole(p, pid)? {
+        found.extend(p.listeners(pid)?);
+    }
+    found.sort();
+    found.dedup();
+    Some(found)
+}
+
+/// The network namespace of the process, `None` where there are none.
+pub fn net_namespace(pid: u32) -> Option<PathBuf> {
+    current().net_namespace(pid)
 }
 
 pub fn command_lines() -> Vec<(u32, String)> {

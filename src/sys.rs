@@ -996,6 +996,201 @@ pub fn splice(pipe: BorrowedFd<'_>, out: BorrowedFd<'_>, off_out: Option<&mut u6
     Ok(n as usize)
 }
 
+// ------------------------------------------------------------- sock_diag
+//
+// The kernel's socket diagnostics (netlink, NETLINK_SOCK_DIAG: what `ss`
+// reads): the TCP sockets in LISTEN of Warden's network namespace, with their
+// accept queues, in one request, however many connections the host has (the
+// /proc/net/tcp text has a row per connection: megabytes on a busy host).
+// Read-only: nothing is asked of the processes that own the sockets.
+
+/// A TCP socket in LISTEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpListen {
+    /// Its inode: `socket:[N]` in the /proc/<pid>/fd of the process holding it.
+    pub inode: u64,
+    pub addr: std::net::IpAddr,
+    pub port: u16,
+    /// Connections that are established and wait for the app to accept them.
+    pub backlog: u32,
+    /// How many may wait (listen(2)'s backlog, capped by net.core.somaxconn).
+    pub max_backlog: u32,
+    /// Connections dropped since the socket was made: the queue was full, or
+    /// memory short (the socket's `sk_drops`, its share of ListenDrops).
+    pub drops: u32,
+}
+
+#[cfg(target_os = "linux")]
+mod diag {
+    pub(super) const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    pub(super) const NLMSG_ERROR: u16 = 2;
+    pub(super) const NLMSG_DONE: u16 = 3;
+    pub(super) const TCP_LISTEN: u32 = 10;
+    /// The attribute with the socket's memory counters (`INET_DIAG_SKMEMINFO`).
+    pub(super) const SKMEMINFO: u16 = 7;
+    /// Where `sk_drops` is in it (`SK_MEMINFO_DROPS`), in u32s.
+    pub(super) const MEMINFO_DROPS: usize = 8;
+    /// struct nlmsghdr, and struct inet_diag_msg before its attributes.
+    pub(super) const NLMSG_HDR: usize = 16;
+    pub(super) const MSG: usize = 72;
+}
+
+/// The TCP sockets in LISTEN of this network namespace, IPv4 and IPv6. Not
+/// Linux: `Unsupported`.
+#[cfg(target_os = "linux")]
+pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
+    // SAFETY: socket(2) with constant arguments; the descriptor it returns
+    // is owned by the OwnedFd from here on, which closes it.
+    let fd = check(unsafe {
+        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_SOCK_DIAG)
+    })?;
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut found = Vec::new();
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        let req = inet_diag_request(family, 1 << diag::TCP_LISTEN, 1 << (diag::SKMEMINFO - 1));
+        diag_dump(std::os::fd::AsFd::as_fd(&sock), &req, |msg| found.extend(parse_tcp_listen(msg)))?;
+    }
+    Ok(found)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// A dump request: struct nlmsghdr, then struct inet_diag_req_v2 for TCP
+/// sockets of `family` in `states` (a bit per TCP state) with the attributes
+/// in `ext` (a bit per INET_DIAG_* attribute, less one), and a socket id of
+/// zeros (every socket).
+#[cfg(target_os = "linux")]
+fn inet_diag_request(family: u8, states: u32, ext: u8) -> [u8; 72] {
+    let mut r = [0u8; 72];
+    r[0..4].copy_from_slice(&72u32.to_ne_bytes());
+    r[4..6].copy_from_slice(&diag::SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    r[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    r[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    r[16] = family;
+    r[17] = libc::IPPROTO_TCP as u8;
+    r[18] = ext;
+    r[20..24].copy_from_slice(&states.to_ne_bytes());
+    r
+}
+
+/// Send `req` to the kernel and hand the payload of each answer to `each`,
+/// until the dump is done.
+#[cfg(target_os = "linux")]
+fn diag_dump(sock: BorrowedFd<'_>, req: &[u8], mut each: impl FnMut(&[u8])) -> io::Result<()> {
+    // SAFETY: sockaddr_nl is plain data, for which all zeros is a valid value
+    // (the kernel as the destination, no multicast groups).
+    let mut to: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    to.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: the descriptor is borrowed, so it stays open for the call; the
+    // kernel reads `req.len()` bytes of `req`, and the address, a live
+    // sockaddr_nl on this stack frame, for the size given.
+    let sent = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            req.as_ptr().cast(),
+            req.len(),
+            0,
+            (&raw const to).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A dump arrives in parts of at most 32 KB.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: the descriptor is borrowed; the kernel writes at most
+        // `buf.len()` bytes into `buf`, which this function owns.
+        let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "socket diagnostics ended early"));
+        }
+        if diag_messages(&buf[..n as usize], &mut each)? {
+            return Ok(());
+        }
+    }
+}
+
+/// The netlink messages in one part of a dump: each payload of an answer to
+/// `each`. True when the dump is done (or ended with an error, returned).
+#[cfg(target_os = "linux")]
+fn diag_messages(part: &[u8], each: &mut impl FnMut(&[u8])) -> io::Result<bool> {
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "a malformed socket diagnostics message");
+    let mut at = 0;
+    while at + diag::NLMSG_HDR <= part.len() {
+        let len = u32::from_ne_bytes(part[at..at + 4].try_into().map_err(|_| bad())?) as usize;
+        let kind = u16::from_ne_bytes(part[at + 4..at + 6].try_into().map_err(|_| bad())?);
+        if len < diag::NLMSG_HDR || at + len > part.len() {
+            return Err(bad());
+        }
+        let payload = &part[at + diag::NLMSG_HDR..at + len];
+        match kind {
+            diag::NLMSG_DONE => return Ok(true),
+            diag::NLMSG_ERROR => {
+                let code = payload.get(..4).ok_or_else(bad)?;
+                let errno = i32::from_ne_bytes(code.try_into().map_err(|_| bad())?);
+                return if errno == 0 { Ok(true) } else { Err(io::Error::from_raw_os_error(-errno)) };
+            }
+            diag::SOCK_DIAG_BY_FAMILY => each(payload),
+            _ => {}
+        }
+        at += (len + 3) & !3;
+    }
+    Ok(false)
+}
+
+/// One struct inet_diag_msg (and its attributes) of a socket in LISTEN.
+#[cfg(target_os = "linux")]
+fn parse_tcp_listen(msg: &[u8]) -> Option<TcpListen> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    if msg.len() < diag::MSG {
+        return None;
+    }
+    let u32_at = |i: usize| msg.get(i..i + 4).and_then(|b| b.try_into().ok()).map(u32::from_ne_bytes);
+    let addr = match i32::from(msg[0]) {
+        libc::AF_INET => IpAddr::V4(Ipv4Addr::new(msg[8], msg[9], msg[10], msg[11])),
+        libc::AF_INET6 => IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&msg[8..24]).ok()?)),
+        _ => return None,
+    };
+    let mut drops = 0;
+    let mut at = diag::MSG;
+    while at + 4 <= msg.len() {
+        let len = usize::from(u16::from_ne_bytes([msg[at], msg[at + 1]]));
+        let kind = u16::from_ne_bytes([msg[at + 2], msg[at + 3]]);
+        if len < 4 || at + len > msg.len() {
+            break;
+        }
+        if kind == diag::SKMEMINFO {
+            let data = &msg[at + 4..at + len];
+            let i = diag::MEMINFO_DROPS * 4;
+            if let Some(d) = data.get(i..i + 4) {
+                drops = u32::from_ne_bytes(d.try_into().ok()?);
+            }
+        }
+        at += (len + 3) & !3;
+    }
+    Some(TcpListen {
+        inode: u64::from(u32_at(68)?),
+        addr,
+        port: u16::from_be_bytes([msg[4], msg[5]]),
+        backlog: u32_at(56)?,
+        max_backlog: u32_at(60)?,
+        drops,
+    })
+}
+
 // ------------------------------------------------ between fork and exec
 //
 // These run in the child after fork(2) and before exec: only
@@ -2600,5 +2795,107 @@ mod tests {
             let _ = std::fs::remove_file(p);
             let _ = std::fs::remove_file(p2);
         }
+    }
+
+    /// The kernel's own view of a listener: found by its port, with the inode
+    /// its descriptor shows, and an accept queue that holds the connections
+    /// nobody has accepted yet.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_see_a_listener_and_its_queue() {
+        use std::net::{TcpListener, TcpStream};
+        let inode_of = |fd: RawFd| -> u64 {
+            let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+            let link = link.to_string_lossy();
+            link.trim_start_matches("socket:[").trim_end_matches(']').parse().unwrap()
+        };
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let inode = inode_of(l.as_raw_fd());
+        let find = |port: u16| tcp_listeners().unwrap().into_iter().find(|s| s.port == port);
+        let s = find(port).expect("listed");
+        assert_eq!((s.inode, s.addr, s.backlog), (inode, "127.0.0.1".parse().unwrap(), 0));
+        assert!(s.max_backlog >= 1, "{s:?}");
+        // Two connections nobody accepts wait in the queue; one accepted leaves it.
+        let _a = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _b = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let t0 = std::time::Instant::now();
+        while find(port).unwrap().backlog < 2 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", find(port));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let _accepted = l.accept().unwrap();
+        assert_eq!(find(port).unwrap().backlog, 1);
+        drop(l);
+        assert!(find(port).is_none(), "closed: no longer listed");
+        // IPv6, where the host has it.
+        if let Ok(l6) = TcpListener::bind("[::1]:0") {
+            let p6 = l6.local_addr().unwrap().port();
+            let s6 = find(p6).expect("an IPv6 listener is listed");
+            assert_eq!((s6.addr, s6.inode), ("::1".parse().unwrap(), inode_of(l6.as_raw_fd())));
+        }
+    }
+
+    /// The parts of a dump are read with care: several messages in one part,
+    /// the end, an error, and lengths that do not fit are refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_messages_are_read_with_care() {
+        let msg = |kind: u16, payload: &[u8]| -> Vec<u8> {
+            let len = (diag::NLMSG_HDR + payload.len()) as u32;
+            let mut m = Vec::new();
+            m.extend_from_slice(&len.to_ne_bytes());
+            m.extend_from_slice(&kind.to_ne_bytes());
+            m.extend_from_slice(&[0; 10]);
+            m.extend_from_slice(payload);
+            while m.len() % 4 != 0 {
+                m.push(0);
+            }
+            m
+        };
+        // An inet_diag_msg of 127.0.0.1:3000 in LISTEN, 3 waiting of 128,
+        // inode 12345, with its memory counters (7 drops) as an attribute.
+        let mut listen = vec![0u8; diag::MSG];
+        listen[0] = libc::AF_INET as u8;
+        listen[1] = diag::TCP_LISTEN as u8;
+        listen[4..6].copy_from_slice(&3000u16.to_be_bytes());
+        listen[8..12].copy_from_slice(&[127, 0, 0, 1]);
+        listen[56..60].copy_from_slice(&3u32.to_ne_bytes());
+        listen[60..64].copy_from_slice(&128u32.to_ne_bytes());
+        listen[68..72].copy_from_slice(&12345u32.to_ne_bytes());
+        let mut meminfo = vec![0u8; 4 + 9 * 4];
+        let meminfo_len = meminfo.len() as u16;
+        meminfo[0..2].copy_from_slice(&meminfo_len.to_ne_bytes());
+        meminfo[2..4].copy_from_slice(&diag::SKMEMINFO.to_ne_bytes());
+        meminfo[4 + 8 * 4..4 + 9 * 4].copy_from_slice(&7u32.to_ne_bytes());
+        listen.extend_from_slice(&meminfo);
+
+        let part = [msg(diag::SOCK_DIAG_BY_FAMILY, &listen), msg(diag::SOCK_DIAG_BY_FAMILY, &listen)].concat();
+        let mut got = Vec::new();
+        assert!(!diag_messages(&part, &mut |m| got.extend(parse_tcp_listen(m))).unwrap(), "more to come");
+        let want = TcpListen {
+            inode: 12345,
+            addr: "127.0.0.1".parse().unwrap(),
+            port: 3000,
+            backlog: 3,
+            max_backlog: 128,
+            drops: 7,
+        };
+        assert_eq!(got, vec![want.clone(), want]);
+        let done = [msg(diag::SOCK_DIAG_BY_FAMILY, &listen), msg(diag::NLMSG_DONE, &[0; 4])].concat();
+        assert!(diag_messages(&done, &mut |_| {}).unwrap(), "done");
+        let err = msg(diag::NLMSG_ERROR, &(-libc::EPERM).to_ne_bytes());
+        assert_eq!(diag_messages(&err, &mut |_| {}).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        let mut cut = msg(diag::SOCK_DIAG_BY_FAMILY, &listen);
+        cut[0..4].copy_from_slice(&1000u32.to_ne_bytes());
+        assert_eq!(diag_messages(&cut, &mut |_| {}).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        // A message too short to be one, or of another family, is no listener.
+        assert_eq!(parse_tcp_listen(&listen[..40]), None);
+        let mut unix = listen.clone();
+        unix[0] = libc::AF_UNIX as u8;
+        assert_eq!(parse_tcp_listen(&unix), None);
+        // Without the attribute, no drops; a cut attribute is ignored.
+        assert_eq!(parse_tcp_listen(&listen[..diag::MSG]).unwrap().drops, 0);
+        assert_eq!(parse_tcp_listen(&listen[..diag::MSG + 10]).unwrap().drops, 0);
     }
 }
