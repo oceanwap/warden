@@ -2,7 +2,7 @@
 # ...) current: one pull request a week for all of them. Workflows name an
 # action by its major version (actions/checkout@v5), which Dependabot moves.
 # A bump to release.yml is worth a dry run before it is merged: Actions > Release
-# > Run workflow, "Publish the release" unticked (docs/releasing.md).
+# > Run workflow (by hand it is always a dry run; docs/releasing.md).
 #
 # Not for Cargo: the toolchain and the crates are bumped on purpose.
 version: 2

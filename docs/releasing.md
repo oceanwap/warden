@@ -29,9 +29,9 @@ publishing (next section).
 
 ## A dry run first
 
-**Actions → Release → Run workflow**, on any branch, with **Publish the
-release** left unticked, builds everything the release has, exactly as a
-release would, and publishes nothing: no tag, no GitHub Release, no draft. The
+**Actions → Release → Run workflow**, on any branch, builds everything the
+release has, exactly as a release would, and publishes nothing: no tag, no
+GitHub Release, no draft. Run by hand, the workflow is always a dry run. The
 Linux archives and packages are built and tested (the packages installed in
 containers, `install.sh` against the archives), `SHA256SUMS` is written, and the
 files are kept for 14 days as the workflow artifacts `release-<version>` (every
@@ -53,38 +53,8 @@ proves about macOS:
   for or take: no macOS archives, as before. (`cargo dist-macos --no-upload` on
   the Mac builds and checks them without touching GitHub.)
 
-A pushed tag `v*` is always the real release; run by hand, only the ticked box
-is (below).
-
-## From GitHub, without a checkout
-
-The same workflow can publish by hand, for when you can't push tags from
-where you are (a Mac is needed only if you pick the source `local`):
-
-1. Make sure `main` has the commit to release, with the version in
-   `Cargo.toml` (and `protocol/Cargo.toml`, `gui/Cargo.toml`, `Cargo.lock`)
-   already at the number to release, and that **CI is green on it**.
-2. **Actions → Release → Run workflow**, choose the branch `main`, tick
-   **Publish the release**, choose where the macOS archives are built
-   (**macOS archives**: `runner`, the default, or `local`), and run it.
-3. Only for `local`: on a Mac, with that very commit checked out
-   (`git pull`): `cargo dist-macos`. The workflow's `macos-local` job is
-   waiting for the files (up to an hour). With `runner` there is nothing to do.
-
-The first job checks what `cargo release` checks before it tags, and stops
-with a message saying how to fix it: the run is on `main`; the tag
-`v<Cargo.toml version>` does not exist yet; the `CI` workflow has a passed
-run on this very commit (tick **Publish even without a green CI run** only
-if you are sure). Then it builds, packages and install-tests the Linux
-archives and packages, builds the macOS ones on a runner (or takes them from
-the draft release your Mac filled), and only when all of that passed does the
-last job publish the release and create the tag `v<version>` at that commit,
-with the notes from `CHANGELOG.md`. A failed build leaves no tag behind. Run it
-without ticking the box for a dry run (above).
-
-This path does not change the version: to release another number, commit
-the bump to `main` first (`cargo release <version>` does that and the tag
-locally in one go).
+Only a pushed tag `v*` releases. Nothing else does: not a push to `main` or any
+other branch, and not the workflow run by hand.
 
 ## The steps
 
@@ -174,16 +144,15 @@ hour, enough to follow a release at a slower pace.
 ## What the Release workflow does
 
 `.github/workflows/release.yml`, on a pushed `v*` tag (the release), or run by
-hand: a dry run, or with **Publish the release** ticked (above). On Linux
-runners, except the `macos-runner` job:
+hand (a dry run, above). On Linux runners, except the `macos-runner` job:
 
 - **meta**: the version in `Cargo.toml` must be `X.Y.Z` or `X.Y.Z-PRERELEASE`,
-  and a pushed tag must match it, or nothing is built. By hand with the box
-  ticked: the same, plus the checks above (on `main`, no such tag yet, a green
-  CI run). It also writes the release notes (below) and keeps them as the
-  artifact `release-notes`, on a dry run too. And it decides where the macOS
-  archives are built, its output `macos_source` (`runner` or `local`): the
-  input of that name when run by hand; for a pushed tag, the line
+  and a pushed tag must match it, or nothing is built. (The checks before the
+  tag, on `main` and a green CI run among them, are `cargo release`'s.) It
+  also writes the release notes (below) and keeps them as the artifact
+  `release-notes`, on a dry run too. And it decides where the macOS archives
+  are built, its output `macos_source` (`runner` or `local`): the input of
+  that name in a dry run by hand; for a pushed tag, the line
   `macos: runner` or `macos: local` in the tag's annotation (a lightweight tag,
   or no such line, means `runner`; any other value stops the run before
   anything is built). Of the two macOS jobs below exactly one runs.
@@ -235,8 +204,8 @@ runners, except the `macos-runner` job:
   macOS archives came from a runner and no Mac made one; the macOS files
   replaced by the very bytes `SHA256SUMS` lists), downloads the draft and checks it against
   `SHA256SUMS`, file for file, **before** anything is public, then publishes it
-  with the notes (the tag is created there, in a run started by hand); a
-  version with a `-` (`0.2.0-rc.1`) is marked as a pre-release. It does
+  with the notes, for the pushed tag; a version with a `-` (`0.2.0-rc.1`) is
+  marked as a pre-release. It does
   nothing to a release that is already published (a re-run). A last step
   downloads what was published and checks it again.
 
@@ -296,7 +265,7 @@ release**:
   `macos: runner` or `macos: local` (`git show v0.2.0` shows it). That is what
   the workflow reads, so a tag pushed by any means says where its macOS
   archives come from.
-- By hand in the workflow (**Actions → Release → Run workflow**): the input
+- In a dry run by hand (**Actions → Release → Run workflow**): the input
   **macOS archives**, `runner` or `local`.
 - A tag made without `cargo release`: `git tag -a v0.2.0 -m "Warden 0.2.0" -m
   "macos: local"`. A lightweight tag (`git tag v0.2.0`) or an annotation
@@ -422,14 +391,12 @@ always serves the newest release that is not a pre-release
 
 ## Push rights
 
-Pushing the tag starts the release, so it needs write access to the
-repository (and, if a ruleset protects `v*` tags, the right to create them).
-The workflow needs nothing more: its `publish` job uses the run's own token
-(`contents: write`), also when it creates the tag itself in a run started by
-hand; running a workflow needs write access to the repository too. From an
-environment that may push to branches but not tags, the release stops at
-step 7 with the commit and the tag kept: run the printed `git push --atomic …`
-where you can push tags, or use the workflow by hand.
+Pushing the tag starts the release, and only that does, so it needs write
+access to the repository (and, if a ruleset protects `v*` tags, the right to
+create them). The workflow needs nothing more: its `publish` job uses the
+run's own token (`contents: write`). From an environment that may push to
+branches but not tags, the release stops at step 7 with the commit and the tag
+kept: run the printed `git push --atomic …` where you can push tags.
 
 ## Which workflow runs when
 
@@ -443,7 +410,7 @@ changes docs because they are slow, not because they are dear.
 | **Service managers** | every push (also warden from the `.deb`) | | main, pull requests, by hand |
 | **Chaos** | main, daily, by hand | | by hand only |
 | **Bench** | `bench` branch, by hand | `bench` branch, by hand | |
-| **Release** | tag, by hand | tag, by hand | tag, by hand (the `macos-runner` job; with the source `local`, none: built on your Mac) |
+| **Release** | tag (the release); by hand: a dry run | tag; by hand: a dry run | tag; by hand: a dry run (the `macos-runner` job; with the source `local`, none: built on your Mac) |
 
 A commit that only changes docs, `*.md` files or `bench/results/` skips every
 job but the Linux x86_64 ones (`.github/code-changed.sh` decides; Linux x86_64
@@ -504,7 +471,7 @@ slowest job does.
   the Mac. Going from `local` to `runner`, delete the draft release the Mac
   made, so that it holds nothing of the old build. The tag stays on the same
   commit, so nothing else changes. (With no tag pushed yet, there is nothing to
-  switch: pick the other `macos_source` when you start the release.)
+  switch: pick the other `--macos` when you run `cargo release`.)
 - **The workflow**: nothing is published (the draft is checked before it goes
   public). If it was flaky, re-run the failed jobs (`gh run rerun <id> --failed`, or "Re-run failed jobs" on the run
   page). If the code must change: `git push --delete origin v<version>` and

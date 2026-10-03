@@ -28,42 +28,31 @@
 # (cargo-about, about.toml): THIRD-PARTY-LICENSES.txt, and
 # THIRD-PARTY-LICENSES-GUI.txt in the GUI bundles.
 #
-# What starts a run:
-#   - a pushed tag v<version> (matching Cargo.toml): the real release.
-#     `cargo release <version>` does that from a checkout. The macOS source is
-#     the line `macos: runner` or `macos: local` in the tag's annotation (a
-#     lightweight tag, or no such line, means runner);
-#   - Actions > Release > Run workflow, on any branch, with "Publish the
-#     release" UNTICKED (the default): a DRY RUN. Everything is built, packaged,
-#     checksummed and install-tested exactly as for a release and kept as
-#     workflow artifacts (release-<version>: every file, SHA256SUMS included;
-#     release-notes: the notes), but no tag is made and no GitHub Release is
-#     created or touched. With the macOS source "runner" (the input
+# What starts a run (only a pushed tag publishes; nothing else ever does):
+#   - a pushed tag v<version> (matching Cargo.toml): the release.
+#     `cargo release <version>` does that from a checkout, after checking CI.
+#     The macOS source is the line `macos: runner` or `macos: local` in the
+#     tag's annotation (a lightweight tag, or no such line, means runner). To
+#     retry a failed release, re-run the tag's own run;
+#   - Actions > Release > Run workflow, on any branch: a DRY RUN. Everything is
+#     built, packaged, checksummed and install-tested exactly as for a release
+#     and kept as workflow artifacts (release-<version>: every file, SHA256SUMS
+#     included; release-notes: the notes), but no tag is made and no GitHub
+#     Release is created or touched. With the macOS source "runner" (the input
 #     `macos_source`, default runner) the macOS archives are built and checked
 #     too; with "local" none are taken. Use it before tagging, and after
-#     changing this file;
-#   - the same, on `main`, with "Publish the release" TICKED: no checkout at
-#     all. The tag v<version> is created at that commit once everything is
-#     built and tested, so a failed build leaves no tag behind. Needs a green
-#     CI run on the commit (see docs/releasing.md). The macOS source is the
-#     input `macos_source`.
+#     changing this file.
+# Pushes to branches never start it.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  # By hand: a dry run, never a release (a release is a pushed tag).
   workflow_dispatch:
     inputs:
-      release:
-        description: "Publish the release (main only: tags v<Cargo.toml version> at this commit). Unticked: a dry run, nothing is published."
-        type: boolean
-        default: false
-      skip_ci_check:
-        description: "Publish even without a green CI run on this commit (not recommended)"
-        type: boolean
-        default: false
       macos_source:
-        description: "Where the macOS archives are built: runner (a GitHub macOS runner, also in a dry run) or local (on your Mac: run cargo dist-macos while a release waits; a dry run has none)"
+        description: "Where this dry run's macOS archives are built: runner (a GitHub macOS runner, built and checked) or local (on your Mac: a dry run takes none)"
         type: choice
         options: [runner, local]
         default: runner
@@ -72,10 +61,10 @@ permissions:
   contents: read
 
 concurrency:
-  # By mode too: a dry run on main must not cancel a real release waiting there.
-  group: release-${{ github.ref }}-${{ inputs.release && 'publish' || 'dry' }}
-  # A release in progress is never cancelled by another run.
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release }}
+  # By event too: a dry run started on a tag must not cancel the tag's release.
+  group: release-${{ github.ref }}-${{ github.event_name }}
+  # A release in progress is never cancelled; a dry run by a newer one is.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,7 +85,6 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      actions: read # the CI runs of this commit, for a release started by hand
     outputs:
       version: ${{ steps.version.outputs.version }}
       publish: ${{ steps.version.outputs.publish }}
@@ -106,8 +94,6 @@ jobs:
       macos_source: ${{ steps.macos.outputs.macos_source }}
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE: ${{ inputs.release }}
-      SKIP_CI_CHECK: ${{ inputs.skip_ci_check }}
     steps:
       # The whole history, so that every tag is fetched with its annotation:
       # the macOS source is written in the annotation of the tag that was pushed.
@@ -122,8 +108,8 @@ jobs:
             echo "::error title=Bad version::Cargo.toml says version \"$cargo_version\", which is not X.Y.Z or X.Y.Z-PRERELEASE (the packages and the file names need that)."
             exit 1
           fi
-          # A pushed tag is the release. Run by hand, only "Publish the release"
-          # releases (even on a tag: re-run a tag's own run to retry it).
+          # A pushed tag is the release (a re-run of its run too); a run by hand is
+          # always a dry run, on any ref, a tag included.
           if [ "$GITHUB_EVENT_NAME" = push ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             tag_version="${GITHUB_REF_NAME#v}"
             if [ "$tag_version" != "$cargo_version" ]; then
@@ -133,32 +119,6 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
             echo "Release v$cargo_version"
-          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$RELEASE" = "true" ]; then
-            # Started by hand with "Publish the release" ticked. Everything that
-            # `cargo release` checks before it tags, checked here, before the
-            # slow builds.
-            tag="v$cargo_version"
-            if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-              echo "::error title=Not on main::a release is cut from main, and this run is on $GITHUB_REF. Nothing was built or published. Run the workflow again and choose the branch main (or untick \"Publish the release\" for a dry run)."
-              exit 1
-            fi
-            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
-              echo "::error title=Tag exists::$tag already exists in $GITHUB_REPOSITORY, so version $cargo_version was released before. Nothing was built or published. Raise [package] version in Cargo.toml, Cargo.lock, protocol/Cargo.toml and gui/Cargo.toml (all the same number), commit it to main, let CI pass, and run this again."
-              exit 1
-            fi
-            if [ "$SKIP_CI_CHECK" = "true" ]; then
-              echo "::warning title=CI check skipped::publishing $tag without looking for a green CI run on $GITHUB_SHA"
-            else
-              green=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&per_page=20" \
-                --jq '[.workflow_runs[] | select(.conclusion == "success")] | length')
-              if [ "${green:-0}" -lt 1 ]; then
-                echo "::error title=No green CI run::the CI workflow has no passed run on $GITHUB_SHA. Nothing was built or published. Wait for CI to pass on this commit (Actions > CI), or run this again with \"Publish even without a green CI run\" ticked if you are sure."
-                exit 1
-              fi
-            fi
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
-            echo "Release $tag at $GITHUB_SHA"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "Dry run for version $cargo_version: artifacts only, no release"
@@ -940,8 +900,8 @@ jobs:
   # source "local" the draft release already holds them (macos-local read them
   # there); with "runner" there is no draft yet and it is made here. Add the
   # Linux archives and packages, SHA256SUMS and install.sh, check the draft,
-  # write the notes (CHANGELOG.md) and publish it. A tag pushed by hand is what
-  # was built; started by hand, publishing creates the tag at the commit built.
+  # write the notes (CHANGELOG.md) and publish it, for the pushed tag that was
+  # built (a run by hand is a dry run and never gets here).
   # The only job besides `macos-local` that can write. It does not list the
   # macOS jobs: it needs `checksums`, which runs only when the one the release
   # chose has succeeded. `!cancelled()` and the results it needs, spelled out:
@@ -989,12 +949,8 @@ jobs:
                 echo "::error title=No draft release::there is no release $TAG, and the macOS archives were taken from the draft the Mac made: it was deleted meanwhile. Run scripts/dist-macos.sh on the Mac again, then re-run this workflow."
                 exit 1
               fi
-              flags=(--draft --title "Warden $VERSION" --notes-file notes/RELEASE-NOTES.md)
-              if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
-                # Started by hand: the tag does not exist yet; publishing creates it.
-                flags+=(--target "$GITHUB_SHA")
-              fi
-              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Warden $VERSION" \
+                --notes-file notes/RELEASE-NOTES.md
               draft=true ;;
             *)
               echo "::error::can't look for the release $TAG: $seen"
@@ -1033,10 +989,6 @@ jobs:
         run: |
           set -euo pipefail
           flags=(--draft=false --title "Warden $VERSION" --notes-file notes/RELEASE-NOTES.md)
-          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
-            # Started by hand: publishing creates the tag, at the commit built.
-            flags+=(--target "$GITHUB_SHA")
-          fi
           if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease=true); else flags+=(--prerelease=false); fi
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
       # What users download must be what SHA256SUMS lists, file for file.
