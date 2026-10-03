@@ -129,7 +129,10 @@ in worker mode. Enabled by default when `command` is `bun`. It:
    (F13), so health checks reach exactly one worker;
 3. reports `listening` (+ the private socket) and a 1 s **heartbeat** from the
    event loop to Warden (fd 3 in process mode, `postMessage` → host → fd 3 in
-   worker mode) — readiness and watchdog signals. The heartbeat carries the
+   worker mode) — readiness and watchdog signals (and, from the static server
+   and under Node, the responses since the worker started, by status: `req`,
+   through Node's `http.server.response.finish` diagnostics channel, nothing
+   wrapped; `warden list` shows `req/s` and `4xx/5xx`). The heartbeat carries the
    interval's **event-loop delay** (`"loop":{"p50":…,"p99":…,"max":…}`, ms):
    `perf_hooks.monitorEventLoopDelay` (Node and Bun) at a 100 ms resolution,
    a native timer, read and reset once per heartbeat — no work per request,

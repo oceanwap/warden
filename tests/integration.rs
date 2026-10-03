@@ -1,7 +1,7 @@
 //! End-to-end tests: run the real `warden` binary against real Bun processes.
 //! Skipped (with a message) when `bun` is not on PATH.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -1531,6 +1531,90 @@ fn have_node() -> bool {
 /// Node apps get the shim through `--import`: several workers share the
 /// port (SO_REUSEPORT), each knows its NODE_APP_INSTANCE, and a rolling
 /// restart under load drops nothing.
+/// `status --json` until `f` holds of it (the counts come with the
+/// heartbeats, once a second).
+fn wait_status(w: &Warden, what: &str, f: impl Fn(&Value) -> bool) -> Value {
+    w.wait_for(what, T, f)
+}
+
+/// Request health: a Node app's responses are counted by status through
+/// the shim (`node:diagnostics_channel`), per worker and for the app; the
+/// health checks on the private sockets are not; the port shows its queue.
+#[test]
+fn node_responses_are_counted_by_status() {
+    if !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"noderq\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+         [health]\npath = \"/whoami\"\ninterval = 1\n",
+        fixture("node_app.mjs")
+    );
+    let w = Warden::start("noderq", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    for (code, n) in [(200, 20), (301, 2), (404, 5), (400, 1), (503, 3)] {
+        for _ in 0..n {
+            let _ = get(port, &format!("/status?code={code}"));
+        }
+    }
+    let s = wait_status(&w, "the responses counted", |s| s["requests"]["total"]["5xx"] == 3);
+    let total = &s["requests"]["total"];
+    assert_eq!(
+        (&total["2xx"], &total["3xx"], &total["4xx"], &total["404"], &total["5xx"]),
+        (&json!(20), &json!(2), &json!(6), &json!(5), &json!(3)),
+        "health checks (every second, on the private sockets) are not counted: {s:#?}"
+    );
+    assert_eq!(s["requests"]["minute"], s["requests"]["total"]);
+    let per_worker: u64 =
+        s["workers"].as_array().unwrap().iter().map(|w| w["requests"]["total"]["2xx"].as_u64().unwrap_or(0)).sum();
+    assert_eq!(per_worker, 20, "the workers' counts add up to the app's");
+    let p = &s["ports"][0];
+    assert_eq!(p["port"], port);
+    assert!(p["max_backlog"].as_u64().unwrap() > 0 && p["drops"].is_u64(), "{p}");
+    // `warden status` says it in words.
+    let (_, text) = w.cli(&["status"]);
+    assert!(text.contains("last minute: 31 sent, 3 5xx, 6 4xx of which 5 404"), "{text}");
+    assert!(text.contains("waiting to be accepted"), "{text}");
+}
+
+/// Warden's static server counts its own responses; `[metrics] requests =
+/// false` turns the counting off (no figures at all, not zeros).
+#[test]
+fn static_responses_are_counted_and_can_be_turned_off() {
+    let dir = std::env::temp_dir().join(format!("warden-it-site-staticrq-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "<h1>home</h1>").unwrap();
+    let toml = |name: &str, port: u16, extra: &str| {
+        format!(
+            "[app]\nname = \"{name}\"\nport = {port}\n[workers]\ncount = 1\n{extra}[static]\nroot = \"{}\"\n",
+            dir.join("site").display()
+        )
+    };
+    let (on, off) = (free_port(), free_port());
+    let w = Warden::start("staticrq", on, &toml("staticrq", on, ""));
+    let w_off = Warden::start("staticrq-off", off, &toml("staticrq-off", off, "[metrics]\nrequests = false\n"));
+    w.wait_for("ready", T, ready(1));
+    w_off.wait_for("ready", T, ready(1));
+    for port in [on, off] {
+        for _ in 0..7 {
+            assert!(get(port, "/").is_some());
+        }
+        for _ in 0..3 {
+            let _ = get(port, "/missing.html");
+        }
+    }
+    let s = wait_status(&w, "the responses counted", |s| s["requests"]["total"]["404"] == 3);
+    assert_eq!((&s["requests"]["total"]["2xx"], &s["workers"][0]["requests"]["total"]["2xx"]), (&json!(7), &json!(7)));
+    // The static server's sockets defer accepting (TCP_DEFER_ACCEPT), which the kernel counts as drops: none shown.
+    assert!(s["ports"][0]["max_backlog"].as_u64().unwrap() > 0 && s["ports"][0].get("drops").is_none(), "{s:#?}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let s = w_off.status().unwrap();
+    assert!(s.get("requests").is_none() && s["workers"][0].get("requests").is_none(), "{s:#?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn node_workers_share_a_port_through_the_shim() {
     if !have_bun() || !have_node() {
@@ -2168,7 +2252,7 @@ fn static_cache_hits_match_and_stay_fresh() {
     std::fs::write(site.join("swap.txt"), "inside").unwrap();
     std::fs::write(dir.join("outside.txt"), "secret").unwrap();
     // Between the single-write limit (16 KB) and cache_max_file (64 KB):
-    // cached in a memfd (MEMFD_MIN, 8 KB); and one above it (never cached).
+    // cached in a memfd (MEMFD_MIN, 24 KB); and one above it (never cached).
     let mid: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(site.join("mid.bin"), &mid).unwrap();
     let big: Vec<u8> = (0..100_000u32).map(|i| (i % 241) as u8).collect();
@@ -6704,7 +6788,8 @@ fn standby_takes_over_a_killed_bun_worker_in_milliseconds() {
     }
     let (_, out) = w.cli(&["status"]);
     assert!(
-        out.contains("│ standby   │ 1/1 ready") && out.lines().any(|l| l.starts_with("│ s1 ") && l.contains("STANDBY")),
+        out.lines().any(|l| l.starts_with("│ standby ") && l.contains("│ 1/1 ready"))
+            && out.lines().any(|l| l.starts_with("│ s1 ") && l.contains("STANDBY")),
         "{out}"
     );
     assert_eq!(s["workers"].as_array().map(Vec::len), Some(1), "standbys are not workers");

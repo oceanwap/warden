@@ -221,6 +221,15 @@ $ warden status travelerwe-api
 └────────┴─────────┴──────┴────────┴───┴──────┴─────────┴──────────┴────────┴───────────┘
 ```
 
+Where Warden counts the responses (its static server, and Node apps through
+the shim), `warden list` and the worker table have two more columns: `req/s`,
+the worker's responses per second over the last 10 s, and `4xx/5xx`, its
+client and server errors of the last minute (yellow with 4xx, red with a
+5xx); `-` elsewhere. `warden status` and `describe` add a `requests` row
+(the rate, the last minute and the total by class) and a `connections` row:
+each port's open connections, the ones waiting to be accepted out of how
+many may wait, and the ones the kernel dropped, from the kernel.
+
 Every problem Warden logs says what happened, why, what it did and how to fix
 it; [`troubleshooting.md`](troubleshooting.md) collects them by symptom.
 

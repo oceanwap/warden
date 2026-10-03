@@ -166,6 +166,7 @@ max_age_days = 0                             # also delete rotated files older t
 
 [metrics]
 # listen = "127.0.0.1:9464"                  # Prometheus text at /metrics
+requests = true                              # count responses by status (static server; Node via diagnostics_channel)
 
 [control]
 socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory=warden/%i in the unit

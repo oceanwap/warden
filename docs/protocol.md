@@ -189,6 +189,32 @@ interval (about a second), from Warden's shim; in worker mode each
 Worker's own. It is absent without the shim and when the worker sent no
 heartbeat in the last 5 s. An addition: older clients ignore it.
 
+`status.workers[].requests` and `status.requests` (absent where nothing
+counts them) are the responses a worker, and the app, sent, by status:
+`{"rate": <per second over the last 10 s>, "minute": {…}, "total": {…}}`,
+each count `{"2xx", "3xx", "4xx", "404", "5xx"}` (a 404 counts in `4xx`
+too). A worker's `total` is since it started, the app's since the supervisor
+started. They are counted where Warden sees the responses: its own static
+server, and Node apps through the shim, which subscribes to Node's
+`http.server.response.finish` diagnostics channel (nothing of the app or of
+`http` is wrapped); not Bun (its `node:http` does not publish the channel,
+and `Bun.serve` has no such hook), not other runtimes, and not with
+`[metrics] requests = false`. Health checks on the private sockets are not
+counted. The workers send their counts with each heartbeat
+(`"req": {"2xx": n, …}` on fd 3, since they started). Additions: older
+clients ignore them.
+
+`status.ports` (absent where the OS cannot say) has one object per TCP port
+the workers listen on, read from the kernel when a status is asked for, at
+most every 2 s: `port`; `connections`, established on it now, every
+worker's (absent off Linux); `backlog`, connections that wait for a worker
+to accept them now, and `max_backlog`, how many may wait (the listen
+backlogs together); `drops`, what the kernel discarded at those listening
+sockets since they were made, nearly always connections that found the
+accept queue full (absent for Warden's static server, whose sockets wait
+for the request before accepting, which the kernel counts there as well).
+An addition: older clients ignore it.
+
 Hot standbys (process mode, `[workers] standby`) are listed in
 `status.standbys` (`WorkerStatus` rows; the field is absent without
 standbys, and older clients ignore it), never in `status.workers`: `id` is

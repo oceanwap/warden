@@ -106,14 +106,18 @@ async fn serve_requests<R>(
             Ok(Some(n)) => n,
             Ok(None) => return,
             Err(code) => {
-                let _ = respond_error(w, code, false, false).await;
+                if respond_error(w, code, false, false).await.is_ok() {
+                    site.responded(code);
+                }
                 return;
             }
         };
         let req = match parse_head(&head.buf[head.pos..head.pos + len]) {
             Ok(req) => req,
             Err(code) => {
-                let _ = respond_error(w, code, false, false).await;
+                if respond_error(w, code, false, false).await.is_ok() {
+                    site.responded(code);
+                }
                 return;
             }
         };
@@ -123,6 +127,9 @@ async fn serve_requests<R>(
         scratch.cache = "";
         let result = handle(&req, site, w, keep, &mut scratch).await;
         drop(busy);
+        if let Ok((status, _)) = &result {
+            site.responded(*status);
+        }
         if let Some(t0) = t0 {
             log_access(&req, &result, t0, scratch.cache);
         }
@@ -199,6 +206,9 @@ pub(super) fn first_request(site: &Site, fd: OwnedFd, try_inline: bool) -> First
     };
     if let Some(t0) = t0 {
         log_access(&req, &result, t0, cache);
+    }
+    if let Ok((status, _)) = &result {
+        site.responded(*status);
     }
     if result.is_err() {
         // The client is gone, or a file could not be read: no answer to give.
@@ -314,6 +324,7 @@ mod tests {
             idle_timeout: IDLE_TIMEOUT,
             bufs: Mutex::new(Vec::new()),
             inline: AtomicU64::new(0),
+            responses: Some(Default::default()),
         }
     }
 

@@ -397,6 +397,7 @@ function trackNodeServer(server) {
     if (!addr || typeof addr !== "object") return; // a Unix socket
     const isApp = appPort == null || addr.port === appPort;
     if (!isApp) return;
+    if (isHttpServer(server)) appHttpServers.add(server);
     if (!privateServer && isHttpServer(server)) {
       openPrivateNode(server, (socket) =>
         report(socket ? { ev: "listening", port: addr.port, socket } : { ev: "listening", port: addr.port }),
@@ -1225,10 +1226,49 @@ function closePrivateSocket() {
   privateServer = null;
 }
 
+// ------------------------------------------------------------- responses
+//
+// The responses of the app's node:http servers on its port, by status, sent
+// with each heartbeat as `req` (counts since the worker started) for `warden
+// list`, the GUI and the metrics. Node publishes each response's end on its
+// own diagnostics channel, `http.server.response.finish`: subscribing wraps
+// nothing of the app or of http. Measured on a hello-world server under Node
+// 22: 25.89 µs of CPU per request against 25.80 without (within the noise);
+// wrapping `emit` instead cost 3.7 %. Not under Bun, whose node:http does not
+// publish it (and Bun.serve has no such hook), and not with WARDEN_REQUESTS=0
+// (`[metrics] requests = false`). Health checks on the private socket go to
+// its own server, which is not counted. No figure is sent before the first
+// response: a Node without the channel sends none, rather than zeros.
+const appHttpServers = new WeakSet();
+const responses = { "2xx": 0, "3xx": 0, "4xx": 0, "404": 0, "5xx": 0 };
+let responsesSeen = false;
+
+function onResponse(m) {
+  if (!m || !appHttpServers.has(m.server)) return;
+  const s = m.response ? m.response.statusCode : 0;
+  responsesSeen = true;
+  if (s >= 500) responses["5xx"]++;
+  else if (s >= 400) {
+    responses["4xx"]++;
+    if (s === 404) responses["404"]++;
+  } else if (s >= 300) responses["3xx"]++;
+  else if (s >= 200) responses["2xx"]++;
+}
+
+if (!isBun && heartbeatMs > 0 && env.WARDEN_REQUESTS !== "0") {
+  try {
+    require("node:diagnostics_channel").subscribe("http.server.response.finish", onResponse);
+  } catch {}
+}
+
 if (heartbeatMs > 0) {
   // Stops arriving when the event loop is blocked: Warden's watchdog notices.
-  // Carries the event-loop delay of the interval (next section).
-  const t = setInterval(() => report({ ev: "heartbeat", loop: loopDelay() }), heartbeatMs);
+  // Carries the event-loop delay of the interval (next section), and the
+  // responses since the worker started (above).
+  const t = setInterval(
+    () => report(responsesSeen ? { ev: "heartbeat", loop: loopDelay(), req: responses } : { ev: "heartbeat", loop: loopDelay() }),
+    heartbeatMs,
+  );
   if (t && typeof t.unref === "function") t.unref();
 }
 

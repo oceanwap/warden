@@ -47,6 +47,34 @@ pub fn millis(ms: f64) -> String {
     }
 }
 
+/// Responses per second: `0`, `0.4/s`, `12.3/s`, `1234/s` (as `warden list`).
+pub fn per_second(r: f64) -> String {
+    if r == 0.0 {
+        "0/s".into()
+    } else if r < 100.0 {
+        format!("{r:.1}/s")
+    } else {
+        format!("{r:.0}/s")
+    }
+}
+
+/// The errors of a minute, worst first: `3 5xx · 4 4xx`, `4 404s`, or `None`.
+pub fn errors(m: &warden_protocol::control::Responses) -> Option<String> {
+    let mut parts = Vec::new();
+    if m.server_error > 0 {
+        parts.push(format!("{} 5xx", m.server_error));
+    }
+    if m.client_error > 0 {
+        // A static site's 4xx are nearly all 404s: say so when they all are.
+        parts.push(if m.not_found == m.client_error {
+            format!("{} 404{}", m.not_found, if m.not_found == 1 { "" } else { "s" })
+        } else {
+            format!("{} 4xx", m.client_error)
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 pub fn opt<T>(v: Option<T>, f: impl FnOnce(T) -> String) -> String {
     v.map(f).unwrap_or_else(|| "-".into())
 }
@@ -386,6 +414,7 @@ mod tests {
             healthy: None,
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         };
         let mut s = crate::model::tests::status("api", 2);
         assert_eq!(status_summary(&s), "2/2 workers ready");

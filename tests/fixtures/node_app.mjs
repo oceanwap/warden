@@ -4,7 +4,8 @@
 //                             SIGTERM is ignored
 //   FIXTURE_BLOCK_MS=<ms>     block the event loop for <ms> every 400 ms (event-loop delay)
 //   FIXTURE_TLS_DIR=<dir>     serve https with <dir>/key.pem and <dir>/cert.pem
-// Endpoints: /whoami -> "<pid>:<NODE_APP_INSTANCE>", /slow?ms=N -> answers after N ms
+// Endpoints: /whoami -> "<pid>:<NODE_APP_INSTANCE>", /slow?ms=N -> answers after N ms,
+//            /status?code=N -> answers with status N
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
@@ -12,6 +13,11 @@ import https from "node:https";
 const who = () => `${process.pid}:${process.env.NODE_APP_INSTANCE}`;
 const handler = (req, res) => {
   const url = new URL(req.url, "http://x");
+  if (url.pathname === "/status") {
+    res.statusCode = Number(url.searchParams.get("code") || 200);
+    res.end(who());
+    return;
+  }
   if (url.pathname === "/slow") {
     setTimeout(() => res.end(who()), Number(url.searchParams.get("ms") || 500));
     return;

@@ -160,11 +160,17 @@ fn announce(site: &Site, tcp: &Tcp, port: u16, worker: u64, health: Option<&Heal
 fn spawn_timers(site: &Site, worker: u64) {
     let beat_ms: u64 = env_number("WARDEN_HEARTBEAT_MS").unwrap_or(0);
     if beat_ms > 0 {
+        let responses = site.responses.clone();
         tokio::spawn(async move {
             let mut t = tokio::time::interval(Duration::from_millis(beat_ms));
             loop {
                 t.tick().await;
-                report(serde_json::json!({"ev": "heartbeat", "worker": worker}));
+                let mut beat = serde_json::json!({"ev": "heartbeat", "worker": worker});
+                // The responses since the worker started, by status.
+                if let Some(r) = &responses {
+                    beat["req"] = r.json();
+                }
+                report(beat);
             }
         });
     }

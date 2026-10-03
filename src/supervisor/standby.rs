@@ -728,6 +728,7 @@ impl Supervisor {
                     healthy,
                     loop_delay,
                     listening: Vec::new(),
+                    requests: None,
                 }
             };
         let now = Instant::now();

@@ -90,9 +90,33 @@ pub struct IpcMsg {
     /// the heartbeat the watchdog waits for; read with [`IpcMsg::loop_delay`].
     #[serde(default, rename = "loop")]
     pub loop_ms: Option<serde_json::Value>,
+    /// `heartbeat`: the responses sent since the worker started, by status
+    /// (`{"2xx": n, "3xx": n, "4xx": n, "404": n, "5xx": n}`), from Warden's
+    /// static server and the shim under Node. Loose like `loop`; read with
+    /// [`IpcMsg::requests`].
+    #[serde(default)]
+    pub req: Option<serde_json::Value>,
 }
 
 impl IpcMsg {
+    /// The heartbeat's response counts, if it has sane ones: whole numbers
+    /// (a missing class is 0), 404s no more than the 4xx they are part of.
+    pub fn requests(&self) -> Option<crate::control::Responses> {
+        let v = self.req.as_ref()?.as_object()?;
+        let num = |k: &str| match v.get(k) {
+            None => Some(0),
+            Some(x) => x.as_u64(),
+        };
+        let r = crate::control::Responses {
+            ok: num("2xx")?,
+            redirect: num("3xx")?,
+            client_error: num("4xx")?,
+            not_found: num("404")?,
+            server_error: num("5xx")?,
+        };
+        (r.not_found <= r.client_error).then_some(r)
+    }
+
     /// The heartbeat's event-loop delay, if it has a sane one: three
     /// numbers, finite, from 0 to a day (ms); p99 and max are raised to
     /// the figure below them if a histogram's rounding put them lower.
@@ -827,6 +851,38 @@ mod tests {
             assert_eq!(m.ev, "heartbeat", "{bad}");
             assert_eq!(m.loop_delay(), None, "{bad}");
         }
+    }
+
+    /// A heartbeat's response counts are taken when sane; a bad one costs the
+    /// figures, never the heartbeat.
+    #[test]
+    fn heartbeat_requests() {
+        let parse = |s: &str| serde_json::from_str::<IpcMsg>(s).unwrap();
+        let m = parse(r#"{"ev":"heartbeat","worker":1,"req":{"2xx":10,"3xx":2,"4xx":5,"404":4,"5xx":1}}"#);
+        let want = crate::control::Responses { ok: 10, redirect: 2, client_error: 5, not_found: 4, server_error: 1 };
+        assert_eq!(m.requests(), Some(want));
+        assert_eq!(want.total(), 18);
+        // A class it does not send is 0.
+        let m = parse(r#"{"ev":"heartbeat","req":{"2xx":3}}"#);
+        assert_eq!(m.requests(), Some(crate::control::Responses { ok: 3, ..Default::default() }));
+        for bad in [
+            r#"{"ev":"heartbeat"}"#,
+            r#"{"ev":"heartbeat","req":null}"#,
+            r#"{"ev":"heartbeat","req":[1,2,3]}"#,
+            r#"{"ev":"heartbeat","req":{"2xx":-1}}"#,
+            r#"{"ev":"heartbeat","req":{"2xx":1.5}}"#,
+            r#"{"ev":"heartbeat","req":{"2xx":"1"}}"#,
+            r#"{"ev":"heartbeat","req":{"4xx":1,"404":2}}"#,
+        ] {
+            let m = parse(bad);
+            assert_eq!((m.ev.as_str(), m.requests()), ("heartbeat", None), "{bad}");
+        }
+        // Counters only grow; one that went back started again from zero.
+        let before = crate::control::Responses { ok: 8, client_error: 5, not_found: 4, ..Default::default() };
+        let d = want.since(&before);
+        assert_eq!((d.ok, d.redirect, d.client_error, d.not_found, d.server_error), (2, 2, 0, 0, 1));
+        let restarted = crate::control::Responses { ok: 1, ..Default::default() };
+        assert_eq!(restarted.since(&want).ok, 1);
     }
 
     #[test]

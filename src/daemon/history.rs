@@ -536,6 +536,7 @@ mod tests {
                 healthy: None,
                 loop_delay: None,
                 listening: Vec::new(),
+                requests: None,
             })
             .collect();
         s

@@ -1025,7 +1025,12 @@ mod diag {
     pub(super) const SOCK_DIAG_BY_FAMILY: u16 = 20;
     pub(super) const NLMSG_ERROR: u16 = 2;
     pub(super) const NLMSG_DONE: u16 = 3;
+    pub(super) const TCP_ESTABLISHED: u32 = 1;
     pub(super) const TCP_LISTEN: u32 = 10;
+    /// The request's filter attribute, and the comparisons it uses.
+    pub(super) const REQ_BYTECODE: u16 = 1;
+    pub(super) const BC_S_GE: u8 = 2;
+    pub(super) const BC_S_LE: u8 = 3;
     /// The attribute with the socket's memory counters (`INET_DIAG_SKMEMINFO`).
     pub(super) const SKMEMINFO: u16 = 7;
     /// Where `sk_drops` is in it (`SK_MEMINFO_DROPS`), in u32s.
@@ -1057,6 +1062,58 @@ pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
 #[cfg(not(target_os = "linux"))]
 pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// How many TCP connections are established on local port `port` (IPv4 and
+/// IPv6) in this network namespace: the kernel matches the port (a bytecode
+/// filter, as `ss sport = :N` sends) and returns only those. Not Linux:
+/// `Unsupported`.
+#[cfg(target_os = "linux")]
+pub fn tcp_connections(port: u16) -> io::Result<u32> {
+    // SAFETY: as in `tcp_listeners`.
+    let fd = check(unsafe {
+        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_SOCK_DIAG)
+    })?;
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut n = 0u32;
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        let mut req = inet_diag_request(family, 1 << diag::TCP_ESTABLISHED, 0).to_vec();
+        req.extend_from_slice(&sport_filter(port));
+        let len = req.len() as u32;
+        req[0..4].copy_from_slice(&len.to_ne_bytes());
+        diag_dump(std::os::fd::AsFd::as_fd(&sock), &req, |_| n = n.saturating_add(1))?;
+    }
+    Ok(n)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn tcp_connections(_port: u16) -> io::Result<u32> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// The request attribute (INET_DIAG_REQ_BYTECODE) with a filter for local
+/// port `port`: source port >= port, then <= port. Each comparison is an
+/// inet_diag_bc_op (code, yes, no: where to go on true and on false, in
+/// bytes; landing exactly at the end accepts, past it refuses) followed by
+/// one whose `no` holds the port.
+#[cfg(target_os = "linux")]
+fn sport_filter(port: u16) -> [u8; 20] {
+    let op = |code: u8, yes: u8, no: u16| {
+        let mut o = [0u8; 4];
+        o[0] = code;
+        o[1] = yes;
+        o[2..4].copy_from_slice(&no.to_ne_bytes());
+        o
+    };
+    let mut a = [0u8; 20];
+    a[0..2].copy_from_slice(&20u16.to_ne_bytes());
+    a[2..4].copy_from_slice(&diag::REQ_BYTECODE.to_ne_bytes());
+    a[4..8].copy_from_slice(&op(diag::BC_S_GE, 8, 20));
+    a[8..12].copy_from_slice(&op(0, 0, port));
+    a[12..16].copy_from_slice(&op(diag::BC_S_LE, 8, 12));
+    a[16..20].copy_from_slice(&op(0, 0, port));
+    a
 }
 
 /// A dump request: struct nlmsghdr, then struct inet_diag_req_v2 for TCP
@@ -2833,6 +2890,37 @@ mod tests {
             let p6 = l6.local_addr().unwrap().port();
             let s6 = find(p6).expect("an IPv6 listener is listed");
             assert_eq!((s6.addr, s6.inode), ("::1".parse().unwrap(), inode_of(l6.as_raw_fd())));
+        }
+    }
+
+    /// The connections established on a port, counted by the kernel's filter:
+    /// those of this port and no other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_count_the_connections_of_a_port() {
+        use std::net::{TcpListener, TcpStream};
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let other = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert_eq!(tcp_connections(port).unwrap(), 0);
+        let clients: Vec<TcpStream> = (0..3).map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap()).collect();
+        let _elsewhere = TcpStream::connect(other.local_addr().unwrap()).unwrap();
+        // Each connection is two sockets on loopback: the client's, whose
+        // local port is another, and the server's, whose local port is this
+        // one (accepted or still in the queue: established either way).
+        let t0 = std::time::Instant::now();
+        while tcp_connections(port).unwrap() < 3 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{}", tcp_connections(port).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(tcp_connections(port).unwrap(), 3);
+        let accepted: Vec<_> = (0..3).map(|_| l.accept().unwrap()).collect();
+        assert_eq!(tcp_connections(port).unwrap(), 3, "accepted: still established");
+        drop((clients, accepted));
+        let t0 = std::time::Instant::now();
+        while tcp_connections(port).unwrap() > 0 {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

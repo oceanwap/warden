@@ -14,6 +14,7 @@
 mod listening;
 mod portwatch;
 mod release;
+mod requests;
 #[cfg(test)]
 mod rig;
 mod rollout;
@@ -125,6 +126,11 @@ pub struct Supervisor {
     force_kill: bool,
     /// `[watchdog] port_lost`: a look at the workers' sockets is running.
     port_look_inflight: bool,
+    /// The responses of the app's workers, since the supervisor started
+    /// (`None` until one reports them).
+    requests: Option<crate::worker::Window>,
+    /// The app's ports as the kernel sees them (`Status.ports`).
+    ports: requests::PortCache,
     supervisor_cpu_prev: Option<(Instant, f64)>,
     /// What each worker process listens on (a walk of its process tree
     /// reads `/proc`, or asks libproc, for each: see `listening.rs`).
@@ -531,6 +537,8 @@ impl Supervisor {
             host_path,
             force_kill: false,
             port_look_inflight: false,
+            requests: None,
+            ports: requests::PortCache::default(),
             supervisor_cpu_prev: None,
             listeners: ListenerCache::default(),
             ticks: 0,
@@ -907,6 +915,10 @@ impl Supervisor {
         // Always: the heartbeat carries the event-loop delay too; the
         // watchdog only acts on it with [watchdog] timeout > 0.
         add("WARDEN_HEARTBEAT_MS", HEARTBEAT_MS.to_string());
+        if !self.cfg.metrics.requests {
+            // The static server and the shim count responses unless told not to.
+            add("WARDEN_REQUESTS", "0".into());
+        }
         if self.cfg.workers.port_strategy == PortStrategy::Shared {
             add("WARDEN_REUSE_PORT", "1".into());
         }
@@ -1149,6 +1161,10 @@ impl Supervisor {
             "heartbeat" => {
                 let now = Instant::now();
                 inst.heartbeats.insert(worker, now);
+                if let Some(counts) = msg.requests() {
+                    self.count_requests(inst_id, worker, counts);
+                }
+                let Some(inst) = self.insts.get_mut(&inst_id) else { return };
                 let Some(d) = msg.loop_delay() else { return };
                 let warn_ms = self.cfg.watchdog.loop_delay_warn * 1000.0;
                 let state = inst.loop_delay.entry(worker).or_insert_with(|| LoopState::new(d, now));
@@ -2630,6 +2646,8 @@ impl Supervisor {
             Some((st, (pct * 10.0).round() / 10.0))
         };
 
+        // The second the response windows are read at.
+        let sec = self.started.elapsed().as_secs();
         let mut workers = Vec::new();
         let mut standbys = Vec::new();
         let mut host = None;
@@ -2677,20 +2695,22 @@ impl Supervisor {
                     // Each Worker thread has its own event loop and heartbeat.
                     loop_delay: inst.and_then(|i| i.loop_delay.get(&id)).and_then(|l| l.current(now)),
                     listening: Vec::new(),
+                    requests: None,
                 });
             }
         } else {
             for s in self.slots.values() {
                 let inst = s.current.and_then(|c| self.insts.get_mut(&c));
-                let (pid, uptime, stats, healthy, loop_delay) = match inst {
+                let (pid, uptime, stats, healthy, loop_delay, requests) = match inst {
                     Some(i) => {
                         let started = i.started;
                         let pid = i.handle.pid;
                         let stats = sample(pid, &mut i.cpu_prev, started);
                         let loop_delay = i.loop_delay.get(&s.id).and_then(|l| l.current(now));
-                        (Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy, loop_delay)
+                        let requests = i.requests.as_ref().map(|r| r.window.stats(sec));
+                        (Some(pid), Some(started.elapsed().as_secs()), stats, i.healthy, loop_delay, requests)
                     }
-                    None => (None, None, None, None, None),
+                    None => (None, None, None, None, None, None),
                 };
                 if s.state == State::Running {
                     ready += 1;
@@ -2709,6 +2729,7 @@ impl Supervisor {
                     healthy,
                     loop_delay,
                     listening: Vec::new(),
+                    requests,
                 });
             }
             // Hot standbys: their own list (`Status.standbys`).
@@ -2740,6 +2761,7 @@ impl Supervisor {
                 // An old process's loop delay is not tracked (the map is the new one's).
                 loop_delay: None,
                 listening: Vec::new(),
+                requests: i.requests.as_ref().map(|r| r.window.stats(sec)),
             });
         }
         draining.sort_by_key(|w| w.id);
@@ -2760,6 +2782,7 @@ impl Supervisor {
             w.listening = self.listeners.of(pid, now, young, &own);
         }
         self.listeners.retain(&live);
+        let ports = self.port_stats(&workers);
         // Who the app runs as: a running worker's owner (the OS says), else our own user.
         let owner = workers.iter().find_map(|w| w.pid).and_then(crate::platform::proc_owner);
         let user = crate::platform::user_name(owner.unwrap_or_else(crate::sys::euid));
@@ -2803,6 +2826,8 @@ impl Supervisor {
             build: crate::stamp::build(),
             cwd: self.shown_cwd(),
             watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
+            requests: self.app_requests(),
+            ports,
         }
     }
 }

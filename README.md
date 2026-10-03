@@ -114,6 +114,7 @@ Every number, the method and the caveats, including the one synthetic file per s
 - **Compresses in the background**, on by default. The first request for a file is answered as it is and queues the work; the next ones get a brotli or gzip copy. The copies live in a private folder of their own (`compress_dir`), never in the folder you serve, and a changed file never gets an old copy.
 - **Uses your copies too:** a `file.br` or `file.gz` made by your build is sent when Warden has made none.
 - **Caches nothing by default**, like nginx: the OS page cache does it. An opt-in response cache (`cache_size`) keeps small files in memory.
+- **Counts its responses** by status (404s too), shown in `warden list` and the GUI, as it does for Node apps through Node's own diagnostics channel.
 - `compress = false` turns the background compression off. Every `[static]` key: [docs/static-serving.md](docs/static-serving.md).
 
 ## Coming from PM2
@@ -156,7 +157,7 @@ path = "/health"          # checked on each worker's private socket
 
 ## GUI
 
-![Warden GUI: every app with its state, workers, CPU and memory](docs/gui-main-screen.png)
+![Warden GUI: every app with its state, workers, CPU, memory and requests](docs/gui-main-screen.png)
 
 <table>
   <tr>

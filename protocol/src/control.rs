@@ -220,6 +220,15 @@ pub struct Status {
     /// not send it, and reads as `false`: it cannot watch.
     #[serde(default)]
     pub watching: bool,
+    /// The responses of the app's workers, by status (see
+    /// `WorkerStatus.requests`); `total` since the supervisor started. Absent
+    /// when no worker reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<RequestStats>,
+    /// The TCP ports the app's workers listen on, from the kernel: queued and
+    /// dropped connections, open ones. Absent (empty) where the OS cannot say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortStats>,
 }
 
 /// An executable as the supervisor saw it at start: where it was and what
@@ -321,6 +330,88 @@ pub struct WorkerStatus {
     /// user's process, an OS without an adapter).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listening: Vec<Listener>,
+    /// The responses this worker sent, by status: where Warden sees them,
+    /// its own static server and Node apps (the shim, through
+    /// `node:diagnostics_channel`). Absent elsewhere (Bun, other runtimes),
+    /// with `[metrics] requests = false`, and from an older Warden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<RequestStats>,
+}
+
+/// Responses by status class. `4xx` counts the 404s too; `404` is them alone.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Responses {
+    #[serde(rename = "2xx", default)]
+    pub ok: u64,
+    #[serde(rename = "3xx", default)]
+    pub redirect: u64,
+    #[serde(rename = "4xx", default)]
+    pub client_error: u64,
+    #[serde(rename = "404", default)]
+    pub not_found: u64,
+    #[serde(rename = "5xx", default)]
+    pub server_error: u64,
+}
+
+impl Responses {
+    pub fn total(&self) -> u64 {
+        self.ok + self.redirect + self.client_error + self.server_error
+    }
+
+    pub fn add(&mut self, o: &Responses) {
+        self.ok += o.ok;
+        self.redirect += o.redirect;
+        self.client_error += o.client_error;
+        self.not_found += o.not_found;
+        self.server_error += o.server_error;
+    }
+
+    /// What `self` has more than `before` (counters only grow; one that went
+    /// back is a new count from zero, and all of it is new).
+    pub fn since(&self, before: &Responses) -> Responses {
+        let d = |now: u64, then: u64| if now >= then { now - then } else { now };
+        Responses {
+            ok: d(self.ok, before.ok),
+            redirect: d(self.redirect, before.redirect),
+            client_error: d(self.client_error, before.client_error),
+            not_found: d(self.not_found, before.not_found),
+            server_error: d(self.server_error, before.server_error),
+        }
+    }
+}
+
+/// Requests a worker or an app answered (`WorkerStatus.requests`,
+/// `Status.requests`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct RequestStats {
+    /// Responses per second over the last 10 seconds.
+    pub rate: f64,
+    /// The last minute.
+    pub minute: Responses,
+    /// Since the worker started (a worker), or the supervisor (the app).
+    pub total: Responses,
+}
+
+/// A TCP port the app listens on, as the kernel sees it (`Status.ports`):
+/// every listening socket of the app's workers on it together.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortStats {
+    pub port: u16,
+    /// Connections established on it now, every worker's. Absent when not
+    /// counted (not Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<u32>,
+    /// Connections that arrived and wait for a worker to accept them, now,
+    /// and how many may wait (listen(2)'s backlog, capped by somaxconn).
+    pub backlog: u32,
+    pub max_backlog: u32,
+    /// What the kernel discarded at these listening sockets since they were
+    /// made (a worker restart starts it again): connections that found the
+    /// accept queue full, nearly always. Absent for Warden's static server,
+    /// whose sockets wait for the request before accepting a connection
+    /// (TCP_DEFER_ACCEPT), and the kernel counts each such wait there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drops: Option<u64>,
 }
 
 /// A socket a worker listens on (`WorkerStatus.listening`).

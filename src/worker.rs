@@ -169,6 +169,69 @@ pub const LOOP_DELAY_FRESH: std::time::Duration = std::time::Duration::from_secs
 /// One "event loop delay is high" warning per worker per this long.
 pub const LOOP_WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Responses counted a second at a time, for a minute: the rate over the
+/// last ten seconds, the last minute, and everything since it began.
+#[derive(Debug, Clone)]
+pub struct Window {
+    slots: [crate::control::Responses; 60],
+    /// The second (counted from the supervisor's start) of the newest slot.
+    at: u64,
+    total: crate::control::Responses,
+}
+
+impl Default for Window {
+    fn default() -> Self {
+        Window { slots: [crate::control::Responses::default(); 60], at: 0, total: Default::default() }
+    }
+}
+
+impl Window {
+    /// Move to second `sec`: the slots of the seconds since `at` start empty.
+    fn advance(&mut self, sec: u64) {
+        if sec <= self.at {
+            return;
+        }
+        for s in (self.at + 1..=sec).rev().take(60) {
+            self.slots[(s % 60) as usize] = Default::default();
+        }
+        self.at = sec;
+    }
+
+    /// Count `d`, made in second `sec`.
+    pub fn add(&mut self, sec: u64, d: &crate::control::Responses) {
+        self.advance(sec);
+        // A second already gone by (out of order) goes into the newest one.
+        self.slots[(self.at % 60) as usize].add(d);
+        self.total.add(d);
+    }
+
+    /// The figures as of second `sec`.
+    pub fn stats(&self, sec: u64) -> crate::control::RequestStats {
+        let mut minute = crate::control::Responses::default();
+        let mut ten = 0;
+        for back in 0..60u64 {
+            let Some(s) = sec.checked_sub(back) else { break };
+            if s > self.at || self.at - s >= 60 {
+                continue;
+            }
+            let slot = &self.slots[(s % 60) as usize];
+            minute.add(slot);
+            if back < 10 {
+                ten += slot.total();
+            }
+        }
+        crate::control::RequestStats { rate: ten as f64 / 10.0, minute, total: self.total }
+    }
+}
+
+/// A worker's response counts: the last cumulative figure of each of its
+/// reporters (a Worker thread in worker mode), and its window.
+#[derive(Debug, Clone, Default)]
+pub struct Requests {
+    pub last: BTreeMap<usize, crate::control::Responses>,
+    pub window: Window,
+}
+
 /// What a worker was seen listening on, for `[watchdog] port_lost`: the
 /// kernel's view of its process tree, looked at every two seconds.
 #[derive(Debug, Clone, Default)]
@@ -228,6 +291,8 @@ pub struct Instance {
     pub listen: ListenWatch,
     /// Stopped for having stopped listening: its exit is restarted as a crash.
     pub port_lost: bool,
+    /// The responses it sent, by status, when it reports them (heartbeats).
+    pub requests: Option<Requests>,
     /// Per-worker health: consecutive failures, verdict, check in flight.
     pub health_fails: u32,
     pub healthy: Option<bool>,
@@ -277,6 +342,7 @@ impl Instance {
             hung: false,
             listen: ListenWatch::default(),
             port_lost: false,
+            requests: None,
             health_fails: 0,
             healthy: None,
             health_inflight: false,
@@ -343,6 +409,37 @@ mod tests {
         assert!((1..100).all(|i| !off.observe(high, at(i), 0.0)), "0 = off");
         assert_eq!(off.current(at(99)), Some(high));
         assert_eq!(off.current(at(99) + LOOP_DELAY_FRESH + std::time::Duration::from_millis(1)), None);
+    }
+
+    /// The window counts a second at a time: the rate is the last ten
+    /// seconds, the minute the last sixty, and the total everything; seconds
+    /// without a heartbeat count nothing, and a minute later it is all gone
+    /// but the total.
+    #[test]
+    fn a_window_keeps_a_minute_of_seconds() {
+        use crate::control::Responses;
+        let ok = |n| Responses { ok: n, ..Responses::default() };
+        let mut w = Window::default();
+        assert_eq!(w.stats(0).rate, 0.0);
+        for sec in 100..110 {
+            w.add(sec, &ok(5));
+        }
+        w.add(110, &Responses { server_error: 2, ..Responses::default() });
+        let s = w.stats(110);
+        assert_eq!((s.rate, s.minute.ok, s.minute.server_error, s.total.total()), (4.7, 50, 2, 52));
+        // Ten quiet seconds later: no rate, the minute is still there.
+        let s = w.stats(120);
+        assert_eq!((s.rate, s.minute.total()), (0.0, 52));
+        // A minute after the last count: only the total.
+        let s = w.stats(171);
+        assert_eq!((s.minute.total(), s.total.total()), (0, 52));
+        // Counting again after a gap of more than a minute starts from empty slots.
+        w.add(300, &ok(1));
+        let s = w.stats(300);
+        assert_eq!((s.minute.total(), s.total.total(), s.rate), (1, 53, 0.1));
+        // A late count (an older second) goes into the newest one.
+        w.add(250, &ok(1));
+        assert_eq!(w.stats(300).minute.total(), 2);
     }
 
     #[test]

@@ -108,6 +108,57 @@ struct Site {
     bufs: Mutex<Vec<Vec<u8>>>,
     /// Requests answered by the accept loop itself (`first_request`).
     inline: AtomicU64,
+    /// The responses sent, by status, for the heartbeat (`None`:
+    /// `WARDEN_REQUESTS=0`, `[metrics] requests = false`).
+    responses: Option<Arc<Responses>>,
+}
+
+/// Responses by status class since the worker started: one add per response.
+#[derive(Default)]
+struct Responses {
+    ok: AtomicU64,
+    redirect: AtomicU64,
+    client_error: AtomicU64,
+    not_found: AtomicU64,
+    server_error: AtomicU64,
+}
+
+impl Responses {
+    fn count(&self, status: u16) {
+        let class = match status {
+            200..=299 => &self.ok,
+            300..=399 => &self.redirect,
+            404 => {
+                self.not_found.fetch_add(1, Ordering::Relaxed);
+                &self.client_error
+            }
+            400..=499 => &self.client_error,
+            500..=599 => &self.server_error,
+            _ => return,
+        };
+        class.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What the heartbeat carries (`IpcMsg::requests` reads it).
+    fn json(&self) -> serde_json::Value {
+        let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        serde_json::json!({
+            "2xx": n(&self.ok),
+            "3xx": n(&self.redirect),
+            "4xx": n(&self.client_error),
+            "404": n(&self.not_found),
+            "5xx": n(&self.server_error),
+        })
+    }
+}
+
+impl Site {
+    /// Count a response that was sent with `status`.
+    fn responded(&self, status: u16) {
+        if let Some(r) = &self.responses {
+            r.count(status);
+        }
+    }
 }
 
 /// Header text that depends on the configuration only, so a request copies
@@ -240,6 +291,7 @@ impl Site {
             idle_timeout,
             bufs: Mutex::new(Vec::new()),
             inline: AtomicU64::new(0),
+            responses: (std::env::var("WARDEN_REQUESTS").as_deref() != Ok("0")).then(Default::default),
         };
         Ok((Arc::new(site), port))
     }

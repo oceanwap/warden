@@ -169,6 +169,24 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   seen with costs nothing more, however many connections the host has; only a
   worker whose sockets are gone has its process tree walked, and only a whole
   walk can conclude that nothing listens.
+- Request health, on by default (`[metrics] requests = false` turns the
+  counting off): the responses each worker sends, by status (2xx, 3xx, 4xx
+  with 404 apart, 5xx), as a rate over 10 s, the last minute and a total,
+  per worker and for the app, in `warden list` (`req/s`, `4xx/5xx`),
+  `status` and `describe` (`requests`), `status --json`, the GUI (a Requests
+  tile, the app list, the worker table when the window has room) and
+  Prometheus (`warden_responses_total{class}`). Warden's static server
+  counts its own (one atomic add per response); under Node the shim
+  subscribes to Node's `http.server.response.finish` diagnostics channel,
+  which wraps nothing (a hello-world server: 25.89 µs of CPU per request
+  against 25.80 without). Not under Bun, whose `node:http` does not publish
+  it. The counts travel with the heartbeat the workers already send.
+- The app's ports as the kernel sees them (`status.ports`, `warden status`
+  `connections`, the GUI's port chips, `warden_port_*`): open connections,
+  connections waiting to be accepted against how many may wait, and the ones
+  dropped at the listening sockets (a full accept queue, nearly always). Read
+  only when a status is asked for, at most every 2 s, off the event loop: one
+  netlink request for the listeners and one per port for its connections.
 
 ### Changed
 

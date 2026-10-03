@@ -145,6 +145,38 @@ impl App {
         chips
     }
 
+    /// Responses of the app (where Warden counts them: its static server,
+    /// Node through the shim).
+    pub fn requests(&self) -> Option<warden_protocol::control::RequestStats> {
+        self.status.as_ref().and_then(|s| s.requests)
+    }
+
+    /// The list's short form of the traffic: `3.7/s`, `3.7/s · 2 5xx`.
+    pub fn requests_short(&self) -> Option<String> {
+        let r = self.requests()?;
+        let rate = format::per_second(r.rate);
+        Some(match format::errors(&r.minute) {
+            Some(e) => format!("{rate} · {e}"),
+            None => rate,
+        })
+    }
+
+    /// What the kernel says of a port the app listens on: `12 open · 3 waiting · 9 dropped`.
+    pub fn port_stats(&self, port: u16) -> Option<String> {
+        let p = self.status.as_ref()?.ports.iter().find(|p| p.port == port)?;
+        let mut parts = Vec::new();
+        if let Some(c) = p.connections {
+            parts.push(format!("{c} open"));
+        }
+        if p.backlog > 0 {
+            parts.push(format!("{} waiting", p.backlog));
+        }
+        if let Some(d) = p.drops.filter(|d| *d > 0) {
+            parts.push(format!("{d} dropped"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// The list's short form: `:3000 :9229`, `:3000 +2`.
     pub fn ports_short(&self) -> Option<String> {
         let chips = self.ports();
@@ -443,6 +475,7 @@ pub(crate) mod tests {
             healthy: Some(true),
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         }
     }
 
@@ -479,7 +512,35 @@ pub(crate) mod tests {
             build: None,
             cwd: None,
             watching: false,
+            requests: None,
+            ports: vec![],
         }
+    }
+
+    /// The traffic of an app as the list and the port chips say it.
+    #[test]
+    fn requests_and_ports_read_short() {
+        use warden_protocol::control::{PortStats, RequestStats, Responses};
+        let mut s = status("api", 2);
+        let quiet = Responses { ok: 120, ..Responses::default() };
+        s.requests = Some(RequestStats { rate: 2.0, minute: quiet, total: quiet });
+        s.ports = vec![PortStats { port: 3000, connections: Some(12), backlog: 0, max_backlog: 1022, drops: Some(0) }];
+        let mut a = App::new(entry("api", AppState::Running, Some(s.clone())));
+        a.status = Some(Box::new(s.clone()));
+        assert_eq!(a.requests_short().as_deref(), Some("2.0/s"));
+        assert_eq!(a.port_stats(3000).as_deref(), Some("12 open"));
+        assert_eq!(a.port_stats(80), None);
+        let bad = Responses { ok: 100, client_error: 12, not_found: 9, server_error: 3, ..Responses::default() };
+        s.requests = Some(RequestStats { rate: 41.25, minute: bad, total: bad });
+        s.ports[0] = PortStats { port: 3000, connections: None, backlog: 7, max_backlog: 1022, drops: Some(4) };
+        a.status = Some(Box::new(s.clone()));
+        assert_eq!(a.requests_short().as_deref(), Some("41.2/s · 3 5xx · 12 4xx"));
+        assert_eq!(a.port_stats(3000).as_deref(), Some("7 waiting · 4 dropped"));
+        // A static site's 4xx that are all 404s say so.
+        let missing = Responses { ok: 50, client_error: 2, not_found: 2, ..Responses::default() };
+        s.requests = Some(RequestStats { rate: 0.0, minute: missing, total: missing });
+        a.status = Some(Box::new(s));
+        assert_eq!(a.requests_short().as_deref(), Some("0/s · 2 404s"));
     }
 
     pub(crate) fn entry(name: &str, state: AppState, status: Option<Status>) -> AppEntry {

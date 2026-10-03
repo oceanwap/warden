@@ -209,6 +209,7 @@ Applies to every log file above; built in, no logrotate needed.
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | none | e.g. `"127.0.0.1:9464"`: Prometheus text at `/metrics` |
+| `requests` | `true` | Count the responses the workers send, by status (2xx, 3xx, 4xx, 404, 5xx), for `warden list` (`req/s`, `4xx/5xx`), `status`, the GUI and the metrics (`warden_responses_total`): Warden's static server counts its own, and the shim, under Node, subscribes to `node:diagnostics_channel` (`http.server.response.finish`): nothing of the app or of `http` is wrapped, and a hello-world server measured the same with and without (25.89 against 25.80 µs of CPU per request). Not available under Bun. `false` turns both off. The ports' queues and connections come from the kernel either way |
 
 ## `[control]`
 
@@ -280,6 +281,7 @@ JSON, defaults included.
 | `WARDEN_WORKERS`, `WARDEN_ENTRY`, `WARDEN_SHIM` | how many Workers, the module each imports, the shim | worker-mode host process |
 | `WARDEN_STATIC` | the `[static]` section as JSON | `warden serve` workers |
 | `WARDEN_IPC_FD` | `3`: the shim's channel to Warden (readiness, heartbeat) | every worker |
+| `WARDEN_REQUESTS` | `0` with `[metrics] requests = false`: the static server and the shim count no responses | every worker |
 | `WARDEN_HEARTBEAT_MS`, `WARDEN_DRAIN_MS`, `WARDEN_LONG_LIVED_MS`, `WARDEN_STOP_SIGNAL`, `WARDEN_WAIT_READY`, `WARDEN_REUSE_PORT`, `WARDEN_HEALTH_DIR`, `WARDEN_INSTANCE_VAR`, `WARDEN_INSTANCE` | settings for the shim: heartbeat period (1000), `shutdown.drain_ms`, `long_lived_timeout` in ms, `shutdown.signal`, `1` with `wait_ready`, `1` with a shared port, where private health sockets go, the instance variable's name, an internal process number (unique per supervisor run) | every worker |
 
 PM2's `pm_id` and `name` are not set: use `WARDEN_WORKER_ID` and

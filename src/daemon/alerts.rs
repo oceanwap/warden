@@ -1154,6 +1154,7 @@ on = ["all"]
                 healthy: None,
                 loop_delay: None,
                 listening: Vec::new(),
+                requests: None,
             })
             .collect();
         a.attached(&api, &s, Instant::now());

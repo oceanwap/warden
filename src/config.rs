@@ -721,11 +721,22 @@ pub enum WorkerOutput {
     Direct,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Metrics {
     /// e.g. "127.0.0.1:9464". Prometheus text format at /metrics.
     pub listen: Option<String>,
+    /// Count the responses the workers send, by status, for `warden list`,
+    /// the GUI and the metrics: Warden's static server counts its own, and
+    /// the shim, under Node, subscribes to `node:diagnostics_channel` (no
+    /// code of the app or of `http` is wrapped). `false` turns both off.
+    pub requests: bool,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Metrics { listen: None, requests: true }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]

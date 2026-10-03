@@ -616,6 +616,7 @@ fn app_row<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let mut parts: Vec<String> = Vec::new();
     parts.extend(a.ports_short());
     parts.extend(a.workers().map(|(r, c)| format!("{r}/{c} ready")));
+    parts.extend(a.requests_short());
     parts.extend(a.cpu_percent().map(format::percent));
     parts.extend(a.rss_bytes().map(format::bytes));
     if a.entry.supervised_by != "wardend" {
@@ -859,6 +860,8 @@ fn idle_card<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
 
 /// Under this window width the five tiles do not fit in a row.
 const TILES_ONE_ROW_W: f32 = 1100.0;
+/// The worker table shows each worker's requests (two more columns) from this width.
+const REQUEST_COLUMNS_W: f32 = 1080.0;
 /// A tile's height (two lines and the padding).
 const TILE_H: f32 = 98.0;
 
@@ -871,7 +874,7 @@ fn tiles<'a>(g: &Gui, a: &'a App) -> Element<'a, Message> {
         (r, c) => (format!("{} not ready", c - r), Tone::Warn),
     };
     let crashes: u64 = s.workers.iter().map(|w| w.crashes).sum();
-    let all: Vec<Element<'a, Message>> = vec![
+    let mut all: Vec<Element<'a, Message>> = vec![
         tile(Icon::Workers, "Workers", format!("{ready} / {configured}"), workers_sub, workers_tone),
         tile(Icon::Cpu, "CPU", format::opt(a.cpu_percent(), format::percent), "all its processes".into(), Tone::Plain),
         tile(
@@ -900,16 +903,34 @@ fn tiles<'a>(g: &Gui, a: &'a App) -> Element<'a, Message> {
             if crashes == 0 { Tone::Plain } else { Tone::Warn },
         ),
     ];
+    // Where Warden counts the responses (its static server, Node through the shim).
+    if let Some(r) = &s.requests {
+        let errors = format::errors(&r.minute);
+        all.push(tile(
+            Icon::Network,
+            "Requests",
+            format::per_second(r.rate),
+            match &errors {
+                Some(e) => format!("1 min: {e}"),
+                None => "no errors in 1 min".into(),
+            },
+            if r.minute.server_error > 0 { Tone::Bad } else { Tone::Plain },
+        ));
+    }
     if g.window.width >= TILES_ONE_ROW_W {
         return Row::with_children(all).spacing(10).into();
     }
-    // Three and two: the last row keeps the tiles' width with an empty slot.
+    // Two rows of three: the last keeps the tiles' width with an empty slot when it is short.
+    let n = all.len();
     let mut all = all.into_iter();
     let first = Row::with_children(all.by_ref().take(3)).spacing(10);
+    let rest: Vec<Element<'a, Message>> = all.collect();
+    let pad = 3usize.saturating_sub(rest.len());
     let second = Row::with_children(
-        all.chain(std::iter::once(space().width(Length::FillPortion(1)).into())).collect::<Vec<_>>(),
+        rest.into_iter().chain((0..pad).map(|_| space().width(Length::FillPortion(1)).into())).collect::<Vec<_>>(),
     )
     .spacing(10);
+    debug_assert!(n <= 6);
     column![first, second].spacing(10).into()
 }
 
@@ -926,10 +947,16 @@ fn ports_row(a: &App) -> Option<Element<'_, Message>> {
         r = r.push(small("nothing yet (a port shows a second or two after the app binds it)"));
     }
     for c in chips {
+        // A TCP port's connections, as the kernel counts them.
+        let stats = if c.unix { None } else { c.label.parse().ok().and_then(|p| a.port_stats(p)) };
+        let scope = if c.unix { "unix socket".to_string() } else { c.scope.clone() };
         let body = row![
             if c.unix { icon(Icon::Plug).size(13).style(muted) } else { icon(Icon::Link).size(13).style(muted) },
             text(c.label.clone()).font(MONO).size(13),
-            small(if c.unix { "unix socket".to_string() } else { c.scope.clone() }),
+            small(match stats {
+                Some(st) => format!("{scope} · {st}"),
+                None => scope,
+            }),
         ]
         .spacing(6)
         .align_y(Center);
@@ -1149,6 +1176,7 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     let any = |f: fn(&WorkerStatus) -> bool| rows.iter().any(|(_, w)| f(w));
     let (has_loop, has_health, has_exit) =
         (any(|w| w.loop_delay.is_some()), any(|w| w.healthy.is_some()), any(|w| w.last_exit.is_some()));
+    let has_requests = any(|w| w.requests.is_some());
     container(responsive(move |size| {
         // The table is as wide as the card, so its lines run from border to border.
         let width = size.width.max(TABLE_MIN_W);
@@ -1195,6 +1223,25 @@ fn workers<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             columns.push(
                 table::column(h("Loop p99"), move |(_, w): WorkerRow<'a>| {
                     plain(format::opt(w.loop_delay.map(|d| d.p99_ms), format::millis))
+                })
+                .align_x(iced::alignment::Horizontal::Right),
+            );
+        }
+        // Responses per second over the last 10 s, and the errors of the last minute: when
+        // the table has room for them (the app's figures are in the Requests tile anyway),
+        // so the health, the last exit and the restart buttons stay in sight.
+        if has_requests && size.width >= REQUEST_COLUMNS_W {
+            columns.push(
+                table::column(h("Req/s"), move |(_, w): WorkerRow<'a>| {
+                    plain(format::opt(w.requests, |r| format::per_second(r.rate).trim_end_matches("/s").to_string()))
+                })
+                .align_x(iced::alignment::Horizontal::Right),
+            );
+            columns.push(
+                table::column(h("4xx/5xx"), move |(_, w): WorkerRow<'a>| {
+                    let Some(r) = w.requests else { return plain("-".into()) };
+                    let t = text(format!("{} / {}", r.minute.client_error, r.minute.server_error)).size(13);
+                    cell_box(if r.minute.server_error > 0 { t.style(Tone::Bad.style()).into() } else { t.into() })
                 })
                 .align_x(iced::alignment::Horizontal::Right),
             );

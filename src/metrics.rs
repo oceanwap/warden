@@ -123,6 +123,55 @@ pub fn render_prometheus(s: &Status) -> String {
         "gauge",
         per(&|w| w.loop_delay.map(|d| secs(d.max_ms))),
     );
+    // Responses by status class, where Warden counts them (its static server,
+    // Node through the shim): the app's, since the supervisor started.
+    if let Some(r) = &s.requests {
+        let t = &r.total;
+        gauge(
+            "warden_responses_total",
+            "Responses the app's workers sent, by status class (404 also counts in 4xx), since the supervisor started.",
+            "counter",
+            [
+                ("2xx", t.ok),
+                ("3xx", t.redirect),
+                ("4xx", t.client_error),
+                ("404", t.not_found),
+                ("5xx", t.server_error),
+            ]
+            .into_iter()
+            .map(|(class, n)| (format!(",class=\"{class}\""), n as f64))
+            .collect(),
+        );
+    }
+    let port = |f: &dyn Fn(&crate::control::PortStats) -> Option<f64>| -> Vec<(String, f64)> {
+        s.ports.iter().filter_map(|p| f(p).map(|v| (format!(",port=\"{}\"", p.port), v))).collect()
+    };
+    if !s.ports.is_empty() {
+        gauge(
+            "warden_port_connections",
+            "TCP connections established on the app's port.",
+            "gauge",
+            port(&|p| p.connections.map(f64::from)),
+        );
+        gauge(
+            "warden_port_backlog",
+            "Connections waiting for a worker to accept them, on the app's port.",
+            "gauge",
+            port(&|p| Some(f64::from(p.backlog))),
+        );
+        gauge(
+            "warden_port_backlog_max",
+            "How many connections may wait on the app's port (listen backlogs together).",
+            "gauge",
+            port(&|p| Some(f64::from(p.max_backlog))),
+        );
+        gauge(
+            "warden_port_drops_total",
+            "What the kernel discarded at the app's listening sockets, nearly always connections that found the accept queue full, since they were made.",
+            "counter",
+            port(&|p| p.drops.map(|d| d as f64)),
+        );
+    }
     if let Some(r) = &s.last_rollout {
         gauge(
             "warden_last_rollout_success",
@@ -252,6 +301,7 @@ mod tests {
                 healthy: Some(false),
                 loop_delay: Some(crate::control::LoopDelay { p50_ms: 0.25, p99_ms: 12.5, max_ms: 40.0 }),
                 listening: Vec::new(),
+                requests: None,
             }],
             release: None,
             standbys: vec![],
@@ -261,6 +311,8 @@ mod tests {
             build: None,
             cwd: None,
             watching: false,
+            requests: None,
+            ports: vec![],
         };
         let t = render_prometheus(&st);
         assert!(t.contains("warden_workers{app=\"api\"} 2"));
@@ -273,6 +325,32 @@ mod tests {
         assert!(t.contains("warden_worker_event_loop_delay_max_seconds{app=\"api\",worker=\"1\"} 0.04"), "{t}");
         assert!(t.contains("# TYPE warden_worker_event_loop_delay_p99_seconds gauge"));
         assert!(!t.contains("standby"), "no standby series without standbys");
+        assert!(!t.contains("warden_responses_total") && !t.contains("warden_port_"), "none where nothing counts");
+
+        // Responses and ports, where Warden has them.
+        let mut counted = st.clone();
+        let total = crate::control::Responses { ok: 100, redirect: 2, client_error: 7, not_found: 5, server_error: 1 };
+        counted.requests = Some(crate::control::RequestStats { rate: 1.0, minute: total, total });
+        counted.ports = vec![crate::control::PortStats {
+            port: 3000,
+            connections: Some(12),
+            backlog: 3,
+            max_backlog: 1024,
+            drops: Some(4),
+        }];
+        let t = render_prometheus(&counted);
+        for line in [
+            "warden_responses_total{app=\"api\",class=\"2xx\"} 100",
+            "warden_responses_total{app=\"api\",class=\"404\"} 5",
+            "warden_responses_total{app=\"api\",class=\"5xx\"} 1",
+            "# TYPE warden_responses_total counter",
+            "warden_port_connections{app=\"api\",port=\"3000\"} 12",
+            "warden_port_backlog{app=\"api\",port=\"3000\"} 3",
+            "warden_port_backlog_max{app=\"api\",port=\"3000\"} 1024",
+            "warden_port_drops_total{app=\"api\",port=\"3000\"} 4",
+        ] {
+            assert!(t.contains(line), "{line} in {t}");
+        }
 
         // Hot standbys get gauges of their own, never worker series.
         let mut st = st;
@@ -290,6 +368,7 @@ mod tests {
             healthy: None,
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         };
         st.standbys.push(standby(crate::control::STANDBY, 1000));
         st.standbys.push(standby(crate::control::WARMING, 500));

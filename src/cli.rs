@@ -863,6 +863,8 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
                 watching_cell(s.watching),
                 Cell::plain(ports::cell(&w.listening)),
                 Cell::plain(loop_p99(w)),
+                Cell::plain(req_rate(w)),
+                errors_cell(w),
                 health_cell(w.healthy),
                 Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
             ]
@@ -881,6 +883,8 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
             "watching",
             "ports",
             "loop p99",
+            "req/s",
+            "4xx/5xx",
             "health",
             "last exit",
         ]),
@@ -916,6 +920,15 @@ pub fn render_status_with(s: &Status, table_only: bool, id: Option<u32>, fmt: &F
     let listening = ports::app_listeners(s);
     if !listening.is_empty() {
         kv(&mut rows, "ports", ports::detail(&listening));
+    }
+    if !s.ports.is_empty() {
+        let waiting = s.ports.iter().any(|p| p.max_backlog > 0 && p.backlog * 2 >= p.max_backlog);
+        let style = if waiting { YELLOW } else { "" };
+        kv_styled(&mut rows, "connections", ports_stats_text(&s.ports), style);
+    }
+    if let Some(r) = &s.requests {
+        let style = if r.minute.server_error > 0 { RED } else { "" };
+        kv_styled(&mut rows, "requests", requests_text(r), style);
     }
     if !s.standbys.is_empty() {
         let up = s.standbys.iter().filter(|w| w.state == crate::control::STANDBY).count();
@@ -999,6 +1012,67 @@ fn draining_name(s: &Status, w: &crate::control::WorkerStatus) -> String {
 /// last second (`-`: no shim, or no recent heartbeat).
 fn loop_p99(w: &crate::control::WorkerStatus) -> String {
     w.loop_delay.map(|d| millis(d.p99_ms)).unwrap_or_else(|| "-".into())
+}
+
+/// The `req/s` column: the worker's responses per second over the last 10 s;
+/// `-` where they are not counted (not Warden's static server or Node).
+fn req_rate(w: &crate::control::WorkerStatus) -> String {
+    w.requests.map(|r| per_second(r.rate)).unwrap_or_else(|| "-".into())
+}
+
+/// `0`, `0.4`, `12.3`, `1234`.
+pub fn per_second(r: f64) -> String {
+    if r == 0.0 {
+        "0".into()
+    } else if r < 100.0 {
+        format!("{r:.1}")
+    } else {
+        format!("{r:.0}")
+    }
+}
+
+/// The `4xx/5xx` column: the worker's client and server errors in the last
+/// minute; red with a 5xx, yellow with only 4xx.
+fn errors_cell(w: &crate::control::WorkerStatus) -> Cell {
+    match w.requests {
+        None => Cell::plain("-"),
+        Some(r) => {
+            let (c, s) = (r.minute.client_error, r.minute.server_error);
+            let text = format!("{c}/{s}");
+            match (c, s) {
+                (_, 1..) => Cell::styled(text, RED),
+                (1.., 0) => Cell::styled(text, YELLOW),
+                _ => Cell::plain(text),
+            }
+        }
+    }
+}
+
+/// The `requests` row of `warden status` and `describe`.
+fn requests_text(r: &crate::control::RequestStats) -> String {
+    let counts = |m: &crate::control::Responses| {
+        let found = if m.not_found > 0 { format!(" of which {} 404", m.not_found) } else { String::new() };
+        format!("{} sent, {} 5xx, {} 4xx{found}", m.total(), m.server_error, m.client_error)
+    };
+    format!(
+        "{}/s; last minute: {}; since the supervisor started: {}",
+        per_second(r.rate),
+        counts(&r.minute),
+        counts(&r.total)
+    )
+}
+
+/// The `connections` row: each port's open connections, queue and drops.
+fn ports_stats_text(ports: &[crate::control::PortStats]) -> String {
+    ports
+        .iter()
+        .map(|p| {
+            let open = p.connections.map(|c| format!("{c} open, ")).unwrap_or_default();
+            let drops = p.drops.map(|d| format!(", {d} dropped")).unwrap_or_default();
+            format!(":{} {open}{} waiting to be accepted (of {}){drops}", p.port, p.backlog, p.max_backlog)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// `0.41ms`, `12.3ms`, `250ms`, `1.20s`.
@@ -1115,6 +1189,8 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                         watching_cell(s.watching),
                         Cell::plain(ports::cell(&w.listening)),
                         Cell::plain(loop_p99(w)),
+                        Cell::plain(req_rate(w)),
+                        errors_cell(w),
                         health_cell(w.healthy),
                         Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
                     ]);
@@ -1141,7 +1217,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 let mut row = lead(true, &app.namespace);
                 row.push(Cell::plain("-"));
                 row.push(state_cell(what));
-                row.extend((0..11).map(|_| Cell::plain("-")));
+                row.extend((0..13).map(|_| Cell::plain("-")));
                 rows.push(row);
                 if what == "offline" {
                     offline.push(app);
@@ -1184,6 +1260,8 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
             "watching",
             "ports",
             "loop p99",
+            "req/s",
+            "4xx/5xx",
             "health",
             "last exit",
         ]),
@@ -1818,6 +1896,7 @@ mod tests {
             healthy: None,
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         }
     }
 

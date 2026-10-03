@@ -59,10 +59,16 @@ fn status(app: &str, workers: Vec<serde_json::Value>, ready: u64, rollout: serde
 }
 
 /// What wardend sends a new subscriber, as NDJSON, then some events.
+/// Responses as a worker or an app reports them: per second, the last minute, since start.
+fn requests(rate: f64, minute: [u64; 5], total: [u64; 5]) -> serde_json::Value {
+    let counts = |c: [u64; 5]| json!({"2xx": c[0], "3xx": c[1], "4xx": c[2], "404": c[3], "5xx": c[4]});
+    json!({"rate": rate, "minute": counts(minute), "total": counts(total)})
+}
+
 fn fake_stream() -> Vec<Event> {
     let rollout =
         json!({"seq": 3, "kind": "reload", "phase": "replacing worker 3", "done": 2, "total": 4, "elapsed_secs": 4});
-    let api = status(
+    let mut api = status(
         "api",
         vec![
             listening(worker(1, "RUNNING", Some(4230), 41, 1.2, 0, None), json!([tcp("0.0.0.0", 3000)])),
@@ -76,6 +82,14 @@ fn fake_stream() -> Vec<Event> {
         3,
         rollout.clone(),
     );
+    // Request health: the app's responses, and its port as the kernel sees it.
+    for (i, (rate, five)) in [(14.1, 0), (13.7, 3), (0.0, 0), (13.4, 0)].into_iter().enumerate() {
+        if i != 2 {
+            api["workers"][i]["requests"] = requests(rate, [800, 10, 4, 3, five], [52_000, 400, 210, 180, five]);
+        }
+    }
+    api["requests"] = requests(41.2, [2400, 30, 12, 9, 3], [156_000, 1200, 630, 540, 3]);
+    api["ports"] = json!([{"port": 3000, "connections": 128, "backlog": 0, "max_backlog": 1533, "drops": 0}]);
     let web = status(
         "web",
         vec![
@@ -255,9 +269,15 @@ fn main_screen_with_fake_data() {
         "3000",
         "9229",
         "LISTENING",
+        "Requests",
+        "41.2/s",
+        "1 min: 3 5xx · 12 4xx",
+        "all interfaces · 128 open",
     ] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the main screen");
     }
+    // Each worker's requests need a wider table: here the health and the last exit keep their place.
+    assert!(ui.find("Req/s").is_err() && ui.find("Last exit").is_ok());
     save(&mut ui, "main-screen");
     save_with(&mut ui, "main-screen-light", &warden_gui::look::theme(true));
 
@@ -269,6 +289,18 @@ fn main_screen_with_fake_data() {
     assert!(matches!(&msgs[0], Message::Act(app, Act::SafeReload) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[1], Message::Act(app, Act::Stop) if app == "api"), "{msgs:?}");
     assert!(matches!(&msgs[2], Message::Select(app) if app == "jobs"), "{msgs:?}");
+}
+
+/// A window with room for it shows each worker's requests: per second, and the
+/// 4xx and 5xx of the last minute (the worker with 5xx in red).
+#[test]
+fn a_wide_window_shows_each_workers_requests() {
+    let g = connected();
+    let mut ui = Simulator::with_size(warden_gui::settings(), (1680.0, 900.0), warden_gui::view::view(&g));
+    for t in ["Req/s", "4xx/5xx", "14.1", "4 / 3", "4 / 0", "Health", "Last exit", "exit code 3"] {
+        assert!(ui.find(t).is_ok(), "{t:?} is not in the wide window");
+    }
+    save(&mut ui, "main-screen-wide");
 }
 
 /// The window in the desktop's own colors: macOS and GNOME/Ubuntu, light and dark,
