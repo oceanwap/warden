@@ -111,7 +111,7 @@ jobs:
     steps:
       # The whole history, so that every tag is fetched with its annotation:
       # the macOS source is written in the annotation of the tag that was pushed.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: version
@@ -232,7 +232,7 @@ jobs:
           mkdir -p notes
           bash .github/release-notes.sh "$VERSION" > notes/RELEASE-NOTES.md
           { echo "## Release notes for $VERSION"; echo; cat notes/RELEASE-NOTES.md; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: notes/RELEASE-NOTES.md
@@ -246,8 +246,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           cache: false
@@ -263,7 +263,7 @@ jobs:
           fi
           head -20 notices/*.txt
           wc -l notices/*.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: licenses
           path: notices/*
@@ -286,14 +286,14 @@ jobs:
       NAME: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
       BIN: target/${{ matrix.target }}/release/warden
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: ${{ matrix.target }}
           cache: false
           rustflags: ""
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install zig and cargo-zigbuild
@@ -315,7 +315,7 @@ jobs:
           got=$("$BIN" --version)
           echo "$got"
           [ "$got" = "warden $VERSION" ] || { echo "::error::$BIN --version says '$got', expected 'warden $VERSION'"; exit 1; }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: notices
@@ -326,7 +326,7 @@ jobs:
           cp contrib/warden@.service contrib/wardend.service contrib/99-warden.conf contrib/nginx.conf "dist/$NAME/contrib/"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ env.NAME }}.tar.gz
@@ -358,19 +358,19 @@ jobs:
       NAME: warden-gui-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
       CLI: warden-${{ needs.meta.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: ${{ matrix.target }}
           cache: false
           rustflags: ""
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
       - name: The CLI from the cli job
         run: '{ tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version; } || true'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: notices
@@ -414,7 +414,7 @@ jobs:
           cp assets/icon/png/warden-256.png "dist/$NAME/warden.png"
           tar -C dist -czf "$NAME.tar.gz" "$NAME"
           tar -tzvf "$NAME.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gui-${{ matrix.os }}-${{ matrix.arch }}
           path: ${{ env.NAME }}.tar.gz
@@ -448,17 +448,17 @@ jobs:
       # says "Warden authors <https://github.com/oceanwap/warden>".
       WARDEN_PKG_MAINTAINER: ${{ vars.WARDEN_PKG_MAINTAINER }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: cli-linux-${{ matrix.arch }}
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.meta.outputs.gui == 'true'
         with:
           name: gui-linux-${{ matrix.arch }}
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: licenses
           path: notices
@@ -497,7 +497,7 @@ jobs:
       # reinstall and the removal. --require: no runtime or tool is no pass.
       - name: Inspect and install the packages in containers
         run: bash scripts/test-linux-packages.sh --require --version "$VERSION" pkg
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-linux-${{ matrix.arch }}
           path: |
@@ -625,7 +625,7 @@ jobs:
             dmg="Warden-$VERSION-macos-$arch.dmg"
             test -s "$dmg" || { echo "::error::$dmg is empty"; exit 1; }
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-assets
           path: macos/*
@@ -661,8 +661,8 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           cache: false
@@ -795,7 +795,7 @@ jobs:
           ls -l
           { echo "### macOS archives, built on a runner"; echo; echo '```'; cat macos-build-info.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       # Only the release's files (not the notices folder the script leaves).
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-assets
           path: |
@@ -829,9 +829,9 @@ jobs:
       MACOS_SOURCE: ${{ needs.meta.outputs.macos_source }}
       WITH_GUI: ${{ needs.meta.outputs.gui }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # macos-assets, from whichever macOS job ran.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: "{cli,gui,packages,macos}-*"
           path: dist
@@ -881,7 +881,7 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
           ls -l
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ needs.meta.outputs.version }}
           path: dist/*
@@ -903,10 +903,10 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       URL: http://127.0.0.1:8765
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - if: runner.os == 'Linux'
         run: shellcheck install.sh
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-${{ needs.meta.outputs.version }}
           path: dist
@@ -956,11 +956,11 @@ jobs:
       TAG: ${{ needs.meta.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-${{ needs.meta.outputs.version }}
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-notes
           path: notes
