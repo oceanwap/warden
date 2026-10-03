@@ -122,7 +122,7 @@ pub struct Entry {
     pub resp: Arc<[u8]>,
     /// The whole response (head then body) in a memfd, for bodies of at
     /// least MEMFD_MIN: a keep-alive GET is one sendfile(2) of it.
-    pub file: Option<MemFile>,
+    pub file: Option<Arc<MemFile>>,
     pub head_len: usize,
     /// Where the Connection header's value ("keep-alive") starts in `resp`.
     pub conn_at: usize,
@@ -566,7 +566,7 @@ mod tests {
         let head = 300;
         let e = Entry {
             resp: resp[..head].into(),
-            file: Some(d),
+            file: Some(Arc::new(d)),
             head_len: head,
             conn_at: 10,
             not_modified: vec![b'y'; 80].into(),

@@ -461,17 +461,16 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
             _ = AcceptErrors::pause(tcp_errors.resume_at), if tcp_errors.resume_at.is_some() => tcp_errors.resume_at = None,
             _ = AcceptErrors::pause(unix_errors.resume_at), if unix_errors.resume_at.is_some() => unix_errors.resume_at = None,
             acc = listener.accept(), if tcp_errors.resume_at.is_none() => {
-                let accepted = match acc {
-                    Ok(a) => {
+                let fd = match acc {
+                    Ok(fd) => {
                         tcp_errors.accepted();
-                        a
+                        fd
                     }
                     Err(e) => {
                         tcp_errors.failed(&e);
                         continue;
                     }
                 };
-                let fd = accepted;
                 // At the limit a connection is dropped before anything is sent
                 // (an answer promising keep-alive, then a close, is worse).
                 // Only this loop takes permits, so one free now is still free
@@ -483,7 +482,11 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
                     let _ = crate::sys::set_tcp_nodelay(fd.as_fd(), true);
                 }
                 let _ = crate::sys::set_nosigpipe(fd.as_fd());
-                let (fd, head, pending, answered) = match first_request(&site, fd, inline_first) {
+                // Without openat2 every open is a call on a thread (`realpath`):
+                // the quick path would wait for it, give up, and the task would
+                // do it a second time.
+                let inline = inline_first && site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY;
+                let (fd, head, pending, answered) = match first_request(&site, fd, inline) {
                     First::Done => continue,
                     First::Go { fd, head, pending, answered } => (fd, head, pending, answered),
                 };
@@ -537,6 +540,9 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     site.draining.store(true, Ordering::SeqCst);
     report(serde_json::json!({"ev": "draining", "worker": worker}));
     let drain_ms: u64 = std::env::var("WARDEN_DRAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    // A connection spawned in the last turn of the loop has not run yet, so
+    // it has not counted itself as in flight: let it take its first step.
+    tokio::task::yield_now().await;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_millis(drain_ms) || site.active.load(Ordering::SeqCst) > 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -601,6 +607,31 @@ impl From<Vec<u8>> for OutBuf {
     }
 }
 
+/// Where the bytes of a file response come from: a file opened for this
+/// request, or the memfd of a cached response (kept alive by sharing it, so a
+/// response that is finished later still has it).
+enum Source {
+    File(std::fs::File),
+    Memfd(Arc<cache::MemFile>),
+}
+
+impl Source {
+    fn file(&self) -> &std::fs::File {
+        match self {
+            Source::File(f) => f,
+            Source::Memfd(m) => &m.file,
+        }
+    }
+
+    /// An owned file to read from (the health socket's way of sending a body).
+    fn into_file(self) -> std::io::Result<std::fs::File> {
+        match self {
+            Source::File(f) => Ok(f),
+            Source::Memfd(m) => m.file.try_clone(),
+        }
+    }
+}
+
 /// The writing half of a client connection. TCP bodies go out with
 /// sendfile(2); the Unix health socket uses a plain copy.
 enum Conn<'a> {
@@ -650,19 +681,21 @@ impl RawSink<'_> {
         Ok(())
     }
 
-    /// `head`, then `count` bytes of `file` from `offset`.
-    fn file(&mut self, head: &[u8], file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
+    /// `head`, then `count` bytes of `src` from `offset`. The source moves
+    /// into `rest` when it is needed there, so nothing can fail once bytes
+    /// are on the wire.
+    fn file(&mut self, head: &[u8], src: Source, offset: u64, count: u64) -> std::io::Result<()> {
         use std::io::ErrorKind::{Interrupted, UnexpectedEof, WouldBlock};
         self.check_idle()?;
         // A body the task would cork goes out by the task, all of it: a part
         // sent here would be uncorked, and the packets of its end half empty.
         if count >= CORK_MIN {
-            self.rest = Some(Rest::File { head: head.to_vec(), file: file.try_clone()?, off: offset, count });
+            self.rest = Some(Rest::File { head: head.to_vec(), src, off: offset, count });
             return Ok(());
         }
         let now = count.min(INLINE_SEND_MAX);
         let mut off = offset as i64;
-        let n = match crate::sys::sendfile_head(self.fd, file.as_fd(), &mut off, now as usize, head) {
+        let n = match crate::sys::sendfile_head(self.fd, src.file().as_fd(), &mut off, now as usize, head) {
             // Nothing could be sent: the socket is full.
             Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => 0,
             Err(e) => return Err(e),
@@ -676,12 +709,7 @@ impl RawSink<'_> {
             .ok_or_else(|| std::io::Error::other("sendfile reported more bytes than were asked for"))?;
         self.wrote |= n > 0;
         if h < head.len() || b < count {
-            self.rest = Some(Rest::File {
-                head: head[h..].to_vec(),
-                file: file.try_clone()?,
-                off: offset + b,
-                count: count - b,
-            });
+            self.rest = Some(Rest::File { head: head[h..].to_vec(), src, off: offset + b, count: count - b });
         }
         Ok(())
     }
@@ -705,38 +733,23 @@ impl Conn<'_> {
         }
     }
 
-    /// The response `head` (possibly empty), then `count` bytes of a cached
-    /// response's memfd from `offset`: on TCP by page reference (sendfile; the
-    /// head goes in the same system call on macOS, and in the same packet on
-    /// Linux); on the Unix health socket a plain copy (a memfd read never
-    /// waits for a disk).
-    async fn send_cached(&mut self, head: &[u8], file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
+    /// The response `head` (possibly empty), then `count` bytes of `src` from
+    /// `offset`: on TCP by page reference (sendfile; the head goes in the
+    /// same system call on macOS, and in the same packet on Linux); on the
+    /// Unix health socket a plain copy.
+    async fn send_file(&mut self, head: &[u8], src: Source, offset: u64, count: u64) -> std::io::Result<u64> {
         match self {
-            Conn::Tcp(w) => sendfile_all(w.as_ref(), head, file, offset, count).await.map(|_| ()),
-            Conn::Unix(w) => {
-                let mut buf = vec![0u8; usize::try_from(count).map_err(std::io::Error::other)?];
-                file.read_exact_at(&mut buf, offset)?;
-                w.write_all(head).await?;
-                w.write_all(&buf).await
-            }
-            Conn::Raw(r) => r.file(head, file, offset, count),
-        }
-    }
-
-    /// The response `head`, then `count` bytes of `file` from `offset`.
-    async fn send_file(&mut self, head: &[u8], file: std::fs::File, offset: u64, count: u64) -> std::io::Result<u64> {
-        match self {
-            Conn::Tcp(w) => sendfile_all(w.as_ref(), head, &file, offset, count).await,
+            Conn::Tcp(w) => sendfile_all(w.as_ref(), head, src.file(), offset, count).await,
             Conn::Unix(w) => {
                 w.write_all(head).await?;
-                let mut f = tokio::fs::File::from_std(file);
+                let mut f = tokio::fs::File::from_std(src.into_file()?);
                 if offset > 0 {
                     use tokio::io::AsyncSeekExt;
                     f.seek(std::io::SeekFrom::Start(offset)).await?;
                 }
                 tokio::io::copy(&mut f.take(count), w).await
             }
-            Conn::Raw(r) => r.file(head, &file, offset, count).map(|()| count),
+            Conn::Raw(r) => r.file(head, src, offset, count).map(|()| count),
         }
     }
 }
@@ -1094,7 +1107,7 @@ async fn connection<R>(
         site.active.fetch_add(1, Ordering::SeqCst);
         let sent = match p.rest {
             Rest::Bytes { out, at } => w.write_all(out.advance(at)).await,
-            Rest::File { head, file, off, count } => w.send_file(&head, file, off, count).await.map(|_| ()),
+            Rest::File { head, src, off, count } => w.send_file(&head, src, off, count).await.map(|_| ()),
         };
         site.active.fetch_sub(1, Ordering::SeqCst);
         if sent.is_err() || !p.keep {
@@ -1170,8 +1183,8 @@ struct Pending {
 enum Rest {
     /// Bytes in memory: `out` from `at` on.
     Bytes { out: OutBuf, at: usize },
-    /// What is left of a response head, then `count` bytes of `file` from `off`.
-    File { head: Vec<u8>, file: std::fs::File, off: u64, count: u64 },
+    /// What is left of a response head, then `count` bytes of `src` from `off`.
+    File { head: Vec<u8>, src: Source, off: u64, count: u64 },
 }
 
 enum First {
@@ -1247,7 +1260,23 @@ fn first_request(site: &Site, fd: OwnedFd, try_inline: bool) -> First {
     let (mut cached, mut key) = ("", String::new());
     let polled = {
         let mut fut = std::pin::pin!(handle(&req, site, &mut sink, keep, &mut cached, &mut key));
-        fut.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
+        // A task that panics costs its connection and nothing else (tokio
+        // contains it); here the accept loop is the task, so do the same.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fut.as_mut().poll(cx)))
+    };
+    let polled = match polled {
+        Ok(polled) => polled,
+        Err(payload) => {
+            eprintln!(
+                "static: a request handler panicked ({}): {} {}; the connection was closed",
+                crate::guard::panic_message(&*payload),
+                req.method,
+                req.path
+            );
+            head.give_back(site);
+            return First::Done;
+        }
     };
     let (rest, wrote) = match &mut sink {
         Conn::Raw(r) => (r.rest.take(), r.wrote),
@@ -2038,15 +2067,16 @@ async fn respond_cached(
     let not_modified = is_not_modified(req, &e.etag, e.mtime);
     if let (Some(mem), false, false) = (&e.file, not_modified, req.method == "HEAD") {
         // The whole response is in a memfd: one sendfile(2), no copy.
-        if keep {
-            w.send_cached(&[], &mem.file, 0, (e.head_len as u64) + e.body_len).await?;
+        let (head, from, count) = if keep {
+            (Vec::new(), 0, (e.head_len as u64) + e.body_len)
         } else {
             let mut head = Vec::with_capacity(e.head_len);
             head.extend_from_slice(&e.resp[..e.conn_at]);
             head.extend_from_slice(b"close");
             head.extend_from_slice(&e.resp[e.conn_at + cache::KEEP_ALIVE.len()..e.head_len]);
-            w.send_cached(&head, &mem.file, e.head_len as u64, e.body_len).await?;
-        }
+            (head, e.head_len as u64, e.body_len)
+        };
+        w.send_file(&head, Source::Memfd(mem.clone()), from, count).await?;
         w.flush().await?;
         return Ok((200, e.body_len));
     }
@@ -2165,7 +2195,7 @@ async fn send_file(
             let unchanged = file.metadata().is_ok_and(|m| Stamp::of(&m) == stamp);
             // A big body goes into a memfd (sent by page reference); the
             // head stays in memory too, for HEAD and `Connection: close`.
-            let mem = cache.memfd(&buf, len);
+            let mem = cache.memfd(&buf, len).map(Arc::new);
             let resp: Arc<[u8]> = if mem.is_some() { buf[..head_len].into() } else { buf.into() };
             let entry = Arc::new(Entry {
                 resp,
@@ -2237,7 +2267,7 @@ async fn send_file(
         w.flush().await?;
         return Ok((code, count));
     }
-    let sent = w.send_file(&buf, body.file, start, count).await?;
+    let sent = w.send_file(&buf, Source::File(body.file), start, count).await?;
     w.flush().await?;
     Ok((code, sent))
 }
@@ -2380,6 +2410,16 @@ pub fn parse_http_date(s: &str) -> Option<u64> {
     if hms.len() != 3 {
         return None;
     }
+    // Header text comes from the client: bound every field so the arithmetic
+    // below cannot overflow (an HTTP date has a four-digit year).
+    let bounded = (1970..=9999).contains(&y)
+        && (1..=31).contains(&d)
+        && (0..24).contains(&hms[0])
+        && (0..60).contains(&hms[1])
+        && (0..=60).contains(&hms[2]);
+    if !bounded {
+        return None;
+    }
     // Days from civil (Howard Hinnant).
     let (y2, m2) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
     let era = y2.div_euclid(400);
@@ -2473,6 +2513,18 @@ mod tests {
         assert_eq!(http_date_short(1_790_769_601).as_str(), "Wed, 30 Sep 2026 12:00:01 GMT");
         assert_eq!(parse_http_date("Wed, 30 Sep 2026 12:00:01 GMT"), Some(1_790_769_601));
         assert_eq!(parse_http_date("nonsense"), None);
+        // A client chooses these numbers: nothing may overflow or wrap.
+        for bad in [
+            "Wed, 30 Sep 9223372036854775807 12:00:01 GMT",
+            "Wed, 30 Sep 2026 12:00:99999999999999999 GMT",
+            "Wed, 9223372036854775807 Sep 2026 12:00:01 GMT",
+            "Wed, 30 Sep 1969 12:00:01 GMT",
+            "Wed, 32 Sep 2026 12:00:01 GMT",
+            "Wed, 30 Sep 2026 24:00:01 GMT",
+            "Wed, 30 Sep -2026 12:00:01 GMT",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "{bad}");
+        }
         assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
         assert_eq!(base64(b"ab"), "YWI=");
         assert!(fingerprinted("app.3f9a2c1b.js"));
