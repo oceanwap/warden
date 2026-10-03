@@ -304,14 +304,39 @@ async fn a_log_flood_stays_bounded_and_connected() {
     let socket = host.socket();
     let mut logs: Feed = Box::pin(client::feed(Endpoint::Socket(socket), FeedOptions::logs_of("flood")));
     let (mut lines, mut lost, mut batches) = (0usize, 0u64, 0usize);
+    let mut seen: Vec<String> = Vec::new();
+    // What to look at when no line comes: the events, wardend's output, the app's.
+    let diagnose = |what: &str, seen: &[String]| -> String {
+        let status = host
+            .cmd()
+            .args(["status", "flood"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr));
+        let app_log = std::fs::read_to_string(host.home.join("state/logs/flood.log")).unwrap_or_default();
+        let (flood, other): (Vec<&str>, Vec<&str>) = app_log.lines().partition(|l| l.contains("flood-line"));
+        format!(
+            "{what}\nevents seen: {seen:#?}\nwardend:\n{}\nwarden status flood:\n{}\nthe app's log ({} flood lines), the rest:\n{}",
+            host.log(),
+            status.unwrap_or_else(|e| e.to_string()),
+            flood.len(),
+            other[other.len().saturating_sub(40)..].join("\n")
+        )
+    };
     // Five seconds of flood, from its first line: on a busy machine the app
     // can take a while to start.
     let t0 = Instant::now();
     let mut flooding: Option<Instant> = None;
     while flooding.map_or(t0.elapsed() < T, |t| t.elapsed() < Duration::from_secs(5)) {
-        match next(&mut logs).await {
+        // Statuses come once a minute on this feed: a quiet spell means no lines.
+        let msg = match tokio::time::timeout(Duration::from_secs(10), logs.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => panic!("the feed ended"),
+            Err(_) => panic!("{}", diagnose(&format!("no feed message for 10 s ({lines} lines so far)"), &seen)),
+        };
+        match msg {
             FeedMsg::Batch(b) => {
                 assert!(b.logs.len() <= client::BATCH_LOG_CAP, "a batch holds {} lines", b.logs.len());
+                seen.extend(b.events.iter().take(20).map(|e| format!("{e:?}").chars().take(300).collect::<String>()));
                 lines += b.logs.iter().filter(|(a, l)| a == "flood" && l.contains("flood-line")).count();
                 if lines == 0 {
                     continue;
@@ -334,7 +359,11 @@ async fn a_log_flood_stays_bounded_and_connected() {
     // `yes` writes far more than the supervisor forwards (its subscribers
     // lag): what is lost upstream arrives as `lagged`, counted like the
     // lines a batch drops.
-    assert!(batches >= 5 && lines > 100, "{batches} batches, {lines} lines, {lost} lost");
+    assert!(
+        batches >= 5 && lines > 100,
+        "{}",
+        diagnose(&format!("{batches} batches, {lines} lines, {lost} lost"), &seen)
+    );
     assert!(lost > 0, "a flood loses lines (counted); nothing waits for this reader");
 }
 
