@@ -327,7 +327,26 @@ pub fn file_chain(path: &Path) -> Vec<PathBuf> {
 /// Call `each` for every line of `path` (gzip or plain); stop when it
 /// returns false.
 pub fn for_each_line(path: &Path, each: &mut dyn FnMut(&str) -> bool) -> Result<bool, String> {
-    let f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (f, path) = match std::fs::File::open(path) {
+        Ok(f) => (f, path.to_path_buf()),
+        // Rotation goes on while the history is read: a file listed by
+        // `file_chain` may since have been compressed (its lines are in
+        // `x.gz`) or rotated past `keep` (nothing left to read here).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if path.extension().is_some_and(|e| e == "gz") {
+                return Ok(true);
+            }
+            let mut gz = path.as_os_str().to_owned();
+            gz.push(".gz");
+            let gz = PathBuf::from(gz);
+            match std::fs::File::open(&gz) {
+                Ok(f) => (f, gz),
+                Err(_) => return Ok(true),
+            }
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let path = path.as_path();
     let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
         Box::new(std::io::BufReader::new(flate2::read::MultiGzDecoder::new(f)))
     } else {
@@ -907,6 +926,45 @@ mod tests {
             .unwrap();
         }
         assert_eq!(seen, vec!["old", "new"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Listed, then compressed or rotated away before it was read: the
+    /// lines come from `x.gz`, or there are none; never an error.
+    #[test]
+    fn a_file_compressed_or_rotated_away_after_listing_is_no_error() {
+        let dir = std::env::temp_dir().join(format!("warden-logview-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("app.log");
+        std::fs::write(dir.join("app.log.1"), "old\n").unwrap();
+        std::fs::write(&p, "new\n").unwrap();
+        let chain = file_chain(&p);
+        assert_eq!(chain, [dir.join("app.log.1"), p.clone()]);
+        // The compressor finishes in between.
+        let gz = std::fs::File::create(dir.join("app.log.1.gz")).unwrap();
+        let mut enc = flate2::write::GzEncoder::new(gz, flate2::Compression::default());
+        enc.write_all(b"old\n").unwrap();
+        enc.finish().unwrap();
+        std::fs::remove_file(dir.join("app.log.1")).unwrap();
+        let read = |chain: &[PathBuf]| -> Vec<String> {
+            let mut seen = Vec::new();
+            for f in chain {
+                assert!(
+                    for_each_line(f, &mut |l| {
+                        seen.push(l.to_string());
+                        true
+                    })
+                    .unwrap()
+                );
+            }
+            seen
+        };
+        assert_eq!(read(&chain), ["old", "new"]);
+        // Then rotated past `keep`: gone, nothing to read.
+        std::fs::remove_file(dir.join("app.log.1.gz")).unwrap();
+        assert_eq!(read(&chain), ["new"]);
+        assert!(for_each_line(&dir.join("missing.log.3.gz"), &mut |_| true).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -540,9 +540,34 @@ thread_local! {
     static READ_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; READ_CHUNK]);
 }
 
+/// How long a reader of worker output runs before the other tasks on its
+/// thread get a turn. Waiting for a pipe to be readable costs a tokio task
+/// nothing when it always is (a worker that writes faster than it is read):
+/// without turns, a flooding worker kept the supervisor's event loop (control
+/// socket, timers, the other workers) waiting for seconds.
+const TURN: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The clock of a reader's turn: [`Turns::take`] after each read.
+struct Turns(std::time::Instant);
+
+impl Turns {
+    fn new() -> Turns {
+        Turns(std::time::Instant::now())
+    }
+
+    /// Yield once the turn has lasted [`TURN`] (a clock read otherwise).
+    async fn take(&mut self) {
+        if self.0.elapsed() >= TURN {
+            tokio::task::yield_now().await;
+            self.0 = std::time::Instant::now();
+        }
+    }
+}
+
 /// Forward a child stream line by line to the log, capping line length and rate.
 async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream: &'static str, limit: u32) {
     crate::guard::fault(stream);
+    let mut turns = Turns::new();
     let mut line: Vec<u8> = Vec::new();
     let mut rate = RateLimit::new(if limit == 0 { u32::MAX } else { limit });
     loop {
@@ -587,11 +612,7 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
                         (into out_file, no budget)",
             );
         }
-        // A worker that writes faster than this reads keeps the pipe readable,
-        // and waiting for readiness does not count against the task's budget:
-        // without this the loop would never give the supervisor's other tasks
-        // (control socket, timers, the other workers) a turn.
-        tokio::task::coop::consume_budget().await;
+        turns.take().await;
     }
     if !line.is_empty() {
         let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
@@ -651,6 +672,7 @@ async fn pump_direct(
         }
     };
     let file = crate::logging::DirectWriter::open(path, policy, &label, stream);
+    let mut turns = Turns::new();
     // `warden logs -f`: the unfinished line so far (only while someone follows).
     let mut partial: Vec<u8> = Vec::new();
     loop {
@@ -688,9 +710,7 @@ async fn pump_direct(
                 break;
             }
         }
-        // As in `pump_output`: a pipe that never runs dry must not keep the
-        // output thread from its other pipes and the log files.
-        tokio::task::coop::consume_budget().await;
+        turns.take().await;
     }
     if !partial.is_empty() {
         follow_direct(b"\n", &mut partial, &label, stream); // the last line had no newline
@@ -1088,8 +1108,14 @@ mod tests {
                         }
                     }
                 }
-                // The worker is gone: sending fails cleanly instead of blocking.
-                assert!(h.send(b"again\n").is_err());
+                // The worker is gone: sending fails cleanly instead of blocking. (For a
+                // moment a copy of its end can outlive it here: another test's child,
+                // forked from this process and not yet exec'd, holds every descriptor.)
+                let t0 = std::time::Instant::now();
+                while h.send(b"again\n").is_ok() {
+                    assert!(t0.elapsed() < std::time::Duration::from_secs(5), "sending to a worker that is gone");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             })
             .await;
     }
