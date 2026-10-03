@@ -65,7 +65,15 @@ esac
 
 failures=0
 pass() { echo "  ok: $*"; }
-fail() { echo "  FAIL: $*" >&2; failures=$((failures + 1)); }
+# In GitHub Actions a failure is also an annotation: job logs need a login to
+# read, annotations don't.
+annotate() { # text
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  local t=${1//%/%25}
+  t=${t//$'\r'/%0D}
+  echo "::error title=test-linux-packages::${t//$'\n'/%0A}"
+}
+fail() { echo "  FAIL: $*" >&2; failures=$((failures + 1)); annotate "$*"; }
 skip() { # message: a skip, or a failure with --require
   if [ "$require" = 1 ]; then fail "$* (--require)"; else echo "  skip: $*"; fi
 }
@@ -348,14 +356,17 @@ for entry in "${images[@]}"; do
     gui=skip
   fi
   echo "  $image ($family, GUI: $gui)"
+  out=$(mktemp)
   if "$runtime" run --rm -v "$dist:/pkgs:ro" \
     -e FAMILY="$family" -e VERSION="$version" -e GUI="$gui" \
     -e CLI_PKG="${cli_pkg##*/}" -e GUI_PKG="${gui_pkg##*/}" \
-    "$image" sh -c "$inside"; then
+    "$image" sh -c "$inside" 2>&1 | tee "$out"; then
     pass "$image"
   else
-    fail "$image"
+    fail "$image:
+$(tail -n 25 "$out")"
   fi
+  rm -f "$out"
 done
 
 if [ "$failures" = 0 ]; then
