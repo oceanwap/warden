@@ -32,7 +32,7 @@ Warden spawns, watches and replaces the workers; the kernel balances connections
 curl -fsSL https://raw.githubusercontent.com/oceanwap/warden/main/install.sh | sh
 ```
 
-This puts `warden` in `/usr/local/bin` (as root) or `~/.local/bin`, after checking the download against the release's `SHA256SUMS`. Options go after `sh -s --` (`... | sh -s -- --gui`): `--gui` also installs the GUI, `--version v0.2.0` picks a release, `--uninstall` removes it. Linux and macOS, x86_64 and arm64.
+This puts `warden` in `/usr/local/bin` (as root) or `~/.local/bin`, after checking the download against the release's `SHA256SUMS`. Options go after `sh -s --` (`... | sh -s -- --gui`): `--gui` also installs the GUI (`install-gui.sh`, or `warden gui-install` later, does only that), `--version v0.2.0` picks a release, `--uninstall` removes it. Linux and macOS, x86_64 and arm64.
 
 Also: `.deb` and `.rpm` packages for Debian, Ubuntu, Fedora and RHEL ([docs/packages.md](docs/packages.md)), and a `.dmg` with the GUI and the CLI for macOS. Downloading the archives by hand and every installer detail: [docs/install.md](docs/install.md). Linux is the production platform; macOS is for development, and Windows works through WSL2 ([docs/platforms.md](docs/platforms.md)).
 

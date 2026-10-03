@@ -11,6 +11,12 @@
 #
 #   bash scripts/test-install.sh          (CI runs it; no root needed, root is fine)
 #
+# install-gui.sh (install.sh --gui, from the release) is tested the same way,
+# and so is `warden gui-install` (the install.sh built into warden) when a
+# warden that has it is built here.
+#
+#   INSTALL_SH=…/install.sh INSTALL_GUI_SH=…/install-gui.sh   test other copies
+#
 # What it cannot prove: that hdiutil, ditto and codesign behave on a Mac (the
 # release script, scripts/dist-macos.sh, runs install.sh --gui against the real
 # ones there), or that GitHub serves what the URLs name.
@@ -19,6 +25,7 @@ set -uo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 installer=${INSTALL_SH:-$root/install.sh}
+gui_installer=${INSTALL_GUI_SH:-$root/install-gui.sh}
 T=$(mktemp -d)
 keep=0
 srv=""
@@ -150,7 +157,10 @@ stub_program() {
         esac
         echo '  --help)'
         echo "    echo 'USAGE:'"
-        if [ "$4" != noupdate ]; then echo "    echo '    update           Restart every supervisor and wardend'"; fi
+        if [ "$4" != noupdate ]; then
+            echo "    echo '    update           Restart every supervisor and wardend'"
+            echo "    echo '    gui-install      Install the desktop app of this version'"
+        fi
         echo '    ;;'
         echo '  daemon) [ "${2:-}" = status ] && [ -f "${WARDEN_FAKE_RUNNING:-/nonexistent}" ] && exit 0; exit 1 ;;'
         echo 'esac'
@@ -254,6 +264,7 @@ new_case() { # a fresh HOME, install folder, data folder and app folder
     rm -f "$T/running" "$T/stub.log"
 }
 SH="sh"
+RUN=$installer
 out="" rc=0
 
 # inst [VAR=value…] -- ARGS…: install.sh in a clean environment (HOME is $H, the
@@ -268,7 +279,7 @@ inst() {
         FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_GLIBC=2.35 FAKE_LIBC=glibc FAKE_LOG="$T/stub.log" \
         WARDEN_RUNTIME_DIR="$T/run" WARDEN_HOME="$T/wardenhome" WARDEN_NO_DAEMON=1 WARDEN_FAKE_RUNNING="$T/running" \
         XDG_DATA_HOME="$X" WARDEN_APP_DIR="$A" WARDEN_DOWNLOAD_URL="file://$REL" WARDEN_INSTALL_DIR="$D" \
-        ${envs[@]+"${envs[@]}"} $SH "$installer" "$@" </dev/null 2>&1)
+        ${envs[@]+"${envs[@]}"} $SH "$RUN" "$@" </dev/null 2>&1)
     rc=$?
 }
 # The same through a pipe, as `curl … | sh -s -- ARGS` runs it.
@@ -278,7 +289,7 @@ inst_pipe() {
     shift
     # A pipe on purpose (`curl | sh` gives one, not a file), hence the cat.
     # shellcheck disable=SC2086,SC2002
-    out=$(cat "$installer" | env -i PATH="$bin:$PATH" HOME="$H" TMPDIR="$T/tmp" LANG=C SHELL=/bin/bash \
+    out=$(cat "$RUN" | env -i PATH="$bin:$PATH" HOME="$H" TMPDIR="$T/tmp" LANG=C SHELL=/bin/bash \
         FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_GLIBC=2.35 FAKE_LIBC=glibc FAKE_LOG="$T/stub.log" \
         WARDEN_RUNTIME_DIR="$T/run" WARDEN_HOME="$T/wardenhome" WARDEN_NO_DAEMON=1 WARDEN_FAKE_RUNNING="$T/running" \
         XDG_DATA_HOME="$X" WARDEN_APP_DIR="$A" WARDEN_DOWNLOAD_URL="file://$REL" WARDEN_INSTALL_DIR="$D" \
@@ -322,7 +333,7 @@ echo "-- help and arguments"
 new_case
 inst -- --help
 check "--help exits 0" test "$rc" -eq 0
-for o in --version --gui --uninstall --prefix --dir --modify-path --dry-run --no-verify --help WARDEN_VERSION WARDEN_INSTALL_DIR WARDEN_DOWNLOAD_URL; do
+for o in --version --gui --gui-only --uninstall --prefix --dir --modify-path --dry-run --no-verify --help install-gui.sh WARDEN_VERSION WARDEN_INSTALL_DIR WARDEN_DOWNLOAD_URL; do
     check "--help lists $o" has "$o"
 done
 inst -- -h
@@ -353,6 +364,8 @@ check "the temporary folder is gone" scratch_clean
 check "no startup file of the user's was touched" test -z "$(find "$H" -maxdepth 1 -name '.*' ! -name . ! -name .. 2>/dev/null)"
 check "it names the version it found" has "installed warden 0.3.1"
 check "the next steps are printed" has "doctor"
+check "…not the archive's contrib/ files (warden startup writes what a host needs)" hasnt "contrib/"
+check "…and not the GUI, with no desktop session (no DISPLAY)" hasnt "gui-install"
 inst --
 check "installing again exits 0" test "$rc" -eq 0
 check "…and says it was this version" has "it was this version already"
@@ -781,6 +794,71 @@ new_case
 inst -- --gui --no-verify
 check "--gui --no-verify installs both, warning" sh -c "[ '$rc' = 0 ] && [ -x '$D/warden-gui' ]"
 
+echo "-- the GUI in the next steps"
+new_case
+inst DISPLAY=:0 --
+check "a desktop session (DISPLAY): the next steps offer warden gui-install" has "gui-install"
+check "…in their column" has "$D/warden gui-install  add the desktop app"
+inst WAYLAND_DISPLAY=wayland-0 --
+check "…Wayland too" has "gui-install"
+inst DISPLAY=:0 -- --gui
+check "…not after --gui (it is there)" hasnt "gui-install"
+inst DISPLAY=:0 FAKE_GLIBC=2.31 --
+check "…not on a glibc too old for the GUI" hasnt "gui-install"
+inst DISPLAY=:0 WARDEN_DOWNLOAD_URL="file://$T/rel-nogui" --
+check "…not when the release has no GUI" hasnt "gui-install"
+inst DISPLAY=:0 WARDEN_DOWNLOAD_URL="file://$T/rel-old" --
+check "…not when the warden installed has no gui-install command" hasnt "gui-install"
+inst FAKE_OS=Darwin FAKE_ARCH=arm64 --
+check "macOS: offered, no DISPLAY needed" has "add the desktop app, Warden.app"
+
+echo "-- --gui-only on Linux"
+new_case
+inst --
+echo '# this very file' >>"$D/warden"
+cp "$D/warden" "$T/cli-before"
+inst -- --gui-only --dry-run
+check "--gui-only --dry-run: the GUI archive" has "warden-gui-0.3.1-linux-x86_64.tar.gz"
+check "…not the CLI's" hasnt "download   warden-0.3.1-linux-x86_64.tar.gz"
+check "…and the CLI it leaves as it is" has "left as it is: $D/warden"
+inst -- --gui-only
+check "--gui-only exits 0" test "$rc" -eq 0
+check "…installs the GUI program" ver_is "$D/warden-gui" "warden-gui 0.3.1"
+check "…and its menu entry" file_has "$X/applications/warden-gui.desktop" "Exec=$D/warden-gui"
+check "…leaves the CLI as it was" cmp -s "$D/warden" "$T/cli-before"
+check "…without downloading the CLI archive" hasnt "downloading warden-0.3.1-linux-x86_64.tar.gz"
+check "…and no warning: they are one version" hasnt "keep the two at one version"
+check "…and no next steps (that was the CLI's install)" hasnt "Next steps"
+inst -- --uninstall --gui-only
+check "--uninstall --gui-only removes the GUI program" test ! -e "$D/warden-gui"
+check "…and its menu entry" test ! -e "$X/applications/warden-gui.desktop"
+check "…and leaves the CLI" cmp -s "$D/warden" "$T/cli-before"
+inst -- --uninstall --gui-only
+check "…again: nothing to remove, exit 0" ok_has "nothing to remove"
+new_case
+inst WARDEN_DOWNLOAD_URL="file://$T/rel-020b" --
+inst -- --gui-only
+check "--gui-only next to an older CLI installs the GUI (the latest)" ver_is "$D/warden-gui" "warden-gui 0.3.1"
+check "…keeps that CLI" ver_is "$D/warden" "warden 0.2.0"
+check "…and warns that the two are not one version" has "keep the two at one version"
+inst WARDEN_DOWNLOAD_URL="file://$T/rel-020b" -- --gui-only --version v0.2.0
+check "--gui-only --version: the GUI of the CLI's version, no warning" sh -c "[ '$rc' = 0 ] && '$D/warden-gui' --version | grep -q 'warden-gui 0.2.0' && ! printf '%s' \"\$0\" | grep -q 'one version'" "$out"
+new_case
+inst FAKE_GLIBC=2.31 -- --gui-only
+check "--gui-only on glibc 2.31 is refused" test "$rc" -ne 0
+check "…nothing installed" test ! -e "$D"
+new_case
+if PATH=/usr/bin:/bin command -v warden >/dev/null 2>&1; then
+    note "this machine has a warden in /usr/bin or /bin: --gui-only with no CLI is not tested"
+else
+    inst PATH="$bin:/usr/bin:/bin" -- --gui-only --dry-run
+    check "--gui-only --dry-run with no warden anywhere: says the CLI comes too" has "none found: $D/warden, from the GUI archive"
+    inst PATH="$bin:/usr/bin:/bin" -- --gui-only
+    check "--gui-only with no warden anywhere installs the GUI" ver_is "$D/warden-gui" "warden-gui 0.3.1"
+    check "…and the CLI from the GUI archive (the GUI needs it)" ver_is "$D/warden" "warden 0.3.1"
+    check "…saying why" has "the GUI needs it"
+fi
+
 # ============================================================ 15. the macOS GUI
 echo "-- --gui on macOS (stubbed ditto, hdiutil, codesign)"
 mac=(FAKE_OS=Darwin FAKE_ARCH=arm64)
@@ -850,6 +928,26 @@ else
 fi
 inst "${mac[@]}" -- --gui --app-dir "$H/Apps"
 check "--app-dir" test -d "$H/Apps/Warden.app"
+new_case
+inst "${mac[@]}" --
+echo '# this very file' >>"$D/warden"
+cp "$D/warden" "$T/cli-before"
+inst "${mac[@]}" -- --gui-only
+check "macOS --gui-only installs Warden.app" test -x "$A/Warden.app/Contents/MacOS/warden-gui"
+check "…leaves the CLI as it was" cmp -s "$D/warden" "$T/cli-before"
+check "…without downloading the CLI archive" hasnt "downloading warden-0.3.1-macos-arm64.tar.gz"
+inst "${mac[@]}" -- --uninstall --gui-only
+check "…--uninstall --gui-only removes Warden.app" test ! -e "$A/Warden.app"
+check "…and leaves the CLI" cmp -s "$D/warden" "$T/cli-before"
+new_case
+if PATH=/usr/bin:/bin command -v warden >/dev/null 2>&1; then
+    note "this machine has a warden in /usr/bin or /bin: macOS --gui-only with no CLI is not tested"
+else
+    inst "${mac[@]}" PATH="$bin:/usr/bin:/bin" -- --gui-only
+    check "macOS --gui-only with no warden: Warden.app, which links its own CLI when it opens" sh -c "[ '$rc' = 0 ] && [ -d '$A/Warden.app' ]"
+    check "…saying so" has "links its own"
+    check "…and nothing goes in the CLI folder" test ! -e "$D"
+fi
 
 # ============================================================ 15b. GitHub's URLs
 echo "-- the release URLs (a stubbed curl)"
@@ -861,7 +959,7 @@ check "no WARDEN_DOWNLOAD_URL: installs from GitHub's URLs" ver_is "$D/warden" "
 check "…SHA256SUMS comes from the latest release" file_has "$T/stub.log" "curl $base/latest/download/SHA256SUMS"
 check "…and the archive from the very release SHA256SUMS named (not from 'latest')" file_has "$T/stub.log" "curl $base/download/v0.3.1/warden-0.3.1-linux-x86_64.tar.gz"
 check "…nothing is fetched from 'latest' but SHA256SUMS" test "$(grep -c "latest/download" "$T/stub.log")" = 1
-check "…and it says where the archive is from" has "$base/download/v0.3.1/warden-0.3.1-linux-x86_64.tar.gz"
+check "…and it says where the archive is from" has "downloading warden-0.3.1-linux-x86_64.tar.gz from $base/download/v0.3.1"
 new_case
 inst "${gh[@]}" -- --version v0.3.1
 check "--version: SHA256SUMS and the archive come from that tag" sh -c "grep -q 'curl $base/download/v0.3.1/SHA256SUMS' '$T/stub.log' && grep -q 'curl $base/download/v0.3.1/warden-0.3.1-linux-x86_64.tar.gz' '$T/stub.log' && ! grep -q latest '$T/stub.log'"
@@ -938,9 +1036,10 @@ SH="sh"
 # ============================================================ 18. the real platform and program
 echo "-- this machine, no stubs"
 new_case
+# The newer of the release and debug builds (a stale one may lack what is tested).
 real_bin=""
 for c in "$root/target/release/warden" "$root/target/debug/warden"; do
-    if [ -x "$c" ] && "$c" --version >/dev/null 2>&1; then real_bin=$c; break; fi
+    if [ -x "$c" ] && "$c" --version >/dev/null 2>&1 && { [ -z "$real_bin" ] || [ "$c" -nt "$real_bin" ]; }; then real_bin=$c; fi
 done
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-aarch64 | Darwin-arm64 | Darwin-x86_64) ;;
@@ -968,7 +1067,111 @@ else
     check "the real warden is installed for the real platform ($hos-$harch), exit 0" test "$rc" -eq 0
     check "…and it runs and says warden $hv" ver_is "$D/warden" "warden $hv"
     check "…and the installed program answers --help" sh -c "env -i HOME='$H' WARDEN_RUNTIME_DIR='$T/run' WARDEN_HOME='$T/wardenhome' WARDEN_NO_DAEMON=1 '$D/warden' --help >/dev/null"
+    # warden gui-install: the install.sh built into it, for its own version,
+    # against a release of that version with a stand-in GUI (Linux: a Mac's
+    # real codesign would refuse the unsigned stand-in app).
+    if ! "$D/warden" --help 2>/dev/null | grep -q '^ *gui-install '; then
+        note "this warden has no gui-install command (an old build? cargo build): warden gui-install is not tested"
+    elif [ "$hos" != linux ]; then
+        note "warden gui-install is tested on Linux only"
+    elif [ "$(getconf GNU_LIBC_VERSION | awk '{ split($2, v, "."); print (v[1] > 2 || (v[1] == 2 && v[2] >= 35)) ? "yes" : "no" }')" != yes ]; then
+        note "glibc older than 2.35: no GUI here, warden gui-install is not tested"
+    else
+        gn=warden-gui-$hv-linux-$harch
+        mkdir -p "$T/stage/$gn"
+        cp "$real_bin" "$T/stage/$gn/warden"
+        stub_program "$T/stage/$gn/warden-gui" warden-gui "$hv" ok
+        printf '[Desktop Entry]\nType=Application\nName=Warden\nExec=warden-gui\nIcon=warden\nTerminal=false\n' >"$T/stage/$gn/warden-gui.desktop"
+        printf 'PNG' >"$T/stage/$gn/warden.png"
+        COPYFILE_DISABLE=1 tar -C "$T/stage" -czf "$rd/$gn.tar.gz" "$gn"
+        sums "$rd"
+        gi() { # warden gui-install ARGS…, as this user, against the release in $rd
+            out=$(env -i PATH="$PATH" HOME="$H" TMPDIR="$T/tmp" XDG_DATA_HOME="$X" WARDEN_DOWNLOAD_URL="file://$rd" \
+                WARDEN_RUNTIME_DIR="$T/run" WARDEN_HOME="$T/wardenhome" WARDEN_NO_DAEMON=1 "$D/warden" gui-install "$@" </dev/null 2>&1)
+            rc=$?
+        }
+        gi --dry-run
+        check "warden gui-install --dry-run: the GUI of its own version" sh -c "[ '$rc' = 0 ] && printf '%s' \"\$0\" | grep -q '$gn.tar.gz'" "$out"
+        check "…installing nothing" test ! -e "$D/warden-gui"
+        gi
+        check "warden gui-install installs the GUI next to it" ver_is "$D/warden-gui" "warden-gui $hv"
+        check "…with its menu entry" file_has "$X/applications/warden-gui.desktop" "Exec=$D/warden-gui"
+        check "…and leaves the CLI as it was" cmp -s "$D/warden" "$real_bin"
+        gi --uninstall
+        check "warden gui-install --uninstall removes the GUI" sh -c "[ '$rc' = 0 ] && [ ! -e '$D/warden-gui' ] && [ ! -e '$X/applications/warden-gui.desktop' ]"
+        check "…and leaves the CLI" cmp -s "$D/warden" "$real_bin"
+    fi
 fi
+
+# ============================================================ 19. install-gui.sh
+echo "-- install-gui.sh ($gui_installer)"
+check "sh -n" sh -n "$gui_installer"
+if command -v shellcheck >/dev/null 2>&1; then check "shellcheck" shellcheck "$gui_installer"; else note "shellcheck is not installed: skipped"; fi
+check "it is a POSIX sh script (#!/bin/sh)" test "$(head -n 1 "$gui_installer")" = '#!/bin/sh'
+check "its last line calls main with the end marker" test "$(tail -n 1 "$gui_installer")" = 'main "$@" --end-of-install-script'
+check "it never reads its standard input (no read command)" sh -c "! grep -Ev '^[[:space:]]*#' '$gui_installer' | grep -Eq '(^|[;&| ])read( |\$)'"
+# A release has install.sh in it, listed in SHA256SUMS.
+GREL=$T/rel-gui
+cp -R "$REL" "$GREL"
+cp "$installer" "$GREL/install.sh"
+sums "$GREL"
+cp -R "$GREL" "$T/rel-gui-tampered"
+printf '\n# changed on the way\n' >>"$T/rel-gui-tampered/install.sh"
+cp -R "$REL" "$T/rel-gui-noinstaller"
+RUN=$gui_installer
+new_case
+inst WARDEN_DOWNLOAD_URL="file://$GREL" --
+check "install-gui.sh installs the CLI" ver_is "$D/warden" "warden 0.3.1"
+check "…and the GUI" ver_is "$D/warden-gui" "warden-gui 0.3.1"
+check "…with its menu entry" file_has "$X/applications/warden-gui.desktop" "Exec=$D/warden-gui"
+check "…and its temporary folder is gone" scratch_clean
+inst WARDEN_DOWNLOAD_URL="file://$GREL" -- --uninstall
+check "install-gui.sh --uninstall removes both" sh -c "[ '$rc' = 0 ] && [ ! -e '$D/warden' ] && [ ! -e '$D/warden-gui' ]"
+new_case
+inst WARDEN_DOWNLOAD_URL="file://$GREL" -- --dry-run
+check "options go on to install.sh: --dry-run" sh -c "[ '$rc' = 0 ] && [ ! -e '$D' ]"
+check "…which lists the GUI's files" has "warden-gui-0.3.1-linux-x86_64.tar.gz"
+inst WARDEN_DOWNLOAD_URL="file://$GREL" -- --help
+check "--help: what it is" has "Install Warden's GUI"
+check "…and install.sh's options" has "--gui-only"
+inst WARDEN_DOWNLOAD_URL="file://$GREL" FAKE_OS=Darwin FAKE_ARCH=arm64 --
+check "macOS: Warden.app and the CLI" sh -c "[ '$rc' = 0 ] && [ -d '$A/Warden.app' ] && [ -x '$D/warden' ]"
+new_case
+inst WARDEN_DOWNLOAD_URL="file://$T/rel-gui-tampered" --
+check "an install.sh that does not match SHA256SUMS is refused" fail_has "checksum mismatch for install.sh"
+check "…before anything is installed" test ! -e "$D"
+inst WARDEN_DOWNLOAD_URL="file://$T/rel-gui-tampered" -- --no-verify
+check "…--no-verify runs it all the same, saying so" sh -c "[ '$rc' = 0 ] && [ -x '$D/warden-gui' ] && printf '%s' \"\$0\" | grep -q 'NOT checked'" "$out"
+new_case
+inst WARDEN_DOWNLOAD_URL="file://$T/rel-gui-noinstaller" --
+check "a release without install.sh is refused" fail_has "does not list install.sh"
+inst WARDEN_DOWNLOAD_URL="file://$T/does-not-exist" --
+check "an unreachable release is refused" fail_has "cannot download"
+check "…nothing installed" test ! -e "$D"
+new_case
+inst_pipe WARDEN_DOWNLOAD_URL="file://$GREL" -- --dir "$D"
+check "piped into sh (curl | sh): installs both" sh -c "[ '$rc' = 0 ] && [ -x '$D/warden' ] && [ -x '$D/warden-gui' ]"
+new_case
+size=$(wc -c <"$gui_installer" | tr -d ' ')
+bad=""
+for off in 0 $((size / 4)) $((size / 2)) $((size * 3 / 4)) $((size - 25)) $((size - 2)); do
+    rm -rf "$D"
+    cut_out=$(head -c "$off" "$gui_installer" | env -i PATH="$bin:$PATH" HOME="$H" TMPDIR="$T/tmp" FAKE_LOG="$T/stub.log" \
+        XDG_DATA_HOME="$X" WARDEN_DOWNLOAD_URL="file://$GREL" WARDEN_INSTALL_DIR="$D" WARDEN_NO_DAEMON=1 sh -s -- 2>&1)
+    if [ -e "$D" ]; then bad="$bad $off"; fi
+done
+if [ -z "$bad" ]; then pass "a script cut short installs nothing"; else fail "a script cut at byte$bad installed something"; fi
+check "…saying it is incomplete" has_in "$cut_out" "this script is incomplete"
+new_case
+inst PATH="$T/curlbin:$bin:$PATH" FAKE_RELEASE="$GREL" WARDEN_DOWNLOAD_URL= --
+check "GitHub's URLs: installs both" sh -c "[ '$rc' = 0 ] && [ -x '$D/warden' ] && [ -x '$D/warden-gui' ]"
+check "…SHA256SUMS from the latest release" file_has "$T/stub.log" "curl $base/latest/download/SHA256SUMS"
+check "…install.sh from the very release that SHA256SUMS is of" file_has "$T/stub.log" "curl $base/download/v0.3.1/install.sh"
+check "…and nothing else from 'latest' (install.sh is told the version)" test "$(grep -c "latest/download" "$T/stub.log")" = 1
+new_case
+inst PATH="$T/curlbin:$bin:$PATH" FAKE_RELEASE="$GREL" WARDEN_DOWNLOAD_URL= -- --version v0.3.1
+check "--version: everything from that tag" sh -c "[ '$rc' = 0 ] && grep -q 'curl $base/download/v0.3.1/install.sh' '$T/stub.log' && ! grep -q latest '$T/stub.log'"
+RUN=$installer
 
 echo
 if [ "$fails" -gt 0 ]; then

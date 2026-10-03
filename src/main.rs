@@ -13,6 +13,7 @@ mod doctor;
 mod events;
 mod fleet;
 mod guard;
+mod gui_install;
 mod health;
 mod ids;
 mod logging;
@@ -121,6 +122,7 @@ fn main() {
         Command::Doctor => rt.block_on(doctor::run(&args)),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
         Command::WattpmMigrate(ref o) => rt.block_on(migrate_wattpm::run(&args, o)),
+        Command::GuiInstall(ref o) => gui_install::run(o),
         Command::Wardend(cli::WardendCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
         Command::Wardend(cli::WardendCmd::Run { background: true, resurrect }) => {
             rt.block_on(daemon::client::start_background(resurrect))

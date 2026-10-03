@@ -89,6 +89,11 @@ APPS (familiar from PM2):
                      --dry-run  --overwrite  --cutover overlap|new-port:<port> (starts
                      Warden's copy next to Watt; never stops wattpm)
 
+DESKTOP:
+    gui-install      Install the desktop app of this warden's release: Warden.app on macOS,
+                     warden-gui with a menu entry on Linux (next to this warden), checked
+                     against the release's SHA256SUMS  [--dry-run] [--uninstall] (--help)
+
 WARDEND (the host daemon, always on: `start` and `resurrect` start it, a crash or `kill -9`
 brings it back, `kill` of everything stops it; WARDEN_NO_DAEMON=1 never starts it. Apps never
 depend on it. Alert rules: <config dir>/wardend.toml, read again whenever it changes):
@@ -171,6 +176,8 @@ pub enum Command {
     Pm2Migrate(Box<crate::migrate::MigrateOpts>),
     /// `warden migrate-wattpm [dir|file]`: a Platformatic Watt project into Warden configs.
     WattpmMigrate(Box<crate::migrate_wattpm::Opts>),
+    /// `warden gui-install`: the desktop app of this release (install.sh --gui-only).
+    GuiInstall(Box<crate::gui_install::Opts>),
     /// wardend, the internal entry point (not in `--help`): launchd, systemd, the
     /// supervisors and the GUI start it; people use `start`, `resurrect` and `kill`.
     Wardend(WardendCmd),
@@ -354,6 +361,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     }
     if argv.first().map(String::as_str) == Some("migrate-wattpm") {
         return crate::migrate_wattpm::parse_args(&argv[1..]);
+    }
+    // Its --version is a release (as install.sh's), not "print the version".
+    if argv.first().map(String::as_str) == Some("gui-install") {
+        return crate::gui_install::parse_args(&argv[1..]);
     }
     let mut config: Option<PathBuf> = None;
     let mut socket = None;

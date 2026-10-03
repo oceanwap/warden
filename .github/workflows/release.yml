@@ -5,7 +5,7 @@
 #                                            Linux, a zipped Warden.app on macOS)
 #   warden[-gui]_<version>-1_<arch>.deb, warden[-gui]-<version>-1.<arch>.rpm
 #                                            Linux packages (docs/packages.md), amd64/arm64
-# plus install.sh and SHA256SUMS covering every file, and macos-build-info.txt.
+# plus install.sh, install-gui.sh and SHA256SUMS covering every file, and macos-build-info.txt.
 #
 # Linux is built, tested and packaged here. The macOS archives have two possible
 # sources, chosen per release (`macos_source`, see below), and exactly one of
@@ -453,8 +453,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends rpm desktop-file-utils
       # Inspects every package (what it holds, what it must not), then in each
-      # image `dpkg -i` / `rpm -i`, warden --version, warden doctor, the GUI, a
-      # reinstall and the removal. --require: no runtime or tool is no pass.
+      # image `dpkg -i` / `rpm -i`, warden --version, warden doctor, a reinstall,
+      # warden-gui in warden's place and back (apt/dnf, then dpkg/rpm), the
+      # removals, and warden-gui alone. --require: no runtime or tool is no pass.
       - name: Inspect and install the packages in containers
         run: bash scripts/test-linux-packages.sh --require --version "$VERSION" pkg
       - uses: actions/upload-artifact@v7
@@ -835,7 +836,7 @@ jobs:
           exit $missing
       - name: SHA256SUMS
         run: |
-          cp install.sh dist/
+          cp install.sh install-gui.sh dist/
           cd dist
           rm -f SHA256SUMS
           sha256sum -- * > SHA256SUMS
@@ -865,7 +866,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - if: runner.os == 'Linux'
-        run: shellcheck install.sh
+        run: shellcheck install.sh install-gui.sh
       - uses: actions/download-artifact@v8
         with:
           name: release-${{ needs.meta.outputs.version }}
@@ -894,7 +895,7 @@ jobs:
           fi
           test ! -e "$RUNNER_TEMP/tampered/warden"
       - name: scripts/test-install.sh (the install.sh being released, against fake releases)
-        run: INSTALL_SH="$PWD/dist/install.sh" bash scripts/test-install.sh
+        run: INSTALL_SH="$PWD/dist/install.sh" INSTALL_GUI_SH="$PWD/dist/install-gui.sh" bash scripts/test-install.sh
 
   # The macOS archives are in the artifacts either way (macos-assets). With the
   # source "local" the draft release already holds them (macos-local read them

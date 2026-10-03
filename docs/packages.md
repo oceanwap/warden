@@ -9,7 +9,13 @@ file. Two packages:
 | Package | Holds | Needs |
 |---|---|---|
 | `warden` | the CLI, `/usr/bin/warden` (wardend is `warden wardend`), the licenses and examples | glibc 2.28 |
-| `warden-gui` | the desktop GUI, `/usr/bin/warden-gui`, its menu entry and icons | `warden` of the same version, glibc 2.35 (Ubuntu 22.04, Debian 12, Fedora 36, ...), a desktop session |
+| `warden-gui` | the desktop GUI, `/usr/bin/warden-gui`, its menu entry and icons, **and the CLI** (the same `/usr/bin/warden`) | glibc 2.35 (Ubuntu 22.04, Debian 12, Fedora 36, ...), a desktop session |
+
+`warden-gui` is the whole of Warden for a desktop: it contains the CLI, provides
+`warden` and replaces the `warden` package, so install one of the two, not both.
+Installing `warden-gui` over `warden` swaps them (apt and dnf do it without
+asking; with `dpkg -i` or `rpm -U` too), and removing `warden-gui` removes the
+CLI with it. To go back to the CLI alone, install `warden` again.
 
 The packages are for hosts that want `apt` or `dnf` to know what is installed
 and where it came from. `install.sh` and the archives (docs/install.md) do
@@ -35,7 +41,7 @@ sudo dnf install ./warden-0.1.0-1.x86_64.rpm
 (the C library, and for the GUI the icon theme and the display libraries).
 The CLI package needs only the C library, so `sudo dpkg -i` and `sudo rpm -i`
 work for it too, without a package manager's network. The GUI the same way,
-once `warden` is installed:
+with or without `warden` installed:
 
 ```sh
 sudo apt install ./warden-gui_0.1.0-1_amd64.deb      # or: sudo dnf install ./warden-gui-0.1.0-1.x86_64.rpm
@@ -65,11 +71,11 @@ which `apt` and `dnf` order before `0.2.0`.
 | `/usr/share/doc/warden/` | `README.md`, `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY-LICENSES.txt` |
 | `/usr/share/doc/warden/examples/` | `warden.example.toml`, `wardend.service`, `warden@.service`, `99-warden.conf`, `nginx.conf`: to read and copy, never active |
 
-**warden-gui**
+**warden-gui** (the CLI's files above, and)
 
 | Path | What |
 |---|---|
-| `/usr/bin/warden-gui` | the GUI. It finds `warden` on the PATH |
+| `/usr/bin/warden-gui` | the GUI |
 | `/usr/share/applications/warden-gui.desktop` | the menu entry (the same file as in the GUI archive) |
 | `/usr/share/icons/hicolor/<size>/apps/warden.png`, `.../scalable/apps/warden.svg` | the icon, 16 to 512 px and scalable |
 | `/usr/share/doc/warden-gui/` | `README.md` (the GUI's), the licenses, `THIRD-PARTY-LICENSES-GUI.txt`, `FONT-LICENSES.txt` |
@@ -130,12 +136,10 @@ Not done, and why:
 Install the new package over the old one:
 
 ```sh
-sudo apt install ./warden_0.2.0-1_amd64.deb ./warden-gui_0.2.0-1_amd64.deb
-sudo dnf install ./warden-0.2.0-1.x86_64.rpm ./warden-gui-0.2.0-1.x86_64.rpm   # or: sudo rpm -U ...
+sudo apt install ./warden_0.2.0-1_amd64.deb         # the CLI alone, or
+sudo apt install ./warden-gui_0.2.0-1_amd64.deb     # the GUI with the CLI
+sudo dnf install ./warden-0.2.0-1.x86_64.rpm        # or ./warden-gui-0.2.0-1.x86_64.rpm; or: sudo rpm -U ...
 ```
-
-`warden-gui` needs exactly the `warden` of its own version: upgrade both
-together, as above.
 
 The package replaces the binary on disk and restarts nothing: a running
 supervisor keeps the code it started with. `warden list` and the GUI say when
@@ -162,7 +166,7 @@ binary. With both installed, the one found first on the PATH runs.
 ```sh
 sudo warden unstartup                  # if you ran `warden startup`: removes the units it wrote
 sudo warden kill --yes                 # if apps are still running and should stop
-sudo apt remove warden-gui warden      # or: sudo dnf remove warden-gui warden
+sudo apt remove warden-gui             # or warden: whichever is installed (dnf the same)
 ```
 
 Removing leaves your configs, saved state, logs and anything `warden startup`

@@ -7,15 +7,12 @@
 #   sh install.sh --version v0.2.0 --dry-run
 #
 # `sh install.sh --help` lists the options and the environment variables. The
-# manual is docs/install.md.
+# manual is docs/install.md. install-gui.sh runs this script with --gui, and
+# `warden gui-install` runs the copy built into warden with --gui-only.
 #
 # Safe under `curl | sh`: the script never reads from its standard input (it
 # asks nothing), and every command lives in a function that the last line
 # calls, so a download cut short runs nothing.
-#
-# NOTE: GitHub Releases are not published yet. Until the first release exists,
-# this script will fail when it cannot download SHA256SUMS. Prefer building
-# from source: `cargo build --release` (see docs/development.md).
 set -eu
 
 usage() {
@@ -25,15 +22,21 @@ Install Warden, a supervisor for Bun and Node apps.
 Usage: install.sh [OPTIONS]
 
   curl -fsSL https://github.com/oceanwap/warden/releases/latest/download/install.sh | sh
-  curl -fsSL https://github.com/oceanwap/warden/releases/latest/download/install.sh | sh -s -- --gui
+  curl -fsSL https://github.com/oceanwap/warden/releases/latest/download/install-gui.sh | sh
+
+(install-gui.sh is this script with --gui: the CLI and the GUI.)
 
 Options:
   --version VERSION   Install this release (v0.2.0 or 0.2.0), not the latest
   --gui               Also install the GUI. macOS: Warden.app in /Applications
                       (or ~/Applications). Linux: warden-gui, a menu entry and an
                       icon (~/.local/share, or /usr/local/share as root)
+  --gui-only          The GUI, not the CLI: for a machine that has `warden`
+                      already (`warden gui-install` runs this). On Linux, with
+                      no `warden` to be found, the CLI comes too (the GUI needs it)
   --uninstall         Remove what this installer installs (with --gui: the GUI
-                      too). Your apps, their configs and saved state stay
+                      too; with --gui-only: the GUI alone). Your apps, their
+                      configs and saved state stay
   --prefix DIR        Put the binaries in DIR (default: /usr/local/bin as root,
   --dir DIR           else ~/.local/bin); the same as WARDEN_INSTALL_DIR
   --app-dir DIR       macOS GUI: the folder for Warden.app; same as WARDEN_APP_DIR
@@ -99,6 +102,10 @@ parse_args() {
                 ;;
             --version=*) version=${1#--version=} ;;
             --gui) gui=1 ;;
+            --gui-only)
+                gui=1
+                cli=0
+                ;;
             --uninstall) uninstall=1 ;;
             --prefix | --dir)
                 need_value "$1" "${2:-}"
@@ -497,7 +504,7 @@ bad_checksum() { # file expected actual
 
 # Download a file of the release into $tmp and check it (want_hash is its line).
 get_file() { # file
-    say "downloading $1"
+    say "downloading $1 from $base"
     fetch "$base/$1" "$tmp/$1" big || fail "cannot download $base/$1"
     if [ "$verify" = 1 ]; then
         actual=$(sha256 "$tmp/$1")
@@ -688,6 +695,61 @@ EOF
 
 # ------------------------------------------------------------ install
 
+# One line of "Next steps": the command, then what it does, in a column.
+step() { # command what
+    # shellcheck disable=SC2059 # the width is a number of ours
+    printf "  %-${step_width}s  %s\n" "$1" "$2"
+}
+
+# The `warden` the GUI would use: the one in the folder it goes in (the GUI
+# looks beside itself first), else the one on PATH. Fails when there is none.
+cli_found() {
+    if [ -x "$dir/warden" ]; then
+        printf '%s\n' "$dir/warden"
+    else
+        command -v warden 2>/dev/null
+    fi
+}
+
+# After a full install without --gui: is the desktop app worth a line? Only
+# where it can run (a Mac; Linux with a desktop session and glibc 2.35+), when
+# this release has it, and when the installed warden has `gui-install`.
+gui_offered() {
+    if [ "$os" = linux ]; then
+        if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then return 1; fi
+        if [ "$libc" = glibc ]; then
+            gmaj=${glibc%%.*}
+            gmin=${glibc#*.}
+            gmin=${gmin%%.*}
+            if [ "$gmaj" -lt 2 ] || { [ "$gmaj" -eq 2 ] && [ "$gmin" -lt 35 ]; }; then return 1; fi
+        fi
+        sums_find "warden-gui-$version-linux-$arch.tar.gz" || return 1
+    else
+        sums_find "warden-gui-$version-macos-$arch.zip" || sums_find "Warden-$version-macos-$arch.dmg" || return 1
+    fi
+    if [ "$have_sums" = 0 ]; then return 1; fi
+    "$dir/warden" --help 2>/dev/null </dev/null | grep -q '^ *gui-install '
+}
+
+# --gui-only, after the GUI is in place: the CLI it will use, which this did
+# not touch (or, on Linux with none, the one from the GUI archive).
+gui_only_done() {
+    if [ -z "$have_cli" ]; then
+        if [ "$os" = linux ]; then
+            install_program "$gui_src/warden" warden
+            say "installed $("$dir/warden" --version 2>/dev/null </dev/null | head -n 1 || echo warden) to $dir/warden too: the GUI needs it, and there was none"
+            path_hint
+        else
+            say "Warden.app links its own \`warden\` command into /usr/local/bin the first time it opens (it may ask for your password)"
+        fi
+        return 0
+    fi
+    v=$("$have_cli" --version 2>/dev/null </dev/null | head -n 1) || v=""
+    if [ "$v" != "warden $version" ]; then
+        warn "the GUI is $version, and $have_cli says '${v:-nothing}': keep the two at one version (install.sh --gui installs both)"
+    fi
+}
+
 do_install() {
     check_libc
     find_tools
@@ -718,7 +780,7 @@ do_install() {
             warn "cannot download $base/SHA256SUMS; carrying on without it (--no-verify)"
         else
             fail "cannot download $base/SHA256SUMS${version:+ (is v$version a Warden release?)}.
-    No release published yet? Build from source: git clone https://github.com/$REPO && cd warden && cargo build --release (see docs/development.md).
+    The releases are at https://github.com/$REPO/releases; or build from source: git clone https://github.com/$REPO && cd warden && cargo build --release (see docs/development.md).
     Behind a proxy or offline? Check that curl $base/SHA256SUMS works here."
         fi
     fi
@@ -731,14 +793,17 @@ do_install() {
     fi
     cli_archive="warden-$version-$os-$arch.tar.gz"
     cli_name="warden-$version-$os-$arch"
-    if ! sums_find "$cli_archive"; then
-        if [ "$verify" = 1 ]; then
-            fail "$base/SHA256SUMS has no $cli_archive. It lists:
+    cli_hash=""
+    if [ "$cli" = 1 ]; then
+        if ! sums_find "$cli_archive"; then
+            if [ "$verify" = 1 ]; then
+                fail "$base/SHA256SUMS has no $cli_archive. It lists:
 $(sums_listing)"
+            fi
+            warn "SHA256SUMS does not list $cli_archive; trying it anyway (--no-verify)"
         fi
-        warn "SHA256SUMS does not list $cli_archive; trying it anyway (--no-verify)"
+        cli_hash=$want_hash
     fi
-    cli_hash=$want_hash
 
     gui_archive=""
     gui_hash=""
@@ -767,16 +832,21 @@ $(sums_listing)
     preflight_gui
 
     old=""
-    if [ -x "$dir/warden" ]; then old=$("$dir/warden" --version 2>/dev/null </dev/null | head -n 1) || old=""; fi
+    if [ "$cli" = 1 ] && [ -x "$dir/warden" ]; then old=$("$dir/warden" --version 2>/dev/null </dev/null | head -n 1) || old=""; fi
+    # --gui-only: the CLI the GUI will use, if there is one.
+    have_cli=""
+    if [ "$cli" = 0 ]; then have_cli=$(cli_found) || have_cli=""; fi
 
     if [ "$dry" = 1 ]; then
         say "dry run: nothing is downloaded or installed (only SHA256SUMS was fetched)"
         cat <<EOF
     platform   $os $arch${glibc:+ (glibc $glibc)}
     release    $version, from $base
-    download   $cli_archive${cli_hash:+  sha256 $cli_hash}
-    install    $dir/warden${old:+  (replaces: $old)}
 EOF
+        if [ "$cli" = 1 ]; then
+            printf '    download   %s%s\n' "$cli_archive" "${cli_hash:+  sha256 $cli_hash}"
+            printf '    install    %s%s\n' "$dir/warden" "${old:+  (replaces: $old)}"
+        fi
         if [ -n "$gui_archive" ]; then
             printf '    download   %s%s\n' "$gui_archive" "${gui_hash:+  sha256 $gui_hash}"
             if [ "$os" = linux ]; then
@@ -785,7 +855,15 @@ EOF
                 printf '    install    %s\n' "$app_dir/Warden.app"
             fi
         fi
-        if ! on_path "$dir"; then
+        if [ "$cli" = 0 ]; then
+            if [ -n "$have_cli" ]; then
+                printf '    CLI        left as it is: %s\n' "$have_cli"
+            elif [ "$os" = linux ]; then
+                printf '    CLI        none found: %s, from the GUI archive (the GUI needs it)\n' "$dir/warden"
+            else
+                printf '    CLI        none found: Warden.app links its own the first time it opens\n'
+            fi
+        elif ! on_path "$dir"; then
             if [ "$modify_path" = 1 ]; then
                 printf '    PATH       would add %s to %s\n' "$dir" "$(tilde "$(profile_file)")"
             else
@@ -796,10 +874,12 @@ EOF
     fi
 
     # Everything is downloaded and checked before anything is installed.
-    sums_find "$cli_archive" || true
-    get_file "$cli_archive"
-    tar -xzf "$tmp/$cli_archive" -C "$tmp" || fail "cannot unpack $cli_archive"
-    [ -f "$tmp/$cli_name/warden" ] || fail "$cli_archive has no $cli_name/warden"
+    if [ "$cli" = 1 ]; then
+        sums_find "$cli_archive" || true
+        get_file "$cli_archive"
+        tar -xzf "$tmp/$cli_archive" -C "$tmp" || fail "cannot unpack $cli_archive"
+        [ -f "$tmp/$cli_name/warden" ] || fail "$cli_archive has no $cli_name/warden"
+    fi
 
     if [ -n "$gui_archive" ]; then
         sums_find "$gui_archive" || true
@@ -810,22 +890,33 @@ EOF
                 tar -xzf "$tmp/$gui_archive" -C "$tmp" || fail "cannot unpack $gui_archive"
                 gui_src=$tmp/$gui_name
                 [ -f "$gui_src/warden-gui" ] || fail "$gui_archive has no $gui_name/warden-gui"
+                if [ "$cli" = 0 ] && [ -z "$have_cli" ] && [ ! -f "$gui_src/warden" ]; then
+                    fail "$gui_archive has no $gui_name/warden, and this machine has no warden for the GUI: install both with --gui"
+                fi
                 ;;
             *) unpack_app "$gui_archive" ;;
         esac
     fi
 
-    mkdir -p "$dir" || fail "cannot create $dir: run with sudo for /usr/local/bin, or choose a folder you own with --dir DIR"
-    install_program "$tmp/$cli_name/warden" warden
-    installed=$("$dir/warden" --version 2>/dev/null </dev/null | head -n 1) || installed="warden $version"
-    if [ "$old" = "$installed" ]; then
-        say "installed $installed to $dir/warden (it was this version already)"
-    else
-        say "installed $installed to $dir/warden${old:+ (was: $old)}"
+    if [ "$cli" = 1 ] || [ "$os" = linux ]; then
+        mkdir -p "$dir" || fail "cannot create $dir: run with sudo for /usr/local/bin, or choose a folder you own with --dir DIR"
+    fi
+    if [ "$cli" = 1 ]; then
+        install_program "$tmp/$cli_name/warden" warden
+        installed=$("$dir/warden" --version 2>/dev/null </dev/null | head -n 1) || installed="warden $version"
+        if [ "$old" = "$installed" ]; then
+            say "installed $installed to $dir/warden (it was this version already)"
+        else
+            say "installed $installed to $dir/warden${old:+ (was: $old)}"
+        fi
     fi
 
     if [ -n "$gui_archive" ]; then
         if [ "$os" = linux ]; then install_gui_linux; else install_gui_macos; fi
+    fi
+    if [ "$cli" = 0 ]; then
+        gui_only_done
+        return 0
     fi
 
     if on_path "$dir"; then
@@ -841,16 +932,22 @@ EOF
     fi
     path_hint
 
-    cat <<EOF
-
-Next steps:
-  $cmd doctor     check this machine (kernel, runtimes, limits)
-  $cmd startup    start your saved apps at boot
-  $cmd --help     everything else
-
-The archive also has the systemd units, the sysctl file and an nginx example (contrib/):
-  $base/$cli_archive
-EOF
+    show_gui=0
+    if [ "$gui" = 0 ] && gui_offered; then show_gui=1; fi
+    # The command column is as wide as its longest command.
+    step_width=$((${#cmd} + 8))
+    if [ "$show_gui" = 1 ]; then step_width=$((${#cmd} + 12)); fi
+    printf '\nNext steps:\n'
+    step "$cmd doctor" "check this machine (kernel, runtimes, limits)"
+    step "$cmd startup" "start your saved apps at boot"
+    if [ "$show_gui" = 1 ]; then
+        if [ "$os" = macos ]; then
+            step "$cmd gui-install" "add the desktop app, Warden.app"
+        else
+            step "$cmd gui-install" "add the desktop app, warden-gui (with a menu entry)"
+        fi
+    fi
+    step "$cmd --help" "everything else"
     note_running
 }
 
@@ -929,6 +1026,11 @@ uninstall_gui() { # remove=1 removes it; 0 only looks (prints a hint)
 }
 
 do_uninstall() {
+    if [ "$cli" = 0 ]; then
+        uninstall_gui 1
+        if [ "$found" = 0 ]; then say "no GUI of Warden's found: nothing to remove"; fi
+        return 0
+    fi
     removed=0
     # Said first: removing the program does not stop what runs.
     if [ -x "$dir/warden" ] && "$dir/warden" daemon status >/dev/null 2>&1 </dev/null; then
@@ -987,6 +1089,7 @@ main() {
     dir_opt=""
     app_dir_opt=${WARDEN_APP_DIR:-}
     gui=0
+    cli=1
     uninstall=0
     dry=0
     verify=1
@@ -997,6 +1100,7 @@ main() {
     mnt=""
     mounted=0
     other=""
+    step_width=0
 
     parse_args "$@"
     detect_platform

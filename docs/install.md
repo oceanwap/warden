@@ -56,6 +56,14 @@ sh install.sh --dry-run          # what it would do
 sh install.sh --gui
 ```
 
+For the GUI there are two shortcuts: `warden gui-install` (for an installed
+`warden`, the GUI of the same version) and `install-gui.sh`, the same installer
+with `--gui`, from the same release:
+
+```sh
+curl -fsSL https://github.com/oceanwap/warden/releases/latest/download/install-gui.sh | sh
+```
+
 **Safe under `curl | sh`.** The script never reads its standard input (it has
 no prompts), every command is inside a function that the last line calls with
 an end marker, and a script that is cut short anywhere, even just before that
@@ -79,6 +87,7 @@ releases (no network, no root).
 |---|---|
 | `--version VERSION` | Install this release (`v0.2.0` or `0.2.0`) instead of the latest. Also `WARDEN_VERSION`; the flag wins. A pre-release (`0.2.0-rc.1`) is only ever installed this way |
 | `--gui` | Also install the GUI: see [The GUI](#the-gui) |
+| `--gui-only` | Install the GUI and leave the CLI as it is (what `warden gui-install` runs). On Linux with no `warden` yet, it installs the CLI from the GUI archive; a different version of the two gets a warning |
 | `--uninstall` | Remove what the installer installs; `--uninstall --gui` removes the GUI too: see [Uninstalling](#uninstalling) |
 | `--dir DIR`, `--prefix DIR` | The folder for the programs (the same as `WARDEN_INSTALL_DIR`). Created if missing |
 | `--app-dir DIR` | macOS `--gui`: the folder for `Warden.app` (the same as `WARDEN_APP_DIR`) |
@@ -143,7 +152,10 @@ installs the units for you, with the path of the `warden` that ran it
 
 ## The GUI
 
-`--gui` installs `warden` and `warden-gui`.
+`--gui` installs `warden` and `warden-gui`. Every GUI package carries the CLI:
+the archives hold `warden` next to `warden-gui`, `Warden.app` has it inside (the
+app offers to link it into your `PATH` on first launch), and the Linux
+`warden-gui` packages ship `/usr/bin/warden` ([Packages](packages.md)).
 
 **Linux.** `warden-gui` goes next to `warden`, the menu entry and the icon to
 the folders above, so Warden shows up in the applications menu. The entry's

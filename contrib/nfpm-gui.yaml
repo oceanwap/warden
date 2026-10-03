@@ -1,15 +1,23 @@
 # nfpm (https://nfpm.goreleaser.com) configuration for the `warden-gui`
-# package: /usr/bin/warden-gui, its menu entry and its icon. It needs the
-# `warden` package (contrib/nfpm.yaml) of the same version: the GUI talks to
-# wardend through the `warden` binary, found next to it or on PATH. Run by
-# scripts/dist-linux-packages.sh, which sets:
+# package: the GUI (/usr/bin/warden-gui, its menu entry and its icons) AND the
+# CLI it runs on (/usr/bin/warden, the same files as the `warden` package, at
+# the same paths: contrib/nfpm.yaml). One package gives a desktop everything,
+# like the GUI tarball and the macOS app: the GUI talks to wardend through the
+# `warden` binary, found next to it or on PATH.
 #
-#   ARCH, VERSION, RELEASE, MAINTAINER   as in contrib/nfpm.yaml
-#   BIN_DIR        holds the `warden-gui` binary
-#   NOTICES_DIR    holds THIRD-PARTY-LICENSES-GUI.txt
-#   WARDEN_DEP     the exact `warden` package this one needs, spelled for the
-#                  format (deb "warden (= 0.1.0-1)", rpm "warden = 0.1.0-1",
-#                  archlinux "warden=0.1.0-1")
+# So warden-gui takes the place of warden: it provides warden (anything that
+# needs warden is satisfied), and installing it removes the warden package
+# (deb: Conflicts + Replaces, dpkg and apt remove warden in its favour; rpm:
+# Obsoletes, dnf swaps them in one transaction; Arch: conflicts + replaces).
+# Removing warden-gui removes the CLI too. Installing the warden package
+# again removes warden-gui (a desktop that wants the CLI alone).
+#
+# Run by scripts/dist-linux-packages.sh, which sets:
+#
+#   ARCH, VERSION, RELEASE, MAINTAINER   as in contrib/nfpm.yaml; VERSION and
+#                  RELEASE also make the versions in provides and replaces
+#   BIN_DIR        holds the `warden` and `warden-gui` binaries
+#   NOTICES_DIR    holds THIRD-PARTY-LICENSES.txt and THIRD-PARTY-LICENSES-GUI.txt
 #
 # The menu entry is assets/warden-gui.desktop, the icons assets/icon/ (the
 # files the GUI tarball ships, too); change them there.
@@ -30,13 +38,72 @@ section: x11
 priority: optional
 maintainer: ${MAINTAINER}
 description: |
-  Warden's native GUI: every app on a host and its live monitoring, from wardend.
-  Needs a desktop session (Wayland or X11). It draws on the CPU (no GPU driver)
-  and can also reach a remote host over SSH (`warden-gui --ssh`).
+  Warden's GUI and CLI: every app on a host, monitored live from wardend.
+  The window (warden-gui) and the `warden` command line in one package, which
+  takes the place of the warden package. The window needs a desktop session
+  (Wayland or X11); it draws on the CPU (no GPU driver) and can also reach a
+  remote host over SSH (`warden-gui --ssh`).
 homepage: https://github.com/oceanwap/warden
 license: MIT OR Apache-2.0
 
 contents:
+  # ---- The CLI: what contrib/nfpm.yaml installs, path for path (the package
+  # test checks that every one of its paths is here too). Keep them in step.
+  - src: ${BIN_DIR}/warden
+    dst: /usr/bin/warden
+    expand: true
+    file_info:
+      mode: 0755
+
+  - dst: /usr/share/doc/warden
+    type: dir
+    file_info:
+      mode: 0755
+  - dst: /usr/share/doc/warden/examples
+    type: dir
+    file_info:
+      mode: 0755
+
+  - src: LICENSE-MIT
+    dst: /usr/share/doc/warden/LICENSE-MIT
+    file_info:
+      mode: 0644
+  - src: LICENSE-APACHE
+    dst: /usr/share/doc/warden/LICENSE-APACHE
+    file_info:
+      mode: 0644
+  - src: ${NOTICES_DIR}/THIRD-PARTY-LICENSES.txt
+    dst: /usr/share/doc/warden/THIRD-PARTY-LICENSES.txt
+    expand: true
+    file_info:
+      mode: 0644
+  - src: README.md
+    dst: /usr/share/doc/warden/README.md
+    file_info:
+      mode: 0644
+
+  - src: warden.example.toml
+    dst: /usr/share/doc/warden/examples/warden.example.toml
+    file_info:
+      mode: 0644
+  - src: contrib/wardend.service
+    dst: /usr/share/doc/warden/examples/wardend.service
+    file_info:
+      mode: 0644
+  - src: contrib/warden@.service
+    dst: /usr/share/doc/warden/examples/warden@.service
+    file_info:
+      mode: 0644
+  - src: contrib/99-warden.conf
+    dst: /usr/share/doc/warden/examples/99-warden.conf
+    file_info:
+      mode: 0644
+  - src: contrib/nginx.conf
+    dst: /usr/share/doc/warden/examples/nginx.conf
+    file_info:
+      mode: 0644
+
+  # ---- The GUI.
   - src: ${BIN_DIR}/warden-gui
     dst: /usr/bin/warden-gui
     expand: true
@@ -108,12 +175,24 @@ contents:
     file_info:
       mode: 0644
 
+# Removing warden-gui removes /usr/bin/warden too: like the warden package's,
+# its pre-removal note says what that leaves behind, and changes nothing.
+scripts:
+  preremove: contrib/nfpm-gui-preremove.sh
+
+# Taking warden's place. VERSION-RELEASE is this package's own version, spelled
+# for each format by the script (0.2.0~rc.1 in a deb and an rpm).
 overrides:
   deb:
     depends:
-      - ${WARDEN_DEP}
       - libc6 (>= 2.35)
       - hicolor-icon-theme
+    provides:
+      - warden (= ${VERSION}-${RELEASE})
+    conflicts:
+      - warden
+    replaces:
+      - warden
     recommends:
       - libxkbcommon0
       - libwayland-client0
@@ -125,9 +204,15 @@ overrides:
       - libxkbcommon-x11-0
   rpm:
     depends:
-      - ${WARDEN_DEP}
       - glibc >= 2.35
       - hicolor-icon-theme
+    provides:
+      - warden = ${VERSION}-${RELEASE}
+    # nfpm writes an rpm's replaces as Obsoletes: dnf removes the warden
+    # package of this version or older when warden-gui is installed. No
+    # Conflicts: Obsoletes is what lets dnf swap them.
+    replaces:
+      - warden <= ${VERSION}-${RELEASE}
     recommends:
       - libxkbcommon
       - libwayland-client
@@ -139,9 +224,14 @@ overrides:
       - libxkbcommon-x11
   archlinux:
     depends:
-      - ${WARDEN_DEP}
       - glibc
       - hicolor-icon-theme
+    provides:
+      - warden=${VERSION}-${RELEASE}
+    conflicts:
+      - warden
+    replaces:
+      - warden
     # Arch has no weak dependencies: optdepends is what pacman prints.
     # nfpm's archlinux packager does not take recommends.
 

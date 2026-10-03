@@ -2,7 +2,8 @@
 # Linux packages from built binaries, with nfpm (https://nfpm.goreleaser.com):
 #
 #   warden_<version>-<rev>_<amd64|arm64>.deb              CLI (+ wardend): /usr/bin/warden
-#   warden-gui_<version>-<rev>_<amd64|arm64>.deb          GUI: /usr/bin/warden-gui, menu entry, icons
+#   warden-gui_<version>-<rev>_<amd64|arm64>.deb          GUI + CLI: /usr/bin/warden-gui, menu entry,
+#                                                         icons, and all of the above (it replaces warden)
 #   warden-<version>-<rev>.<x86_64|aarch64>.rpm           the same two packages as rpm
 #   warden-gui-<version>-<rev>.<x86_64|aarch64>.rpm
 #   (--formats archlinux: warden[-gui]-<version>-<rev>-<arch>.pkg.tar.zst)
@@ -119,7 +120,8 @@ epoch=${epoch:-$(date +%s)}
 export SOURCE_DATE_EPOCH=$epoch   # nfpm stamps every file with it
 maintainer=${WARDEN_PKG_MAINTAINER:-Warden authors <https://github.com/oceanwap/warden>}
 
-# One package name per call: <recipe> <name>
+# One package name per call: <recipe> <name>. warden-gui holds the CLI too, and
+# names its own version in provides and replaces (contrib/nfpm-gui.yaml).
 packages=("contrib/nfpm.yaml warden")
 [ "$gui" = 1 ] && packages+=("contrib/nfpm-gui.yaml warden-gui")
 
@@ -135,22 +137,19 @@ for entry in "${packages[@]}"; do
       deb)
         v=${version/-/\~}
         file="${name}_${version}-${release}_${goarch}.deb"
-        warden_dep="warden (= $v-$release)"
         ;;
       rpm)
         v=${version/-/\~}
         file="${name}-${version}-${release}.${rpmarch}.rpm"
-        warden_dep="warden = $v-$release"
         ;;
       archlinux)
         v=${version//-/}
         file="${name}-${v}-${release}-${rpmarch}.pkg.tar.zst"
-        warden_dep="warden=$v-$release"
         ;;
     esac
     rm -f "$out/$file"
     ARCH=$goarch VERSION=$v RELEASE=$release MAINTAINER=$maintainer \
-      BIN_DIR=$bin_dir NOTICES_DIR=$notices WARDEN_DEP=$warden_dep \
+      BIN_DIR=$bin_dir NOTICES_DIR=$notices \
       "$nfpm" package --config "$recipe" --packager "$format" --target "$out/$file" >&2
     [ -s "$out/$file" ] || die "nfpm did not write $out/$file"
     made+=("$file")

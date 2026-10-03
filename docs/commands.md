@@ -181,6 +181,7 @@ the GUI. You should not need to run it by hand.
 | `check` | Validate the config file and exit. `-c wardend.toml` validates the alert rules |
 | `doctor` | Check this host for the problems Warden knows about, with a fix for each; `--json`. Checks `wardend.toml` too |
 | `version` | Print the version |
+| `gui-install` | Install the GUI for this `warden`'s version (macOS: `Warden.app`; Linux: `warden-gui` next to `warden`, a menu entry and an icon). `--dry-run`, `--uninstall`, `--version`, `--dir`, `--app-dir`. It runs the release's `install.sh --gui-only`, checked against `SHA256SUMS`; for a `warden` from a Linux package it points at the `warden-gui` package instead |
 
 ## Options
 
