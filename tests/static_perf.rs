@@ -908,10 +908,17 @@ fn a_file_is_sent_plain_first_and_from_its_compressed_copy_later() {
     assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("", new.as_slice()));
     let again = until_encoded(w.port, "/app.css", "br");
     assert_eq!(unbr(&again.body), new);
-    // The old version's copies are removed once the new one is in place.
+    // The old version's copies are removed once the new ones are in place: by
+    // the job that made them, right after it moved them there, so a moment
+    // after the first request that was answered from them.
     let t0 = Instant::now();
     let app_folder = |dir: &Path| std::fs::read_dir(dir).map(|d| d.flatten().count()).unwrap_or(0);
-    let count: Vec<usize> = copy_folders(&copies).iter().map(|f| app_folder(f)).collect();
+    let counts = || -> Vec<usize> { copy_folders(&copies).iter().map(|f| app_folder(f)).collect() };
+    let mut count = counts();
+    while !count.iter().all(|n| *n <= 2) && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+        count = counts();
+    }
     assert!(count.iter().all(|n| *n <= 2), "{count:?} after {:?}", t0.elapsed());
 
     // The compressing was done by other processes, not by threads of the worker (a thread

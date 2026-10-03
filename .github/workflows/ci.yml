@@ -215,5 +215,16 @@ jobs:
           components: clippy
       - run: cargo build --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --bin warden
-      - run: cargo test -p warden-protocol
+      - name: cargo test --bin warden
+        run: |
+          set -o pipefail
+          cargo test --bin warden 2>&1 | tee unit.log
+      - name: cargo test -p warden-protocol
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test -p warden-protocol 2>&1 | tee protocol.log
+      # As on Linux: the failed tests, with their output, as annotations.
+      - name: annotate failing tests
+        if: failure()
+        run: python3 .github/annotate-test-failures.py unit.log protocol.log
