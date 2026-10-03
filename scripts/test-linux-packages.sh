@@ -275,7 +275,9 @@ say "$(. /etc/os-release && echo "$PRETTY_NAME"), glibc $(ldd --version 2>&1 | s
 
 # 1. The CLI package alone, with the package tool's lowest level.
 if [ "$FAMILY" = deb ]; then dpkg -i "$cli" >/dev/null; else rpm -i "$cli"; fi
-[ "$(command -v warden)" = /usr/bin/warden ] || die "warden is not /usr/bin/warden"
+# Found on PATH, maybe through a symlink (Fedora 42+: /usr/sbin is /usr/bin).
+w=$(command -v warden) || die "warden is not on PATH"
+[ "$(readlink -f "$w")" = /usr/bin/warden ] || die "warden is $w, not /usr/bin/warden"
 [ "$(warden --version)" = "warden $VERSION" ] || die "warden --version says '$(warden --version)'"
 say "warden --version: $(warden --version)"
 warden doctor >/tmp/doctor.txt 2>&1 || { cat /tmp/doctor.txt; die "warden doctor failed"; }
@@ -287,7 +289,14 @@ for f in /etc/systemd/system/warden@.service /etc/systemd/system/wardend.service
   [ ! -e "$f" ] || die "the package installed $f"
 done
 [ ! -S /run/warden/wardend.sock ] || die "installing the package started wardend"
-[ -f /usr/share/doc/warden/examples/wardend.service ] || die "the example unit is missing"
+# The examples are documentation: an image that leaves /usr/share/doc out
+# (Ubuntu's minimized ones: dpkg path-exclude) has none on disk, and the
+# inspection above found them in the package.
+if grep -qsx 'path-exclude=/usr/share/doc/\*' /etc/dpkg/dpkg.cfg.d/*; then
+  say "this image leaves /usr/share/doc out: the example unit was checked in the package"
+else
+  [ -f /usr/share/doc/warden/examples/wardend.service ] || die "the example unit is missing"
+fi
 
 # 3. The GUI package.
 if [ "$FAMILY" = deb ]; then
