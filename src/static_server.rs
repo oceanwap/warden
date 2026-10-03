@@ -54,6 +54,8 @@ struct Site {
     cached_hits: AtomicU64,
     cached_misses: AtomicU64,
     cfg: Static,
+    /// The parts of a response that the configuration decides, made once.
+    fixed: Fixed,
     auth: Option<String>,
     /// Prebuilt responses of small files (None: `cache_size = 0`).
     cache: Option<Cache>,
@@ -70,6 +72,27 @@ struct Site {
     bufs: Mutex<Vec<Vec<u8>>>,
     /// Requests answered by the accept loop itself (`first_request`).
     inline: AtomicU64,
+}
+
+/// Header text that depends on the configuration only, so a request copies
+/// it instead of building it.
+struct Fixed {
+    /// Cache-Control of a file that is neither a page nor fingerprinted.
+    cc_plain: String,
+    /// Cache-Control of an HTML page.
+    cc_html: String,
+    /// The configured `headers`, one `Name: value\r\n` line each.
+    extra: String,
+}
+
+impl Fixed {
+    fn new(cfg: &Static) -> Fixed {
+        let mut extra = String::new();
+        for (k, v) in &cfg.headers {
+            extra += &format!("{k}: {v}\r\n");
+        }
+        Fixed { cc_plain: format!("public, max-age={}", cfg.cache_max_age), cc_html: html_cache_control(cfg), extra }
+    }
 }
 
 /// Entry point of `warden serve-static` (started by the supervisor).
@@ -140,6 +163,7 @@ pub fn main() -> i32 {
         open_mode: AtomicU8::new(open_mode),
         cached_hits: AtomicU64::new(0),
         cached_misses: AtomicU64::new(0),
+        fixed: Fixed::new(&cfg),
         cfg,
         auth,
         cache,
@@ -350,13 +374,12 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     // without it the server is just as correct, a little busier.
     let deferred = crate::sys::tcp_defer_accept(std_listener.as_fd(), site.head_timeout.as_secs() as i32).is_ok();
     // With the request already waiting when the connection is accepted (Linux,
-    // TCP_DEFER_ACCEPT), a cached answer can be sent from the accept loop
-    // itself, `first_request`. `WARDEN_STATIC_INLINE=0` turns that off (tests,
+    // TCP_DEFER_ACCEPT), the accept loop itself can answer it, `first_request`,
+    // with no task and no epoll registration for a connection that only needs
+    // one answer. `WARDEN_STATIC_INLINE=0` turns that off (tests,
     // troubleshooting).
-    let inline_first = cfg!(target_os = "linux")
-        && deferred
-        && site.cache.is_some()
-        && std::env::var("WARDEN_STATIC_INLINE").as_deref() != Ok("0");
+    let inline_first =
+        cfg!(target_os = "linux") && deferred && std::env::var("WARDEN_STATIC_INLINE").as_deref() != Ok("0");
     // TCP_NODELAY (responses go out at once, never held back for Nagle's
     // algorithm) once on the listener: Linux hands it to every connection it
     // accepts, so there is no setsockopt per connection. Where that is not
@@ -525,17 +548,17 @@ async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
         let (files, used, cap) = c.usage();
         println!(
             "static cache: {} hits, {} misses, {} dropped as changed on disk, {} evicted; {files} files in {} of {} KB \
-             ({} of them in memfds); {} requests answered in the accept loop",
+             ({} of them in memfds)",
             c.hits.load(Ordering::Relaxed),
             c.misses.load(Ordering::Relaxed),
             c.stale.load(Ordering::Relaxed),
             c.evicted.load(Ordering::Relaxed),
             used.div_ceil(1024),
             cap >> 10,
-            c.memfds(),
-            site.inline.load(Ordering::Relaxed)
+            c.memfds()
         );
     }
+    println!("static: {} requests answered in the accept loop", site.inline.load(Ordering::Relaxed));
     Ok(())
 }
 
@@ -583,6 +606,85 @@ impl From<Vec<u8>> for OutBuf {
 enum Conn<'a> {
     Tcp(tokio::net::tcp::WriteHalf<'a>),
     Unix(tokio::net::unix::WriteHalf<'a>),
+    /// The accept loop answering a new connection's first request itself
+    /// (`first_request`): never waits.
+    Raw(RawSink<'a>),
+}
+
+/// A socket written to without waiting. A write the socket cannot take whole
+/// is accepted all the same: what is left is kept, for the connection's task
+/// to finish (`Rest`). Every response is a single write, made last, so a
+/// second one before the first is finished is a bug and fails the request.
+struct RawSink<'a> {
+    fd: std::os::fd::BorrowedFd<'a>,
+    rest: Option<Rest>,
+    /// Anything has been handed to the socket.
+    wrote: bool,
+}
+
+/// The most the accept loop hands a socket in one sendfile. The worker is one
+/// thread, and a file's rest goes on as a task, which sends it in pieces and
+/// lets the other connections run between them (`SEND_CHUNK`).
+const INLINE_SEND_MAX: u64 = 256 * 1024;
+
+impl RawSink<'_> {
+    fn check_idle(&self) -> std::io::Result<()> {
+        match self.rest {
+            None => Ok(()),
+            Some(_) => Err(std::io::Error::other("a second write before the first was finished")),
+        }
+    }
+
+    fn bytes(&mut self, out: OutBuf) -> std::io::Result<()> {
+        use std::io::ErrorKind::{Interrupted, WouldBlock};
+        self.check_idle()?;
+        let at = match crate::sys::send(self.fd, out.as_slice(), false) {
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => 0,
+            Err(e) => return Err(e),
+        };
+        self.wrote |= at > 0;
+        if at < out.as_slice().len() {
+            self.rest = Some(Rest::Bytes { out, at });
+        }
+        Ok(())
+    }
+
+    /// `head`, then `count` bytes of `file` from `offset`.
+    fn file(&mut self, head: &[u8], file: &std::fs::File, offset: u64, count: u64) -> std::io::Result<()> {
+        use std::io::ErrorKind::{Interrupted, UnexpectedEof, WouldBlock};
+        self.check_idle()?;
+        // A body the task would cork goes out by the task, all of it: a part
+        // sent here would be uncorked, and the packets of its end half empty.
+        if count >= CORK_MIN {
+            self.rest = Some(Rest::File { head: head.to_vec(), file: file.try_clone()?, off: offset, count });
+            return Ok(());
+        }
+        let now = count.min(INLINE_SEND_MAX);
+        let mut off = offset as i64;
+        let n = match crate::sys::sendfile_head(self.fd, file.as_fd(), &mut off, now as usize, head) {
+            // Nothing could be sent: the socket is full.
+            Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => 0,
+            Err(e) => return Err(e),
+            // The file shrank under us: the promised Content-Length can't be met.
+            Ok(0) if head.is_empty() && now > 0 => {
+                return Err(std::io::Error::new(UnexpectedEof, "file truncated while sending"));
+            }
+            Ok(n) => n,
+        };
+        let (h, b) = crate::sys::split_head_body(n, head.len(), now)
+            .ok_or_else(|| std::io::Error::other("sendfile reported more bytes than were asked for"))?;
+        self.wrote |= n > 0;
+        if h < head.len() || b < count {
+            self.rest = Some(Rest::File {
+                head: head[h..].to_vec(),
+                file: file.try_clone()?,
+                off: offset + b,
+                count: count - b,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Conn<'_> {
@@ -591,6 +693,7 @@ impl Conn<'_> {
         match self {
             Conn::Tcp(w) => w.write_all(b.as_slice()).await,
             Conn::Unix(w) => w.write_all(b.as_slice()).await,
+            Conn::Raw(r) => r.bytes(b),
         }
     }
 
@@ -598,6 +701,7 @@ impl Conn<'_> {
         match self {
             Conn::Tcp(w) => w.flush().await,
             Conn::Unix(w) => w.flush().await,
+            Conn::Raw(_) => Ok(()),
         }
     }
 
@@ -615,6 +719,7 @@ impl Conn<'_> {
                 w.write_all(head).await?;
                 w.write_all(&buf).await
             }
+            Conn::Raw(r) => r.file(head, file, offset, count),
         }
     }
 
@@ -631,6 +736,7 @@ impl Conn<'_> {
                 }
                 tokio::io::copy(&mut f.take(count), w).await
             }
+            Conn::Raw(r) => r.file(head, &file, offset, count).map(|()| count),
         }
     }
 }
@@ -986,7 +1092,10 @@ async fn connection<R>(
         // the rest goes first. It counts as a request in flight, so a drain
         // waits for it as it does for any other.
         site.active.fetch_add(1, Ordering::SeqCst);
-        let sent = w.write_all(p.out.advance(p.at)).await;
+        let sent = match p.rest {
+            Rest::Bytes { out, at } => w.write_all(out.advance(at)).await,
+            Rest::File { head, file, off, count } => w.send_file(&head, file, off, count).await.map(|_| ()),
+        };
         site.active.fetch_sub(1, Ordering::SeqCst);
         if sent.is_err() || !p.keep {
             head.give_back(&site);
@@ -1040,13 +1149,7 @@ async fn serve_requests<R>(
         let result = handle(&req, site, w, keep, &mut cached, &mut key).await;
         site.active.fetch_sub(1, Ordering::SeqCst);
         if let Some(t0) = t0 {
-            let (status, bytes) = result.as_ref().map(|x| *x).unwrap_or((0, 0));
-            println!(
-                "{} {} {status} {bytes}B {:.1}ms{cached}",
-                req.method,
-                req.path,
-                t0.elapsed().as_secs_f64() * 1000.0
-            );
+            log_access(&req, &result, t0, cached);
         }
         // Closing: the caller's drop of the connection is close(2), which
         // sends the FIN after the response bytes (no shutdown(2) first).
@@ -1059,11 +1162,16 @@ async fn serve_requests<R>(
 
 /// The part of a response `first_request` could not send yet.
 struct Pending {
-    out: OutBuf,
-    /// How much of `out` has gone out.
-    at: usize,
+    rest: Rest,
     /// Keep the connection for more requests afterwards.
     keep: bool,
+}
+
+enum Rest {
+    /// Bytes in memory: `out` from `at` on.
+    Bytes { out: OutBuf, at: usize },
+    /// What is left of a response head, then `count` bytes of `file` from `off`.
+    File { head: Vec<u8>, file: std::fs::File, off: u64, count: u64 },
 }
 
 enum First {
@@ -1079,29 +1187,24 @@ enum First {
     Go { fd: OwnedFd, head: HeadBuf, pending: Option<Pending>, answered: bool },
 }
 
-/// A request answered entirely from the response cache.
-struct Inlined {
-    out: OutBuf,
-    status: u16,
-    bytes: u64,
-    keep: bool,
-    /// Method and path, when the access log wants them.
-    log: Option<(String, String)>,
-}
-
 /// The first request of a new connection, answered without leaving the accept
 /// loop when that costs nothing: the request is already in the socket (Linux
-/// accepts a connection only once its data has arrived, TCP_DEFER_ACCEPT) and
-/// is a plain GET or HEAD of a file whose response is cached and fresh. Then
-/// the whole exchange is `recv`, `send` and, unless the client wants the
-/// connection kept, `close`: no task, no epoll registration (and so no
-/// deregistration), no timer, nothing waited for. A client that sends
-/// `Connection: close` (or HTTP/1.0: `ab`, `curl`, health checks, a browser's
-/// first request on each connection) costs about half what it did.
+/// accepts a connection only once its data has arrived, TCP_DEFER_ACCEPT), so
+/// the normal handler runs on the spot, once, with the raw socket as its
+/// output (`Conn::Raw`). A cached hit, a file opened and sent, a 404: the
+/// whole exchange is `recv`, the file's open, stat and read or sendfile, the
+/// send and, unless the client wants the connection kept, `close`. No task,
+/// no epoll registration (and so no deregistration), no timer, nothing waited
+/// for. A client that sends `Connection: close` (or HTTP/1.0: `ab`, `curl`,
+/// health checks, a browser's first request on each connection) costs about
+/// half what it did.
 ///
-/// Anything else (a miss, a stale entry, auth, a range, a head still arriving,
-/// a body too big for the socket's room) is handed on as it stands, as `Go`.
+/// What cannot be answered without waiting is handed on as it stands, as
+/// `Go`: a head still arriving, a lookup or a read the disk has to serve (the
+/// handler would wait for a thread), a response the socket has no room for
+/// (the rest goes with it, `pending`).
 fn first_request(site: &Site, fd: OwnedFd, try_inline: bool) -> First {
+    use std::task::Poll;
     let mut head = HeadBuf::take(site);
     if !try_inline {
         return First::Go { fd, head, pending: None, answered: false };
@@ -1134,64 +1237,58 @@ fn first_request(site: &Site, fd: OwnedFd, try_inline: bool) -> First {
         Head::TooLong => return First::Go { fd, head, pending: None, answered: false },
     };
     head.pos = skip;
-    let t0 = site.cfg.access_log.then(Instant::now);
-    let mut key = String::new();
-    let Some(hit) = inline_hit(site, &head.buf[skip..skip + len], &mut key) else {
-        // The head is whole and `pos` is at it: the normal path finds it again.
+    let Ok(req) = parse_head(&head.buf[skip..skip + len]) else {
+        // The task answers it (400).
         return First::Go { fd, head, pending: None, answered: false };
     };
-    let sent = crate::sys::send(fd.as_fd(), hit.out.as_slice(), false);
-    if site.cfg.access_log {
-        let (m, p) = hit.log.as_ref().map(|(m, p)| (m.as_str(), p.as_str())).unwrap_or(("", ""));
-        let ms = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-        println!("{m} {p} {} {}B {ms:.1}ms cache=hit", hit.status, hit.bytes);
-    }
-    let at = match sent {
-        Ok(n) => {
-            site.inline.fetch_add(1, Ordering::Relaxed);
-            n
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
-        Err(_) => {
+    let t0 = site.cfg.access_log.then(Instant::now);
+    let keep = req.keep_alive && !site.draining.load(Ordering::SeqCst);
+    let mut sink = Conn::Raw(RawSink { fd: fd.as_fd(), rest: None, wrote: false });
+    let (mut cached, mut key) = ("", String::new());
+    let polled = {
+        let mut fut = std::pin::pin!(handle(&req, site, &mut sink, keep, &mut cached, &mut key));
+        fut.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    };
+    let (rest, wrote) = match &mut sink {
+        Conn::Raw(r) => (r.rest.take(), r.wrote),
+        _ => (None, false),
+    };
+    let result = match polled {
+        Poll::Ready(r) => r,
+        // The handler had to wait (for a thread, for the disk). Nothing has
+        // gone out, a response being one write made last: the task starts
+        // over from the same head. (If something had, the connection is no
+        // use any more.)
+        Poll::Pending if !wrote => return First::Go { fd, head, pending: None, answered: false },
+        Poll::Pending => {
             head.give_back(site);
             return First::Done;
         }
     };
-    head.consume(len);
-    if at < hit.out.as_slice().len() {
-        let pending = Some(Pending { out: hit.out, at, keep: hit.keep });
-        return First::Go { fd, head, pending, answered: true };
+    if let Some(t0) = t0 {
+        log_access(&req, &result, t0, cached);
     }
-    if !hit.keep {
+    if result.is_err() {
+        // The client is gone, or a file could not be read: no answer to give.
+        head.give_back(site);
+        return First::Done;
+    }
+    site.inline.fetch_add(1, Ordering::Relaxed);
+    head.consume(len);
+    if let Some(rest) = rest {
+        return First::Go { fd, head, pending: Some(Pending { rest, keep }), answered: true };
+    }
+    if !keep {
         head.give_back(site);
         return First::Done;
     }
     First::Go { fd, head, pending: None, answered: true }
 }
 
-/// The cached answer to the request in `bytes`, if it can be sent at once
-/// from memory and is exactly what `handle` would send. The checks are
-/// `handle`'s own, in its order, minus everything that waits.
-fn inline_hit(site: &Site, bytes: &[u8], key: &mut String) -> Option<Inlined> {
-    let cache = site.cache.as_ref()?;
-    let req = parse_head(bytes).ok()?;
-    if (req.method != "GET" && req.method != "HEAD") || site.auth.is_some() || req.range.is_some() {
-        return None;
-    }
-    let cfg = &site.cfg;
-    let rel = relative_cow(req.path, cfg.dotfiles).ok()?;
-    let url_path = req.path.split(['?', '#']).next().unwrap_or("/");
-    cache_key_into(key, &rel, cfg, &req, url_path.ends_with('/'));
-    let Lookup::Fresh(e) = cache.lookup(key, Instant::now()) else { return None };
-    let not_modified = is_not_modified(&req, &e.etag, e.mtime);
-    if e.file.is_some() && !not_modified && req.method != "HEAD" {
-        return None; // a body in a memfd goes by sendfile, on the normal path
-    }
-    cache.hits.fetch_add(1, Ordering::Relaxed);
-    let keep = req.keep_alive && !site.draining.load(Ordering::SeqCst);
-    let (out, status, bytes) = cached_bytes(&req, &e, keep, not_modified);
-    let log = cfg.access_log.then(|| (req.method.to_string(), req.path.to_string()));
-    Some(Inlined { out, status, bytes, keep, log })
+/// The access log line of a request (`access_log = true`).
+fn log_access(req: &Request<'_>, result: &std::io::Result<(u16, u64)>, t0: Instant, cached: &str) {
+    let (status, bytes) = result.as_ref().map(|x| *x).unwrap_or((0, 0));
+    println!("{} {} {status} {bytes}B {:.1}ms{cached}", req.method, req.path, t0.elapsed().as_secs_f64() * 1000.0);
 }
 
 /// A plain-text error. The head and the body go out in one write (one
@@ -1269,21 +1366,37 @@ pub fn relative(url_path: &str, dotfiles: bool) -> Result<String, u16> {
 /// anything else takes the full `relative` and its answer, so the two always
 /// agree (a test compares them on thousands of paths).
 fn relative_cow(url_path: &str, dotfiles: bool) -> Result<Cow<'_, str>, u16> {
-    let path = match url_path.find(['?', '#']) {
-        Some(i) => &url_path[..i],
-        None => url_path,
-    };
-    if let Some(rest) = path.strip_prefix('/') {
+    if let Some(rest) = path_of(url_path).strip_prefix('/') {
         let rest = rest.strip_suffix('/').unwrap_or(rest);
-        let plain = rest.is_empty()
-            || rest
-                .split('/')
-                .all(|seg| !seg.is_empty() && !seg.starts_with('.') && !seg.bytes().any(|b| b == b'%' || b == 0));
-        if plain {
+        // One pass: every segment non-empty, none starting with a dot, no `%`, no NUL.
+        let mut segment_start = true;
+        let mut plain = true;
+        for &c in rest.as_bytes() {
+            match c {
+                b'/' if segment_start => plain = false,
+                b'/' => segment_start = true,
+                b'%' | 0 => plain = false,
+                b'.' if segment_start => plain = false,
+                _ => segment_start = false,
+            }
+            if !plain {
+                break;
+            }
+        }
+        // A trailing empty segment (`a//`) is not plain either.
+        if plain && (!segment_start || rest.is_empty()) {
             return Ok(Cow::Borrowed(rest));
         }
     }
     relative(url_path, dotfiles).map(Cow::Owned)
+}
+
+/// A request target without its query or fragment.
+fn path_of(target: &str) -> &str {
+    match target.bytes().position(|c| c == b'?' || c == b'#') {
+        Some(i) => &target[..i],
+        None => target,
+    }
 }
 
 fn join_rel(dir: &str, name: &str) -> String {
@@ -1319,17 +1432,33 @@ fn opened(fd: OwnedFd) -> std::io::Result<Opened> {
     Ok(Opened { file, meta })
 }
 
+/// openat2 of `rel` (empty: the root itself) relative to `dir`. The path
+/// is made a C string on the stack when it fits, so a request does not
+/// allocate for it.
+fn openat2_rel(dir: std::os::fd::BorrowedFd<'_>, rel: &str, resolve: u64) -> std::io::Result<OwnedFd> {
+    use std::io::{Error, ErrorKind};
+    let name = if rel.is_empty() { "." } else { rel };
+    let mut stack = [0u8; 256];
+    if name.len() < stack.len() {
+        stack[..name.len()].copy_from_slice(name.as_bytes());
+        // The NUL after the name is already there; a NUL inside it is an error.
+        let path = std::ffi::CStr::from_bytes_with_nul(&stack[..=name.len()])
+            .map_err(|_| Error::from(ErrorKind::InvalidInput))?;
+        return crate::sys::openat2(dir, path, OPEN_FLAGS, resolve);
+    }
+    let path = std::ffi::CString::new(name).map_err(|_| Error::from(ErrorKind::InvalidInput))?;
+    crate::sys::openat2(dir, &path, OPEN_FLAGS, resolve)
+}
+
 /// Open `rel` under the root. Errors: NotFound (also for paths the kernel
 /// or the realpath check says leave the root), PermissionDenied, others.
 async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
     use std::io::{Error, ErrorKind};
     let mode = site.open_mode.load(Ordering::Relaxed);
     if mode != OPEN_LEGACY {
-        let path = std::ffi::CString::new(if rel.is_empty() { "." } else { rel })
-            .map_err(|_| Error::from(ErrorKind::InvalidInput))?;
         let beneath = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
         let resolve = if mode == OPEN_CACHED { beneath | crate::sys::RESOLVE_CACHED } else { beneath };
-        let mut result = crate::sys::openat2(site.dir.as_fd(), &path, OPEN_FLAGS, resolve);
+        let mut result = openat2_rel(site.dir.as_fd(), rel, resolve);
         if mode == OPEN_CACHED {
             match &result {
                 Ok(_) => {
@@ -1345,16 +1474,15 @@ async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
                         site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
                     }
                     let dir = site.dir.clone();
-                    let p = path.clone();
-                    result =
-                        tokio::task::spawn_blocking(move || crate::sys::openat2(dir.as_fd(), &p, OPEN_FLAGS, beneath))
-                            .await
-                            .map_err(Error::other)?;
+                    let p = rel.to_string();
+                    result = tokio::task::spawn_blocking(move || openat2_rel(dir.as_fd(), &p, beneath))
+                        .await
+                        .map_err(Error::other)?;
                 }
                 // RESOLVE_CACHED is newer (5.12) than openat2 (5.6).
                 Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
                     site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
-                    result = crate::sys::openat2(site.dir.as_fd(), &path, OPEN_FLAGS, beneath);
+                    result = openat2_rel(site.dir.as_fd(), rel, beneath);
                 }
                 Err(_) => {}
             }
@@ -1548,7 +1676,7 @@ async fn handle(
         Ok(p) => p,
         Err(code) => return not_found_or(w, site, req, code, keep).await,
     };
-    let url_path = req.path.split(['?', '#']).next().unwrap_or("/");
+    let url_path = path_of(req.path);
     // The cache answers plain GET / HEAD (conditional or not) for a path
     // that passed the checks above; ranges take the normal path.
     let mut fill = None;
@@ -1699,9 +1827,140 @@ struct HeadParts<'a> {
     extra: &'a str,
 }
 
-/// The head of a file response, and where its Connection value starts
-/// (a cached head is stored with `keep-alive` there and patched for
-/// `close`). `range`: (first byte, file length) for a 206.
+/// Appends `s` to `out`.
+#[inline]
+fn put(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// `n` in decimal, in the tail of `buf`.
+fn dec(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &buf[i..];
+        }
+    }
+}
+
+/// `n` in lowercase hexadecimal (like `{:x}`), in the tail of `buf`.
+fn hex(mut n: u64, buf: &mut [u8; 16]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b"0123456789abcdef"[(n & 15) as usize];
+        n >>= 4;
+        if n == 0 {
+            return &buf[i..];
+        }
+    }
+}
+
+/// Appends `n` in decimal to `out`.
+fn put_dec(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(dec(n, &mut [0; 20]));
+}
+
+/// A short ASCII text kept on the stack: an ETag or a date, which every
+/// request makes and none needs the heap for.
+struct Short {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl Short {
+    fn new() -> Short {
+        Short { buf: [0; 64], len: 0 }
+    }
+
+    fn push(&mut self, b: &[u8]) -> &mut Short {
+        // 64 bytes hold the longest text made here (an ETag is at most 42, a
+        // date 45); a longer one is cut short rather than overrun.
+        let n = b.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+        self
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+/// The weak ETag of a file: `W/"<size>-<mtime>"`, with `-<encoding>` for a
+/// precompressed variant, all in hexadecimal.
+fn etag(len: u64, mtime: u64, encoding: Option<&str>) -> Short {
+    let mut e = Short::new();
+    e.push(b"W/\"").push(hex(len, &mut [0; 16])).push(b"-").push(hex(mtime, &mut [0; 16]));
+    if let Some(enc) = encoding {
+        e.push(b"-").push(enc.as_bytes());
+    }
+    e.push(b"\"");
+    e
+}
+
+/// What a file response's head says about the response: its status, the
+/// type and length of the body, the Connection value, the encoding of a
+/// precompressed variant and, for a 206, (first byte, file length).
+#[derive(Clone, Copy)]
+struct FileHead<'a> {
+    code: u16,
+    mime: &'a str,
+    count: u64,
+    conn: &'a str,
+    encoding: Option<&'a str>,
+    range: Option<(u64, u64)>,
+}
+
+/// The head of a file response, appended to `out`; returns where its
+/// Connection value starts in `out` (a cached head is stored with
+/// `keep-alive` there and patched for `close`). `range`: (first byte, file
+/// length) for a 206.
+fn file_head_into(out: &mut Vec<u8>, p: &HeadParts, h: &FileHead) -> usize {
+    let FileHead { code, mime, count, conn, encoding, range } = *h;
+    put(out, "HTTP/1.1 ");
+    put_dec(out, u64::from(code));
+    out.push(b' ');
+    put(out, reason(code));
+    put(out, "\r\nContent-Type: ");
+    put(out, mime);
+    put(out, "\r\nContent-Length: ");
+    put_dec(out, count);
+    put(out, "\r\nETag: ");
+    put(out, p.etag);
+    put(out, "\r\nLast-Modified: ");
+    put(out, p.last_modified);
+    put(out, "\r\nCache-Control: ");
+    put(out, p.cache_control);
+    put(out, "\r\nAccept-Ranges: bytes\r\n");
+    put(out, p.vary);
+    put(out, p.extra);
+    put(out, "Connection: ");
+    let conn_at = out.len();
+    put(out, conn);
+    put(out, "\r\n");
+    if let Some(e) = encoding {
+        put(out, "Content-Encoding: ");
+        put(out, e);
+        put(out, "\r\n");
+    }
+    if let Some((start, len)) = range {
+        put(out, "Content-Range: bytes ");
+        put_dec(out, start);
+        out.push(b'-');
+        put_dec(out, start + count - 1);
+        out.push(b'/');
+        put_dec(out, len);
+        put(out, "\r\n");
+    }
+    put(out, "\r\n");
+    conn_at
+}
+
+/// `file_head_into` into a string of its own.
 fn file_head(
     p: &HeadParts,
     code: u16,
@@ -1711,39 +1970,38 @@ fn file_head(
     encoding: Option<&str>,
     range: Option<(u64, u64)>,
 ) -> (String, usize) {
-    let mut head = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {mime}\r\nContent-Length: {count}\r\nETag: {}\r\n\
-         Last-Modified: {}\r\nCache-Control: {}\r\nAccept-Ranges: bytes\r\n{}{}Connection: ",
-        reason(code),
-        p.etag,
-        p.last_modified,
-        p.cache_control,
-        p.vary,
-        p.extra,
-    );
-    let conn_at = head.len();
-    head += conn;
-    head += "\r\n";
-    if let Some(e) = encoding {
-        head += &format!("Content-Encoding: {e}\r\n");
-    }
-    if let Some((start, len)) = range {
-        head += &format!("Content-Range: bytes {start}-{}/{len}\r\n", start + count - 1);
-    }
-    head += "\r\n";
-    (head, conn_at)
+    let mut head = Vec::with_capacity(HEAD_ROOM + p.extra.len());
+    let conn_at = file_head_into(&mut head, p, &FileHead { code, mime, count, conn, encoding, range });
+    (String::from_utf8(head).unwrap_or_default(), conn_at)
+}
+
+/// More than a response head needs (about 250 bytes and the configured
+/// headers): room for one and the file after it in a single allocation.
+const HEAD_ROOM: usize = 384;
+
+/// The 304 head, appended to `out`; returns where its Connection value starts.
+fn not_modified_head_into(out: &mut Vec<u8>, p: &HeadParts, conn: &str) -> usize {
+    put(out, "HTTP/1.1 304 Not Modified\r\nETag: ");
+    put(out, p.etag);
+    put(out, "\r\nLast-Modified: ");
+    put(out, p.last_modified);
+    put(out, "\r\nCache-Control: ");
+    put(out, p.cache_control);
+    put(out, "\r\n");
+    put(out, p.vary);
+    put(out, p.extra);
+    put(out, "Connection: ");
+    let conn_at = out.len();
+    put(out, conn);
+    put(out, "\r\n\r\n");
+    conn_at
 }
 
 /// The 304 head, and where its Connection value starts.
 fn not_modified_head(p: &HeadParts, conn: &str) -> (String, usize) {
-    let mut head = format!(
-        "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nLast-Modified: {}\r\nCache-Control: {}\r\n{}{}Connection: ",
-        p.etag, p.last_modified, p.cache_control, p.vary, p.extra
-    );
-    let conn_at = head.len();
-    head += conn;
-    head += "\r\n\r\n";
-    (head, conn_at)
+    let mut head = Vec::with_capacity(HEAD_ROOM + p.extra.len());
+    let conn_at = not_modified_head_into(&mut head, p, conn);
+    (String::from_utf8(head).unwrap_or_default(), conn_at)
 }
 
 /// Cache-Control of an HTML page (also an index page and the SPA fallback).
@@ -1839,8 +2097,8 @@ async fn send_file(
     mut fill: Option<Fill>,
 ) -> std::io::Result<(u16, u64)> {
     let cfg = &site.cfg;
-    let name = Path::new(rel);
-    let ext = name.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let mut ext_buf = [0u8; 12];
+    let ext = extension_of(rel, &mut ext_buf);
     // Precompressed sibling the client accepts.
     let accept = req.header("accept-encoding").unwrap_or("");
     let mut body = found;
@@ -1870,26 +2128,27 @@ async fn send_file(
     let meta = &body.meta;
     let len = meta.len();
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-    let etag = format!("W/\"{len:x}-{mtime:x}{}\"", encoding.map(|e| format!("-{e}")).unwrap_or_default());
-    let last_modified = http_date(mtime);
+    let etag = etag(len, mtime, encoding);
+    let last_modified = http_date_short(mtime);
 
-    let html = matches!(ext.as_str(), "html" | "htm");
-    let cache_control = if status != 200 {
-        "no-cache".to_string()
+    let html = matches!(ext, "html" | "htm");
+    let cache_control: &str = if status != 200 {
+        "no-cache"
     } else if html {
-        html_cache_control(cfg)
-    } else if fingerprinted(name) {
-        "public, max-age=31536000, immutable".to_string()
+        &site.fixed.cc_html
+    } else if fingerprinted(rel) {
+        "public, max-age=31536000, immutable"
     } else {
-        format!("public, max-age={}", cfg.cache_max_age)
+        &site.fixed.cc_plain
     };
-    let mut extra = String::new();
-    for (k, v) in &cfg.headers {
-        extra += &format!("{k}: {v}\r\n");
-    }
     let vary = if cfg.precompressed { "Vary: Accept-Encoding\r\n" } else { "" };
-    let parts =
-        HeadParts { etag: &etag, last_modified: &last_modified, cache_control: &cache_control, vary, extra: &extra };
+    let parts = HeadParts {
+        etag: etag.as_str(),
+        last_modified: last_modified.as_str(),
+        cache_control,
+        vary,
+        extra: &site.fixed.extra,
+    };
 
     // A small file on a cache miss: build the whole response once, keep it
     // (unless the file changed while it was read, or so recently that a
@@ -1897,7 +2156,7 @@ async fn send_file(
     if let (Some(fill), Some(cache)) = (fill, &site.cache) {
         let stamp = Stamp::of(meta);
         if status == 200 && len <= cache.max_file && meta.is_file() && !stamp.racy(std::time::SystemTime::now()) {
-            let (head, conn_at) = file_head(&parts, 200, mime(&ext), len, "keep-alive", encoding, None);
+            let (head, conn_at) = file_head(&parts, 200, mime(ext), len, "keep-alive", encoding, None);
             let (not_modified, nm_conn_at) = not_modified_head(&parts, "keep-alive");
             let head_len = head.len();
             let mut buf = head.into_bytes();
@@ -1915,7 +2174,7 @@ async fn send_file(
                 conn_at,
                 not_modified: not_modified.into_bytes().into(),
                 nm_conn_at,
-                etag: etag.into(),
+                etag: etag.as_str().into(),
                 mtime,
                 body_len: len,
                 deps: fill.deps,
@@ -1928,9 +2187,10 @@ async fn send_file(
     }
 
     let conn = if keep { "keep-alive" } else { "close" };
-    let not_modified = status == 200 && is_not_modified(req, &etag, mtime);
+    let not_modified = status == 200 && is_not_modified(req, etag.as_str(), mtime);
     if not_modified {
-        let (head, _) = not_modified_head(&parts, conn);
+        let mut head = Vec::with_capacity(HEAD_ROOM + site.fixed.extra.len());
+        not_modified_head_into(&mut head, &parts, conn);
         w.write_all(head).await?;
         w.flush().await?;
         return Ok((304, 0));
@@ -1958,15 +2218,18 @@ async fn send_file(
         Some((a, b)) => (206, a, b - a + 1),
         None => (status, 0, len),
     };
-    let (head, _) = file_head(&parts, code, mime(&ext), count, conn, encoding, (code == 206).then_some((start, len)));
-    if req.method == "HEAD" {
-        w.write_all(head).await?;
+    // The head, and for a small file its body after it: one allocation, one write.
+    let head_only = req.method == "HEAD";
+    let small = !head_only && count <= SMALL_FILE;
+    let mut buf = Vec::with_capacity(HEAD_ROOM + site.fixed.extra.len() + if small { count as usize } else { 0 });
+    let range = (code == 206).then_some((start, len));
+    file_head_into(&mut buf, &parts, &FileHead { code, mime: mime(ext), count, conn, encoding, range });
+    if head_only {
+        w.write_all(buf).await?;
         w.flush().await?;
         return Ok((code, 0));
     }
-    if count <= SMALL_FILE {
-        // Headers and body in one write.
-        let mut buf = head.into_bytes();
+    if small {
         let body_start = buf.len();
         buf.resize(body_start + count as usize, 0);
         let (_, buf) = read_body(body.file, buf, body_start, start).await?;
@@ -1974,7 +2237,7 @@ async fn send_file(
         w.flush().await?;
         return Ok((code, count));
     }
-    let sent = w.send_file(head.as_bytes(), body.file, start, count).await?;
+    let sent = w.send_file(&buf, body.file, start, count).await?;
     w.flush().await?;
     Ok((code, sent))
 }
@@ -2009,14 +2272,37 @@ pub fn parse_range(h: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
     Some(Ok(r))
 }
 
+/// The last segment of `rel`, a path under the root (no trailing slash, no
+/// `.` or `..` segment: `relative` has seen to that).
+fn file_name(rel: &str) -> &str {
+    rel.rsplit_once('/').map_or(rel, |(_, name)| name)
+}
+
+/// The extension of the file `rel`, in lowercase, as `mime` wants it: what
+/// follows the last dot of its name (none for `.dotfile`). An extension
+/// longer than `buf`, which no known type has, comes back empty.
+fn extension_of<'a>(rel: &str, buf: &'a mut [u8; 12]) -> &'a str {
+    let name = file_name(rel);
+    match name.rfind('.') {
+        Some(i) if i > 0 && name.len() - i - 1 <= buf.len() => {
+            let ext = &name.as_bytes()[i + 1..];
+            for (to, from) in buf.iter_mut().zip(ext) {
+                *to = from.to_ascii_lowercase();
+            }
+            std::str::from_utf8(&buf[..ext.len()]).unwrap_or("")
+        }
+        _ => "",
+    }
+}
+
 /// `app.3f9a2c1b.js`, `index-DkS8xW2q.css`: a content hash in the name.
-fn fingerprinted(p: &Path) -> bool {
-    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    name.split(['.', '-', '_']).any(|part| {
-        part.len() >= 8
-            && part.chars().all(|c| c.is_ascii_alphanumeric())
-            && part.chars().any(|c| c.is_ascii_digit())
-            && part.chars().any(|c| c.is_ascii_alphabetic())
+fn fingerprinted(rel: &str) -> bool {
+    file_name(rel).split(['.', '-', '_']).any(|part| {
+        let b = part.as_bytes();
+        b.len() >= 8
+            && b.iter().all(u8::is_ascii_alphanumeric)
+            && b.iter().any(u8::is_ascii_digit)
+            && b.iter().any(u8::is_ascii_alphabetic)
     })
 }
 
@@ -2059,18 +2345,27 @@ const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /// IMF-fixdate: `Wed, 30 Sep 2026 12:00:01 GMT`.
-pub fn http_date(secs: u64) -> String {
+fn http_date_short(secs: u64) -> Short {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let (y, m, d) = crate::logging::civil_from_days(days);
-    format!(
-        "{}, {d:02} {} {y} {:02}:{:02}:{:02} GMT",
-        DAYS[(days.rem_euclid(7)) as usize],
-        MONTHS[(m - 1) as usize],
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
+    let two = |n: u64| [b'0' + (n / 10) as u8, b'0' + (n % 10) as u8];
+    let mut s = Short::new();
+    s.push(DAYS[(days.rem_euclid(7)) as usize].as_bytes())
+        .push(b", ")
+        .push(&two(u64::from(d)))
+        .push(b" ")
+        .push(MONTHS[(m - 1) as usize].as_bytes())
+        .push(b" ")
+        .push(dec(y.unsigned_abs(), &mut [0; 20]))
+        .push(b" ")
+        .push(&two(rem / 3600))
+        .push(b":")
+        .push(&two((rem % 3600) / 60))
+        .push(b":")
+        .push(&two(rem % 60))
+        .push(b" GMT");
+    s
 }
 
 pub fn parse_http_date(s: &str) -> Option<u64> {
@@ -2174,17 +2469,102 @@ mod tests {
 
     #[test]
     fn dates_and_misc() {
-        assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
-        assert_eq!(http_date(1_790_769_601), "Wed, 30 Sep 2026 12:00:01 GMT");
+        assert_eq!(http_date_short(0).as_str(), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(http_date_short(1_790_769_601).as_str(), "Wed, 30 Sep 2026 12:00:01 GMT");
         assert_eq!(parse_http_date("Wed, 30 Sep 2026 12:00:01 GMT"), Some(1_790_769_601));
         assert_eq!(parse_http_date("nonsense"), None);
         assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
         assert_eq!(base64(b"ab"), "YWI=");
-        assert!(fingerprinted(Path::new("app.3f9a2c1b.js")));
-        assert!(fingerprinted(Path::new("index-DkS8xW2q.css")));
-        assert!(!fingerprinted(Path::new("favicon.ico")));
-        assert!(!fingerprinted(Path::new("background.png")));
+        assert!(fingerprinted("app.3f9a2c1b.js"));
+        assert!(fingerprinted("index-DkS8xW2q.css"));
+        assert!(!fingerprinted("favicon.ico"));
+        assert!(!fingerprinted("background.png"));
         assert_eq!(mime("woff2"), "font/woff2");
+    }
+
+    /// The text helpers that replaced `format!` and `Path` calls give what
+    /// those gave.
+    #[test]
+    fn the_allocation_free_helpers_agree_with_what_they_replaced() {
+        // Dates and ETags, over small, ordinary and huge values.
+        let old_date = |secs: u64| {
+            let days = (secs / 86_400) as i64;
+            let rem = secs % 86_400;
+            let (y, m, d) = crate::logging::civil_from_days(days);
+            format!(
+                "{}, {d:02} {} {y} {:02}:{:02}:{:02} GMT",
+                DAYS[(days.rem_euclid(7)) as usize],
+                MONTHS[(m - 1) as usize],
+                rem / 3600,
+                (rem % 3600) / 60,
+                rem % 60
+            )
+        };
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut values = vec![0, 1, 59, 86_399, 86_400, 1_790_769_601, u64::from(u32::MAX), u64::MAX / 2000, u64::MAX];
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push(x >> (x % 40));
+        }
+        for v in values {
+            // (The year of the largest values has more digits than any real date.)
+            assert_eq!(http_date_short(v).as_str(), old_date(v), "date of {v}");
+            for enc in [None, Some("br"), Some("gzip")] {
+                let old = format!("W/\"{v:x}-{:x}{}\"", v / 3, enc.map(|e| format!("-{e}")).unwrap_or_default());
+                assert_eq!(etag(v, v / 3, enc).as_str(), old);
+            }
+            let mut out = Vec::new();
+            put_dec(&mut out, v);
+            assert_eq!(out, v.to_string().into_bytes());
+        }
+        // Extensions and fingerprints, over names with every kind of dot.
+        let old_ext = |rel: &str| {
+            Path::new(rel).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+        };
+        let old_fp = |rel: &str| {
+            let name = Path::new(rel).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            name.split(['.', '-', '_']).any(|part| {
+                part.len() >= 8
+                    && part.chars().all(|c| c.is_ascii_alphanumeric())
+                    && part.chars().any(|c| c.is_ascii_digit())
+                    && part.chars().any(|c| c.is_ascii_alphabetic())
+            })
+        };
+        for rel in [
+            "a.js",
+            "A.JS",
+            "dir/b.Woff2",
+            "x/.hidden",
+            ".hidden",
+            "x/.hidden.css",
+            "noext",
+            "trailing.",
+            "a.b.c.d",
+            "dir.v2/file",
+            "dir.v2/file.webmanifest",
+            "dir/file.averyveryverylongextension",
+            "ü.png",
+            "dir/ünï.PÑG",
+            "app.3f9a2c1b.js",
+            "index-DkS8xW2q.css",
+            "favicon.ico",
+            "abcdefgh.js",
+            "12345678.js",
+            "a_1b2c3d4e5.map",
+            "x/y/vendor-0a1b2c3d4e.min.js",
+        ] {
+            let mut buf = [0u8; 12];
+            let got = extension_of(rel, &mut buf);
+            // Extensions too long for any known type are not looked at.
+            if old_ext(rel).len() <= 12 {
+                assert_eq!(got, old_ext(rel), "extension of {rel:?}");
+            } else {
+                assert_eq!(mime(got), mime(&old_ext(rel)));
+            }
+            assert_eq!(fingerprinted(rel), old_fp(rel), "fingerprint of {rel:?}");
+        }
     }
 
     /// The heads, byte for byte as the server wrote them before they were
@@ -2537,14 +2917,19 @@ mod tests {
     // ---- first_request: answering from the accept loop
 
     fn test_site(access_log: bool) -> Site {
-        let cfg: Static = serde_json::from_value(serde_json::json!({"root": "/", "access_log": access_log})).unwrap();
+        test_site_at(Path::new("/"), access_log)
+    }
+
+    fn test_site_at(root: &Path, access_log: bool) -> Site {
+        let cfg: Static = serde_json::from_value(serde_json::json!({"root": root, "access_log": access_log})).unwrap();
         Site {
-            root: PathBuf::from("/"),
-            dir: Arc::new(OwnedFd::from(std::fs::File::open("/").unwrap())),
+            root: root.to_path_buf(),
+            dir: Arc::new(OwnedFd::from(std::fs::File::open(root).unwrap())),
             open_mode: AtomicU8::new(OPEN_CACHED),
             cached_hits: AtomicU64::new(0),
             cached_misses: AtomicU64::new(0),
             cache: Cache::new(8 << 20, 1 << 16, 1000, 1024),
+            fixed: Fixed::new(&cfg),
             cfg,
             auth: None,
             draining: AtomicBool::new(false),
@@ -2650,8 +3035,9 @@ mod tests {
         assert!(got.starts_with(b"HTTP/1.1 304 Not Modified\r\n"));
     }
 
+    /// What the accept loop does not answer is handed on whole, nothing sent.
     #[test]
-    fn what_the_quick_path_leaves_alone_is_handed_on_whole() {
+    fn what_cannot_be_answered_at_once_is_handed_on_whole() {
         use std::io::{Read, Write};
         let site = test_site(false);
         put_entry(&site, 1000);
@@ -2667,12 +3053,9 @@ mod tests {
             c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
             assert!(c.read(&mut [0u8; 1]).is_err(), "nothing was sent: {raw:?}");
         };
-        leaves(b"GET /missing.js HTTP/1.1\r\nConnection: close\r\n\r\n"); // not cached
-        leaves(b"GET /t.js HTTP/1.1\r\nRange: bytes=0-1\r\nConnection: close\r\n\r\n"); // a range
-        leaves(b"POST /t.js HTTP/1.1\r\nConnection: close\r\n\r\n"); // not GET or HEAD
         leaves(b"GET /t.js HTTP/1.1\r\nHost: x"); // the head is still arriving
-        leaves(b"GET /t.js HTTP/1.1\r\nAccept-Encoding: br\r\n\r\n"); // another variant of the file
-        leaves(b"GET /../etc/passwd HTTP/1.1\r\n\r\n");
+        leaves(b"GET /t.js HTTP/1.1\r\nHost: x\r\n"); // so is this one
+        leaves(b"GET\r\n\r\n"); // a request line the task answers with 400
 
         // Nothing sent yet: carry on.
         let (_c, fd) = accepted();
@@ -2689,14 +3072,125 @@ mod tests {
         wait_readable(&c);
         let First::Go { head, .. } = first_request(&site, fd, false) else { panic!("off") };
         assert!(head.buf.is_empty());
-        // A site with Basic auth never takes the quick path.
-        let mut guarded = test_site(false);
-        guarded.auth = Some("Basic eDp5".into());
-        put_entry(&guarded, 10);
-        let (mut c, fd) = accepted();
-        c.write_all(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
-        wait_readable(&c);
-        assert!(matches!(first_request(&guarded, fd, true), First::Go { .. }));
+    }
+
+    /// Whatever the request, the accept loop's answer is the normal one: files
+    /// that are not cached, misses, ranges, 404s, other methods, a password.
+    #[test]
+    fn requests_that_are_not_cache_hits_are_answered_at_once_too() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("warden-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..30_000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("f.bin"), &body).unwrap();
+        std::fs::write(dir.join("small.txt"), b"hello").unwrap();
+        let mut site = test_site_at(&dir, false);
+        site.cache = None; // nothing is cached: every file is opened and sent
+        // A lookup the dentry cache cannot answer waits for a thread, and the
+        // request goes on as a task (nothing sent); the lookup warms the
+        // cache, so a later try is answered at once (a 404 looks up two names).
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _in_runtime = rt.enter();
+        let exchange = |site: &Site, raw: &str| -> Vec<u8> {
+            for attempt in 0..3 {
+                let (mut c, fd) = accepted();
+                c.write_all(raw.as_bytes()).unwrap();
+                wait_readable(&c);
+                match first_request(site, fd, true) {
+                    First::Done => {
+                        let mut got = Vec::new();
+                        c.read_to_end(&mut got).unwrap();
+                        return got;
+                    }
+                    First::Go { pending: None, answered: false, .. } if attempt < 2 => {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    First::Go { .. } => panic!("not answered at once: {raw:?}"),
+                }
+            }
+            unreachable!()
+        };
+        let split = |got: &[u8]| -> (String, Vec<u8>) {
+            let at = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            (String::from_utf8_lossy(&got[..at]).into_owned(), got[at..].to_vec())
+        };
+
+        let (h, b) = split(&exchange(&site, "GET /f.bin HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 200 OK\r\n") && h.contains("Content-Length: 30000\r\n"), "{h}");
+        assert!(h.contains("Connection: close\r\n") && b == body);
+        let (h, b) = split(&exchange(&site, "GET /small.txt HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 200 OK\r\n") && b == b"hello", "{h}");
+        let (h, b) = split(&exchange(&site, "HEAD /f.bin HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.contains("Content-Length: 30000\r\n") && b.is_empty());
+        let (h, b) = split(&exchange(&site, "GET /f.bin HTTP/1.1\r\nRange: bytes=10-19\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 206 ") && b == body[10..20], "{h}");
+        let (h, _) = split(&exchange(&site, "GET /nope HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 404 "), "{h}");
+        let (h, _) = split(&exchange(&site, "GET /../etc/passwd HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 403 "), "{h}");
+        let (h, _) = split(&exchange(&site, "POST /f.bin HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 405 "), "{h}");
+        let (h, b) = split(&exchange(&site, "GET /f.bin HTTP/1.1\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 304 ") && b.is_empty(), "{h}");
+        site.auth = Some("Basic eDp5".into());
+        let (h, _) = split(&exchange(&site, "GET /f.bin HTTP/1.1\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 401 "), "{h}");
+        let (h, b) =
+            split(&exchange(&site, "GET /f.bin HTTP/1.1\r\nAuthorization: Basic eDp5\r\nConnection: close\r\n\r\n"));
+        assert!(h.starts_with("HTTP/1.1 200 ") && b == body, "{h}");
+        assert!(site.inline.load(Ordering::Relaxed) >= 10, "answered by the accept loop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file bigger than the accept loop sends in one go: the first part goes
+    /// out at once, the rest (and the head, if the socket was full) with the
+    /// task, and the client gets the file once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_big_file_goes_on_as_a_task_after_its_first_part() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("warden-first-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: Vec<u8> = (0..3_000_000).map(|i| (i % 253) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &body).unwrap();
+        let mut site = test_site_at(&dir, false);
+        site.cache = None;
+        let site = Arc::new(site);
+        for small_send_buffer in [false, true] {
+            let (mut c, fd) = accepted();
+            if small_send_buffer {
+                crate::sys::set_send_buffer(fd.as_fd(), 4096).unwrap();
+            }
+            c.write_all(b"GET /big.bin HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+            wait_readable(&c);
+            let First::Go { fd, head, pending, answered } = first_request(&site, fd, true) else {
+                panic!("a 3 MB file is not all sent at once")
+            };
+            assert!(answered && matches!(&pending, Some(Pending { keep: false, rest: Rest::File { .. } })));
+            let reader = std::thread::spawn(move || {
+                let mut got = Vec::new();
+                c.read_to_end(&mut got).unwrap();
+                got
+            });
+            let stream = tokio::net::TcpStream::from_std(std::net::TcpStream::from(fd)).unwrap();
+            let guard = site.idle.register(stream.as_raw_fd());
+            let s2 = site.clone();
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let guard = guard;
+                let (r, w) = stream.split();
+                connection(r, Conn::Tcp(w), s2, &guard, head, pending, answered).await;
+            })
+            .await
+            .unwrap();
+            let got = reader.join().unwrap();
+            let at = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            assert!(got[at..] == body[..], "send buffer shrunk: {small_send_buffer}: {} body bytes", got.len() - at);
+            assert!(String::from_utf8_lossy(&got[..at]).contains("Content-Length: 3000000\r\n"));
+        }
+        assert_eq!(site.active.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A response that does not fit the socket's room: what was sent is
@@ -2722,12 +3216,13 @@ mod tests {
             )
         };
         assert!(!p.keep && answered);
-        let total = p.out.as_slice().len();
-        assert!(p.at < total, "the socket took {} of {total}", p.at);
+        let Rest::Bytes { out, at } = p.rest else { panic!("bytes in memory") };
+        let total = out.as_slice().len();
+        assert!(at < total, "the socket took {at} of {total}");
         // What was sent plus what is pending is the whole response, in order.
-        let mut sent = vec![0u8; p.at];
+        let mut sent = vec![0u8; at];
         c.read_exact(&mut sent).unwrap();
-        let rest = p.out.advance(p.at);
+        let rest = out.advance(at);
         sent.extend_from_slice(rest.as_slice());
         let want =
             cached_bytes(&parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(), &e, false, false).0;

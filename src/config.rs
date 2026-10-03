@@ -87,7 +87,10 @@ pub struct Static {
     #[serde(default)]
     pub access_log: bool,
     /// Per worker: memory for complete prebuilt responses of small files
-    /// ("16MB"; 0 turns the cache off). A hit is one send(2).
+    /// ("16MB"). Off (0) unless set: like nginx, files are read from the
+    /// operating system's page cache on every request, which costs about as
+    /// much as a hit here (docs/benchmarks.md) and never serves a stale or
+    /// memory-hungry copy. A hit is one send(2).
     #[serde(default = "default_cache_size", deserialize_with = "size_bytes")]
     pub cache_size: u64,
     /// Files larger than this are not cached (they go out with sendfile).
@@ -101,7 +104,7 @@ pub struct Static {
 }
 
 fn default_cache_size() -> u64 {
-    16 << 20
+    0
 }
 fn default_cache_max_file() -> u64 {
     64 << 10
@@ -1630,21 +1633,22 @@ mod tests {
         let c = Config::parse(&site).unwrap();
         let st = c.static_files.unwrap();
         assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
-        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (0, 64 << 10, 1000));
     }
 
     #[test]
     fn static_cache_and_io_settings() {
         let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        // No cache unless asked for.
         let st = Config::parse(base).unwrap().static_files.unwrap();
-        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (16 << 20, 64 << 10, 1000));
+        assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (0, 64 << 10, 1000));
         let st =
             Config::parse(&format!("{base}cache_size = \"64MB\"\ncache_max_file = \"256K\"\ncache_valid_ms = 0\n"))
                 .unwrap()
                 .static_files
                 .unwrap();
         assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (64 << 20, 256 << 10, 0));
-        // 0 turns the cache off; plain numbers are bytes.
+        // 0 is the default, no cache; plain numbers are bytes.
         let st =
             Config::parse(&format!("{base}cache_size = 0\ncache_max_file = 1000\n")).unwrap().static_files.unwrap();
         assert_eq!((st.cache_size, st.cache_max_file), (0, 1000));

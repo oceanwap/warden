@@ -1986,9 +1986,10 @@ fn raw_exchange(port: u16, req: &str) -> Vec<u8> {
     buf
 }
 
-/// The static cache (default on): cached responses are byte-identical to
-/// an uncached server's (`cache_size = 0` behaves as before); an edited or deleted file shows within cache_valid_ms; a cached
-/// path swapped for a symlink out of the root is refused, not served.
+/// The static cache (opt-in, `cache_size`): cached responses are byte-identical
+/// to an uncached server's (the default); an edited or deleted file shows
+/// within cache_valid_ms; a cached path swapped for a symlink out of the root
+/// is refused, not served.
 /// CPU time (user + system, in clock ticks) `pid` has used.
 fn cpu_ticks(pid: u32) -> u64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
@@ -2109,9 +2110,13 @@ fn static_cache_hits_match_and_stay_fresh() {
         )
     };
     let env: [(&str, &str); 0] = [];
-    let mut w_on =
-        Warden::start_env(&format!("cache-on-{io}"), on, &toml("cache-on", on, "cache_valid_ms = 300\n"), &env);
-    let w_off = Warden::start_env(&format!("cache-off-{io}"), off, &toml("cache-off", off, "cache_size = 0\n"), &env);
+    let mut w_on = Warden::start_env(
+        &format!("cache-on-{io}"),
+        on,
+        &toml("cache-on", on, "cache_size = \"16MB\"\ncache_valid_ms = 300\n"),
+        &env,
+    );
+    let w_off = Warden::start_env(&format!("cache-off-{io}"), off, &toml("cache-off", off, ""), &env);
     w_on.wait_for("cached static worker ready", T, ready(1));
     w_off.wait_for("uncached static worker ready", T, ready(1));
     let used = "epoll";

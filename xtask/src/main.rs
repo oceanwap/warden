@@ -64,7 +64,7 @@ const SUITES: &[Suite] = &[
         title: "Static files",
         about: "`warden serve` against nginx, `pm2 serve` and the `serve` package, 4 workers each (serve has no cluster mode).",
         script: "bench/static.ts",
-        args: &["--scenarios", "warden,warden-nocache,nginx,pm2-serve,serve"],
+        args: &["--scenarios", "warden,warden-cache,nginx,pm2-serve,serve"],
     },
     Suite {
         name: "logs",
@@ -142,7 +142,7 @@ bench/profile.ts with --perf: per target, req/s, server CPU time and context swi
 per request, and where the CPU time goes (perf record -e cpu-clock, top symbols).
 Every option is bench/profile.ts's:
 
-    --targets a,b      warden, warden-nocache, nginx, bun, bun-shim, node, node-shim;
+    --targets a,b      warden, warden-cache, nginx, bun, bun-shim, node, node-shim;
                        warden@/path/bin, bun-shim@/path/shim.mjs, warden:key=value,...
     --path P           URL path (static: /index.html, /assets/app.3f9a2c1b.js, /media/video.bin)
     --requests N       Requests per measurement (default 200000)

@@ -236,9 +236,9 @@ Every key but `root` is optional. What the server does and why:
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request |
-| `cache_size` | `"16MB"` | Per worker: prebuilt responses of small files in memory (`0` = off); bodies of 8 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
-| `cache_max_file` | `"64KB"` | Larger files are not cached (sent with `sendfile`) |
-| `cache_valid_ms` | `1000` | A cached file is re-checked on disk at most this often |
+| `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 8 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
+| `cache_max_file` | `"64KB"` | With a cache: larger files are not cached (sent with `sendfile`) |
+| `cache_valid_ms` | `1000` | With a cache: a cached file is re-checked on disk at most this often |
 
 ## Environment variables
 

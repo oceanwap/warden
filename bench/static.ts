@@ -16,9 +16,11 @@
 // server's CPU time per request (every process of the scenario, from /proc/<pid>/task/*/schedstat).
 //
 // Scenarios:
-//   warden        warden serve: N worker processes sharing the port (SO_REUSEPORT), small files from its
-//                 response cache, sendfile above
-//   warden-nocache  warden with the response cache off ([static] cache_size = 0): what the cache buys
+//   warden        warden serve: N worker processes sharing the port (SO_REUSEPORT); every request
+//                 opens the file (like nginx without open_file_cache): pread for small files,
+//                 sendfile above
+//   warden-cache  warden with the opt-in response cache on ([static] cache_size = "16MB"): what the
+//                 cache buys
 //   nginx         nginx with N worker processes, sendfile, tcp_nopush, access log off (skipped if not installed)
 //   pm2-serve  PM2's static server (`pm2 serve`), N instances in cluster mode
 //   serve      the `serve` npm package (one process: it has no cluster mode)
@@ -86,7 +88,7 @@ export interface Running {
   stop: () => Promise<void>;
 }
 
-/** `cache: false` sets cache_size = 0; `bin`: another warden binary (A/B of
+/** `cache: true` sets cache_size = "16MB" (the response cache is off by default); `bin`: another warden binary (A/B of
  *  two builds); `staticExtra` / `workersExtra`: more lines for [static] /
  *  [workers]; `workers`: instead of --workers. */
 export async function startWarden(
@@ -100,7 +102,7 @@ export async function startWarden(
   writeFileSync(
     cfg,
     `[app]\nname = "bench-static"\nport = ${PORT}\n[workers]\ncount = ${workers}\n${opts.workersExtra ?? ""}` +
-      `[static]\nroot = ${JSON.stringify(SITE)}\n${opts.cache === false ? "cache_size = 0\n" : ""}${opts.staticExtra ?? ""}` +
+      `[static]\nroot = ${JSON.stringify(SITE)}\n${opts.cache === true ? 'cache_size = "16MB"\n' : ""}${opts.staticExtra ?? ""}` +
       `[logging]\nlevel = "warn"\n[control]\nsocket = ${JSON.stringify(join(TMP, "warden-static.sock"))}\n`,
   );
   writeFileSync(log, "");
@@ -215,7 +217,7 @@ async function startServe(): Promise<Running> {
 
 export const starters: Record<string, () => Promise<Running>> = {
   warden: () => startWarden(),
-  "warden-nocache": () => startWarden({ cache: false }),
+  "warden-cache": () => startWarden({ cache: true }),
   nginx: () => startNginx(),
   "pm2-serve": startPm2Serve,
   serve: startServe,

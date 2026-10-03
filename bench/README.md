@@ -74,7 +74,7 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `run.ts --app nest-node` | A minimal NestJS app on Node, same scenarios |
 | `run.ts --app bun-http` | A `Bun.serve` app under bare / the shim alone / PM2 (fork mode: it has no Bun cluster mode) / Warden processes / Warden worker threads |
 | `run.ts --app nest-bun` | The NestJS app on Bun, same scenarios |
-| `static.ts` | `warden serve` vs nginx vs `pm2 serve` vs `serve`: a 1.5 KB page, a 48 KB script and a 1 MB file, keep-alive and a new connection per request; `warden-nocache` is Warden with the response cache off (`cache_size = 0`), to show what the cache buys; a second table (Warden and nginx, one process each) shows what a 10 MB download costs the 1.5 KB page requested next to it |
+| `static.ts` | `warden serve` vs nginx vs `pm2 serve` vs `serve`: a 1.5 KB page, a 48 KB script and a 1 MB file, keep-alive and a new connection per request; `warden-cache` is Warden with the opt-in response cache on (`cache_size = "16MB"`; the default is no cache, like nginx), to show what the cache buys; a second table (Warden and nginx, one process each) shows what a 10 MB download costs the 1.5 KB page requested next to it |
 | `logs.ts` | Capturing worker output: steady logging (CPU, completeness) and a flood (throughput, CPU per GB); `warden-direct` is `worker_output = "direct"` (bytes spliced into the file, unparsed) |
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
 | `longlived.ts` | WebSocket and SSE clients held through a rolling restart: PM2 (cluster mode for Node, fork mode for Bun) vs Warden (processes; Bun also worker mode) |
@@ -202,7 +202,7 @@ bun bench/profile.ts --targets warden,warden:cache_max_file=16384 --path /assets
 bun bench/profile.ts --targets warden,warden@/tmp/warden-before --rounds 5   # two builds
 ```
 
-Targets: `warden`, `warden-nocache`, `nginx` (the static site of
+Targets: `warden`, `warden-cache`, `nginx` (the static site of
 `static.ts`), `bun`, `node` (the bench apps, bare) and `bun-shim`,
 `node-shim` (with the shim). `warden@PATH` / `bun-shim@PATH` use another
 binary or shim; `warden:key=value,…` sets `[static]` keys. Per target:

@@ -128,9 +128,11 @@ protocol allows, and no transfer keeps it from its other connections.
   `openat2(RESOLVE_BENEATH | RESOLVE_CACHED)` (no `realpath`, no thread
   pool), the first bytes of a file are read with `preadv2(RWF_NOWAIT)`, and
   a request never leaves the thread (tested: one thread, one sleep per
-  request). A response cache keeps the whole response of small files: a hit
-  is one `send(2)`, and for bodies of 8 KB and more one `sendfile(2)` from a
-  sealed memfd.
+  request). Files are not cached by default (as in nginx, the OS page cache
+  does that): a request opens its file, looks at it, reads it (or hands it to
+  `sendfile`) and closes it. An opt-in response cache (`cache_size`) keeps
+  the whole response of small files: a hit is one `send(2)`, and for bodies
+  of 8 KB and more one `sendfile(2)` from a sealed memfd.
 - **One packet per response.** The head and the body go out together: one
   `send` for a small file, `MSG_MORE` + `sendfile` for a large one (macOS:
   one `sendfile` with `sf_hdtr`); error pages, 401s and listings are one
@@ -139,9 +141,11 @@ protocol allows, and no transfer keeps it from its other connections.
   (the request is there when `accept` returns), `TCP_NODELAY` on the
   listener (Linux sockets inherit it), no `shutdown(2)` at close;
   `SO_NOSIGPIPE` once per accepted connection on macOS. A kept-alive request
-  is 3 system calls (`epoll_wait`, `recv`, `send`); a new connection whose request is already
-  there and whose answer is cached is 4 (`accept4`, `recv`, `send`, `close`: it is answered
-  from the accept loop, no task, no epoll registration, no timer), otherwise 9.
+  is 7 or 8 system calls (`epoll_wait`, `recv`, `openat2`, `statx`, `pread` or
+  `send` + `sendfile`, `close`; 3 with the cache on); a new connection whose request is already
+  there is 8 (`accept4`, `recv`, `openat2`, `statx`, `send`, `sendfile`, `close` of the file and
+  of the socket; 4 with a cache hit): it is answered from the accept loop, no task, no epoll
+  registration, no timer. It used to be 9 or more.
 - **Big files in pieces.** At most 1 MiB per `sendfile`, then the connection
   yields, so one download never holds up the other requests of its worker
   (with several workers the others are not blocked either, but a connection
@@ -205,8 +209,8 @@ throughput table and, after it, the "page next to a big download" table
 
 | Change | Measured on | Before | After |
 |---|---|---|---|
-| Response cache (`[static] cache_size`, default 16 MB per worker): a small-file hit is one `send(2)` of a prebuilt response | worker syscalls per keep-alive request, 1.5 KB page (strace -c, 1 worker) | ~9.1 | ~2.1 |
-| same | 1.5 KB page, 4 workers, same run (`warden-nocache` column) | 99.4k req/s | 107.6k req/s (nginx 100.8k) |
+| Response cache (`[static] cache_size`, 16 MB per worker; off by default since 2026-10-03): a small-file hit is one `send(2)` of a prebuilt response | worker syscalls per keep-alive request, 1.5 KB page (strace -c, 1 worker) | ~9.1 | ~2.1 |
+| same | 1.5 KB page, 4 workers, same run (the cache-off column, then called `warden-nocache`) | 99.4k req/s | 107.6k req/s (nginx 100.8k) |
 | same | 48 KB script, `cache_max_file` 64 KB vs 16 KB vs off (8 s × 2 each) | 72–74k req/s | 72–74k req/s: no difference, so 64 KB stays |
 | Hot standby (`[workers] standby = 1`) | crash recovery, 4 workers | node:http 129 ms, NestJS/Node 687 ms, Bun 54 ms, NestJS/Bun 406 ms | 44 / 57 / 17 / 45 ms |
 | Surge rollouts (`[reload] surge = "all"`) | rolling restart under load | NestJS/Node 1,556 ms, NestJS/Bun 1,297 ms | 1,268 / 964 ms, 0 failed |
@@ -398,11 +402,79 @@ core against both servers; against the slower nginx the server never slept,
 and the same oha did 94k). Measured as the server's CPU per request, or with
 both on one CPU, the order is the other way round, and that is what the tables
 use. Read req/s from a single client pinned next to the server as the
-client's speed, not the server's. Not done: files above `cache_max_file`
-(64 KB) on a new connection per request (31 vs nginx 26.5 µs: both sides make
-the same system calls; a 1 MB `cache_max_file` measured 14 % less CPU for
-100 KB but makes a miss read the whole file into memory first, so it stays
-off by default).
+client's speed, not the server's. Not done in this part: files above
+`cache_max_file` (64 KB) on a new connection per request (31 vs nginx 26.5 µs:
+both sides make the same system calls; a 1 MB `cache_max_file` measured 14 %
+less CPU for 100 KB but makes a miss read the whole file into memory first).
+The third part, below, closes that gap without a cache.
+
+2026-10-03, third part: no file cache by default, and the path without one made
+cheap. A cache of file contents is the wrong default for a file server: files
+can be huge, a copy can be stale (`cache_valid_ms`), it costs memory per
+worker, and nginx does not do it (its `open_file_cache`, which keeps open
+descriptors and `stat` results, is off unless configured). So `cache_size` is
+now `0`: the cache stays as an option (`cache_size = "16MB"`), and the
+question was whether a request that opens its file every time could cost as
+little. The starting point (the build of the second part, `cache_size = 0`):
+a new connection for a 1 KB file 18.3 µs against nginx's 19.2, for 100 KB
+28.4 against 25.5. Two changes:
+
+- **Every new connection's first request is answered from the accept loop,
+  not only a cache hit's.** The request handler itself runs once, there, on
+  the raw non-blocking socket (polled with a waker that does nothing). It
+  never has to wait: the path is opened with `RESOLVE_CACHED` and the file
+  read with `RWF_NOWAIT`, so a request that would need the disk (or a thread)
+  returns "pending" before it has written a byte, and the connection's task
+  starts it over from the same head. A response the socket cannot take whole
+  leaves its rest to the task (at most 256 KB of a file go out in the accept
+  loop; a body of 1.25 MiB or more goes to the task whole, so that it is
+  corked). 100 KB on a new connection is now `accept4`, `recv`, `openat2`,
+  `statx`, `send` (head, `MSG_MORE`), `sendfile`, `close` ×2: 8 system calls,
+  where the task path made 10, adding an `epoll_ctl` pair and a share of
+  `epoll_wait`. More than 100 requests of every kind (ranges, 304s,
+  HEAD, 404, traversal, Basic auth, `gzip` siblings, requests arriving in
+  pieces, pipelined ones) are compared byte for byte with the task path in
+  `tests/static_perf.rs`, with and without the cache.
+- **The response is built without the formatting machinery.** `perf` on the
+  uncached path put about a tenth of the worker's samples in `format!` and string
+  allocation: the head was a dozen `String`s, `into_bytes` and a `resize` that
+  reallocated the buffer the body is read into. Now the head is written
+  straight into the one buffer that the body is read after; the ETag and the
+  date are made on the stack; the Cache-Control value and the configured
+  headers are made once at start; the file extension, the content-hash test
+  and the path check do not allocate, and the C string for `openat2` is on the
+  stack. User space per request: 1 KB keep-alive 2.9 to 1.7 µs, new connection
+  3.5 to 2.1. The old `format!` heads are kept in the tests, and the new
+  ones must equal them byte for byte (`heads_are_byte_identical_and_patchable`).
+
+Server CPU per request in µs (user + system), 16 connections, wrk on CPU 1,
+one worker on CPU 0, nginx 1.24 with one worker (default configuration, and
+with `open_file_cache max=1000 inactive=60s` and `open_file_cache_valid 30s`,
+which is the nearest nginx comes to a cache), medians of 3 rounds of 4 s:
+
+| | nginx | nginx, `open_file_cache` | before (`cache_size = 0`) | now (default, no cache) | now, `cache_size = "16MB"` |
+|---|---|---|---|---|---|
+| 1 KB, keep-alive | 14.3 | 9.3 | 9.5 | **7.8** | 6.3 |
+| 1 KB, new connection | 19.2 | 17.9 | 18.3 | **14.2** | 12.6 |
+| 20 KB, keep-alive | 11.6 | 8.9 | 9.2 | **8.8** | 7.8 |
+| 20 KB, new connection | 20.1 | 18.7 | 19.3 | **15.0** | 13.9 |
+| 100 KB, keep-alive | 20.1 | 20.2 | 18.7 | **18.2** | 19.3 (not cached: over 64 KB) |
+| 100 KB, new connection | 25.5 | 24.5 | 28.4 | **24.0** | 24.0 (not cached) |
+
+("Before" is the build of the second part with the cache switched off, 4
+rounds. With its cache on, which was the default, it measured 6.4 and 12.4 µs
+for 1 KB, 7.7 and 17.1 for 20 KB, 18.8 and 29.8 for 100 KB.)
+
+What this says. Without any cache Warden costs 45 % less server CPU than
+nginx on a kept-alive 1 KB file and 26 % less on a new connection, 16 % and
+20 % less than nginx with its file cache on, and is level with or ahead of it
+at 20 and 100 KB. The cache, where it applies, still saves a tenth to a fifth on
+small files (1 KB: 7.8 to 6.3 µs kept alive, 14.2 to 12.6 on a new
+connection) and nothing on big ones; it is a small win for an extra
+moving part (staleness, memory), so it is an option and not the default. The
+default's price against the old default is that, on small files only.
+What is left is the kernel's: of the 7.8 µs, 1.7 are Warden's own code.
+Measured on the same loaded 2-CPU VM; not repeated on other hardware.
 
 Tried and not kept, or not done:
 
@@ -658,6 +730,11 @@ The NestJS app on Bun, 4 workers; Warden also in worker (thread) mode.
 ### Static files
 
 `warden serve` against nginx, `pm2 serve` and the `serve` package, 4 workers each (serve has no cluster mode).
+
+(This run is from before the response cache became opt-in: its `warden`
+column is `cache_size = "16MB"` and `warden-nocache` is today's default. The
+scenarios are now `warden` (default, no cache) and `warden-cache`; the next
+full run uses those.)
 
 4 workers · nginx/1.24.0 (Ubuntu) · pm2 6.0.14 · serve 14.2.6 · node v22.22.2 · warden 0.1.0
 

@@ -9,11 +9,11 @@
 //
 //   bun bench/profile.ts --targets warden,nginx --path /assets/app.3f9a2c1b.js --strace --perf
 //   bun bench/profile.ts --targets bun,bun-shim,node,node-shim --rounds 5
-//   bun bench/profile.ts --targets warden,warden:cache_max_file=16384 --path /assets/app.3f9a2c1b.js
+//   bun bench/profile.ts --targets warden-cache,warden-cache:cache_max_file=16384 --path /assets/app.3f9a2c1b.js
 //   bun bench/profile.ts --targets warden,warden@/tmp/warden-before --app-cpus 0 --loadgen-cpus 1
 //
 // Targets:
-//   warden, warden-nocache, nginx   the static site of bench/static.ts (1.5 KB page, 48 KB script, 1 MB file)
+//   warden, warden-cache, nginx   the static site of bench/static.ts (1.5 KB page, 48 KB script, 1 MB file)
 //   bun, node                       the bench apps (bench/app/server.ts, bench/node/server.mjs), started bare
 //   bun-shim, node-shim             the same with Warden's shim preloaded, as Warden runs them
 // A target can carry overrides:
@@ -110,12 +110,12 @@ function parseTarget(spec: string): Target {
   };
   switch (name) {
     case "warden":
-    case "warden-nocache":
+    case "warden-cache":
       return {
         spec,
         port: st.PORT,
         path: STATIC_PATH,
-        start: fromStatic(() => st.startWarden({ cache: name === "warden", bin: override ?? args.warden, staticExtra })),
+        start: fromStatic(() => st.startWarden({ cache: name === "warden-cache", bin: override ?? args.warden, staticExtra })),
       };
     case "nginx":
       if (override || keys) throw new Error("nginx takes no overrides");
@@ -132,7 +132,7 @@ function parseTarget(spec: string): Target {
         start: () => startApp(name.startsWith("bun") ? "bun" : "node", name.endsWith("-shim") ? (override ?? SHIM) : null),
       };
   }
-  throw new Error(`unknown target ${name}: warden, warden-nocache, nginx, bun, bun-shim, node, node-shim`);
+  throw new Error(`unknown target ${name}: warden, warden-cache, nginx, bun, bun-shim, node, node-shim`);
 }
 
 /** The bench app, N processes sharing the port; with `shim`, preloaded as Warden does

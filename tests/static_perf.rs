@@ -297,9 +297,12 @@ fn html_pages_follow_html_max_age_and_other_files_do_not() {
     quiet();
 
     // Unset (the default) and 0: ask again on every page load, as before.
-    for extra in [json!({}), json!({ "html_max_age": 0 })] {
-        let w = Worker::start(&tmp, &site, extra);
-        expect(&policies(&w, ""), "no-cache", "public, max-age=3600");
+    // With and without the cache.
+    for cache in ["0", "16MB"] {
+        for extra in [json!({ "cache_size": cache }), json!({ "html_max_age": 0, "cache_size": cache })] {
+            let w = Worker::start(&tmp, &site, extra);
+            expect(&policies(&w, ""), "no-cache", "public, max-age=3600");
+        }
     }
 
     // Set: pages (the index, other .html files, a directory's index) are
@@ -549,22 +552,34 @@ fn exchange(port: u16, segments: &[&str], pause: Duration) -> Vec<u8> {
     out
 }
 
-/// A new connection whose request is already in the socket and whose answer
-/// is cached is answered from the accept loop (`first_request`), with no task
-/// and no epoll registration. The bytes must be exactly what the normal path
-/// sends (`WARDEN_STATIC_INLINE=0`), whatever the request, however it arrives.
+/// A new connection whose request is already in the socket is answered from
+/// the accept loop (`first_request`), with no task and no epoll registration,
+/// when the file can be had without waiting (and, with a cache, when it is a
+/// hit). The bytes must be exactly what the normal path sends
+/// (`WARDEN_STATIC_INLINE=0`), whatever the request, however it arrives.
 #[test]
 fn a_request_answered_from_the_accept_loop_matches_the_normal_path() {
-    let tmp = Tmp::new("inline");
+    accept_loop_matches_normal_path(false);
+}
+
+/// The same with the response cache on (`cache_size`).
+#[test]
+fn a_cache_hit_answered_from_the_accept_loop_matches_the_normal_path() {
+    accept_loop_matches_normal_path(true);
+}
+
+fn accept_loop_matches_normal_path(cache: bool) {
+    let tmp = Tmp::new(if cache { "inline-cache" } else { "inline" });
     let site = make_site(&tmp);
     write(&site, "gz.js", b"console.log('plain')");
     write(&site, "gz.js.gz", b"not really gzip, but a sibling");
     write(&site, "sp ace.txt", b"percent-encoded in the URL");
     quiet();
-    // Entries stay fresh for the whole test (the default is 1 s, after which a
-    // hit takes the normal path to be checked against the disk): every case
-    // below is a hit, and on the first worker an accept-loop one.
-    let fresh = json!({ "cache_valid_ms": 600_000 });
+    // With a cache, entries stay fresh for the whole test (the default is
+    // 1 s, after which a hit takes the normal path to be checked against the
+    // disk): every case below is a hit, and on the first worker an
+    // accept-loop one.
+    let fresh = if cache { json!({ "cache_size": "16MB", "cache_valid_ms": 600_000 }) } else { json!({}) };
     let inline = Worker::start(&tmp, &site, fresh.clone());
     let normal = Worker::start_env(&tmp, &site, fresh, &[("WARDEN_STATIC_INLINE", "0")]);
 
@@ -665,8 +680,11 @@ fn a_request_answered_from_the_accept_loop_matches_the_normal_path() {
     // answer on the first worker, and never on the second: the workers say
     // how many when they stop.
     let answered = |log: &str| -> u64 {
-        let line = log.lines().find(|l| l.contains("static cache: ")).unwrap_or_else(|| panic!("no summary in {log}"));
-        let (n, _) = line.split("; ").last().unwrap().split_once(' ').unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("requests answered in the accept loop"))
+            .unwrap_or_else(|| panic!("no summary in {log}"));
+        let n = line.strip_prefix("static: ").and_then(|l| l.split_once(' ')).unwrap_or_else(|| panic!("{line}")).0;
         n.parse().unwrap_or_else(|_| panic!("{line}"))
     };
     let n = answered(&inline.stop());
@@ -682,7 +700,7 @@ fn connections_waiting_for_a_request_time_out_and_busy_ones_do_not() {
     let tmp = Tmp::new("timeouts");
     let site = make_site(&tmp);
     write(&site, "huge.bin", &pattern(40_000_000));
-    let w = Worker::start_env(&tmp, &site, json!({}), &[("WARDEN_STATIC_TIMEOUTS", "2,5")]);
+    let w = Worker::start_env(&tmp, &site, json!({ "cache_size": "16MB" }), &[("WARDEN_STATIC_TIMEOUTS", "2,5")]);
     quiet(); // so that the files can be cached
 
     // Closed after how long, or None if it stays open past `within`.
@@ -768,11 +786,20 @@ fn connections_waiting_for_a_request_time_out_and_busy_ones_do_not() {
 }
 
 #[test]
+fn large_bodies_arrive_intact_on_kept_alive_connections() {
+    bodies_arrive_intact("0");
+}
+
+#[test]
 fn cached_and_large_bodies_arrive_intact_on_kept_alive_connections() {
-    let tmp = Tmp::new("bodies");
+    bodies_arrive_intact("16MB");
+}
+
+fn bodies_arrive_intact(cache: &str) {
+    let tmp = Tmp::new(&format!("bodies-{cache}"));
     let site = make_site(&tmp);
     quiet();
-    let w = Worker::start(&tmp, &site, json!({}));
+    let w = Worker::start(&tmp, &site, json!({ "cache_size": cache }));
 
     // 20 KB: kept in a memfd and sent with sendfile on a cache hit. Three
     // pipelined requests (the first fills the cache), then a close.
@@ -979,7 +1006,7 @@ mod linux {
         // first leaves at once, and the client's ACK delay is a latency of
         // its own. Only responses well under the first send buffer count
         // (a larger one may legitimately need several).
-        let cached = Worker::start(&tmp, &site, json!({}));
+        let cached = Worker::start(&tmp, &site, json!({ "cache_size": "16MB" }));
         let uncached = Worker::start(&tmp, &site, json!({ "cache_size": 0 }));
         let plain = Worker::start(&tmp, &bare, json!({ "listing": true }));
         let locked = Worker::start(&tmp, &bare, json!({ "basic_auth": "u:p" }));
@@ -1035,7 +1062,8 @@ mod linux {
         let tmp = Tmp::new("threads");
         let site = make_site(&tmp);
         quiet();
-        for (what, extra) in [("cache on", json!({})), ("cache off", json!({ "cache_size": 0 }))] {
+        for (what, extra) in [("cache on", json!({ "cache_size": "16MB" })), ("cache off", json!({ "cache_size": 0 }))]
+        {
             let w = Worker::start(&tmp, &site, extra);
             let mut c = Client::connect(w.port);
             for _ in 0..200 {
@@ -1189,44 +1217,56 @@ mod linux {
         let tmp = Tmp::new("syscalls");
         let site = make_site(&tmp);
         quiet();
-        let w = Worker::start(&tmp, &site, json!({}));
-        // Warm the cache and the connection setup.
-        for _ in 0..20 {
-            Client::connect(w.port).get("/index.html", "Connection: close\r\n");
-        }
-
-        const N: u64 = 300;
-        let keep = count_syscalls(w.pid(), || {
-            let mut c = Client::connect(w.port);
-            for _ in 0..N {
-                c.get("/index.html", "");
-            }
-        });
-        let Some(keep) = keep else {
-            skipped("system_calls_per_request_stay_low", "strace cannot attach to the worker");
-            return;
-        };
-        let fresh = count_syscalls(w.pid(), || {
-            for _ in 0..N {
+        // (what, config, most calls per kept-alive request, most per request
+        // on a new connection)
+        //
+        // With a cache. Kept alive: wait for readiness, read the request,
+        // send the response (3 measured). A new connection whose request is
+        // already in the socket and whose answer is cached never leaves the
+        // accept loop: wait for the listener, accept, read, send, close (5
+        // measured when connections arrive one by one; 4 when they queue up).
+        // It used to register the socket with epoll and take it out again,
+        // start a task and a timer (9, and 11 before the worker stopped
+        // setting TCP_NODELAY and shutting down each connection).
+        //
+        // Without: the file is opened, looked at, read (or sent) and closed
+        // each time, four calls more: kept alive 8 measured; a new connection
+        // 10 (it also never leaves the accept loop: no epoll registration).
+        //
+        // One system call more per request is a regression; the margin is the
+        // heartbeat and idle-sweep timers, which a slower (debug) build runs
+        // more often per request.
+        for (what, cfg, keep_max, fresh_max) in
+            [("cache", json!({ "cache_size": "16MB" }), 3.5, 5.6), ("no cache", json!({}), 8.5, 10.6)]
+        {
+            let w = Worker::start(&tmp, &site, cfg);
+            // Warm the cache and the connection setup.
+            for _ in 0..20 {
                 Client::connect(w.port).get("/index.html", "Connection: close\r\n");
             }
-        })
-        .unwrap();
-        let (keep, fresh) = (keep as f64 / N as f64, fresh as f64 / N as f64);
-        eprintln!("system calls per request: {keep:.2} kept alive, {fresh:.2} on a new connection");
-        // Kept alive: wait for readiness, read the request, send the response
-        // (3 measured). A new connection whose request is already in the
-        // socket and whose answer is cached never leaves the accept loop:
-        // wait for the listener, accept, read, send, close (5 measured when
-        // connections arrive one by one; 4 when they queue up). It used to
-        // register the socket with epoll and take it out again, start a
-        // task and a timer (9, and 11 before the worker stopped setting
-        // TCP_NODELAY and shutting down each connection). One system call
-        // more per request is a regression; the margin is the heartbeat and
-        // idle-sweep timers, which a slower (debug) build runs more often per
-        // request.
-        assert!(keep <= 3.5, "{keep:.2} system calls per kept-alive request");
-        assert!(fresh <= 5.6, "{fresh:.2} system calls per new-connection request");
+
+            const N: u64 = 300;
+            let keep = count_syscalls(w.pid(), || {
+                let mut c = Client::connect(w.port);
+                for _ in 0..N {
+                    c.get("/index.html", "");
+                }
+            });
+            let Some(keep) = keep else {
+                skipped("system_calls_per_request_stay_low", "strace cannot attach to the worker");
+                return;
+            };
+            let fresh = count_syscalls(w.pid(), || {
+                for _ in 0..N {
+                    Client::connect(w.port).get("/index.html", "Connection: close\r\n");
+                }
+            })
+            .unwrap();
+            let (keep, fresh) = (keep as f64 / N as f64, fresh as f64 / N as f64);
+            eprintln!("system calls per request, {what}: {keep:.2} kept alive, {fresh:.2} on a new connection");
+            assert!(keep <= keep_max, "{what}: {keep:.2} system calls per kept-alive request");
+            assert!(fresh <= fresh_max, "{what}: {fresh:.2} system calls per new-connection request");
+        }
     }
 
     /// A trivial HTTP server: one thread, blocking sockets, one canned

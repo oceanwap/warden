@@ -185,6 +185,21 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   is bound by the kernel and does not change. Measured on a loaded 2-CPU VM, with
   a note on why a single pinned client misreads it:
   [`docs/benchmarks.md`](docs/benchmarks.md).
+- Static serving keeps no copy of files by default: `[static] cache_size`
+  is `0` (it was 16 MB per worker), as in nginx; files can be any size, an edit
+  shows at once, and memory does not grow with the site. The response cache stays as an option
+  (`cache_size = "16MB"`), and saves a tenth to a fifth of the CPU on small
+  files. To make up for it the first request of every new connection, hit or
+  not, is answered from the accept loop (8 system calls for a 100 KB file
+  instead of 10, no epoll registration), and responses are built without
+  allocation (user-space CPU per request 3.5 to 2.1 µs on a new
+  connection). Server CPU per request without any cache, 1 KB file: 7.8 µs
+  kept alive and 14.2 on a new connection (nginx 14.3 and 19.2; nginx with
+  `open_file_cache` 9.3 and 17.9); 100 KB on a new connection 24.0 instead of
+  28.4 (nginx 25.5). The exit summary line "N requests answered in the accept
+  loop" is printed with or without a cache. The benchmark scenario
+  `warden-nocache` is now `warden` and `warden` is `warden-cache`:
+  [`docs/benchmarks.md`](docs/benchmarks.md).
 - `Status.watching` (the `watching` column) says whether a watcher is running
   now, not only that `[watch]` is enabled: it reads `disabled` for a stopped
   app or a watcher that died (`describe` says "set, but not running").
