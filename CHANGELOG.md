@@ -211,9 +211,10 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   generated responses (errors, 301, 416, listings, 401) are made by one
   function, so their header lines can come in another order (the 401 now says
   `charset=utf-8`).
-- Static serving no longer looks for a `.br` / `.gz` sibling of an image, font,
-  audio, video, archive, PDF or office document (a compressed sibling would
-  save nothing). Browsers
+- Static serving no longer looks for a `.br` / `.gz` sibling of a file that is
+  compressed already (`[static] precompressed_skip`: by default images, fonts,
+  audio, video, archives, PDF and office documents; a list replaces it, `[]`
+  looks up every file; a sibling of such a file would save nothing). Browsers
   send `Accept-Encoding: gzip, br` with every request, and each lookup that
   fails costs a system call: a 1 KB PNG took 11.9 µs of server CPU, and now
   takes 7.9. Text files without siblings still pay the two lookups (11.9 µs

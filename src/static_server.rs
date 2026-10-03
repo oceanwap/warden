@@ -80,6 +80,9 @@ struct Site {
     cfg: Static,
     /// The parts of a response that the configuration decides, made once.
     fixed: Fixed,
+    /// Extensions of files that are not looked up for a compressed sibling
+    /// (`precompressed_skip`).
+    skip_siblings: names::ExtSet,
     /// The `Authorization` value a request needs (`basic_auth`).
     auth: Option<String>,
     /// Prebuilt responses of small files (None: `cache_size = 0`, the default).
@@ -196,6 +199,7 @@ impl Site {
             cached_hits: AtomicU64::new(0),
             cached_misses: AtomicU64::new(0),
             fixed: Fixed::new(&cfg),
+            skip_siblings: names::ExtSet::new(&cfg.precompressed_skip),
             cache: Cache::new(cfg.cache_size, cfg.cache_max_file, cfg.cache_valid_ms, crate::sys::nofile_limit().0),
             cfg,
             auth,

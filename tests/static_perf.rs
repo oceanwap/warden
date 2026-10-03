@@ -715,7 +715,7 @@ fn without_openat2_every_request_is_answered_by_a_task() {
 /// Files that are compressed already get no sibling looked up (`logo.png.br`
 /// is not served: it would save nothing), and everything else still does.
 #[test]
-fn precompressed_siblings_are_served_for_text_and_not_looked_up_for_images() {
+fn precompressed_siblings_are_served_for_text_and_not_looked_up_for_the_listed_formats() {
     let tmp = Tmp::new("precompressed");
     let site = tmp.site();
     write(&site, "style.css", b"a{}");
@@ -737,6 +737,19 @@ fn precompressed_siblings_are_served_for_text_and_not_looked_up_for_images() {
     assert_eq!(get("/plain.js", "gzip, br"), (200, "".into(), b"console.log(1)".to_vec()));
     // An image is sent as it is, whatever sits next to it.
     assert_eq!(get("/logo.png", "gzip, br"), (200, "".into(), b"png bytes".to_vec()));
+
+    // `precompressed_skip` replaces the list: now the image is looked up, and the stylesheet is not.
+    let w = Worker::start(&tmp, &site, json!({ "precompressed_skip": ["css"] }));
+    let get = |path: &str| {
+        let r = Client::connect(w.port).get(path, "Accept-Encoding: gzip, br\r\nConnection: close\r\n");
+        (r.status, r.h("content-encoding").to_string(), r.body)
+    };
+    assert_eq!(get("/logo.png"), (200, "br".into(), b"br bytes of the png".to_vec()));
+    assert_eq!(get("/style.css"), (200, "".into(), b"a{}".to_vec()));
+    // An empty list looks up every file.
+    let w = Worker::start(&tmp, &site, json!({ "precompressed_skip": [] }));
+    let r = Client::connect(w.port).get("/style.css", "Accept-Encoding: br\r\nConnection: close\r\n");
+    assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("br", b"br bytes".as_slice()));
 }
 
 /// `Accept-Encoding: br;q=0` says "not brotli": the gzip file or the plain one.

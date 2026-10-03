@@ -182,6 +182,9 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # listing = false                            # HTML listing for directories without an index
 # dotfiles = false                           # serve dotfiles (.well-known is always served)
 # precompressed = true                       # serve file.br / file.gz when the client accepts them
+# precompressed_skip = ["png", "jpg", "pdf"]  # example; extensions never looked up for a .br/.gz (default: images, fonts, audio,
+#                                            # video, archives, PDF and office documents, see docs/static-serving.md); a list replaces
+#                                            # the default, [] looks up every file
 # basic_auth = "user:password"               # example; keep the config file private (0600)
 # headers = { "X-Frame-Options" = "DENY" }   # example; extra response headers
 # access_log = false                         # one stdout line per request

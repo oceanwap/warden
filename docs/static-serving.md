@@ -63,9 +63,10 @@ find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*
 
 or with your bundler's plugin (`vite-plugin-compression`, webpack's
 `compression-webpack-plugin`). A site without such files can set
-`precompressed = false`, which saves the lookups. Images, fonts, audio, video,
-archives and PDF or office documents are never looked up: they are compressed
-already (which is most of what an uploads folder holds).
+`precompressed = false`, which saves the lookups. Files that are compressed
+already (images, fonts, audio, video, archives, PDF and office documents:
+most of what an uploads folder holds) are never looked up; the list is
+`precompressed_skip`, and a list of your own replaces it.
 
 ## The response cache (optional)
 
@@ -129,7 +130,8 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages (`warden serve --html-max-age N`). Unset or `0`: HTML is revalidated on every load with its ETag, a 304 when unchanged. 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
-| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file but images, fonts, audio, video, archives and PDF or office documents: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
+| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file whose extension is not in `precompressed_skip`: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
+| `precompressed_skip` | images, fonts, audio, video, archives, PDF and office documents (`png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `heic`, `jxl`, `woff`, `woff2`, `mp3`, `m4a`, `aac`, `flac`, `ogg`, `opus`, `mp4`, `m4v`, `mov`, `mkv`, `webm`, `zip`, `gz`, `br`, `zst`, `bz2`, `xz`, `7z`, `rar`, `tgz`, `jar`, `apk`, `pdf`, `docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`, `epub`) | File extensions (last one of a name, any case, a dot in front is fine) that are never looked up for a `.br` / `.gz` sibling: formats that are compressed already, where a sibling saves nothing. A list **replaces** the default (to add one, write the default and yours); `[]` looks up every file |
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request (method, path, status, bytes, ms) |

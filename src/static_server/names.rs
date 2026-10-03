@@ -70,56 +70,34 @@ pub(super) fn mime(ext: &str) -> &'static str {
     }
 }
 
-/// A format that is compressed already (images, fonts, audio, video, archives,
-/// and PDF and office documents, which are archives inside): a `.br` or `.gz`
-/// next to such a file would save nothing, so none is looked for. Without
-/// this, every request of a browser, which sends `Accept-Encoding: gzip, br`,
-/// spent two failed lookups on each of them, which is most of what an uploads
-/// folder holds.
-pub(super) fn already_compressed(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "avif"
-            | "heic"
-            | "jxl"
-            | "woff"
-            | "woff2"
-            | "mp3"
-            | "m4a"
-            | "aac"
-            | "flac"
-            | "ogg"
-            | "opus"
-            | "mp4"
-            | "m4v"
-            | "mov"
-            | "mkv"
-            | "webm"
-            | "zip"
-            | "gz"
-            | "br"
-            | "zst"
-            | "bz2"
-            | "xz"
-            | "7z"
-            | "rar"
-            | "tgz"
-            | "jar"
-            | "apk"
-            | "pdf"
-            | "docx"
-            | "xlsx"
-            | "pptx"
-            | "odt"
-            | "ods"
-            | "odp"
-            | "epub"
-    )
+/// A set of file extensions (lowercase, at most 12 bytes: what `extension_of`
+/// gives) that a request tests its file against, `precompressed_skip`. Each
+/// is packed into 16 bytes and the set is sorted, so a lookup costs a copy and
+/// a few comparisons, whatever the list holds, and allocates nothing.
+pub(super) struct ExtSet(Vec<u128>);
+
+fn pack(ext: &str) -> Option<u128> {
+    let bytes = ext.as_bytes();
+    if bytes.is_empty() || bytes.len() > 12 {
+        return None;
+    }
+    let mut packed = [0u8; 16];
+    packed[..bytes.len()].copy_from_slice(bytes);
+    Some(u128::from_le_bytes(packed))
+}
+
+impl ExtSet {
+    /// Entries that are not extensions are left out.
+    pub(super) fn new<S: AsRef<str>>(list: &[S]) -> ExtSet {
+        let mut packed: Vec<u128> = list.iter().filter_map(|e| pack(e.as_ref())).collect();
+        packed.sort_unstable();
+        packed.dedup();
+        ExtSet(packed)
+    }
+
+    pub(super) fn contains(&self, ext: &str) -> bool {
+        pack(ext).is_some_and(|p| self.0.binary_search(&p).is_ok())
+    }
 }
 
 #[cfg(test)]
@@ -137,14 +115,20 @@ mod tests {
     }
 
     #[test]
-    fn compressed_formats_are_not_looked_up_for_a_compressed_sibling() {
-        for ext in ["png", "jpg", "heic", "woff2", "mp4", "mov", "zip", "gz", "br", "pdf", "docx", "xlsx"] {
-            assert!(already_compressed(ext), "{ext}");
+    fn a_set_of_extensions_finds_exactly_its_members() {
+        let set = ExtSet::new(&["png", "pdf", "woff2", "tar-gz", "png", "", "waytoolongextension"]);
+        for ext in ["png", "pdf", "woff2", "tar-gz"] {
+            assert!(set.contains(ext), "{ext}");
         }
-        // Text, and what is not known to be compressed, still is.
-        for ext in ["js", "css", "html", "svg", "json", "txt", "csv", "wasm", "ico", "ttf", "wav", "bmp", ""] {
-            assert!(!already_compressed(ext), "{ext}");
+        // Not members: other names, prefixes and extensions of members, nothing, too long.
+        for ext in ["js", "pn", "pngg", "pd", "woff", "", "waytoolongextension", "PNG"] {
+            assert!(!set.contains(ext), "{ext:?}");
         }
+        assert!(!ExtSet::new::<&str>(&[]).contains("png"));
+        // Whatever the default list holds is found, and only that.
+        let default = ExtSet::new(crate::config::PRECOMPRESSED_SKIP);
+        assert!(crate::config::PRECOMPRESSED_SKIP.iter().all(|e| default.contains(e)));
+        assert!(!default.contains("css") && !default.contains("svg"));
     }
 
     #[test]

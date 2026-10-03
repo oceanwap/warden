@@ -77,6 +77,13 @@ pub struct Static {
     /// Serve `file.br` / `file.gz` next to `file` when the client accepts them.
     #[serde(default = "yes")]
     pub precompressed: bool,
+    /// File extensions that are never looked up for a `.br` / `.gz` sibling:
+    /// formats that are compressed already, where a sibling would save
+    /// nothing and the lookups (two failed system calls) are a cost of every
+    /// request. The default is `PRECOMPRESSED_SKIP`; a list replaces it, and
+    /// `[]` looks up every file.
+    #[serde(default = "default_precompressed_skip", deserialize_with = "extensions")]
+    pub precompressed_skip: Vec<String>,
     /// `user:password` for HTTP Basic auth.
     #[serde(default)]
     pub basic_auth: Option<String>,
@@ -101,6 +108,44 @@ pub struct Static {
     /// an edited or deleted file is served fresh within this time.
     #[serde(default = "default_cache_valid_ms")]
     pub cache_valid_ms: u64,
+}
+
+/// `static.precompressed_skip` unless it is set: images, fonts, audio, video,
+/// archives, and PDF and office documents (archives inside).
+pub const PRECOMPRESSED_SKIP: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "jxl", // images
+    "woff", "woff2", // fonts
+    "mp3", "m4a", "aac", "flac", "ogg", "opus", "mp4", "m4v", "mov", "mkv", "webm", // audio and video
+    "zip", "gz", "br", "zst", "bz2", "xz", "7z", "rar", "tgz", "jar", "apk", // archives
+    "pdf", "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub", // documents
+];
+
+fn default_precompressed_skip() -> Vec<String> {
+    PRECOMPRESSED_SKIP.iter().map(|e| e.to_string()).collect()
+}
+
+/// `precompressed_skip = ["png", ".PDF"]`: extensions, made lowercase and
+/// without their dot (the worker matches against the last extension of a file
+/// name in lowercase).
+fn extensions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde::de::Error;
+    Vec::<String>::deserialize(d)?
+        .into_iter()
+        .map(|given| {
+            let ext = given.trim().trim_start_matches('.').to_ascii_lowercase();
+            let fine = !ext.is_empty()
+                && ext.len() <= 12
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-+".contains(&b));
+            if fine {
+                Ok(ext)
+            } else {
+                Err(D::Error::custom(format!(
+                    "static.precompressed_skip: {given:?} is not a file extension (letters and digits, \
+                     at most 12, like \"png\"; a dot in front is fine)"
+                )))
+            }
+        })
+        .collect()
 }
 
 fn default_cache_size() -> u64 {
@@ -1667,6 +1712,39 @@ mod tests {
         // The worker gets the section as JSON (WARDEN_STATIC); sizes survive the round trip.
         let json = serde_json::to_string(&st).unwrap();
         assert_eq!(serde_json::from_str::<Static>(&json).unwrap(), st);
+    }
+
+    #[test]
+    fn static_precompressed_skip_has_a_default_and_can_be_replaced() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        let skip =
+            |extra: &str| Config::parse(&format!("{base}{extra}\n")).unwrap().static_files.unwrap().precompressed_skip;
+        // Unset: formats that are compressed already, and nothing a text file could be.
+        let default = skip("");
+        for ext in ["png", "jpg", "webp", "woff2", "mp4", "zip", "pdf", "docx"] {
+            assert!(default.iter().any(|e| e == ext), "{ext}");
+        }
+        for ext in ["js", "css", "html", "svg", "json", "txt", "csv", "wasm", "ttf", "ico"] {
+            assert!(!default.iter().any(|e| e == ext), "{ext}");
+        }
+        assert_eq!(default.len(), PRECOMPRESSED_SKIP.len());
+        // A list replaces the default, and says what it means: no merging.
+        assert_eq!(skip("precompressed_skip = [\"png\", \"bin\"]"), ["png", "bin"]);
+        assert!(skip("precompressed_skip = []").is_empty(), "[] looks up every file");
+        // Dots and capitals are forgiven.
+        assert_eq!(skip("precompressed_skip = [\".PNG\", \" Jpg \"]"), ["png", "jpg"]);
+        // Anything that is not an extension is refused, with the key's name.
+        for bad in ["\"\"", "\"a/b\"", "\"png.br\"", "\"waytoolongextension\"", "\"p ng\"", "5"] {
+            let e = Config::parse(&format!("{base}precompressed_skip = [{bad}]\n")).unwrap_err();
+            assert!(e.contains("precompressed_skip") || e.contains("invalid type"), "{bad}: {e}");
+        }
+        // The worker gets it in WARDEN_STATIC.
+        let st = Config::parse(&format!("{base}precompressed_skip = [\"png\"]\n")).unwrap().static_files.unwrap();
+        let json = serde_json::to_string(&st).unwrap();
+        assert_eq!(serde_json::from_str::<Static>(&json).unwrap().precompressed_skip, ["png"]);
+        // A worker started with a configuration that has no such key has the default.
+        let old = serde_json::json!({ "root": "/srv/site" }).to_string();
+        assert_eq!(serde_json::from_str::<Static>(&old).unwrap().precompressed_skip, default);
     }
 
     #[test]
