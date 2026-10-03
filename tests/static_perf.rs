@@ -578,6 +578,7 @@ fn a_request_answered_from_the_accept_loop_matches_the_normal_path() {
         "/small.bin",
         "/mid10k.bin",
         "/mid12k.bin",
+        "/mid20k.bin",
         "/gz.js",
         "/sp%20ace.txt",
         "/style.css?v=1",

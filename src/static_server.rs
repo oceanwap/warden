@@ -986,7 +986,13 @@ async fn connection<R>(
         // the rest goes first. It counts as a request in flight, so a drain
         // waits for it as it does for any other.
         site.active.fetch_add(1, Ordering::SeqCst);
-        let sent = w.write_all(p.out.advance(p.at)).await;
+        let sent = match p.rest {
+            Rest::Bytes { out, at } => w.write_all(out.advance(at)).await,
+            Rest::Memfd { head, head_at, entry, off, count } => match &entry.file {
+                Some(m) => w.send_cached(&head.as_slice()[head_at..], &m.file, off, count).await,
+                None => Err(std::io::Error::other("a cached body without its memfd")),
+            },
+        };
         site.active.fetch_sub(1, Ordering::SeqCst);
         if sent.is_err() || !p.keep {
             head.give_back(&site);
@@ -1059,11 +1065,17 @@ async fn serve_requests<R>(
 
 /// The part of a response `first_request` could not send yet.
 struct Pending {
-    out: OutBuf,
-    /// How much of `out` has gone out.
-    at: usize,
+    rest: Rest,
     /// Keep the connection for more requests afterwards.
     keep: bool,
+}
+
+enum Rest {
+    /// Bytes in memory: `out` from `at` on.
+    Bytes { out: OutBuf, at: usize },
+    /// A response head (from `head_at` on), then `count` bytes of the cached
+    /// body in the entry's memfd, from `off`.
+    Memfd { head: OutBuf, head_at: usize, entry: Arc<Entry>, off: u64, count: u64 },
 }
 
 enum First {
@@ -1079,9 +1091,27 @@ enum First {
     Go { fd: OwnedFd, head: HeadBuf, pending: Option<Pending>, answered: bool },
 }
 
+/// A cached body in a memfd, to go out after `Inlined::out`: `count` bytes of
+/// the entry's memfd from `off`.
+struct MemBody {
+    entry: Arc<Entry>,
+    off: u64,
+    count: u64,
+}
+
+/// The most (head and body) the accept loop sends from a memfd itself: a
+/// sendfile of this much takes the kernel well under a tenth of a
+/// millisecond, which every other connection on the worker waits out. Bigger
+/// cached bodies go on as a task, which sends them in pieces and lets the
+/// others run in between.
+const INLINE_MEMFD_MAX: u64 = 256 * 1024;
+
 /// A request answered entirely from the response cache.
 struct Inlined {
+    /// What to send first: the whole response, or, with `memfd`, its head
+    /// (empty when the memfd holds the head too).
     out: OutBuf,
+    memfd: Option<MemBody>,
     status: u16,
     bytes: u64,
     keep: bool,
@@ -1140,33 +1170,62 @@ fn first_request(site: &Site, fd: OwnedFd, try_inline: bool) -> First {
         // The head is whole and `pos` is at it: the normal path finds it again.
         return First::Go { fd, head, pending: None, answered: false };
     };
-    let sent = crate::sys::send(fd.as_fd(), hit.out.as_slice(), false);
+    let (status, bytes, keep, log) = (hit.status, hit.bytes, hit.keep, hit.log);
+    let rest = send_inline(fd.as_fd(), hit.out, hit.memfd);
     if site.cfg.access_log {
-        let (m, p) = hit.log.as_ref().map(|(m, p)| (m.as_str(), p.as_str())).unwrap_or(("", ""));
+        let (m, p) = log.as_ref().map(|(m, p)| (m.as_str(), p.as_str())).unwrap_or(("", ""));
         let ms = t0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-        println!("{m} {p} {} {}B {ms:.1}ms cache=hit", hit.status, hit.bytes);
+        println!("{m} {p} {status} {bytes}B {ms:.1}ms cache=hit");
     }
-    let at = match sent {
-        Ok(n) => {
+    let rest = match rest {
+        Ok(rest) => {
             site.inline.fetch_add(1, Ordering::Relaxed);
-            n
+            rest
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 0,
         Err(_) => {
             head.give_back(site);
             return First::Done;
         }
     };
     head.consume(len);
-    if at < hit.out.as_slice().len() {
-        let pending = Some(Pending { out: hit.out, at, keep: hit.keep });
-        return First::Go { fd, head, pending, answered: true };
+    if let Some(rest) = rest {
+        return First::Go { fd, head, pending: Some(Pending { rest, keep }), answered: true };
     }
-    if !hit.keep {
+    if !keep {
         head.give_back(site);
         return First::Done;
     }
     First::Go { fd, head, pending: None, answered: true }
+}
+
+/// Send an inlined response without waiting: all of `out` (then `mem`, if
+/// any) that the socket takes now. `Ok(None)`: all of it went out;
+/// `Ok(Some(rest))`: the socket is full, `rest` is what is left; `Err`: the
+/// client is gone.
+fn send_inline(sock: std::os::fd::BorrowedFd<'_>, out: OutBuf, mem: Option<MemBody>) -> std::io::Result<Option<Rest>> {
+    use std::io::ErrorKind::{Interrupted, WouldBlock};
+    let Some(m) = mem else {
+        let at = match crate::sys::send(sock, out.as_slice(), false) {
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => 0,
+            Err(e) => return Err(e),
+        };
+        return Ok((at < out.as_slice().len()).then_some(Rest::Bytes { out, at }));
+    };
+    let Some(file) = &m.entry.file else { return Err(std::io::Error::other("a cached body without its memfd")) };
+    let head_len = out.as_slice().len();
+    let mut off = m.off as i64;
+    let n = match crate::sys::sendfile_head(sock, file.file.as_fd(), &mut off, m.count as usize, out.as_slice()) {
+        Ok(n) => n,
+        Err(e) if matches!(e.kind(), WouldBlock | Interrupted) => 0,
+        Err(e) => return Err(e),
+    };
+    let (h, b) = crate::sys::split_head_body(n, head_len, m.count)
+        .ok_or_else(|| std::io::Error::other("sendfile reported more bytes than were asked for"))?;
+    if h == head_len && b == m.count {
+        return Ok(None);
+    }
+    Ok(Some(Rest::Memfd { head: out, head_at: h, entry: m.entry, off: m.off + b, count: m.count - b }))
 }
 
 /// The cached answer to the request in `bytes`, if it can be sent at once
@@ -1184,14 +1243,28 @@ fn inline_hit(site: &Site, bytes: &[u8], key: &mut String) -> Option<Inlined> {
     cache_key_into(key, &rel, cfg, &req, url_path.ends_with('/'));
     let Lookup::Fresh(e) = cache.lookup(key, Instant::now()) else { return None };
     let not_modified = is_not_modified(&req, &e.etag, e.mtime);
-    if e.file.is_some() && !not_modified && req.method != "HEAD" {
-        return None; // a body in a memfd goes by sendfile, on the normal path
+    // A body in a memfd goes by sendfile; the accept loop does that for the
+    // smaller ones.
+    let from_memfd = e.file.is_some() && !not_modified && req.method != "HEAD";
+    if from_memfd && e.head_len as u64 + e.body_len > INLINE_MEMFD_MAX {
+        return None;
     }
     cache.hits.fetch_add(1, Ordering::Relaxed);
     let keep = req.keep_alive && !site.draining.load(Ordering::SeqCst);
-    let (out, status, bytes) = cached_bytes(&req, &e, keep, not_modified);
     let log = cfg.access_log.then(|| (req.method.to_string(), req.path.to_string()));
-    Some(Inlined { out, status, bytes, keep, log })
+    if from_memfd {
+        let (head_len, body_len) = (e.head_len as u64, e.body_len);
+        // The memfd holds the whole response, head included: kept, one
+        // sendfile of all of it; closing, the head with `close` goes first.
+        let (out, memfd) = if keep {
+            (OutBuf::Vec(Vec::new()), MemBody { entry: e.clone(), off: 0, count: head_len + body_len })
+        } else {
+            (OutBuf::Vec(close_head(&e)), MemBody { entry: e.clone(), off: head_len, count: body_len })
+        };
+        return Some(Inlined { out, memfd: Some(memfd), status: 200, bytes: body_len, keep, log });
+    }
+    let (out, status, bytes) = cached_bytes(&req, &e, keep, not_modified);
+    Some(Inlined { out, memfd: None, status, bytes, keep, log })
 }
 
 /// A plain-text error. The head and the body go out in one write (one
@@ -1783,10 +1856,7 @@ async fn respond_cached(
         if keep {
             w.send_cached(&[], &mem.file, 0, (e.head_len as u64) + e.body_len).await?;
         } else {
-            let mut head = Vec::with_capacity(e.head_len);
-            head.extend_from_slice(&e.resp[..e.conn_at]);
-            head.extend_from_slice(b"close");
-            head.extend_from_slice(&e.resp[e.conn_at + cache::KEEP_ALIVE.len()..e.head_len]);
+            let head = close_head(e);
             w.send_cached(&head, &mem.file, e.head_len as u64, e.body_len).await?;
         }
         w.flush().await?;
@@ -1796,6 +1866,16 @@ async fn respond_cached(
     w.write_all(out).await?;
     w.flush().await?;
     Ok((status, bytes))
+}
+
+/// The head of a cached response with `Connection: close` in place of
+/// `keep-alive`.
+fn close_head(e: &Entry) -> Vec<u8> {
+    let mut head = Vec::with_capacity(e.head_len);
+    head.extend_from_slice(&e.resp[..e.conn_at]);
+    head.extend_from_slice(b"close");
+    head.extend_from_slice(&e.resp[e.conn_at + cache::KEEP_ALIVE.len()..e.head_len]);
+    head
 }
 
 /// The bytes that answer `req` from the cached `e`, and the status and body
@@ -2559,6 +2639,25 @@ mod tests {
 
     /// A cache entry for `/t.js`: a response of `body` bytes, as the server builds them.
     fn put_entry(site: &Site, body: usize) -> Arc<Entry> {
+        put_entry_as(site, body, false)
+    }
+
+    /// The same, the whole response in a memfd (as for bodies of 8 KB and more).
+    fn put_memfd_entry(site: &Site, body: usize) -> Arc<Entry> {
+        let e = put_entry_as(site, body, true);
+        assert!(e.file.is_some(), "a memfd was made");
+        e
+    }
+
+    /// What a memfd entry holds: the head, then the body.
+    fn memfd_bytes(e: &Entry) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let mut v = vec![0u8; e.head_len + e.body_len as usize];
+        e.file.as_ref().unwrap().file.read_exact_at(&mut v, 0).unwrap();
+        v
+    }
+
+    fn put_entry_as(site: &Site, body: usize, memfd: bool) -> Arc<Entry> {
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {body}\r\nETag: W/\"1-2\"\r\n\
              Last-Modified: Thu, 01 Jan 1970 00:00:02 GMT\r\nConnection: keep-alive\r\n\r\n"
@@ -2567,9 +2666,11 @@ mod tests {
         let nm = "HTTP/1.1 304 Not Modified\r\nETag: W/\"1-2\"\r\nConnection: keep-alive\r\n\r\n";
         let mut resp = head.clone().into_bytes();
         resp.extend((0..body).map(|i| b'a' + (i % 26) as u8));
+        let file = memfd.then(|| site.cache.as_ref().unwrap().memfd(&resp, body as u64)).flatten();
+        let resp: Arc<[u8]> = if file.is_some() { resp[..head.len()].into() } else { resp.into() };
         let e = Arc::new(Entry {
-            resp: resp.into(),
-            file: None,
+            resp,
+            file,
             head_len: head.len(),
             conn_at,
             not_modified: nm.as_bytes().to_vec().into(),
@@ -2722,12 +2823,13 @@ mod tests {
             )
         };
         assert!(!p.keep && answered);
-        let total = p.out.as_slice().len();
-        assert!(p.at < total, "the socket took {} of {total}", p.at);
+        let Rest::Bytes { out, at } = p.rest else { panic!("bytes in memory") };
+        let total = out.as_slice().len();
+        assert!(at < total, "the socket took {at} of {total}");
         // What was sent plus what is pending is the whole response, in order.
-        let mut sent = vec![0u8; p.at];
+        let mut sent = vec![0u8; at];
         c.read_exact(&mut sent).unwrap();
-        let rest = p.out.advance(p.at);
+        let rest = out.advance(at);
         sent.extend_from_slice(rest.as_slice());
         let want =
             cached_bytes(&parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(), &e, false, false).0;
@@ -2812,5 +2914,125 @@ mod tests {
         }
         assert!(ran.load(Ordering::SeqCst), "{} connections taken before any other task had a turn", taken.len());
         assert!(taken.len() < 200, "{} connections taken before another task ran", taken.len());
+    }
+    /// A cached body in a memfd (8 KB and more) is sent by the accept loop too:
+    /// the same bytes the normal path sends, in one sendfile (kept alive) or a
+    /// head and a sendfile (closing).
+    #[test]
+    fn a_cached_body_in_a_memfd_is_answered_from_the_accept_loop() {
+        use std::io::{Read, Write};
+        let site = test_site(false);
+        let e = put_memfd_entry(&site, 20_000);
+        let whole = memfd_bytes(&e);
+
+        let (mut c, fd) = accepted();
+        c.write_all(b"GET /t.js HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+        wait_readable(&c);
+        assert!(matches!(first_request(&site, fd, true), First::Done));
+        let mut got = Vec::new();
+        c.read_to_end(&mut got).unwrap();
+        let mut want = close_head(&e);
+        want.extend_from_slice(&whole[e.head_len..]);
+        assert!(got == want, "got {} bytes, wanted {}", got.len(), want.len());
+        assert!(String::from_utf8_lossy(&got[..e.head_len]).contains("Connection: close\r\n"));
+        assert_eq!(site.inline.load(Ordering::Relaxed), 1);
+        assert_eq!(site.cache.as_ref().unwrap().hits.load(Ordering::Relaxed), 1);
+
+        // Kept alive: the memfd as it is, and what came after the request is kept.
+        let (mut c, fd) = accepted();
+        c.write_all(b"GET /t.js HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\n").unwrap();
+        wait_readable(&c);
+        let First::Go { fd: _fd, head, pending, answered } = first_request(&site, fd, true) else {
+            panic!("kept alive")
+        };
+        assert!(pending.is_none() && answered);
+        assert_eq!(&head.buf[head.pos..], b"GET /next HTTP/1.1\r\n");
+        let mut got = vec![0u8; whole.len()];
+        c.read_exact(&mut got).unwrap();
+        assert!(got == whole, "the keep-alive response, byte for byte");
+
+        // Bigger than the accept loop sends itself: handed on whole, nothing sent.
+        let big = put_memfd_entry(&site, 300_000);
+        let (mut c, fd) = accepted();
+        c.write_all(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        wait_readable(&c);
+        let First::Go { fd: _fd, head, pending, answered } = first_request(&site, fd, true) else {
+            panic!("too big for the accept loop")
+        };
+        assert!(pending.is_none() && !answered && !head.buf.is_empty());
+        c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        assert!(c.read(&mut [0u8; 1]).is_err(), "nothing was sent");
+        assert!(big.head_len as u64 + big.body_len > INLINE_MEMFD_MAX);
+    }
+
+    /// A memfd body the socket cannot take all of: what went out is counted
+    /// and the rest, head included, is handed on exactly.
+    #[test]
+    fn a_memfd_body_too_big_for_the_socket_goes_on_with_the_rest() {
+        use std::io::{Read, Write};
+        let site = test_site(false);
+        let e = put_memfd_entry(&site, 250_000);
+        let whole = memfd_bytes(&e);
+        for keep in [true, false] {
+            let (mut c, fd) = accepted();
+            crate::sys::set_send_buffer(fd.as_fd(), 4096).unwrap();
+            let conn = if keep { "" } else { "Connection: close\r\n" };
+            c.write_all(format!("GET /t.js HTTP/1.1\r\n{conn}\r\n").as_bytes()).unwrap();
+            wait_readable(&c);
+            let First::Go { fd: _fd, pending: Some(p), answered, .. } = first_request(&site, fd, true) else {
+                panic!("partial, keep={keep}")
+            };
+            assert!(answered && p.keep == keep);
+            let Rest::Memfd { head, head_at, entry, off, count } = p.rest else { panic!("memfd, keep={keep}") };
+            assert!(Arc::ptr_eq(&entry, &e));
+            assert!(count > 0 && off + count == whole.len() as u64, "the rest ends where the response does");
+            // What the client has, then what is left: the whole response.
+            let mut want = if keep { whole[..e.head_len].to_vec() } else { close_head(&e) };
+            want.extend_from_slice(&whole[e.head_len..]);
+            let sent = want.len() - count as usize - (head.as_slice().len() - head_at);
+            let mut got = vec![0u8; sent];
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            c.read_exact(&mut got).unwrap();
+            got.extend_from_slice(&head.as_slice()[head_at..]);
+            got.extend_from_slice(&whole[off as usize..]);
+            assert!(got == want, "keep={keep}: {} bytes, wanted {}", got.len(), want.len());
+        }
+    }
+
+    /// The task finishes a memfd body the accept loop could not send, then
+    /// closes (Connection: close).
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_task_finishes_a_memfd_response() {
+        use std::io::{Read, Write};
+        let site = Arc::new(test_site(false));
+        let e = put_memfd_entry(&site, 250_000);
+        let whole = memfd_bytes(&e);
+        let (mut c, fd) = accepted();
+        crate::sys::set_send_buffer(fd.as_fd(), 4096).unwrap();
+        c.write_all(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap();
+        wait_readable(&c);
+        let First::Go { fd, head, pending, answered } = first_request(&site, fd, true) else { panic!("partial") };
+        assert!(matches!(pending, Some(Pending { rest: Rest::Memfd { .. }, .. })) && answered);
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            c.read_to_end(&mut got).unwrap();
+            got
+        });
+        let stream = tokio::net::TcpStream::from_std(std::net::TcpStream::from(fd)).unwrap();
+        let guard = site.idle.register(stream.as_raw_fd());
+        let s2 = site.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let guard = guard;
+            let (r, w) = stream.split();
+            connection(r, Conn::Tcp(w), s2, &guard, head, pending, answered).await;
+        })
+        .await
+        .unwrap();
+        let got = reader.join().unwrap();
+        let mut want = close_head(&e);
+        want.extend_from_slice(&whole[e.head_len..]);
+        assert!(got == want, "{} bytes, wanted {}", got.len(), want.len());
+        assert_eq!(site.active.load(Ordering::SeqCst), 0);
     }
 }
