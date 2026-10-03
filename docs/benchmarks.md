@@ -268,8 +268,11 @@ For a page this small `sendfile off` is clearly cheaper for nginx (11.3 against
 14.0 µs), so the README's plain-file graphic shows nginx at that setting for the
 1.5 KB bar, next to Warden from the same run: 8.19 against 11.28 µs, 27 % less
 CPU (against `sendfile on; tcp_nopush on`, 8.19 against 14.00). At 20 and 100
-KB nginx ran only with `sendfile on; tcp_nopush on`: other settings were not
-tried at those sizes, and may favour nginx there too. The nginx columns of the
+KB nginx stays at `sendfile on; tcp_nopush on`, because it is its fastest
+setting there: a second run (5 rounds, same method) had `sendfile off` slower,
+at 20 KB 13.79 (`tcp_nopush off`) and 13.37 (`on`) µs against 10.63 for the
+stock setting, at 100 KB 40.48 and 40.84 against 20.00, with Warden at 9.02 and
+20.15 µs in that run. The nginx columns of the
 2026-10-02 round and of the third part of 2026-10-03 (both further down) were
 measured with that same setting (the package's default configuration has it):
 the lead over nginx on 1 KB files in those tables, such as 45 % less CPU on a

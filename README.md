@@ -91,7 +91,7 @@ One small VM with 2 CPUs, shared with the load generator: compare the bars, not 
 
 ![Warden against nginx for plain files of 1.5, 20 and 100 KB: server CPU per request and requests per second](docs/img/bench-static.svg)
 
-- **Better:** 27 % less CPU per request on a 1.5 KB page (nginx at the fastest of four settings tried) and 19 % less on a 20 KB stylesheet (nginx with `sendfile on`, the only setting tried there): 121k and 112k req/s against 87k and 93k.
+- **Better:** 27 % less CPU per request on a 1.5 KB page (nginx at the fastest of four settings tried) and 19 % less on a 20 KB stylesheet (nginx with `sendfile on`, its fastest setting there): 121k and 112k req/s against 87k and 93k.
 - **Level:** at 100 KB, 18.19 against 18.58 µs, inside the spread of the rounds (same nginx setting as at 20 KB).
 - **Costs:** none that this run shows. It measures kept-alive connections only, and neither side caches files: Warden's response cache is off by default, and the nginx here has no `open_file_cache`.
 
