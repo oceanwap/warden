@@ -110,6 +110,20 @@ under every manager, and Warden's rolling restarts still lost none).
   between them: the same request waits 0.34 ms (nginx 0.68), and from 1.25
   MiB `TCP_CORK` takes 21-38 % off the CPU per 2-100 MB response, level with
   nginx. 2026-10-02 round below; measured on a loaded VM.
+- **Compressed files against nginx** (2026-10-03, one worker each, a 20 KB
+  stylesheet and a 100 KB script, the client asking for gzip; section "Static
+  files against nginx" below). Warden answers from a copy it made in the
+  background: 12.56 and 13.72 µs of CPU per request. nginx compressing on the
+  fly (`gzip on`) needs 94.05 and 627.36 µs at level 1, 345.99 and 2,430.30 µs
+  at level 6: 7 to 177 times Warden's CPU, at 10.6k down to 412 req/s against
+  Warden's 79.0k and 70.1k. Against `gzip_static` (a `.gz` made at build time)
+  it is level: 11 % less CPU at 20 KB (12.56 against 14.16 µs), 10 % **more**
+  at 100 KB (13.72 against 12.50 µs), where nginx also has the better p99
+  (0.84 against 2.19 ms). Warden's costs: the first request for a file, and
+  the first after it changes, is sent uncompressed (the compression is queued),
+  and a compressed answer takes about 4 µs more CPU than a plain one of the
+  same file (12.56 against 8.60 µs for the stylesheet), because it opens the
+  copy as well.
 - **Logs.** Warden reads a flooding worker at ~810 MB/s (PM2 177 MB/s) for
   a tenth of PM2's CPU per GB. Keeping every line costs more when lines
   are parsed (`max_lines_per_sec = 0`: 379 MB/s, 3.4 CPU s/GB); with
@@ -174,6 +188,123 @@ tests fail (the ratio and thread tests pass: they only catch a gross
 regression). `bun bench/static.ts --scenarios warden,nginx` runs the
 throughput table and, after it, the "page next to a big download" table
 (`--no-blocking` skips it, `--warden PATH` runs another build).
+
+## Static files against nginx, plain and compressed (2026-10-03)
+
+The two nginx graphics of the README come from this round: Warden's static
+server (`warden serve`, one worker, default configuration: no response cache,
+`compress` on) against nginx 1.24 (the Ubuntu package, one worker), for plain
+files and for files sent compressed with gzip. Warden's compression makes a
+copy once, in the background; nginx can serve a `.gz` made at build time
+(`gzip_static`) or compress on every request (`gzip on`, level 1 or level 6).
+nginx 1.24 here has no brotli module, so brotli is not compared.
+
+**Method.** One 2-CPU VM (Xeon 2.10 GHz, kernel 6.18.44), noisy as in the
+other rounds; loopback. The server on CPU 0 and `wrk -t1 -c32 -d4s` on CPU 1:
+32 keep-alive connections in a closed loop, 4 s per run, medians of 5 rounds
+in which the servers took turns first (so a slow minute does not fall on one
+of them). Server CPU per request is the server's user + system time from
+`/proc/<pid>/stat` over the run, divided by the requests `wrk` counted (clock
+ticks of 10 ms; the kernel's loopback work is in it, `wrk`'s is not). Brackets
+give the lowest and highest of the 5 rounds. Warden: its copies were made
+before the timed runs, so the compressed rows measure answers from a copy, not
+the compression itself. nginx: `sendfile on; tcp_nopush on; access_log off;
+keepalive_requests 1000000`, and `gzip_static on` or `gzip on` with
+`gzip_comp_level` 1 or 6 for the compressed rows. The files are synthetic: a
+1,537 byte HTML page, a 20,480 byte stylesheet and a 102,400 byte script. For
+the compressed rows Warden sent 3,259 and 13,036 bytes (the `.gz` files
+`gzip_static` serves are 3,267 and 13,038 bytes), and it has a brotli copy of
+2,830 bytes for the stylesheet, sent when the client takes `br`. The harness is
+a throwaway script, not in the repository.
+
+Plain files, no compression asked for:
+
+| File | Server | CPU per request, µs | req/s | p99, µs |
+|---|---|---|---|---|
+| 1.5 KB page | Warden | 8.12 (8.07-8.40) | 121.7k | 543 |
+| | nginx | 14.14 (13.20-14.59) | 69.7k | 703 |
+| 20 KB stylesheet | Warden | 8.60 (8.38-8.71) | 112.0k | 495 |
+| | nginx | 10.58 (10.09-11.25) | 93.3k | 697 |
+| 100 KB script | Warden | 18.19 (16.89-19.88) | 46.4k | 930 |
+| | nginx | 18.58 (17.76-18.86) | 43.3k | 41,290 |
+
+nginx's p99 of 41.3 ms for the 100 KB script (41.2 to 41.4 ms in each of the 5
+rounds; Warden's: 0.9 ms) was not investigated. It is used nowhere in the
+README or its graphics. The 1.5 KB nginx row is its package default
+(`sendfile on; tcp_nopush on`); see the next check.
+
+Compressed (`Accept-Encoding: gzip`):
+
+| File | Server | CPU per request, µs | req/s | p99, µs |
+|---|---|---|---|---|
+| 20 KB stylesheet | Warden, background copy | 12.56 (12.28-12.86) | 79.0k | 797 |
+| | nginx `gzip_static` | 14.16 (13.68-14.52) | 69.2k | 843 |
+| | nginx `gzip on`, level 1 | 94.05 (90.80-101.37) | 10.6k | 3,610 |
+| | nginx `gzip on`, level 6 | 345.99 (340.95-362.43) | 2.9k | 13,680 |
+| 100 KB script | Warden, background copy | 13.72 (13.57-14.71) | 70.1k | 2,190 |
+| | nginx `gzip_static` | 12.50 (11.95-13.11) | 77.4k | 843 |
+| | nginx `gzip on`, level 1 | 627.36 (623.93-647.35) | 1.6k | 22,140 |
+| | nginx `gzip on`, level 6 | 2,430.30 (2,389.75-2,461.54) | 412 | 762,300 |
+
+In a closed loop of 32 connections the mean latency is 32 divided by req/s:
+for the `gzip on` rows 3.0 ms (stylesheet, level 1), 11 ms (stylesheet, level
+6), 20 ms (script, level 1) and 78 ms (script, level 6). Their p99 is the queue
+in front of a worker that has no CPU left, not the cost of one request.
+
+**The 1.5 KB check.** nginx's 14.1 µs for a 1.5 KB file looked high, and
+`tcp_nopush` adds system calls to a body that small, so the page was measured
+again with four nginx settings and Warden in the same run (5 rounds, medians,
+CPU µs per request and req/s; no p99 or ranges were kept):
+
+| Server | CPU per request, µs | req/s |
+|---|---|---|
+| Warden | 8.19 | 121.3k |
+| nginx `sendfile on; tcp_nopush on` (the table above) | 14.00 | 71.3k |
+| nginx `sendfile on; tcp_nopush off` | 13.31 | 76.4k |
+| nginx `sendfile off; tcp_nopush off` | **11.28** | 86.9k |
+| nginx `sendfile off; tcp_nopush on` | 11.47 | 85.8k |
+
+For a page this small `sendfile off` is clearly cheaper for nginx (11.3 against
+14.0 µs), so the README's plain-file graphic shows nginx at that setting for the
+1.5 KB bar, next to Warden from the same run: 8.19 against 11.28 µs, 27 % less
+CPU (against `sendfile on; tcp_nopush on`, 8.19 against 14.00). At 20 and 100
+KB nginx ran only with `sendfile on; tcp_nopush on`: other settings were not
+tried at those sizes, and may favour nginx there too. The nginx columns of the
+2026-10-02 round and of the third part of 2026-10-03 (both further down) were
+measured with that same setting (the package's default configuration has it):
+the lead over nginx on 1 KB files in those tables, such as 45 % less CPU on a
+kept-alive file, is against that setting and is probably smaller against
+`sendfile off`. It was not re-measured.
+
+**What this says.**
+
+- Compressed, against nginx compressing on the fly, Warden uses 7 to 177 times
+  less CPU per request: 94.05 and 345.99 µs against 12.56 for the stylesheet
+  (7.5 and 27.5 times), 627.36 and 2,430.30 against 13.72 for the script (45.7
+  and 177.2 times). The README quotes them rounded down. nginx pays that on
+  every request; Warden once per version of a file.
+- Against `gzip_static` it is level. 11 % less CPU at 20 KB (12.56 against 14.16
+  µs, the ranges do not overlap), and 10 % **more** at 100 KB (13.72 against
+  12.50 µs, again no overlap): there nginx is ahead, with 77.4k against 70.1k
+  req/s and a better p99 (0.84 against 2.19 ms).
+- Plain, Warden uses 27 % less CPU on the 1.5 KB page against nginx's best
+  setting of four, 19 % less on the 20 KB stylesheet, and is level at 100 KB
+  (18.19 against 18.58 µs; the ranges overlap).
+
+**What it costs, and what is not measured.**
+
+- The first request for a file, and the first after it changes, is sent as it
+  is and queues the compression. The numbers above are for answers from a copy.
+- An answer from a copy takes about 4 µs more CPU than a plain one of the same
+  file (12.56 against 8.60 µs for the stylesheet): it opens the copy as well.
+- The CPU of making a copy is not in the per-request numbers: brotli at its best
+  level takes about 1.5 s of CPU per MB ([`static-serving.md`](static-serving.md)),
+  once per version of a file, in a process at the lowest priority that still
+  takes CPU while it runs. The copies need a private folder (`compress_dir`).
+- One synthetic file per size, and compression ratios depend on the content (6.3
+  and 7.9 times here). One connection count (32), kept-alive connections only.
+  A noisy VM: compare the columns, and re-measure on a quiet machine, ideally the
+  ARM64 target, before deciding anything that depends on a few percent.
 
 ## Findings about the other managers
 

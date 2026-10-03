@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 641" width="1000" height="641" role="img" aria-labelledby="t d">
+<!-- Numbers: docs/benchmarks.md (nginx runs of 2026-10-03) -->
+<title id="t">Compressed files: Warden against nginx</title>
+<desc id="d">Two bar charts of server CPU per request when the client asks for gzip, Warden against nginx 1.24. 20 KB stylesheet: Warden 12.56 microseconds, nginx gzip_static 14.16, nginx gzip on level 1 94.05, level 6 345.99. 100 KB script: Warden 13.72, gzip_static 12.50, gzip on level 1 627.36, level 6 2,430.30. Warden uses 7 to 177 times less CPU than nginx compressing on the fly; against gzip_static it is level, 11 percent less at 20 KB and 10 percent more at 100 KB.</desc>
+<rect x="0.5" y="0.5" width="999" height="640" rx="16" fill="#0f111a" stroke="#2a3060" stroke-width="1" />
+<text x="32" y="58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#f1f3ff" text-anchor="start" >Compressed files: Warden against nginx 1.24</text>
+<text x="32" y="86" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#a9b1d6" text-anchor="start" >Server CPU per request, shorter is better. The client asks for gzip.</text>
+<text x="968" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f1f3ff" text-anchor="end" >nginx</text>
+<rect x="902.219" y="44" width="14" height="14" rx="3" fill="#66708f" />
+<text x="880.219" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f1f3ff" text-anchor="end" >Warden</text>
+<rect x="797.438" y="44" width="14" height="14" rx="3" fill="#6b76f5" />
+<rect x="32" y="104" width="936" height="34" rx="17" fill="#12332b" stroke="#34d399" stroke-width="1.2" />
+<text x="500" y="126.58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15.5" font-weight="700" fill="#34d399" text-anchor="middle" >Against nginx compressing on the fly: 7× (20 KB, level 1) to 177× (100 KB, level 6) less CPU</text>
+<rect x="32" y="146" width="936" height="34" rx="17" fill="#33270a" stroke="#fbbf24" stroke-width="1.2" />
+<text x="500" y="168.58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15.5" font-weight="700" fill="#fbbf24" text-anchor="middle" >Against gzip_static: level. 11 % less CPU at 20 KB, 10 % more at 100 KB (nginx is ahead)</text>
+<rect x="32" y="200" width="460" height="314" rx="14" fill="#161a2b" stroke="#2a3060" stroke-width="1" />
+<text x="54" y="236" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="700" fill="#f1f3ff" text-anchor="start" >20 KB stylesheet</text>
+<text x="470" y="236" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#a9b1d6" text-anchor="end" >3,259 bytes sent</text>
+<text x="54" y="258" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >gzip. Bars start at zero; full width is 346 µs.</text>
+<text x="54" y="292" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >Warden</text>
+<text x="470" y="292" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >79.0k req/s</text>
+<rect x="54" y="301" width="11.1832" height="20" rx="3" fill="#6b76f5" />
+<text x="75.1832" y="317" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7ff" text-anchor="start" >12.56 µs</text>
+<text x="54" y="348" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip_static</text>
+<text x="470" y="348" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >69.2k req/s</text>
+<rect x="54" y="357" width="12.6039" height="20" rx="3" fill="#66708f" />
+<text x="76.6039" y="373" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >14.16 µs</text>
+<text x="54" y="404" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip on, level 1</text>
+<text x="470" y="404" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >10.6k req/s</text>
+<rect x="54" y="413" width="83.7202" height="20" rx="3" fill="#66708f" />
+<text x="147.72" y="429" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >94.05 µs</text>
+<text x="54" y="460" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip on, level 6</text>
+<text x="470" y="460" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >2.9k req/s</text>
+<rect x="54" y="469" width="308" height="20" rx="3" fill="#66708f" />
+<text x="372" y="485" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >345.99 µs</text>
+<rect x="508" y="200" width="460" height="314" rx="14" fill="#161a2b" stroke="#2a3060" stroke-width="1" />
+<text x="530" y="236" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="19" font-weight="700" fill="#f1f3ff" text-anchor="start" >100 KB script</text>
+<text x="946" y="236" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#a9b1d6" text-anchor="end" >13,036 bytes sent</text>
+<text x="530" y="258" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >gzip. Bars start at zero; full width is 2,430 µs.</text>
+<text x="530" y="292" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >Warden</text>
+<text x="946" y="292" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >70.1k req/s</text>
+<rect x="530" y="301" width="3" height="20" rx="3" fill="#6b76f5" />
+<text x="543" y="317" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7ff" text-anchor="start" >13.72 µs</text>
+<text x="530" y="348" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip_static</text>
+<text x="946" y="348" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >77.4k req/s</text>
+<rect x="530" y="357" width="3" height="20" rx="3" fill="#66708f" />
+<text x="543" y="373" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >12.50 µs</text>
+<text x="530" y="404" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip on, level 1</text>
+<text x="946" y="404" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >1.6k req/s</text>
+<rect x="530" y="413" width="79.5071" height="20" rx="3" fill="#66708f" />
+<text x="619.507" y="429" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >627.36 µs</text>
+<text x="530" y="460" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#f1f3ff" text-anchor="start" >nginx gzip on, level 6</text>
+<text x="946" y="460" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >412 req/s</text>
+<rect x="530" y="469" width="308" height="20" rx="3" fill="#66708f" />
+<text x="848" y="485" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >2,430.30 µs</text>
+<text x="32" y="540" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >Warden: default configuration, compress on, the copy already made. The first request for a file is sent as it is.</text>
+<text x="32" y="559" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >gzip_static serves a .gz made at build time; gzip on compresses on every request.</text>
+<text x="32" y="578" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >Warden also makes brotli (2,830 bytes for the 20 KB file); the nginx package tested has no brotli module.</text>
+<text x="32" y="597" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >One worker each, 32 connections, wrk on the other CPU, medians of 5 interleaved rounds, 2-vCPU VM. Measured 2026-10-03. Source and</text>
+<text x="32" y="616" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >method: docs/benchmarks.md</text>
+</svg>
