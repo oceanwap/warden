@@ -200,6 +200,17 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   loop" is printed with or without a cache. The benchmark scenario
   `warden-nocache` is now `warden` and `warden` is `warden-cache`:
   [`docs/benchmarks.md`](docs/benchmarks.md).
+- The static server's source is split by concern (`src/static_server/`: the
+  accept loop, the request head, the output side, the handler, the response
+  heads, the cache glue), with the same behaviour apart from details found
+  in review: a response the socket takes only in part keeps its file open
+  (a worker out of descriptors could cut it short), the accept loop contains
+  a panicking handler to its connection as a task would, a conditional
+  request with an absurd date no longer overflows the date arithmetic, a
+  worker without `openat2` does not try the accept-loop path twice, and the
+  generated responses (errors, 301, 416, listings, 401) are made by one
+  function, so their header lines can come in another order (the 401 now says
+  `charset=utf-8`).
 - `Status.watching` (the `watching` column) says whether a watcher is running
   now, not only that `[watch]` is enabled: it reads `disabled` for a stopped
   app or a watcher that died (`describe` says "set, but not running").

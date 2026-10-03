@@ -741,7 +741,7 @@ pub fn recv_into(sock: BorrowedFd<'_>, buf: &mut Vec<u8>) -> io::Result<usize> {
 }
 
 /// A small send buffer on `sock`, so a test can fill it with a modest write.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub fn set_send_buffer(sock: BorrowedFd<'_>, bytes: i32) -> io::Result<()> {
     setsockopt_int(sock, libc::SOL_SOCKET, libc::SO_SNDBUF, bytes)
 }

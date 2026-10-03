@@ -329,7 +329,7 @@ keep-alive request says 74 % of the worker's CPU is the kernel's TCP
 (`tcp_sendmsg`, the loopback delivery and the wake-up of the client) and 26 %
 its own: parsing the head into a dozen heap strings, a tokio timer per
 request, a formatted cache key, and the task machinery. Three changes, in
-`src/static_server.rs` and `src/static_server/idle.rs`:
+the static server (`src/static_server*`, then one file, now split by concern):
 
 - **The head is parsed in place.** No allocation per request: the method,
   target and the seven headers the server reads are slices of the read buffer

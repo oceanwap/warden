@@ -679,17 +679,68 @@ fn accept_loop_matches_normal_path(cache: bool) {
     // The comparison above means something only if the accept loop really did
     // answer on the first worker, and never on the second: the workers say
     // how many when they stop.
-    let answered = |log: &str| -> u64 {
-        let line = log
-            .lines()
-            .find(|l| l.contains("requests answered in the accept loop"))
-            .unwrap_or_else(|| panic!("no summary in {log}"));
-        let n = line.strip_prefix("static: ").and_then(|l| l.split_once(' ')).unwrap_or_else(|| panic!("{line}")).0;
-        n.parse().unwrap_or_else(|_| panic!("{line}"))
-    };
     let n = answered(&inline.stop());
     assert!(n > cases.len() as u64 / 2, "only {n} of {} exchanges were answered in the accept loop", cases.len());
     assert_eq!(answered(&normal.stop()), 0, "WARDEN_STATIC_INLINE=0 turns it off");
+}
+
+/// How many requests the accept loop answered, from the worker's output when
+/// it stopped.
+fn answered(log: &str) -> u64 {
+    let line = log
+        .lines()
+        .find(|l| l.contains("requests answered in the accept loop"))
+        .unwrap_or_else(|| panic!("no summary in {log}"));
+    let n = line.strip_prefix("static: ").and_then(|l| l.split_once(' ')).unwrap_or_else(|| panic!("{line}")).0;
+    n.parse().unwrap_or_else(|_| panic!("{line}"))
+}
+
+/// Without openat2 every open waits for a thread: the accept loop leaves the
+/// requests to tasks (it would only wait, give up, and have the task open the
+/// file a second time), and the answers are the same.
+#[test]
+fn without_openat2_every_request_is_answered_by_a_task() {
+    let tmp = Tmp::new("legacy-open");
+    let site = make_site(&tmp);
+    let w = Worker::start_env(&tmp, &site, json!({}), &[("WARDEN_STATIC_OPEN", "legacy")]);
+    for path in ["/index.html", "/small.bin", "/mid20k.bin", "/missing"] {
+        let r = Client::connect(w.port).get(path, "Connection: close\r\n");
+        assert_eq!(r.status, if path == "/missing" { 404 } else { 200 }, "{path}");
+    }
+    let log = w.stop();
+    assert!(log.contains("realpath check"), "{log}");
+    assert_eq!(answered(&log), 0);
+}
+
+/// A bug in a handler costs the connection it was serving and nothing else.
+/// The accept loop answers new connections itself, so a panic there must not
+/// take the worker down (a panic in a task never does). Uses the fault
+/// injection of debug builds (`WARDEN_FAULT`); a release binary has none, and
+/// the test skips.
+#[test]
+fn a_panicking_handler_costs_its_connection_and_nothing_else() {
+    let tmp = Tmp::new("panic");
+    let site = make_site(&tmp);
+    let w = Worker::start_env(&tmp, &site, json!({}), &[("WARDEN_FAULT", "static:3")]);
+    for n in 1..=4 {
+        let mut c = Client::connect(w.port);
+        c.send("GET /index.html HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let _ = c.s.read_to_end(&mut got);
+        if n == 3 && got.starts_with(b"HTTP/1.1 200 ") {
+            eprintln!(
+                "SKIPPED a_panicking_handler_costs_its_connection_and_nothing_else: no fault injection in this binary"
+            );
+            return;
+        }
+        if n == 3 {
+            assert!(got.is_empty(), "the connection of the panic is closed without an answer: {got:?}");
+        } else {
+            assert!(got.starts_with(b"HTTP/1.1 200 "), "request {n}: {:?}", String::from_utf8_lossy(&got));
+        }
+    }
+    let log = w.stop();
+    assert!(log.contains("a request handler panicked (injected fault at static (hit 3))"), "{log}");
 }
 
 /// The limits on a connection that is waiting for a request (idle.rs): the

@@ -26,7 +26,7 @@ the files it serves: the operating system's page cache already holds what is
 used, and a copy of its own would be one more thing to keep in step with the
 disk, to size and to lose a big file's worth of memory to. Every request
 opens the file (`openat2`, which also keeps it inside the root), looks at it
-(`statx`), reads it (`preadv2` for files up to 48 KB, which go out with their
+(`statx`), reads it (`preadv2` for files up to 16 KB, which go out with their
 head in one `send`) or hands it to the kernel (`sendfile`, for bigger ones,
 after the head), and closes it. An edit, a deletion or a symlink swapped in
 shows at once. Nothing here grows with the size of the site, and a file of
