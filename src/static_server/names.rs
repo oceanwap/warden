@@ -70,10 +70,12 @@ pub(super) fn mime(ext: &str) -> &'static str {
     }
 }
 
-/// A format that is compressed already (images, fonts, audio, video,
-/// archives): a `.br` or `.gz` next to such a file would save nothing, so
-/// none is looked for. Without this, every request of a browser, which sends
-/// `Accept-Encoding: gzip, br`, spent two failed lookups on each of them.
+/// A format that is compressed already (images, fonts, audio, video, archives,
+/// and PDF and office documents, which are archives inside): a `.br` or `.gz`
+/// next to such a file would save nothing, so none is looked for. Without
+/// this, every request of a browser, which sends `Accept-Encoding: gzip, br`,
+/// spent two failed lookups on each of them, which is most of what an uploads
+/// folder holds.
 pub(super) fn already_compressed(ext: &str) -> bool {
     matches!(
         ext,
@@ -83,15 +85,40 @@ pub(super) fn already_compressed(ext: &str) -> bool {
             | "gif"
             | "webp"
             | "avif"
+            | "heic"
+            | "jxl"
             | "woff"
             | "woff2"
-            | "mp4"
-            | "webm"
             | "mp3"
+            | "m4a"
+            | "aac"
+            | "flac"
             | "ogg"
+            | "opus"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "mkv"
+            | "webm"
             | "zip"
             | "gz"
             | "br"
+            | "zst"
+            | "bz2"
+            | "xz"
+            | "7z"
+            | "rar"
+            | "tgz"
+            | "jar"
+            | "apk"
+            | "pdf"
+            | "docx"
+            | "xlsx"
+            | "pptx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "epub"
     )
 }
 
@@ -111,11 +138,11 @@ mod tests {
 
     #[test]
     fn compressed_formats_are_not_looked_up_for_a_compressed_sibling() {
-        for ext in ["png", "jpg", "woff2", "mp4", "zip", "gz", "br"] {
+        for ext in ["png", "jpg", "heic", "woff2", "mp4", "mov", "zip", "gz", "br", "pdf", "docx", "xlsx"] {
             assert!(already_compressed(ext), "{ext}");
         }
         // Text, and what is not known to be compressed, still is.
-        for ext in ["js", "css", "html", "svg", "json", "wasm", "pdf", "ico", "ttf", ""] {
+        for ext in ["js", "css", "html", "svg", "json", "txt", "csv", "wasm", "ico", "ttf", "wav", "bmp", ""] {
             assert!(!already_compressed(ext), "{ext}");
         }
     }

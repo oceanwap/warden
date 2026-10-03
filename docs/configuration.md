@@ -232,7 +232,7 @@ Every key but `root` is optional. What the server does and why:
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages. Unset or `0`: HTML is revalidated on every load with its ETag (a 304 when unchanged). 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
-| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file but images, fonts, audio, video and archives: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
+| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file but images, fonts, audio, video, archives and PDF or office documents: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request |
