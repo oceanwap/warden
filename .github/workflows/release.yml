@@ -944,10 +944,17 @@ jobs:
   # was built; started by hand, publishing creates the tag at the commit built.
   # The only job besides `macos-local` that can write. It does not list the
   # macOS jobs: it needs `checksums`, which runs only when the one the release
-  # chose has succeeded.
+  # chose has succeeded. `!cancelled()` and the results it needs, spelled out:
+  # without a status function a job is skipped when any job upstream of it
+  # was, even with everything it needs passed, and one of the two macOS jobs
+  # always is (the first real release went through every job but this one).
   publish:
     needs: [meta, checksums, install-test]
-    if: needs.meta.outputs.publish == 'true'
+    if: >-
+      ${{ !cancelled()
+      && needs.meta.outputs.publish == 'true'
+      && needs.checksums.result == 'success'
+      && needs.install-test.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
