@@ -279,8 +279,21 @@ pub(super) fn parse_range(h: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
 /// Precompressed encodings (in preference order) and their file suffixes.
 pub(super) const ENCODINGS: [(&str, &str); 2] = [("br", "br"), ("gzip", "gz")];
 
+/// Whether an `Accept-Encoding` header takes `enc` (RFC 9110, 12.5.3): it names
+/// it, in any letter case, and not with a quality of 0, which means "not this
+/// one".
 pub(super) fn accepts(accept_encoding: &str, enc: &str) -> bool {
-    accept_encoding.split(',').any(|a| a.trim().split(';').next() == Some(enc))
+    accept_encoding.split(',').any(|item| {
+        let mut parts = item.split(';');
+        parts.next().is_some_and(|name| name.trim().eq_ignore_ascii_case(enc)) && !parts.any(refuses)
+    })
+}
+
+/// A parameter of the form `q=0`, `Q = 0.00`.
+fn refuses(param: &str) -> bool {
+    param
+        .split_once('=')
+        .is_some_and(|(k, v)| k.trim().eq_ignore_ascii_case("q") && v.trim().parse::<f32>().is_ok_and(|q| q == 0.0))
 }
 
 /// A request head with the given headers, for the tests of several modules.
@@ -308,6 +321,21 @@ pub(super) fn owned_request(lines: &[(&str, &str)]) -> Owned {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn accept_encoding_names_are_matched_the_way_the_rfc_says() {
+        assert!(accepts("gzip, deflate, br", "br") && accepts("gzip, deflate, br", "gzip"));
+        assert!(accepts("GZip", "gzip") && accepts(" br ; q=0.8", "br"));
+        assert!(accepts("br;q=0.001", "br") && accepts("gzip;level=1", "gzip"));
+        // A quality of 0 refuses the encoding; the others in the list stay.
+        for refused in ["br;q=0", "br; q=0.0", "BR;Q=0.000", "gzip, br;q=0"] {
+            assert!(!accepts(refused, "br"), "{refused}");
+        }
+        assert!(accepts("br;q=0, gzip", "gzip") && !accepts("br;q=0, gzip;q=0", "gzip"));
+        // Not named, or only part of a name.
+        assert!(!accepts("", "br") && !accepts("identity", "gzip") && !accepts("x-gzip, brotli", "gzip"));
+        assert!(!accepts("*", "gzip"), "a wildcard is answered with the file as it is");
+    }
 
     #[test]
     fn ranges() {

@@ -712,6 +712,53 @@ fn without_openat2_every_request_is_answered_by_a_task() {
     assert_eq!(answered(&log), 0);
 }
 
+/// Files that are compressed already get no sibling looked up (`logo.png.br`
+/// is not served: it would save nothing), and everything else still does.
+#[test]
+fn precompressed_siblings_are_served_for_text_and_not_looked_up_for_images() {
+    let tmp = Tmp::new("precompressed");
+    let site = tmp.site();
+    write(&site, "style.css", b"a{}");
+    write(&site, "style.css.gz", b"gz bytes");
+    write(&site, "style.css.br", b"br bytes");
+    write(&site, "plain.js", b"console.log(1)");
+    write(&site, "logo.png", b"png bytes");
+    write(&site, "logo.png.br", b"br bytes of the png");
+    let w = Worker::start(&tmp, &site, json!({}));
+    let get = |path: &str, accept: &str| {
+        let r = Client::connect(w.port).get(path, &format!("Accept-Encoding: {accept}\r\nConnection: close\r\n"));
+        (r.status, r.h("content-encoding").to_string(), r.body)
+    };
+    // br is preferred, gzip when it is all the client takes, neither when it takes neither.
+    assert_eq!(get("/style.css", "gzip, deflate, br"), (200, "br".into(), b"br bytes".to_vec()));
+    assert_eq!(get("/style.css", "gzip"), (200, "gzip".into(), b"gz bytes".to_vec()));
+    assert_eq!(get("/style.css", "identity"), (200, "".into(), b"a{}".to_vec()));
+    // No sibling: the file itself.
+    assert_eq!(get("/plain.js", "gzip, br"), (200, "".into(), b"console.log(1)".to_vec()));
+    // An image is sent as it is, whatever sits next to it.
+    assert_eq!(get("/logo.png", "gzip, br"), (200, "".into(), b"png bytes".to_vec()));
+}
+
+/// `Accept-Encoding: br;q=0` says "not brotli": the gzip file or the plain one.
+#[test]
+fn an_encoding_refused_with_q_zero_is_not_served() {
+    let tmp = Tmp::new("q-zero");
+    let site = tmp.site();
+    write(&site, "style.css", b"a{}");
+    write(&site, "style.css.gz", b"gz bytes");
+    write(&site, "style.css.br", b"br bytes");
+    let w = Worker::start(&tmp, &site, json!({}));
+    let get = |accept: &str| {
+        let r =
+            Client::connect(w.port).get("/style.css", &format!("Accept-Encoding: {accept}\r\nConnection: close\r\n"));
+        (r.h("content-encoding").to_string(), r.body)
+    };
+    assert_eq!(get("br;q=0, gzip"), ("gzip".into(), b"gz bytes".to_vec()));
+    assert_eq!(get("br;q=0, gzip;q=0"), ("".into(), b"a{}".to_vec()));
+    assert_eq!(get("GZIP"), ("gzip".into(), b"gz bytes".to_vec()));
+    assert_eq!(get("*"), ("".into(), b"a{}".to_vec()));
+}
+
 /// A bug in a handler costs the connection it was serving and nothing else.
 /// The accept loop answers new connections itself, so a panic there must not
 /// take the worker down (a panic in a task never does). Uses the fault

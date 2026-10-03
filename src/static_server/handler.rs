@@ -4,7 +4,7 @@ use super::cache::{Dep, Seen, Stamp};
 use super::cached::{self, Cached, Fill, respond_cached};
 use super::conn::{Conn, Source};
 use super::head::{ENCODINGS, Request, accepts, parse_range};
-use super::names::{extension_of, fingerprinted, mime};
+use super::names::{already_compressed, extension_of, fingerprinted, mime};
 use super::open::{Opened, inside, open, open_error_status, read_body};
 use super::path::{join_rel, path_of, relative_cow};
 use super::response::{
@@ -214,11 +214,12 @@ async fn send_file(
     let Exchange { site, req, keep } = x;
     let mut ext_buf = [0u8; 12];
     let ext = extension_of(rel, &mut ext_buf);
-    let sibling = if site.cfg.precompressed && status == 200 && req.header("range").is_none() {
-        precompressed(x, rel, fill.as_mut()).await
-    } else {
-        None
-    };
+    let sibling =
+        if site.cfg.precompressed && status == 200 && !already_compressed(ext) && req.header("range").is_none() {
+            precompressed(x, rel, fill.as_mut()).await
+        } else {
+            None
+        };
     let (body, encoding) = match sibling {
         Some((sibling, enc)) => (sibling, Some(enc)),
         None => (found, None),

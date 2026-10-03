@@ -37,6 +37,35 @@ kept-alive connection and 14.2 µs on a new one, against 14.3 and 19.2 for
 nginx on the same machine (100 KB: 18.2 and 24.0, against 20.1 and 25.5; see
 [benchmarks.md](benchmarks.md)).
 
+## Compression
+
+Warden serves files that were compressed ahead of time and does not compress
+anything itself. When a request's `Accept-Encoding` takes `br` or `gzip` (a
+quality of 0 refuses it, and names may be in any letter case) and `file.br` or
+`file.gz` sits next to `file`, that file is sent with `Content-Encoding`, an
+`ETag` of its own, and `Vary: Accept-Encoding`; brotli is preferred. The
+`Content-Type` is the original file's. When the client takes a compression and
+there is no such file, the request is not an error: the file is sent as it is.
+A request with a `Range` always gets the file as it is.
+
+There is no compression on the fly, on purpose. Compressing 100 KB takes
+a millisecond or more of CPU (brotli much more), a hundred times the rest of
+what a request costs, and it would be done again for every request unless the
+result were kept in memory, which is the copy of files that Warden does not
+make (see above). It would also give up `sendfile` and a length known before
+the first byte. Compress when the site is built or deployed:
+
+```sh
+# every text file, once, next to the original (keeps the original)
+find dist -type f \( -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' -o -name '*.json' \) \
+  -exec gzip -9 -k -f {} \; -exec brotli -f -k {} \;
+```
+
+or with your bundler's plugin (`vite-plugin-compression`, webpack's
+`compression-webpack-plugin`). A site without such files can set
+`precompressed = false`, which saves the lookups. Images, fonts, audio, video
+and archives are never looked up: they are compressed already.
+
 ## The response cache (optional)
 
 `cache_size = "16MB"` turns on a cache of complete responses. Each worker
@@ -99,7 +128,7 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages (`warden serve --html-max-age N`). Unset or `0`: HTML is revalidated on every load with its ETag, a 304 when unchanged. 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
-| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them |
+| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file but images, fonts, audio, video and archives: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request (method, path, status, bytes, ms) |

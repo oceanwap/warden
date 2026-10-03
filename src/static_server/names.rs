@@ -70,6 +70,31 @@ pub(super) fn mime(ext: &str) -> &'static str {
     }
 }
 
+/// A format that is compressed already (images, fonts, audio, video,
+/// archives): a `.br` or `.gz` next to such a file would save nothing, so
+/// none is looked for. Without this, every request of a browser, which sends
+/// `Accept-Encoding: gzip, br`, spent two failed lookups on each of them.
+pub(super) fn already_compressed(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "woff"
+            | "woff2"
+            | "mp4"
+            | "webm"
+            | "mp3"
+            | "ogg"
+            | "zip"
+            | "gz"
+            | "br"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +107,17 @@ mod tests {
         assert!(!fingerprinted("favicon.ico"));
         assert!(!fingerprinted("background.png"));
         assert_eq!(mime("woff2"), "font/woff2");
+    }
+
+    #[test]
+    fn compressed_formats_are_not_looked_up_for_a_compressed_sibling() {
+        for ext in ["png", "jpg", "woff2", "mp4", "zip", "gz", "br"] {
+            assert!(already_compressed(ext), "{ext}");
+        }
+        // Text, and what is not known to be compressed, still is.
+        for ext in ["js", "css", "html", "svg", "json", "wasm", "pdf", "ico", "ttf", ""] {
+            assert!(!already_compressed(ext), "{ext}");
+        }
     }
 
     #[test]
