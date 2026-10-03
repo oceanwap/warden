@@ -3,11 +3,9 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — 0.1.0-unreleased
+## [0.1.0] — 2026-10-03
 
-Current `main`. There is no GitHub Release or tag yet; the first one is cut
-with `cargo release 0.1.0` (the macOS archives are built on a GitHub runner, or
-on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
+The first release.
 
 ### Added
 

@@ -1985,6 +1985,13 @@ fn log_history_search_and_pipes() {
     // "worker ready" comes min_uptime (300 ms) after the start; a fast flood
     // can be written, rotated and gzipped before that.
     f.wait("worker ready", |f| f.app("chatty")["status"]["workers_ready"] == 1);
+    // The files lag the live log a little (they are written in batches): the
+    // history reads the files, so wait until they hold the end of the flood
+    // and the ready line (CI saw it read them at line 199, and before `ready`).
+    f.wait("the files caught up", |f| {
+        let (_, out) = f.cli(&["logs", "chatty", "--history"]);
+        out.contains("line 400 padding") && out.contains("INFO  worker ready")
+    });
 
     // History: every retained line, oldest first, across .gz and current.
     let out = f.ok(&["logs", "chatty", "--history"]);

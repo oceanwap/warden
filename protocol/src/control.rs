@@ -489,6 +489,7 @@ mod tests {
             healthy: None,
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["standbys"][0]["state"], "STANDBY");
@@ -521,6 +522,7 @@ mod tests {
             healthy: None,
             loop_delay: None,
             listening: Vec::new(),
+            requests: None,
         });
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!((v["draining"][0]["id"].as_u64(), v["draining"][0]["state"].as_str()), (Some(2), Some("DRAINING")));

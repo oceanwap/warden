@@ -95,7 +95,7 @@ jobs:
           sudo apt-get install -y -qq nginx wrk >/dev/null
           # The suites run their own nginx; the distribution's would only take CPU.
           sudo systemctl disable --now nginx || true
-          oha --version && nginx -v && wrk --version | head -1 || true
+          { oha --version && nginx -v && wrk --version | head -1; } || true
       - name: npm ci (bench/ and bench/nest/)
         run: |
           (cd bench && npm ci --no-audit --no-fund)

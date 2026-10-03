@@ -276,7 +276,8 @@ inst_pipe() {
     local envs=()
     while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
     shift
-    # shellcheck disable=SC2086
+    # A pipe on purpose (`curl | sh` gives one, not a file), hence the cat.
+    # shellcheck disable=SC2086,SC2002
     out=$(cat "$installer" | env -i PATH="$bin:$PATH" HOME="$H" TMPDIR="$T/tmp" LANG=C SHELL=/bin/bash \
         FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_GLIBC=2.35 FAKE_LIBC=glibc FAKE_LOG="$T/stub.log" \
         WARDEN_RUNTIME_DIR="$T/run" WARDEN_HOME="$T/wardenhome" WARDEN_NO_DAEMON=1 WARDEN_FAKE_RUNNING="$T/running" \

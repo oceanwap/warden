@@ -286,8 +286,9 @@ check_dmg() { # target dmg
     check_version "$t" "$mounted/Warden.app/Contents/MacOS/warden" "warden $version"
     check_version "$t" "$mounted/Warden.app/Contents/MacOS/warden-gui" "warden-gui $version"
     codesign --verify --deep --strict "$mounted/Warden.app" || die "$(basename "$dmg"): the Warden.app inside fails codesign --verify"
-    [ -L "$mounted/Applications" ] && [ "$(readlink "$mounted/Applications")" = /Applications ] ||
+    if [ ! -L "$mounted/Applications" ] || [ "$(readlink "$mounted/Applications")" != /Applications ]; then
         die "$(basename "$dmg"): there is no Applications link to /Applications"
+    fi
     # The volume name (best effort: diskutil may not say).
     vol=$(diskutil info "$mounted" 2>/dev/null | sed -n 's/^ *Volume Name: *//p' | head -1)
     if [ -n "$vol" ] && [ "$vol" != Warden ]; then die "$(basename "$dmg"): the volume is called '$vol', not Warden"; fi

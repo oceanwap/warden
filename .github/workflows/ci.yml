@@ -133,6 +133,9 @@ jobs:
           WARDEN_REQUIRE_STRACE: "1"
         run: |
           set -o pipefail
+          # strace attaches to the static workers the tests start, which are
+          # not its children: Ubuntu's Yama (ptrace_scope 1) refuses that.
+          sudo sysctl -w kernel.yama.ptrace_scope=0
           cargo test --test static_perf 2>&1 | tee static_perf.log
       # Job logs need a login to read; annotations don't: name the failing
       # tests and their panic messages there.

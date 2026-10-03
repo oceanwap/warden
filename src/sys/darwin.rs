@@ -629,9 +629,8 @@ mod tests {
         // answers for it must never look like a running process, the one
         // thing the orphan sweep must not take it for.
         std::thread::sleep(Duration::from_millis(300));
-        match bsd_info(pid) {
-            Ok(info) => assert!(info.zombie, "an exited child that is not collected is a zombie: {info:?}"),
-            Err(_) => {}
+        if let Ok(info) = bsd_info(pid) {
+            assert!(info.zombie, "an exited child that is not collected is a zombie: {info:?}");
         }
         child.wait().unwrap();
         assert!(bsd_info(pid).is_err(), "collected: no such process");

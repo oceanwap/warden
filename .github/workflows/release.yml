@@ -369,7 +369,7 @@ jobs:
         with:
           name: cli-${{ matrix.os }}-${{ matrix.arch }}
       - name: The CLI from the cli job
-        run: tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version || true
+        run: '{ tar -xzf "$CLI.tar.gz" && "$CLI/warden" --version; } || true'
       - uses: actions/download-artifact@v4
         with:
           name: licenses
@@ -382,7 +382,7 @@ jobs:
         run: |
           pkg=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.manifest_path | endswith("/gui/Cargo.toml")) | .name')
           bin=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.manifest_path | endswith("/gui/Cargo.toml")) | .targets[] | select(.kind | index("bin")) | .name' | head -1)
-          [ -n "$pkg" ] && [ -n "$bin" ] || { echo "::error::gui/Cargo.toml has no binary target"; exit 1; }
+          if [ -z "$pkg" ] || [ -z "$bin" ]; then echo "::error::gui/Cargo.toml has no binary target"; exit 1; fi
           cargo build --release --locked -p "$pkg" --bin "$bin" --target "${{ matrix.target }}"
           echo "bin=$bin" >> "$GITHUB_OUTPUT"
           ls -l "target/${{ matrix.target }}/release/$bin"
@@ -573,7 +573,7 @@ jobs:
               fetch "macos/$f" gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" || { why="could not download $f"; return 1; }
               want=$(awk -v f="$f" '$1 == "sha256" && $3 == f { print $2 }' macos/macos-build-info.txt)
               got=$(sha256sum "macos/$f" | awk '{ print $1 }')
-              [ -n "$want" ] && [ "$got" = "$want" ] || { why="$f does not match the checksum in macos-build-info.txt (an upload may be in progress)"; return 1; }
+              if [ -z "$want" ] || [ "$got" != "$want" ]; then why="$f does not match the checksum in macos-build-info.txt (an upload may be in progress)"; return 1; fi
             done
             return 0
           }
@@ -763,7 +763,7 @@ jobs:
           for f in "${files[@]}"; do
             want=$(awk -v f="$f" '$1 == "sha256" && $3 == f { print $2 }' macos-build-info.txt)
             got=$(shasum -a 256 "$f" | awk '{ print $1 }')
-            [ -n "$want" ] && [ "$got" = "$want" ] || fail "$f does not match the checksum in macos-build-info.txt"
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then fail "$f does not match the checksum in macos-build-info.txt"; fi
           done
 
           for arch in arm64 x86_64; do
