@@ -517,6 +517,8 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
         );
     }
 
+    // These read this machine's /proc: Linux only (the parsing tests run everywhere).
+    #[cfg(target_os = "linux")]
     #[test]
     fn processes_in_one_network_namespace_share_one_read_of_the_tables() {
         // Two listeners in this process and a child's: one call lists all of them.
@@ -558,6 +560,7 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
         assert_eq!(parse_stat_identity("1 (x) S 1 1"), None, "too short for a start time");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn identity_of_a_child_follows_it_and_is_gone_with_it() {
         use std::os::unix::process::CommandExt;
@@ -580,6 +583,7 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
         assert_eq!(Linux.proc_identity(0x7fff_fff0), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scanning_for_children_agrees_with_the_children_files() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -621,6 +625,7 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
         assert_eq!(parse_loadavg("0.52\n"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_command_name_and_owner_of_pid_1_are_readable() {
         assert!(Linux.proc_name(1).is_some_and(|n| !n.is_empty()));

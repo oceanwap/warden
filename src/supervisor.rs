@@ -2091,12 +2091,26 @@ impl Supervisor {
             skip.extend(skip_entries(abs(p, "the log file")?, l.per_worker_files));
         }
         skip.extend(skip_entries(abs(&self.cfg.socket_path(), "the control socket")?, false));
-        // The runtime directory as written, and by its real path when that differs (a symlink).
-        let runtime = abs(&self.runtime_dir, "the runtime directory")?;
-        let mut runtimes = vec![runtime.clone()];
-        runtimes.extend(std::fs::canonicalize(&runtime).ok().filter(|real| *real != watch::clean(&runtime)));
         let watched: Vec<PathBuf> =
             [base.clone()].into_iter().chain(w.paths.iter().map(|p| base.join(p))).map(|p| watch::clean(&p)).collect();
+        // The runtime directory as written; by its real path when that differs
+        // (a symlink); and by that real path as the watcher spells it, under a
+        // watched directory as written: the walk does not resolve symlinks, and
+        // a directory above both may be one (on macOS the temporary directory
+        // is under /var, which is /private/var).
+        let runtime = abs(&self.runtime_dir, "the runtime directory")?;
+        let mut runtimes = vec![runtime.clone()];
+        if let Ok(real) = std::fs::canonicalize(&runtime) {
+            for dir in &watched {
+                let Ok(real_dir) = std::fs::canonicalize(dir) else { continue };
+                if let Ok(rest) = real.strip_prefix(&real_dir) {
+                    runtimes.push(dir.join(rest));
+                }
+            }
+            runtimes.push(real);
+        }
+        let mut seen = std::collections::HashSet::new();
+        runtimes.retain(|p| seen.insert(watch::clean(p)));
         for runtime in runtimes {
             let runtime_clean = watch::clean(&runtime);
             if watched.iter().any(|p| p.starts_with(&runtime_clean)) {
@@ -3433,6 +3447,16 @@ exec sleep 60
         r.sup.runtime_dir = link.clone();
         r.sup.cfg.control.socket = Some(link.join("control.sock"));
         assert_eq!(files_seen(&r.sup.watch_spec().unwrap().unwrap()), 1, "main.js; link/ is run/, Warden's");
+
+        // The working directory reached through a symlink above it, the runtime directory by
+        // its real name (on macOS the temporary directory is under /var, which is /private/var):
+        // the walk spells the files as the working directory is written, and still skips run/.
+        let above = dir.join("above");
+        std::os::unix::fs::symlink(&dir, &above).unwrap();
+        r.sup.cfg.app.working_directory = Some(above.join("app"));
+        r.sup.runtime_dir = std::fs::canonicalize(&run).unwrap();
+        r.sup.cfg.control.socket = Some(r.sup.runtime_dir.join("control.sock"));
+        assert_eq!(files_seen(&r.sup.watch_spec().unwrap().unwrap()), 1, "main.js; above/app/run/ is run/");
         tidy(&dir);
     }
 

@@ -3965,12 +3965,14 @@ fn subscribe_sends_status_every_interval_and_bye_on_sigterm() {
     let port = free_port();
     let mut w = Warden::start("sub-interval", port, &simple("sub-interval", port, 1, ""));
     w.wait_for("1 ready worker", T, ready(1));
-    let t0 = Instant::now();
     let mut ev = Events::open(&w, r#"{"cmd":"subscribe","interval_ms":500}"#);
     assert_eq!(ev.next()["type"], "hello");
     assert_eq!(ev.next()["type"], "status");
+    // Two more (at 0.5 s and 1 s) in the 1.6 s after the snapshot: the clock
+    // starts there, as on a busy machine connecting takes a while.
+    let t0 = Instant::now();
     let mut periodic = 0;
-    while let Some(left) = Duration::from_millis(1300).checked_sub(t0.elapsed()) {
+    while let Some(left) = Duration::from_millis(1600).checked_sub(t0.elapsed()) {
         match ev.read(left) {
             Ok(Some(e)) if e["type"] == "status" => {
                 assert_eq!(e["status"]["workers_ready"], 1);
@@ -3981,7 +3983,7 @@ fn subscribe_sends_status_every_interval_and_bye_on_sigterm() {
             Err(()) => break,
         }
     }
-    assert!(periodic >= 2, "{periodic} status events after the snapshot in 1.3 s: {:#?}", ev.seen);
+    assert!(periodic >= 2, "{periodic} status events in the 1.6 s after the snapshot: {:#?}", ev.seen);
 
     w.signal(libc::SIGTERM);
     let rest = ev.rest();

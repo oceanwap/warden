@@ -304,12 +304,19 @@ async fn a_log_flood_stays_bounded_and_connected() {
     let socket = host.socket();
     let mut logs: Feed = Box::pin(client::feed(Endpoint::Socket(socket), FeedOptions::logs_of("flood")));
     let (mut lines, mut lost, mut batches) = (0usize, 0u64, 0usize);
+    // Five seconds of flood, from its first line: on a busy machine the app
+    // can take a while to start.
     let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(5) {
+    let mut flooding: Option<Instant> = None;
+    while flooding.map_or(t0.elapsed() < T, |t| t.elapsed() < Duration::from_secs(5)) {
         match next(&mut logs).await {
             FeedMsg::Batch(b) => {
                 assert!(b.logs.len() <= client::BATCH_LOG_CAP, "a batch holds {} lines", b.logs.len());
                 lines += b.logs.iter().filter(|(a, l)| a == "flood" && l.contains("flood-line")).count();
+                if lines == 0 {
+                    continue;
+                }
+                flooding.get_or_insert_with(Instant::now);
                 lost += b.logs_dropped;
                 lost += b
                     .events

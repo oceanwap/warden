@@ -554,12 +554,13 @@ mod tests {
         let e =
             local(run_command(&["/nonexistent/notify".to_string()], &[], b"{}", Duration::from_secs(5))).unwrap_err();
         assert!(e.starts_with("cannot run /nonexistent/notify"), "{e}");
-        // A command that hangs, with a child of its own: both are killed at the timeout.
+        // A command that hangs, with a child of its own: both are killed at the timeout. The
+        // child would leave a file 2 s in; the command writes its pid once it has started it.
         let d = dir("hang");
-        let pidfile = d.join("pid");
+        let (pidfile, survived) = (d.join("pid"), d.join("survived"));
         let t0 = Instant::now();
         let e = local(run_command(
-            &argv(&format!("sleep 30 & echo $! > '{}'; wait", pidfile.display())),
+            &argv(&format!("(sleep 2; echo yes > '{}') & echo $! > '{}'; wait", survived.display(), pidfile.display())),
             &[],
             b"",
             Duration::from_millis(500),
@@ -567,12 +568,9 @@ mod tests {
         .unwrap_err();
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         assert!(e.contains("did not finish within 0.5 s; killed it"), "{e}");
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        let t1 = Instant::now();
-        while running(pid) && t1.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(!running(pid), "the command's own child was killed too");
+        assert!(pidfile.exists(), "the command had started its child");
+        std::thread::sleep(Duration::from_secs(3).saturating_sub(t0.elapsed()));
+        assert!(!survived.exists(), "the command's own child was killed too");
         let _ = std::fs::remove_dir_all(&d);
         // Endless stderr is read and dropped, not kept.
         let e = local(run_command(&argv("yes 'x' | head -c 100000 >&2; exit 1"), &[], b"", Duration::from_secs(5)))
