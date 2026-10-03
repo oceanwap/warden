@@ -8,11 +8,11 @@
 pub mod exit;
 
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -148,16 +148,20 @@ pub enum ProcEvent {
 }
 
 /// The `worker=` label on a process's captured output. Shared with its
-/// output readers, so a promoted standby's lines carry the slot it took.
+/// output readers on the output thread, so a promoted standby's lines carry
+/// the slot it took.
 #[derive(Clone)]
-pub struct Label(Rc<RefCell<Rc<str>>>);
+pub struct Label(Arc<Mutex<Arc<str>>>);
 
 impl Label {
     fn new(s: &str) -> Label {
-        Label(Rc::new(RefCell::new(s.into())))
+        Label(Arc::new(Mutex::new(s.into())))
     }
-    fn get(&self) -> Rc<str> {
-        self.0.borrow().clone()
+    fn get(&self) -> Arc<str> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+    fn set(&self, s: &str) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = s.into();
     }
 }
 
@@ -219,7 +223,7 @@ impl Handle {
 
     /// From now on, label this process's captured output `label`.
     pub fn relabel(&self, label: &str) {
-        *self.label.0.borrow_mut() = label.into();
+        self.label.set(label);
     }
 
     /// SIGTERM and SIGKILL go to the whole process group (like supervisord's
@@ -314,23 +318,15 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             let _ = ctl.send((libc::SIGKILL, true));
         }
     };
-    if let Some(out) = child.stdout.take().and_then(|o| output_receiver(o.into_owned_fd(), &label, "stdout")) {
-        let on_fail = reader_failed("stdout", ctl_tx.clone(), label.clone());
-        let fut = pump_output(out, shared_label.clone(), "stdout", spec.max_lines_per_sec);
-        tokio::task::spawn_local(async move {
-            if let Err(m) = crate::guard::catch_unwind(fut).await {
-                on_fail(m);
-            }
-        });
-    }
-    if let Some(err) = child.stderr.take().and_then(|e| output_receiver(e.into_owned_fd(), &label, "stderr")) {
-        let on_fail = reader_failed("stderr", ctl_tx.clone(), label.clone());
-        let fut = pump_output(err, shared_label.clone(), "stderr", spec.max_lines_per_sec);
-        tokio::task::spawn_local(async move {
-            if let Err(m) = crate::guard::catch_unwind(fut).await {
-                on_fail(m);
-            }
-        });
+    let captured = [
+        (child.stdout.take().map(|o| o.into_owned_fd()), "stdout"),
+        (child.stderr.take().map(|e| e.into_owned_fd()), "stderr"),
+    ];
+    for (pipe, stream) in captured {
+        if let Some(pipe) = pipe {
+            let on_fail = reader_failed(stream, ctl_tx.clone(), label.clone());
+            start_capture(pipe, shared_label.clone(), stream, spec.max_lines_per_sec, on_fail);
+        }
     }
     if let Output::Direct(files) = &spec.output {
         for (fd, path, stream) in direct {
@@ -533,19 +529,21 @@ impl RateLimit {
 }
 
 thread_local! {
-    /// One read buffer for every output reader on this thread: readers
-    /// borrow it only between `readable()` and the end of the synchronous
-    /// read-and-split (never across an await), so 16 workers × stdout and
-    /// stderr share 64 KB instead of holding 2 MB.
+    /// One read buffer for every output reader on this thread (the output
+    /// thread): readers borrow it only between `readable()` and the end of
+    /// the synchronous read-and-split (never across an await), so 16 workers
+    /// × stdout and stderr share 64 KB instead of holding 2 MB.
     static READ_BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; READ_CHUNK]);
 }
 
-/// How long a reader of worker output runs before the other tasks on its
-/// thread get a turn. Waiting for a pipe to be readable costs a tokio task
-/// nothing when it always is (a worker that writes faster than it is read):
-/// without turns, a flooding worker kept the supervisor's event loop (control
-/// socket, timers, the other workers) waiting for seconds.
-const TURN: std::time::Duration = std::time::Duration::from_millis(5);
+/// How long a reader of worker output runs before the other readers on the
+/// output thread get a turn. Waiting for a pipe to be readable costs a tokio
+/// task nothing when it always is (a worker that writes faster than it is
+/// read): without turns, one flooding worker would keep the others' pipes
+/// unread until they fill, and those workers would block writing to them.
+/// Each turn costs a flood some throughput (a 200 MB flood kept whole, 2
+/// vCPUs: about 11% at 5 ms, 4% at 25 ms); 20 ms is fair enough for logs.
+const TURN: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// The clock of a reader's turn: [`Turns::take`] after each read.
 struct Turns(std::time::Instant);
@@ -621,6 +619,33 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
     }
 }
 
+/// `worker_output = "capture"` (the default): read one of the worker's pipes
+/// on the output thread, where direct mode's pipes are read too. However
+/// fast a worker writes, the supervisor's event loop (control socket,
+/// timers, IPC) never waits for its output: it once stalled for seconds
+/// behind a worker printing as fast as it could. If the reader panics, the
+/// worker is killed so it restarts (its writes would otherwise block on a
+/// pipe nobody reads).
+fn start_capture(
+    pipe: std::io::Result<OwnedFd>,
+    label: Label,
+    stream: &'static str,
+    limit: u32,
+    on_fail: impl FnOnce(String) + Send + 'static,
+) {
+    let active = crate::logging::OutputActive::begin();
+    crate::logging::on_output_thread(Box::new(move || {
+        // Registered with this thread's reactor: a pipe is read where it is registered.
+        let Some(rx) = output_receiver(pipe, &label.get(), stream) else { return };
+        tokio::task::spawn_local(async move {
+            let _active = active;
+            if let Err(m) = crate::guard::catch_unwind(pump_output(rx, label, stream, limit)).await {
+                on_fail(m);
+            }
+        });
+    }));
+}
+
 /// `worker_output = "direct"`: pump one of the worker's pipes into its file
 /// on the output thread. If the pump panics, the worker is killed so it
 /// restarts (its writes would otherwise block on a pipe nobody reads).
@@ -632,7 +657,7 @@ fn start_direct(
     stream: &'static str,
     on_fail: impl FnOnce(String) + Send + 'static,
 ) {
-    let active = crate::logging::DirectActive::begin();
+    let active = crate::logging::OutputActive::begin();
     crate::logging::on_output_thread(Box::new(move || {
         tokio::task::spawn_local(async move {
             let _active = active;
@@ -1039,9 +1064,9 @@ mod tests {
             .await;
     }
 
-    /// A worker that writes as fast as it can keeps its pipe readable; the
-    /// reader still gives the other tasks on the supervisor's thread a turn
-    /// (it starved them for seconds at a time before).
+    /// A worker that writes as fast as it can: its output is read on the
+    /// output thread, so the supervisor's event loop goes on as if it were
+    /// quiet (it stalled for seconds at a time when it read the output).
     #[tokio::test(flavor = "current_thread")]
     async fn a_flood_of_output_leaves_the_event_loop_running() {
         use std::time::{Duration, Instant};
@@ -1049,16 +1074,7 @@ mod tests {
         local
             .run_until(async {
                 let (tx, mut rx) = mpsc::unbounded_channel();
-                let spec = Spec {
-                    program: "yes".into(),
-                    args: vec!["flood-line-with-some-text-in-it".into()],
-                    cwd: None,
-                    env: vec![],
-                    label: "flood".into(),
-                    output: Output::Capture,
-                    max_lines_per_sec: 10_000,
-                };
-                let h = spawn(spec, 1, tx).unwrap();
+                let h = spawn(flood_spec("flood"), 1, tx).unwrap();
                 // A ticker beside it: the longest it waited for its turn.
                 let (t0, mut last, mut worst, mut ticks) = (Instant::now(), Instant::now(), Duration::ZERO, 0);
                 while t0.elapsed() < Duration::from_secs(1) {
@@ -1070,6 +1086,78 @@ mod tests {
                 h.signal(libc::SIGKILL);
                 while !matches!(rx.recv().await, Some(ProcEvent::Exited { .. }) | None) {}
                 assert!(worst < Duration::from_millis(250), "the loop stalled for {worst:?} ({ticks} ticks in 1 s)");
+            })
+            .await;
+    }
+
+    /// `yes` as a worker, keeping one line a second (the rest is read and
+    /// counted as dropped: tests print captured output to stdout).
+    fn flood_spec(label: &str) -> Spec {
+        Spec {
+            program: "yes".into(),
+            args: vec!["flood-line-with-some-text-in-it".into()],
+            cwd: None,
+            env: vec![],
+            label: label.into(),
+            output: Output::Capture,
+            max_lines_per_sec: 1,
+        }
+    }
+
+    /// Every worker's output is read on the one output thread: a worker that
+    /// floods it does not hold up another's lines (the readers take turns).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_flooding_worker_does_not_hold_up_another_ones_output() {
+        use std::time::{Duration, Instant};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let flood = spawn(flood_spec("flood-2"), 1, tx.clone()).unwrap();
+                let marker = format!("quiet-{}-line", std::process::id());
+                let quiet = Spec {
+                    program: "sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        format!(
+                            "i=0; while [ $i -lt 10 ]; do i=$((i+1)); echo {marker} $i; sleep 0.05; done; exec sleep 30"
+                        ),
+                    ],
+                    cwd: None,
+                    env: vec![],
+                    label: "quiet".into(),
+                    output: Output::Capture,
+                    max_lines_per_sec: 0,
+                };
+                let quiet = spawn(quiet, 2, tx).unwrap();
+                // Written 50 ms apart: all ten in the log well within 3 s, each read
+                // soon after the one before (the time a line was read starts it).
+                let t0 = Instant::now();
+                let seen = || crate::logging::recent_matching(100, &|l: &str| l.contains(&marker));
+                while seen().len() < 10 && t0.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let lines = seen();
+                let read_at = |l: &str| -> u64 {
+                    // 2026-10-03T12:38:05.123Z: milliseconds into the day.
+                    let t = &l[11..23];
+                    let n = |r: std::ops::Range<usize>| t[r].parse::<u64>().unwrap();
+                    ((n(0..2) * 60 + n(3..5)) * 60 + n(6..8)) * 1000 + n(9..12)
+                };
+                let gaps: Vec<u64> = lines.windows(2).map(|w| read_at(&w[1]).saturating_sub(read_at(&w[0]))).collect();
+                flood.signal(libc::SIGKILL);
+                quiet.signal(libc::SIGKILL);
+                let mut exited = 0;
+                while exited < 2 {
+                    match rx.recv().await {
+                        Some(ProcEvent::Exited { .. }) => exited += 1,
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                assert_eq!(lines.len(), 10, "the quiet worker's lines after {:?}: {lines:?}", t0.elapsed());
+                let worst = gaps.iter().max().copied().unwrap_or(0);
+                assert!(worst < 400, "a quiet line waited {worst} ms behind the flood: gaps {gaps:?}");
             })
             .await;
     }

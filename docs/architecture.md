@@ -87,7 +87,11 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
 - **systemd**: boot, top‑level restart, resource limits, user/group.
 - **warden** (one process, single‑threaded tokio runtime): spawns workers,
   tracks state, restarts with backoff, drains on shutdown, answers the CLI over
-  a Unix socket, optionally serves `/metrics`. Never proxies requests.
+  a Unix socket, optionally serves `/metrics`. Never proxies requests. Two
+  helper threads keep slow work off that event loop: the log writer (files,
+  stdout, journald) and the output thread, which reads every worker's stdout
+  and stderr (captured, or spliced into files with `worker_output =
+  "direct"`), so however fast a worker prints, the supervisor answers on time.
 - **Workers**: the application. Each binds the shared port itself.
 - **wardend** (always on, one per host and user; `warden wardend` runs it): one socket
   for every app's live events and commands (the CLI's `warden events`,

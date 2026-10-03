@@ -1071,9 +1071,10 @@ type Known = (PathBuf, String, &'static str);
 static DIRECT_KNOWN: Mutex<Vec<Known>> = Mutex::new(Vec::new());
 /// Paths whose filesystem refused splice: warned once, then copied.
 static DIRECT_NO_SPLICE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-/// Direct streams still being pumped (`flush` waits for them at exit, so
-/// the last lines of exited workers are drained into their files).
-static DIRECT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// Worker output streams still being read on the output thread, captured or
+/// direct (`flush` waits for them at exit, so the last lines of exited
+/// workers reach the log and their files).
+static OUTPUT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static DIRECT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
 
 fn with_scratch<R>(f: impl FnOnce(&mut [u8]) -> R) -> R {
@@ -1095,19 +1096,19 @@ fn discard_chunk(pipe: &std::fs::File) -> std::io::Result<usize> {
     })
 }
 
-/// Counts one direct stream as active until dropped.
-pub struct DirectActive(());
+/// Counts one output stream as being read until dropped.
+pub struct OutputActive(());
 
-impl DirectActive {
+impl OutputActive {
     pub fn begin() -> Self {
-        DIRECT_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        DirectActive(())
+        OUTPUT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        OutputActive(())
     }
 }
 
-impl Drop for DirectActive {
+impl Drop for OutputActive {
     fn drop(&mut self) {
-        DIRECT_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        OUTPUT_ACTIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1955,13 +1956,13 @@ fn write_loop(rx: Receiver<Queued>, sinks: Sinks) {
     }
 }
 
-/// Wait (up to `timeout`) for queued lines to be written, and for direct
-/// worker output to be drained from the pipes of workers that have exited.
-/// Called before exit.
+/// Wait (up to `timeout`) for queued lines to be written, and for worker
+/// output to be drained from the pipes of workers that have exited. Called
+/// before exit.
 pub fn flush(timeout: Duration) {
     let l = logger();
     let t0 = Instant::now();
-    while (l.pending.load(Ordering::Relaxed) > 0 || DIRECT_ACTIVE.load(Ordering::Relaxed) > 0) && t0.elapsed() < timeout
+    while (l.pending.load(Ordering::Relaxed) > 0 || OUTPUT_ACTIVE.load(Ordering::Relaxed) > 0) && t0.elapsed() < timeout
     {
         std::thread::sleep(Duration::from_millis(5));
     }
