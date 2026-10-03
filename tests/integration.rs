@@ -2139,6 +2139,27 @@ fn static_open_modes_agree_and_keep_the_root_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `raw` with the value of every Date header the same (each checked to be an
+/// HTTP date): two answers a second apart differ there and nowhere else.
+fn undated(raw: &[u8]) -> Vec<u8> {
+    const KEY: &[u8] = b"\r\nDate: ";
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i..].starts_with(KEY) && i + KEY.len() + 29 <= raw.len() {
+            let date = &raw[i + KEY.len()..i + KEY.len() + 29];
+            assert!(date.ends_with(b" GMT") && date[3] == b',', "an HTTP date: {:?}", String::from_utf8_lossy(date));
+            out.extend_from_slice(KEY);
+            out.extend_from_slice(b"Sun, 06 Nov 1994 08:49:37 GMT");
+            i += KEY.len() + 29;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Everything the server sends back for `req` (pipelined requests too),
 /// until it closes the connection.
 fn raw_exchange(port: u16, req: &str) -> Vec<u8> {
@@ -2337,13 +2358,13 @@ fn static_cache_hits_match_and_stay_fresh() {
         let hit = raw_exchange(on, &full);
         let show = |b: &[u8]| String::from_utf8_lossy(&b[..b.len().min(600)]).to_string();
         assert!(
-            miss == reference,
+            undated(&miss) == undated(&reference),
             "{io}: first answer differs for {r:?}:\n{}\nvs uncached:\n{}",
             show(&miss),
             show(&reference)
         );
         assert!(
-            hit == reference,
+            undated(&hit) == undated(&reference),
             "{io}: cached answer differs for {r:?}:\n{}\nvs uncached:\n{}",
             show(&hit),
             show(&reference)
