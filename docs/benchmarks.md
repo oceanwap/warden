@@ -309,6 +309,48 @@ kept-alive file, is against that setting and is probably smaller against
   A noisy VM: compare the columns, and re-measure on a quiet machine, ideally the
   ARM64 target, before deciding anything that depends on a few percent.
 
+## Dates and validators: what they cost (2026-10-03)
+
+Every response now carries `Date`, cached ones included, and the conditional
+requests follow RFC 9110 ([`static-serving.md`](static-serving.md#dates-and-validators)).
+This round compares the server before (`main` at 0920b1f) and after, on the
+same files, one worker each.
+
+**Method.** As in the nginx round above: the server on CPU 0, `wrk -t1 -c32
+-d4s` on CPU 1, kept-alive connections, server CPU per request from
+`/proc/<pid>/stat`, medians of 5 rounds taking turns (lowest and highest in
+brackets), `compress = false`. The files: the 1,537 byte page and 20,480 byte
+stylesheet of the nginx round, and a 48 KB file for the cache. The harness is
+a throwaway script, not in the repository.
+
+| Request | Before, µs | After, µs | Change |
+|---|---|---|---|
+| 1.5 KB page | 8.09 (7.80–8.20) | 8.16 (8.09–8.41) | +0.8 % |
+| 20 KB stylesheet | 8.89 (8.82–8.97) | 8.85 (8.78–9.18) | −0.4 % |
+| 304 (If-None-Match) | 6.99 (6.76–7.31) | 7.08 (7.06–7.52) | +1.3 % |
+| Cached 1.5 KB page | 6.24 (6.15–6.31) | 6.24 (6.23–6.28) | 0 |
+| Cached 304 | 5.97 (5.94–6.03) | 6.02 (6.01–6.14) | +0.9 % |
+| Cached 20 KB stylesheet | 7.62 (7.51–7.70) | 7.84 (7.60–8.01) | +2.9 % |
+| Cached 48 KB file | 9.04 (8.78–9.09) | 9.42 (9.24–9.57) | +4.2 % |
+
+- Without the cache the change is within the noise of this machine.
+- A cached body in a memfd used to go out with its head in one `sendfile(2)`
+  (the head was in the memfd). The head now carries the time of each
+  response and a sealed memfd is never written again, so the head is sent
+  first, with `MSG_MORE` (one packet still): one system call more, +0.4 µs.
+  That moved the size where a memfd beats a body in memory. Same build, the
+  memfd slots used up on one worker to keep bodies in memory, 4 rounds of
+  3 s: in memory 6.78 µs at 8 KB, 7.10 at 12, 7.63 at 16, 8.02 at 24, 8.48
+  at 32; memfd 7.12, 7.36, 7.70, 8.06, 8.31. `MEMFD_MIN` went from 8 KB to
+  24 KB, which is why the cached 20 KB row lost less than the 48 KB one.
+- The first build read `If-Match`, `If-Unmodified-Since` and `If-Range` by
+  searching the header lines on every request: +4.1 % on the page and +6.6 %
+  on the 304. They are now picked out with the other headers in the one pass
+  over the head, which gave the numbers above.
+- `Date` reads the clock through the vDSO (no system call) and formats the
+  text once a second per worker thread; the strace-based guard in
+  `tests/static_perf.rs` counts the same system calls per request as before.
+
 ## Findings about the other managers
 
 - **PM2 cluster mode can hang a connection** it handed to a worker that is

@@ -19,6 +19,11 @@ pub(super) struct Request<'a> {
     pub(super) range: Option<&'a str>,
     pub(super) if_none_match: Option<&'a str>,
     pub(super) if_modified_since: Option<&'a str>,
+    /// The rare preconditions: looked for on every file response, so picked
+    /// out with the others (a search of `rest` for each cost more).
+    pub(super) if_match: Option<&'a str>,
+    pub(super) if_unmodified_since: Option<&'a str>,
+    pub(super) if_range: Option<&'a str>,
     pub(super) authorization: Option<&'a str>,
     pub(super) accept: Option<&'a str>,
     /// The header lines, as received.
@@ -32,6 +37,9 @@ impl<'a> Request<'a> {
             "range" => Some(self.range),
             "if-none-match" => Some(self.if_none_match),
             "if-modified-since" => Some(self.if_modified_since),
+            "if-match" => Some(self.if_match),
+            "if-unmodified-since" => Some(self.if_unmodified_since),
+            "if-range" => Some(self.if_range),
             "authorization" => Some(self.authorization),
             "accept" => Some(self.accept),
             _ => None,
@@ -213,6 +221,9 @@ pub(super) fn parse_head(bytes: &[u8]) -> Result<Request<'_>, u16> {
         range: None,
         if_none_match: None,
         if_modified_since: None,
+        if_match: None,
+        if_unmodified_since: None,
+        if_range: None,
         authorization: None,
         accept: None,
         rest,
@@ -230,11 +241,14 @@ pub(super) fn parse_head(bytes: &[u8]) -> Result<Request<'_>, u16> {
         let slot = match k.len() {
             5 if k.eq_ignore_ascii_case("range") => &mut req.range,
             6 if k.eq_ignore_ascii_case("accept") => &mut req.accept,
+            8 if k.eq_ignore_ascii_case("if-match") => &mut req.if_match,
+            8 if k.eq_ignore_ascii_case("if-range") => &mut req.if_range,
             10 if k.eq_ignore_ascii_case("connection") => &mut connection,
             13 if k.eq_ignore_ascii_case("if-none-match") => &mut req.if_none_match,
             13 if k.eq_ignore_ascii_case("authorization") => &mut req.authorization,
             15 if k.eq_ignore_ascii_case("accept-encoding") => &mut req.accept_encoding,
             17 if k.eq_ignore_ascii_case("if-modified-since") => &mut req.if_modified_since,
+            19 if k.eq_ignore_ascii_case("if-unmodified-since") => &mut req.if_unmodified_since,
             _ => continue,
         };
         slot.get_or_insert(v);
@@ -490,7 +504,8 @@ mod tests {
     fn headers_are_picked_out_as_before() {
         let head = b"GET /p?q=1 HTTP/1.1\r\nrange:  bytes=0-1 \r\nRANGE: bytes=5-6\r\nnonsense\r\n\
                      Accept-Encoding:gzip\r\nX-Other: 1\r\nx-other: 2\r\nIf-None-Match: \"a\"\r\n\
-                     Authorization: Basic eA==\r\nAccept: text/html\r\nIf-Modified-Since: d\r\n\r\n";
+                     Authorization: Basic eA==\r\nAccept: text/html\r\nIf-Modified-Since: d\r\n\
+                     if-match: *\r\nIF-RANGE: \"r\"\r\nIf-Unmodified-Since: u\r\nIf-Match: x\r\n\r\n";
         let r = parse_head(head).unwrap();
         assert_eq!((r.method, r.path), ("GET", "/p?q=1"));
         assert_eq!(r.header("range"), Some("bytes=0-1"));
@@ -499,6 +514,9 @@ mod tests {
         assert_eq!(r.header("authorization"), Some("Basic eA=="));
         assert_eq!(r.header("accept"), Some("text/html"));
         assert_eq!(r.header("if-modified-since"), Some("d"));
+        assert_eq!(r.header("if-match"), Some("*"));
+        assert_eq!(r.header("if-range"), Some("\"r\""));
+        assert_eq!(r.header("if-unmodified-since"), Some("u"));
         assert_eq!(r.header("x-other"), Some("1"));
         assert_eq!(r.header("nonsense"), None);
         assert_eq!(r.header("host"), None);

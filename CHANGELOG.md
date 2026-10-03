@@ -254,6 +254,34 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   two SIGKILL deaths) are deterministic: they were races in the tests.
 - `warden start --watch` is no longer rejected ("Warden is for production").
   `warden serve --watch` is an error: the file server reads from disk.
+- Static serving follows RFC 9110 on dates and validators, so a browser or a
+  cache is never told an old copy is current
+  ([`docs/static-serving.md`](docs/static-serving.md#dates-and-validators)):
+  every response has a `Date` (there was none); the `ETag` includes the nanoseconds of the modification time,
+  so two edits of the same size within a second are two versions (files with
+  sub-second times get a new tag once, and browsers download them once more
+  after the upgrade); `Last-Modified` is sent once the file's second is over
+  and never later than `Date` (a file stamped in the future has none); an
+  `If-Modified-Since` later than the server's clock is ignored; `If-Match` and
+  `If-Unmodified-Since` get a 412 for another version; `If-Range` resumes a
+  range only for the same version (a whole file otherwise); a 304 says `Date`,
+  `ETag`, `Last-Modified`, `Cache-Control` and `Vary`; conditions apply only
+  where the answer would be a 200. Cost: within 1.3 % without the response
+  cache; with it, +2.9 % for a 20 KB body and +4.2 % for 48 KB, the head of a
+  memfd body being sent on its own (bodies under 24 KB, was 8 KB, now stay in
+  memory, where that is cheaper; [`docs/benchmarks.md`](docs/benchmarks.md)).
+- `[static] cache_max_age` defaults to `0`: files that are neither HTML nor
+  fingerprinted get `Cache-Control: no-cache` (a 304 while unchanged) instead
+  of `public, max-age=3600`, so a deploy reaches browsers at once instead of
+  up to an hour later. `cache_max_age = 3600` gives the old behaviour.
+- With `[static] basic_auth`, files are sent `private` (they were `public`,
+  which allows a shared cache such as a CDN to keep a file that needed a
+  password and give it to anyone), fingerprinted ones included.
+- Fingerprinted names (cached a year, immutable) are recognised more strictly:
+  lowercase hex (webpack, Parcel, Angular, Next), uppercase base32 (esbuild),
+  or mixed case with a digit before a letter (Vite, Rollup). `report2024.pdf`,
+  `background1.jpg` and `MyPhoto2024.png` used to count, so a new version
+  under the same name could stay unseen in browsers for a year.
 
 ### Notes
 

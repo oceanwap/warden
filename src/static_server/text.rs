@@ -1,6 +1,10 @@
 //! Small texts and numbers written without allocating: decimal and
-//! hexadecimal into a buffer, ETags and dates on the stack, and the date and
-//! Basic-auth text formats read back.
+//! hexadecimal into a buffer, ETags and dates on the stack, the clock a
+//! response's `Date` comes from, and the date and Basic-auth text formats
+//! read back.
+
+use std::cell::Cell;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Appends `s` to `out`.
 #[inline]
@@ -52,7 +56,7 @@ impl Short {
     }
 
     pub(super) fn push(&mut self, b: &[u8]) -> &mut Short {
-        // 64 bytes hold the longest text made here (an ETag is at most 42, a
+        // 64 bytes hold the longest text made here (an ETag is at most 51, a
         // date 45); a longer one is cut short rather than overrun.
         let n = b.len().min(self.buf.len() - self.len);
         self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
@@ -66,10 +70,19 @@ impl Short {
 }
 
 /// The weak ETag of a file: `W/"<size>-<mtime>"`, with `-<encoding>` for a
-/// precompressed variant, all in hexadecimal.
-pub(super) fn etag(len: u64, mtime: u64, encoding: Option<&str>) -> Short {
+/// precompressed variant, all in hexadecimal. The modification time is its
+/// seconds, and `.<nanoseconds>` when it has any: two edits of the same size
+/// within one second are two versions, and a browser holding the first must
+/// not be told it is current (editors and build tools leave times with a
+/// fraction; an archive that keeps only seconds, as tar's default format
+/// does, leaves whole ones). No inode: the tag is the same on every host
+/// that has the same files with the same times.
+pub(super) fn etag(len: u64, mtime: u64, nanos: u32, encoding: Option<&str>) -> Short {
     let mut e = Short::new();
     e.push(b"W/\"").push(hex(len, &mut [0; 16])).push(b"-").push(hex(mtime, &mut [0; 16]));
+    if nanos != 0 {
+        e.push(b".").push(hex(u64::from(nanos), &mut [0; 16]));
+    }
     if let Some(enc) = encoding {
         e.push(b"-").push(enc.as_bytes());
     }
@@ -102,6 +115,59 @@ pub(super) fn http_date_short(secs: u64) -> Short {
         .push(&two(rem % 60))
         .push(b" GMT");
     s
+}
+
+/// An HTTP date is this long, whatever the day (`Sun, 06 Nov 1994 08:49:37 GMT`).
+pub(super) const DATE_LEN: usize = 29;
+
+/// The last day an HTTP date can say (9999-12-31): the clock never gets near.
+const LAST_SECOND: u64 = 253_402_300_799;
+
+/// The time a response is made at: its `Date`, and the second it is of.
+#[derive(Clone, Copy)]
+pub(super) struct Now {
+    pub(super) secs: u64,
+    date: [u8; DATE_LEN],
+}
+
+impl Now {
+    /// The `Date` header's value.
+    pub(super) fn date(&self) -> &str {
+        std::str::from_utf8(&self.date).unwrap_or("")
+    }
+
+    /// The same bytes, to be written over a date already in a buffer.
+    pub(super) fn date_bytes(&self) -> &[u8; DATE_LEN] {
+        &self.date
+    }
+
+    /// The second `secs` (since 1970; the last an HTTP date can say at most).
+    pub(super) fn of(secs: u64) -> Now {
+        let secs = secs.min(LAST_SECOND);
+        let mut date = [b' '; DATE_LEN];
+        let text = http_date_short(secs);
+        let n = text.as_str().len().min(DATE_LEN);
+        date[..n].copy_from_slice(&text.as_str().as_bytes()[..n]);
+        Now { secs, date }
+    }
+}
+
+/// The wall clock now. Reading it costs a vDSO call (no system call); the
+/// text is made once a second, so a request pays a copy of 29 bytes.
+pub(super) fn now() -> Now {
+    thread_local! {
+        static LAST: Cell<(u64, [u8; DATE_LEN])> = const { Cell::new((u64::MAX, [b' '; DATE_LEN])) };
+    }
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()).min(LAST_SECOND);
+    LAST.with(|last| {
+        let (at, date) = last.get();
+        if at == secs {
+            return Now { secs, date };
+        }
+        let now = Now::of(secs);
+        last.set((secs, now.date));
+        now
+    })
 }
 
 pub(super) fn parse_http_date(s: &str) -> Option<u64> {
@@ -177,6 +243,43 @@ mod tests {
         assert_eq!(base64(b"ab"), "YWI=");
     }
 
+    #[test]
+    fn an_etag_tells_edits_within_one_second_apart() {
+        let plain = etag(10, 1_790_769_601, 0, None);
+        assert_eq!(plain.as_str(), "W/\"a-6abcf9c1\"", "no fraction: as before");
+        let a = etag(10, 1_790_769_601, 250_000_000, None);
+        let b = etag(10, 1_790_769_601, 750_000_000, Some("br"));
+        assert_eq!(a.as_str(), "W/\"a-6abcf9c1.ee6b280\"");
+        assert_eq!(b.as_str(), "W/\"a-6abcf9c1.2cb41780-br\"");
+        assert_ne!(a.as_str(), plain.as_str());
+        // The longest: 64-bit size and time, all nanoseconds, the longest encoding.
+        let longest = etag(u64::MAX, u64::MAX, 999_999_999, Some("gzip"));
+        assert!(longest.as_str().ends_with("-gzip\""), "{}", longest.as_str());
+        assert!(longest.as_str().len() <= 64);
+    }
+
+    #[test]
+    fn the_clock_makes_a_date_of_the_right_length_that_follows_the_second() {
+        let a = now();
+        assert_eq!(a.date().len(), DATE_LEN);
+        assert_eq!(parse_http_date(a.date()), Some(a.secs), "the text is the second");
+        assert_eq!(a.date_bytes(), a.date().as_bytes());
+        // In the same second it is the same text; across seconds it moves.
+        let mut seen = std::collections::BTreeSet::new();
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(2300) {
+            let n = now();
+            assert_eq!(parse_http_date(n.date()), Some(n.secs));
+            seen.insert(n.secs);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(seen.len() >= 2, "{seen:?}");
+        // Every date this clock can make has the same length.
+        for secs in [0, 1, 86_399, 951_782_400, 1_790_769_601, LAST_SECOND] {
+            assert_eq!(http_date_short(secs).as_str().len(), DATE_LEN, "{secs}");
+        }
+    }
+
     /// The text helpers that replaced `format!` and `Path` calls give what
     /// those gave.
     #[test]
@@ -208,7 +311,7 @@ mod tests {
             assert_eq!(http_date_short(v).as_str(), old_date(v), "date of {v}");
             for enc in [None, Some("br"), Some("gzip")] {
                 let old = format!("W/\"{v:x}-{:x}{}\"", v / 3, enc.map(|e| format!("-{e}")).unwrap_or_default());
-                assert_eq!(etag(v, v / 3, enc).as_str(), old);
+                assert_eq!(etag(v, v / 3, 0, enc).as_str(), old);
             }
             let mut out = Vec::new();
             put_dec(&mut out, v);

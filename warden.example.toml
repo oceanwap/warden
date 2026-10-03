@@ -175,7 +175,9 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # host = "0.0.0.0"
 # spa = false                                # unknown paths get index.html (single-page apps)
 # index = "index.html"
-# cache_max_age = 3600                       # s; HTML is revalidated (see html_max_age), fingerprinted names cached a year
+# cache_max_age = 0                          # s browsers may reuse other files without asking; 0 = `no-cache` (a 304 while
+#                                            # unchanged, a deploy shows at once). Fingerprinted names (app.3f9a2c1b.js) are
+#                                            # cached a year; HTML follows html_max_age
 # html_max_age = 60                          # example; opt in: browsers reuse a page for 60 s without asking (default: unset,
 #                                            # `no-cache`: a 304 round trip per page load). A deploy shows up after this long,
 #                                            # so keep it short; max 31536000 (a year); 0 = always revalidate

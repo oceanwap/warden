@@ -60,7 +60,7 @@ use crate::config::Static;
 use cache::Cache;
 use head::Request;
 use open::{OPEN_BENEATH, OPEN_CACHED, OPEN_LEGACY};
-use response::html_cache_control;
+use response::{html_cache_control, plain_cache_control};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -117,6 +117,8 @@ struct Fixed {
     cc_plain: String,
     /// Cache-Control of an HTML page.
     cc_html: String,
+    /// Cache-Control of a fingerprinted file: a year, immutable.
+    cc_immutable: &'static str,
     /// The configured `headers`, one `Name: value\r\n` line each.
     extra: String,
 }
@@ -127,7 +129,14 @@ impl Fixed {
         for (k, v) in &cfg.headers {
             extra += &format!("{k}: {v}\r\n");
         }
-        Fixed { cc_plain: format!("public, max-age={}", cfg.cache_max_age), cc_html: html_cache_control(cfg), extra }
+        // `private` behind a password: `public` would let a shared cache
+        // (a CDN, a proxy) keep the file and give it to anyone.
+        let cc_immutable = if cfg.basic_auth.is_some() {
+            "private, max-age=31536000, immutable"
+        } else {
+            "public, max-age=31536000, immutable"
+        };
+        Fixed { cc_plain: plain_cache_control(cfg), cc_html: html_cache_control(cfg), cc_immutable, extra }
     }
 }
 

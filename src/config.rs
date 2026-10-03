@@ -56,10 +56,14 @@ pub struct Static {
     pub spa: bool,
     #[serde(default = "default_index")]
     pub index: String,
-    /// `Cache-Control: max-age` in seconds for files (HTML is revalidated
-    /// unless `html_max_age` is set; fingerprinted names like
-    /// `app.3f9a2c1b.js` are cached a year, immutable).
-    #[serde(default = "default_cache_max_age")]
+    /// Opt in to browsers reusing files other than HTML pages for this many
+    /// seconds (`Cache-Control: max-age`) instead of asking again on every
+    /// use: the default 0 sends `no-cache` (a 304 while unchanged), so a
+    /// deploy shows at once. A file changed within that time is shown old
+    /// until it runs out. Fingerprinted names like `app.3f9a2c1b.js` are
+    /// cached a year, immutable, whatever this says; HTML follows
+    /// `html_max_age`.
+    #[serde(default)]
     pub cache_max_age: u64,
     /// Opt in to browsers reusing HTML pages for this many seconds
     /// (`Cache-Control: max-age`, at most a year) instead of asking again on
@@ -199,9 +203,6 @@ fn default_static_host() -> String {
 }
 fn default_index() -> String {
     "index.html".into()
-}
-fn default_cache_max_age() -> u64 {
-    3600
 }
 /// `static.html_max_age` at most: a year, like fingerprinted assets.
 pub const MAX_HTML_MAX_AGE: u64 = 31_536_000;
@@ -1738,7 +1739,7 @@ mod tests {
         let site = format!("[app]\nname = \"site\"\nport = 8080\n[static]{uncommented}\n");
         let c = Config::parse(&site).unwrap();
         let st = c.static_files.unwrap();
-        assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 3600, true));
+        assert_eq!((st.index.as_str(), st.cache_max_age, st.precompressed), ("index.html", 0, true));
         assert_eq!((st.cache_size, st.cache_max_file, st.cache_valid_ms), (0, 64 << 10, 1000));
     }
 

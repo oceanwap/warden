@@ -8,11 +8,11 @@ use super::names::{extension_of, fingerprinted, mime};
 use super::open::{Opened, inside, open, open_error_status, open_stored, read_body};
 use super::path::{join_rel, path_of, relative_cow};
 use super::response::{
-    FileHead, HeadParts, Page, file_head_into, head_buffer, is_not_modified, not_modified_head_into, respond,
-    respond_error,
+    FileHead, HeadParts, Page, file_head_into, head_buffer, if_range_allows, is_not_modified, not_modified_head_into,
+    preconditions_hold, respond, respond_error,
 };
 use super::store::{Entry, Version};
-use super::text::{etag, http_date_short};
+use super::text::{etag, http_date_short, now};
 use super::{Exchange, Site};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
@@ -23,6 +23,15 @@ use std::time::UNIX_EPOCH;
 /// sendfile; a 1.5 KB page is the same either way. 16 KB is past the point
 /// where the copy costs more than the extra syscall.
 const SMALL_FILE: u64 = 16 * 1024;
+
+/// A file's modification time: whole seconds and the nanoseconds after them
+/// (0 and 0 when it has none, or is before 1970).
+fn modified(meta: &std::fs::Metadata) -> (u64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()))
+}
 
 /// What answering a request leaves for its caller.
 #[derive(Default)]
@@ -282,22 +291,32 @@ async fn send_file(
         Compressed::No => (found, None),
     };
     let len = body.meta.len();
-    let mtime = body.meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-    let etag = etag(len, mtime, encoding);
-    let last_modified = http_date_short(mtime);
+    let (mtime, nanos) = modified(&body.meta);
+    let now = now();
+    let etag = etag(len, mtime, nanos, encoding);
+    // Last-Modified only once the file's second is over. Within it, the file
+    // can change again, and a client that sent this date back in
+    // If-Modified-Since would be told the newer file is the one it has (the
+    // ETag, with its nanoseconds, tells them apart: the client revalidates
+    // with that). A time ahead of the clock (a file stamped in the future:
+    // a clock that was ahead, an archive from another machine) would say
+    // the file changed after the response was made (RFC 9110, 8.8.2.1).
+    let lm_text = http_date_short(mtime);
+    let last_modified = if mtime < now.secs { lm_text.as_str() } else { "" };
     let cache_control: &str = if status != 200 {
         "no-cache"
     } else if matches!(ext, "html" | "htm") {
         &site.fixed.cc_html
     } else if fingerprinted(rel) {
-        "public, max-age=31536000, immutable"
+        site.fixed.cc_immutable
     } else {
         &site.fixed.cc_plain
     };
     let vary = if site.cfg.precompressed { "Vary: Accept-Encoding\r\n" } else { "" };
     let parts = HeadParts {
+        date: now.date(),
         etag: etag.as_str(),
-        last_modified: last_modified.as_str(),
+        last_modified,
         cache_control,
         vary,
         extra: &site.fixed.extra,
@@ -314,7 +333,10 @@ async fn send_file(
     }
 
     let conn = if keep { "keep-alive" } else { "close" };
-    if status == 200 && is_not_modified(req, parts.etag, mtime) {
+    if status == 200 && !preconditions_hold(req, mtime) {
+        return respond_error(w, 412, keep, x.head_only()).await;
+    }
+    if status == 200 && is_not_modified(req, parts.etag, mtime, now.secs) {
         let mut head = head_buffer(&parts, 0);
         not_modified_head_into(&mut head, &parts, conn);
         w.write_all(head).await?;
@@ -324,7 +346,8 @@ async fn send_file(
     // A single byte range of a file served as it is.
     let mut range = None;
     if status == 200 && encoding.is_none() {
-        match req.header("range").and_then(|r| parse_range(r, len)) {
+        // (A Range with an If-Range this file does not meet is no Range: the client gets all of it.)
+        match req.header("range").filter(|_| if_range_allows(req, mtime, now.secs)).and_then(|r| parse_range(r, len)) {
             Some(Ok(r)) => range = Some(r),
             Some(Err(())) => {
                 let headers = format!("Content-Range: bytes */{len}\r\n");

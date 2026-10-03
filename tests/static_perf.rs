@@ -1,4 +1,5 @@
-//! Static file serving: the speed guards and `html_max_age`.
+//! Static file serving: the speed guards, `html_max_age`, and the dates and
+//! validators of responses (RFC 9110).
 //!
 //! Every test runs the real worker (`warden serve-static`, the process
 //! `warden start` runs for a `[static]` site) on a loopback port, with the
@@ -24,7 +25,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_warden");
 
@@ -278,6 +279,10 @@ fn policies(w: &Worker, extra: &str) -> Vec<(&'static str, u16, String)> {
 }
 
 fn expect(got: &[(&str, u16, String)], pages: &str, css: &str) {
+    expect_all(got, pages, css, JS_FINGERPRINTED);
+}
+
+fn expect_all(got: &[(&str, u16, String)], pages: &str, css: &str, js: &str) {
     let want: Vec<(&str, u16, String)> = vec![
         ("/", 200, pages.to_string()),
         ("/page.html", 200, pages.to_string()),
@@ -285,7 +290,7 @@ fn expect(got: &[(&str, u16, String)], pages: &str, css: &str) {
         // The error page is never kept: a 404 must not outlive the fix.
         ("/missing", 404, "no-cache".to_string()),
         ("/style.css", 200, css.to_string()),
-        ("/app.3f9a2c1b.js", 200, JS_FINGERPRINTED.to_string()),
+        ("/app.3f9a2c1b.js", 200, js.to_string()),
     ];
     assert_eq!(got, want.as_slice());
 }
@@ -296,12 +301,12 @@ fn html_pages_follow_html_max_age_and_other_files_do_not() {
     let site = make_site(&tmp);
     quiet();
 
-    // Unset (the default) and 0: ask again on every page load, as before.
-    // With and without the cache.
+    // Unset (the default) and 0: ask again on every page load, as before;
+    // the other files too (`cache_max_age` unset). With and without the cache.
     for cache in ["0", "16MB"] {
         for extra in [json!({ "cache_size": cache }), json!({ "html_max_age": 0, "cache_size": cache })] {
             let w = Worker::start(&tmp, &site, extra);
-            expect(&policies(&w, ""), "no-cache", "public, max-age=3600");
+            expect(&policies(&w, ""), "no-cache", "no-cache");
         }
     }
 
@@ -337,7 +342,12 @@ fn html_pages_follow_html_max_age_and_other_files_do_not() {
     assert_eq!(denied.status, 401);
     assert_eq!(denied.h("cache-control"), "", "the refusal says nothing about caching");
     let got = policies(&w, "Authorization: Basic dTpw\r\n");
-    expect(&got, "private, max-age=60", "public, max-age=3600");
+    let private_js = "private, max-age=31536000, immutable";
+    expect_all(&got, "private, max-age=60", "no-cache", private_js);
+    // And no file: what may be kept, may be kept by the browser only.
+    let w = Worker::start(&tmp, &site, json!({ "cache_max_age": 3600, "basic_auth": "u:p" }));
+    let got = policies(&w, "Authorization: Basic dTpw\r\n");
+    expect_all(&got, "no-cache", "private, max-age=3600", private_js);
 }
 
 #[test]
@@ -449,7 +459,7 @@ fn html_max_age_comes_from_the_config_file_and_is_bounded() {
     };
     assert_eq!(cache_control, "public, max-age=90");
     let css = Client::connect(started.port).get("/style.css", "");
-    assert_eq!(css.h("cache-control"), "public, max-age=3600");
+    assert_eq!(css.h("cache-control"), "no-cache");
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +547,22 @@ fn head_and_pipelined_requests_get_one_exact_response_each() {
 /// Everything a client sends on one connection, `pause` apart, and everything
 /// the server sends back until it closes (the last request says
 /// `Connection: close`, or is HTTP/1.0).
+/// `raw` as text, with the value of each Date header (when the response was
+/// made: two answers a second apart differ there and nowhere else) checked
+/// to be an HTTP date and replaced by a fixed one.
+fn undated(raw: &[u8]) -> String {
+    let mut s = String::from_utf8_lossy(raw).into_owned();
+    let mut from = 0;
+    while let Some(i) = s[from..].find("\r\nDate: ") {
+        let at = from + i + 8;
+        let date = s.get(at..at + 29).unwrap_or_default();
+        assert!(date.ends_with(" GMT") && date.as_bytes()[3] == b',', "an HTTP date: {date:?}");
+        s.replace_range(at..at + 29, "Sun, 06 Nov 1994 08:49:37 GMT");
+        from = at + 29;
+    }
+    s
+}
+
 fn exchange(port: u16, segments: &[&str], pause: Duration) -> Vec<u8> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_nodelay(true).unwrap();
@@ -669,11 +695,7 @@ fn accept_loop_matches_normal_path(cache: bool) {
         let a = exchange(inline.port, &segs, *pause);
         let b = exchange(normal.port, &segs, *pause);
         assert!(a.starts_with(b"HTTP/1.1 "), "{name}: {:?}", String::from_utf8_lossy(&a));
-        assert_eq!(
-            String::from_utf8_lossy(&a),
-            String::from_utf8_lossy(&b),
-            "{name}: the accept-loop answer differs from the normal one"
-        );
+        assert_eq!(undated(&a), undated(&b), "{name}: the accept-loop answer differs from the normal one");
     }
 
     // The comparison above means something only if the accept loop really did
@@ -849,8 +871,12 @@ fn a_file_is_sent_plain_first_and_from_its_compressed_copy_later() {
     assert!(br.body.len() < css.len() / 2);
     assert_eq!(br.h("content-length"), br.body.len().to_string());
     assert!(br.h("etag").ends_with("-br\""), "{}", br.h("etag"));
-    // The copy has the file's date, and its own ETag and length.
-    assert_eq!(br.h("last-modified"), first.h("last-modified"));
+    // The copy has the file's date, and its own ETag and length. (The first
+    // answer may have come within the second the file was written in: then
+    // it had no Last-Modified.)
+    let plain = get("/app.css", "Connection: close\r\n");
+    assert!(!plain.h("last-modified").is_empty());
+    assert_eq!(br.h("last-modified"), plain.h("last-modified"));
     assert_ne!(br.h("etag"), first.h("etag"));
     // gzip when that is all the client takes; the file when it takes neither.
     let gz = until_encoded(w.port, "/app.css", "gzip");
@@ -1855,4 +1881,262 @@ mod linux {
     /// trivial server is a test helper and is the same in both.
     const CPU_FACTOR: f64 = if cfg!(debug_assertions) { 16.0 } else { 4.0 };
     const LATENCY_FACTOR: f64 = if cfg!(debug_assertions) { 6.0 } else { 3.0 };
+}
+
+// ---------------------------------------------------------------------------
+// Date and validators (RFC 9110)
+// ---------------------------------------------------------------------------
+
+const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Seconds since 1970 of an HTTP date (`Sun, 06 Nov 1994 08:49:37 GMT`).
+fn parse_date(s: &str) -> u64 {
+    assert!(s.len() == 29 && s.ends_with(" GMT") && &s[3..5] == ", ", "not an HTTP date: {s:?}");
+    let num = |r: std::ops::Range<usize>| s[r].parse::<i64>().unwrap_or_else(|_| panic!("not an HTTP date: {s:?}"));
+    let m = MONTHS.iter().position(|m| *m == &s[8..11]).unwrap_or_else(|| panic!("month of {s:?}")) as i64 + 1;
+    let (y, d) = (num(12..16), num(5..7));
+    // Days from the civil date (H. Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    (days * 86_400 + num(17..19) * 3600 + num(20..22) * 60 + num(23..25)) as u64
+}
+
+/// The HTTP date of `secs` (seconds since 1970).
+fn http_date(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let wd = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let mon = MONTHS[(m - 1) as usize];
+    format!("{wd}, {d:02} {mon} {y} {:02}:{:02}:{:02} GMT", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Give `rel` the modification time `secs` and `nanos` (seconds since 1970).
+fn set_mtime(site: &Path, rel: &str, secs: u64, nanos: u32) {
+    let f = std::fs::File::options().write(true).open(site.join(rel)).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::new(secs, nanos)).unwrap();
+}
+
+/// `r` has a Date, an HTTP date of the time it was sent (between `before`
+/// and now, in seconds), and a Last-Modified, if any, before it. Gives the
+/// Date in seconds.
+fn dated(r: &Resp, before: u64, what: &str) -> u64 {
+    let date = r.h("date");
+    assert!(!date.is_empty(), "{what}: no Date ({:?})", r.headers);
+    let t = parse_date(date);
+    let after = unix_now();
+    assert!(before <= t && t <= after, "{what}: Date {date} is not when it was sent ({before}..={after})");
+    if !r.h("last-modified").is_empty() {
+        assert!(parse_date(r.h("last-modified")) < t, "{what}: Last-Modified not before the Date: {:?}", r.headers);
+    }
+    t
+}
+
+#[test]
+fn the_date_helpers_agree_with_each_other() {
+    assert_eq!(parse_date("Sun, 06 Nov 1994 08:49:37 GMT"), 784_111_777);
+    assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+    for t in [0, 951_782_400, 1_790_769_601, unix_now()] {
+        assert_eq!(parse_date(&http_date(t)), t, "{t}");
+    }
+}
+
+/// Every response says when it was made: files, 304s, ranges, errors,
+/// redirects, from the cache or not (a cached one says the time it is sent,
+/// never the time it was cached), and a Last-Modified is never after it.
+#[test]
+fn every_response_says_when_it_was_made() {
+    for cache in [false, true] {
+        let tmp = Tmp::new(if cache { "date-cache" } else { "date" });
+        let site = make_site(&tmp);
+        quiet();
+        let cfg = if cache { json!({ "cache_size": "16MB", "cache_valid_ms": 600_000 }) } else { json!({}) };
+        let w = Worker::start(&tmp, &site, cfg);
+        let what = |s: &str| format!("{s} (cache: {cache})");
+        let mut c = Client::connect(w.port);
+        let t0 = unix_now();
+
+        // Files, asked twice a second apart: the second answer (a cache hit,
+        // with a cache; in a memfd for the 20 KB file) says the later time.
+        for (path, body) in [("/style.css", b"a{}".to_vec()), ("/mid20k.bin", pattern(20_000))] {
+            let a = c.get(path, "");
+            assert_eq!((a.status, &a.body), (200, &body), "{}", what(path));
+            let ta = dated(&a, t0, &what(path));
+            std::thread::sleep(Duration::from_millis(1100));
+            let t1 = unix_now();
+            let b = c.get(path, "");
+            assert_eq!((b.status, &b.body), (200, &body), "{}", what(path));
+            let tb = dated(&b, t1, &what(path));
+            assert!(tb > ta, "{}: the second answer is dated {} like the first", what(path), b.h("date"));
+            assert_eq!((b.h("etag"), b.h("last-modified")), (a.h("etag"), a.h("last-modified")));
+            let close = Client::connect(w.port).get(path, "Connection: close\r\n");
+            assert_eq!((close.status, close.h("connection")), (200, "close"));
+            dated(&close, t1, &what(&format!("{path}, Connection: close")));
+            let head = c.head(path, "");
+            assert_eq!(head.h("content-length"), body.len().to_string());
+            dated(&head, t1, &what(&format!("HEAD {path}")));
+        }
+
+        // A 304 says what the 200 would have: Date, ETag, Cache-Control, Vary.
+        let ok = c.get("/style.css", "");
+        for cond in
+            [format!("If-None-Match: {}", ok.h("etag")), format!("If-Modified-Since: {}", ok.h("last-modified"))]
+        {
+            let nm = c.get("/style.css", &format!("{cond}\r\n"));
+            assert_eq!(nm.status, 304, "{}", what(&cond));
+            dated(&nm, t0, &what(&cond));
+            for h in ["etag", "cache-control", "vary", "last-modified"] {
+                assert_eq!(nm.h(h), ok.h(h), "{}: {h}", what(&cond));
+            }
+            assert!(nm.h("content-type").is_empty() && nm.body.is_empty());
+        }
+
+        // Ranges, errors and redirects.
+        for (req, status) in [
+            ("GET /big.bin HTTP/1.1\r\nRange: bytes=0-9\r\n", 206),
+            ("GET /style.css HTTP/1.1\r\nRange: bytes=1000-\r\n", 416),
+            ("GET /missing.txt HTTP/1.1\r\n", 404),
+            ("GET /sub HTTP/1.1\r\n", 301),
+            ("POST /style.css HTTP/1.1\r\nContent-Length: 0\r\n", 405),
+            ("GET /style.css HTTP/1.1\r\nIf-Match: \"x\"\r\n", 412),
+            ("GET /%2e%2e/x HTTP/1.1\r\n", 403),
+        ] {
+            c.send(&format!("{req}Host: x\r\n\r\n"));
+            let r = c.recv(false);
+            assert_eq!(r.status, status, "{}", what(req));
+            dated(&r, t0, &what(req));
+        }
+        drop(c);
+        drop(w);
+
+        let locked = Worker::start(&tmp, &site, json!({ "basic_auth": "u:p" }));
+        let r = Client::connect(locked.port).get("/style.css", "");
+        assert_eq!(r.status, 401);
+        dated(&r, t0, &what("401"));
+    }
+}
+
+/// Validators that never pass a changed file off as the one the client has
+/// (RFC 9110, 8.8 and 13): an edit within the second of the last one is a
+/// new ETag; a file stamped in the future has no Last-Modified, and a date
+/// ahead of the server's clock validates nothing; a range is resumed only
+/// for the same version; If-Match and If-Unmodified-Since get a 412 for any
+/// other one.
+#[test]
+fn validators_tell_versions_apart() {
+    for cache in [false, true] {
+        let tmp = Tmp::new(if cache { "validators-cache" } else { "validators" });
+        let site = tmp.site();
+        let then = unix_now() - 100;
+        write(&site, "v.txt", b"aaaa");
+        set_mtime(&site, "v.txt", then, 100_000_000);
+        write(&site, "r.txt", b"0123456789");
+        set_mtime(&site, "r.txt", then, 0);
+        write(&site, "future.txt", b"from the future");
+        set_mtime(&site, "future.txt", unix_now() + 3600, 0);
+        // With a cache, every hit is checked against the disk first; the files
+        // are cached once they have been still for a while.
+        let cfg = if cache { json!({ "cache_size": "16MB", "cache_valid_ms": 0 }) } else { json!({}) };
+        if cache {
+            quiet();
+        }
+        let w = Worker::start(&tmp, &site, cfg);
+        let what = |s: &str| format!("{s} (cache: {cache})");
+        let mut c = Client::connect(w.port);
+        let get = |c: &mut Client, path: &str, extra: &str| c.get(path, &format!("{extra}\r\n"));
+
+        // Same size, same second, another version: another ETag. The date
+        // can't tell them apart; the tag can, and a client with the old one
+        // gets the new file.
+        let v1 = c.get("/v.txt", "");
+        assert_eq!((v1.status, v1.body.as_slice()), (200, &b"aaaa"[..]));
+        assert_eq!(v1.h("last-modified"), http_date(then));
+        assert_eq!(get(&mut c, "/v.txt", &format!("If-None-Match: {}", v1.h("etag"))).status, 304);
+        write(&site, "v.txt", b"bbbb");
+        set_mtime(&site, "v.txt", then, 600_000_000);
+        let v2 = c.get("/v.txt", "");
+        assert_eq!((v2.status, v2.body.as_slice()), (200, &b"bbbb"[..]), "{}", what("same-second edit"));
+        assert_eq!(v2.h("last-modified"), v1.h("last-modified"));
+        assert_ne!(v2.h("etag"), v1.h("etag"), "{}", what("same-second edit"));
+        let old = get(&mut c, "/v.txt", &format!("If-None-Match: {}", v1.h("etag")));
+        assert_eq!((old.status, old.body.as_slice()), (200, &b"bbbb"[..]), "{}", what("the old tag"));
+        assert_eq!(get(&mut c, "/v.txt", &format!("If-None-Match: {}", v2.h("etag"))).status, 304);
+
+        // A file stamped ahead of the clock: no Last-Modified (it would say
+        // the file changed after the response was made), and no 304 for a
+        // date at all.
+        let f = c.get("/future.txt", "");
+        assert_eq!(f.status, 200);
+        assert!(f.h("last-modified").is_empty() && !f.h("etag").is_empty(), "{:?}", f.headers);
+        dated(&f, then, &what("future file"));
+        for since in [unix_now(), unix_now() + 7200] {
+            let r = get(&mut c, "/future.txt", &format!("If-Modified-Since: {}", http_date(since)));
+            assert_eq!(r.status, 200, "{}", what(&http_date(since)));
+        }
+        assert_eq!(get(&mut c, "/future.txt", &format!("If-None-Match: {}", f.h("etag"))).status, 304);
+
+        // If-Modified-Since: the file's own date and later ones up to now
+        // validate; one ahead of the server's clock does not.
+        let r = c.get("/r.txt", "");
+        let lm = r.h("last-modified").to_string();
+        assert_eq!(lm, http_date(then));
+        assert_eq!(get(&mut c, "/r.txt", &format!("If-Modified-Since: {lm}")).status, 304);
+        assert_eq!(get(&mut c, "/r.txt", &format!("If-Modified-Since: {}", http_date(then + 50))).status, 304);
+        assert_eq!(get(&mut c, "/r.txt", &format!("If-Modified-Since: {}", http_date(then - 1))).status, 200);
+        let ahead = get(&mut c, "/r.txt", &format!("If-Modified-Since: {}", http_date(unix_now() + 3600)));
+        assert_eq!((ahead.status, ahead.body.as_slice()), (200, &b"0123456789"[..]), "{}", what("IMS ahead"));
+
+        // If-Range: the rest of the same version, or all of this one.
+        let range =
+            |c: &mut Client, if_range: &str| get(c, "/r.txt", &format!("Range: bytes=2-4\r\nIf-Range: {if_range}"));
+        let same = range(&mut c, &lm);
+        assert_eq!((same.status, same.body.as_slice()), (206, &b"234"[..]), "{}", what("If-Range: its date"));
+        for other in [http_date(then - 1), http_date(then + 1), r.h("etag").to_string(), "\"x\"".into()] {
+            let full = range(&mut c, &other);
+            assert_eq!((full.status, full.body.as_slice()), (200, &b"0123456789"[..]), "{}", what(&other));
+        }
+
+        // If-Match (strong: no weak tag meets it) and If-Unmodified-Since.
+        for (cond, status) in [
+            ("If-Match: *".to_string(), 200),
+            (format!("If-Match: {}", r.h("etag")), 412),
+            (format!("If-Unmodified-Since: {lm}"), 200),
+            (format!("If-Unmodified-Since: {}", http_date(then - 10)), 412),
+        ] {
+            let g = get(&mut c, "/r.txt", &cond);
+            assert_eq!(g.status, status, "{}", what(&cond));
+            if status == 412 {
+                assert_eq!(g.body, b"412 Precondition Failed\n");
+            }
+            let h = c.head("/r.txt", &format!("{cond}\r\n"));
+            assert_eq!(h.status, status, "{}", what(&format!("HEAD, {cond}")));
+        }
+        drop(c);
+        // With a cache, the answers above came from it, and the edit dropped
+        // the old version.
+        let log = w.stop();
+        if cache {
+            let line = log.lines().find(|l| l.starts_with("static cache:")).unwrap_or_else(|| panic!("{log}"));
+            let n = |what: &str| -> u64 {
+                let at = line.find(what).unwrap_or_else(|| panic!("{line}"));
+                line[..at].trim_end().rsplit([' ', ',']).next().unwrap().parse().unwrap()
+            };
+            assert!(n(" hits") >= 5 && n(" dropped as changed on disk") >= 1, "{line}");
+        }
+    }
 }

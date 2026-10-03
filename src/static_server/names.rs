@@ -24,15 +24,31 @@ pub(super) fn extension_of<'a>(rel: &str, buf: &'a mut [u8; 12]) -> &'a str {
     }
 }
 
-/// `app.3f9a2c1b.js`, `index-DkS8xW2q.css`: a content hash in the name.
+/// A content hash in the name: the file at this name never changes, so
+/// browsers may keep it a year without asking. A part of the name (between
+/// `.`, `-` and `_`) of 8 or more letters and digits, with a digit, that is
+/// lowercase hex (`app.3f9a2c1b.js`: webpack, Parcel, Angular, Next),
+/// uppercase base32 (`chunk-UL3F5VGK.js`: esbuild) or mixed case with a
+/// digit before a letter (`index-DkS8xW2q.css`: Vite, Rollup). Words and a
+/// number are not a hash (`report2024.pdf`, `background1.jpg`,
+/// `MyPhoto2024.png`): a name taken for one by mistake would keep its old
+/// content in browsers for a year, one that is missed is only revalidated.
 pub(super) fn fingerprinted(rel: &str) -> bool {
-    file_name(rel).split(['.', '-', '_']).any(|part| {
-        let b = part.as_bytes();
-        b.len() >= 8
-            && b.iter().all(u8::is_ascii_alphanumeric)
-            && b.iter().any(u8::is_ascii_digit)
-            && b.iter().any(u8::is_ascii_alphabetic)
-    })
+    file_name(rel).split(['.', '-', '_']).any(|part| looks_like_hash(part.as_bytes()))
+}
+
+fn looks_like_hash(p: &[u8]) -> bool {
+    if p.len() < 8 || !p.iter().all(u8::is_ascii_alphanumeric) || !p.iter().any(u8::is_ascii_digit) {
+        return false;
+    }
+    let lower = p.iter().any(u8::is_ascii_lowercase);
+    let upper = p.iter().any(u8::is_ascii_uppercase);
+    match (lower, upper) {
+        (true, false) => p.iter().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c)),
+        (false, true) => p.iter().all(|c| c.is_ascii_uppercase() || (b'2'..=b'7').contains(c)),
+        (true, true) => p.iter().skip_while(|c| !c.is_ascii_digit()).any(u8::is_ascii_alphabetic),
+        (false, false) => false,
+    }
 }
 
 pub(super) fn mime(ext: &str) -> &'static str {
@@ -107,10 +123,43 @@ mod tests {
 
     #[test]
     fn types_and_fingerprints() {
-        assert!(fingerprinted("app.3f9a2c1b.js"));
-        assert!(fingerprinted("index-DkS8xW2q.css"));
-        assert!(!fingerprinted("favicon.ico"));
-        assert!(!fingerprinted("background.png"));
+        // What bundlers write: webpack, Parcel, Angular, Next (lowercase
+        // hex), esbuild (base32), Vite and Rollup (mixed case).
+        for name in [
+            "app.3f9a2c1b.js",
+            "main.8a8f3f3b.chunk.js",
+            "static/media/logo.6ce24c58023cc2f8fd88fe9d219db6c6.svg",
+            "_next/static/chunks/main-app-3f0d5b5f6b0b4e8f.js",
+            "main.4ba3a0e3f2a4a8c3.js",
+            "a_1b2c3d4e5.map",
+            "x/y/vendor-0a1b2c3d4e.min.js",
+            "chunk-UL3F5VGK.js",
+            "index-DkS8xW2q.css",
+            "assets/index-BxwG0dWm.js",
+            "_astro/index.D4uZ8kxY.css",
+        ] {
+            assert!(fingerprinted(name), "{name}");
+        }
+        // Names people give files: revalidated like any other file, so a
+        // new version under the same name reaches browsers.
+        for name in [
+            "favicon.ico",
+            "background.png",
+            "report2024.pdf",
+            "background1.jpg",
+            "chapter10a.html",
+            "v2release.zip",
+            "MyPhoto2024.png",
+            "NotoSans3.woff2",
+            "REPORT2024.PDF",
+            "abcdefgh.js",
+            "12345678.js",
+            "deadbeef.js",
+            "jquery-3.6.0.min.js",
+            "dir.3f9a2c1b/style.css",
+        ] {
+            assert!(!fingerprinted(name), "{name}");
+        }
         assert_eq!(mime("woff2"), "font/woff2");
     }
 
@@ -177,7 +226,11 @@ mod tests {
             } else {
                 assert_eq!(mime(got), mime(&old_ext(rel)));
             }
-            assert_eq!(fingerprinted(rel), old_fp(rel), "fingerprint of {rel:?}");
+            // The rule changed (words and a number are no longer a hash):
+            // where the old one said no, the new one does too.
+            if !old_fp(rel) {
+                assert!(!fingerprinted(rel), "fingerprint of {rel:?}");
+            }
         }
     }
 }

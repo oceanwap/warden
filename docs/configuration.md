@@ -228,7 +228,7 @@ Every key but `root` is optional. What the server does and why:
 | `host` | `"0.0.0.0"` | Address to listen on (the port is `[app] port`) |
 | `spa` | `false` | Unknown paths get `index.html` (single-page apps) |
 | `index` | `"index.html"` | The file served for a directory |
-| `cache_max_age` | `3600` | Seconds; fingerprinted names are cached a year |
+| `cache_max_age` | `0` | Seconds browsers may reuse a file that is neither an HTML page nor fingerprinted without asking. `0`: `no-cache`, revalidated on every use with its ETag (a 304 when unchanged), so a deploy shows at once; e.g. `3600` saves those requests, and a file changed in a deploy is shown old for up to that long. `public`, or `private` with `basic_auth`. Fingerprinted names (`app.3f9a2c1b.js`, `index-DkS8xW2q.css`) are cached a year, immutable ([`static-serving.md`](static-serving.md#dates-and-validators)) |
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages. Unset or `0`: HTML is revalidated on every load with its ETag (a 304 when unchanged). 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
@@ -243,7 +243,7 @@ Every key but `root` is optional. What the server does and why:
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request |
-| `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 8 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
+| `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 24 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
 | `cache_max_file` | `"64KB"` | With a cache: larger files are not cached (sent with `sendfile`) |
 | `cache_valid_ms` | `1000` | With a cache: a cached file is re-checked on disk at most this often |
 

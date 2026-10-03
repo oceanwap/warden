@@ -1,8 +1,12 @@
 //! In-memory cache of small hot files for `warden serve`: one complete,
 //! prebuilt response per file and variant (status line, headers, body), so
 //! a keep-alive GET hit is a single send(2) with no open, fstat or read; a
-//! body of MEMFD_MIN or more lives in a sealed memfd instead, and the hit is
-//! a single sendfile(2), which hands the kernel the pages without copying.
+//! body of MEMFD_MIN or more lives in a sealed memfd instead, and the hit
+//! sends the head, then the body by sendfile(2), which hands the kernel the
+//! pages without copying (on Linux a send with MSG_MORE, so both share the
+//! first packet). Each response says its own time in `Date`: the stored
+//! bytes are dated anew once a second, by the first response of that second
+//! (`Dated`).
 //!
 //! Bounded per worker by `[static] cache_size` (LRU eviction; every byte an
 //! entry holds is counted: response, 304 head, key, validators and the
@@ -26,6 +30,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use super::text::{DATE_LEN, Now};
 
 /// Identity and version of a file: if any of these differ, the cached
 /// response is stale. ctime matters: `rsync --inplace` (and anything that
@@ -96,11 +102,15 @@ pub struct Dep {
 /// sent with sendfile(2): the kernel takes the pages by reference instead of
 /// copying them into the socket, which is what a send(2) from memory costs
 /// (measured: docs/benchmarks.md, "memfd"). Smaller ones stay in memory,
-/// where one send(2) is cheaper than sendfile's page handling.
-pub const MEMFD_MIN: u64 = 8 * 1024;
+/// where one send(2) is cheaper than sendfile's page handling. The head goes
+/// out first in its own send (it carries the time of each response, and a
+/// memfd is never written again), which moved the point where the memfd pays
+/// from 8 KB to between 24 and 32 KB: in memory 6.78 µs per response at
+/// 8 KB, 7.63 at 16, 8.02 at 24, 8.48 at 32; memfd 7.12, 7.70, 8.06, 8.31.
+pub const MEMFD_MIN: u64 = 24 * 1024;
 
-/// A cached response (head and body) in a sealed memfd, counted against
-/// the cache's limit on open memfds while it lives.
+/// The body of a cached response in a sealed memfd, counted against the
+/// cache's limit on open memfds while it lives.
 #[derive(Debug)]
 pub struct MemFile {
     pub file: std::fs::File,
@@ -117,23 +127,71 @@ impl Drop for MemFile {
 /// with `Connection: keep-alive`; the other forms are derived from it.
 #[derive(Debug)]
 pub struct Entry {
-    /// Head then body: a keep-alive GET is exactly these bytes. With
-    /// `file`, only the head (the whole response is in the file).
-    pub resp: Arc<[u8]>,
-    /// The whole response (head then body) in a memfd, for bodies of at
-    /// least MEMFD_MIN: a keep-alive GET is one sendfile(2) of it.
+    /// Head then body (with `file`, only the head): a keep-alive GET sends
+    /// these bytes, dated with its own second.
+    pub resp: Dated,
+    /// The body in a sealed memfd, for bodies of at least MEMFD_MIN: a GET
+    /// sends the head from `resp`, then the body from here by page
+    /// reference. (The head cannot be in it: a sealed memfd is never written
+    /// again, and the pages of one already sent may still be in the socket's
+    /// queue, so a date written over them would change bytes on the wire.)
     pub file: Option<Arc<MemFile>>,
     pub head_len: usize,
-    /// Where the Connection header's value ("keep-alive") starts in `resp`.
+    /// Where the Connection header's value ("keep-alive") starts in `resp`:
+    /// `close` goes in its place when the connection is not kept.
     pub conn_at: usize,
     /// The 304 head (keep-alive), and where its Connection value starts.
-    pub not_modified: Arc<[u8]>,
+    pub not_modified: Dated,
     pub nm_conn_at: usize,
     pub etag: Box<str>,
     /// Last-Modified in seconds (If-Modified-Since compares against it).
     pub mtime: u64,
     pub body_len: u64,
     pub deps: Vec<Dep>,
+}
+
+/// Bytes with an HTTP date at a fixed place (`date_at`, `DATE_LEN` bytes),
+/// as of the second that date says. A response sends them dated with its own
+/// second: the first response of a second makes a copy with that date
+/// written over the old one, and the others of the same second share it, so
+/// a hit still sends shared bytes, copied once a second at most. (The cache
+/// is per worker, so the lock is not contended.)
+#[derive(Debug)]
+pub struct Dated {
+    date_at: usize,
+    len: usize,
+    current: Mutex<(u64, Arc<[u8]>)>,
+}
+
+impl Dated {
+    /// `bytes`, whose date at `date_at` says the second `secs`.
+    pub fn new(bytes: Arc<[u8]>, date_at: usize, secs: u64) -> Dated {
+        debug_assert!(date_at + DATE_LEN <= bytes.len());
+        Dated { date_at, len: bytes.len(), current: Mutex::new((secs, bytes)) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The bytes, dated `now`.
+    pub fn as_of(&self, now: &Now) -> Arc<[u8]> {
+        let (secs, bytes) = {
+            let c = self.current.lock().unwrap_or_else(|e| e.into_inner());
+            (c.0, c.1.clone())
+        };
+        if secs == now.secs {
+            return bytes;
+        }
+        // Copied without the lock held: a big body takes a while.
+        let mut fresh: Arc<[u8]> = Arc::from(&bytes[..]);
+        if let (Some(b), true) = (Arc::get_mut(&mut fresh), self.date_at + DATE_LEN <= self.len) {
+            b[self.date_at..self.date_at + DATE_LEN].copy_from_slice(now.date_bytes());
+        }
+        // The old bytes go when the last response sending them is done.
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = (now.secs, fresh.clone());
+        fresh
+    }
 }
 
 pub const KEEP_ALIVE: &[u8] = b"keep-alive";
@@ -145,7 +203,7 @@ impl Entry {
         const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
         let deps: usize = self.deps.iter().map(|d| d.path.len() + std::mem::size_of::<Dep>()).sum();
         // A memfd's pages are memory like the heap's.
-        let in_file = if self.file.is_some() { self.head_len + self.body_len as usize } else { 0 };
+        let in_file = if self.file.is_some() { self.body_len as usize } else { 0 };
         self.resp.len()
             + in_file
             + self.not_modified.len()
@@ -507,13 +565,42 @@ mod tests {
         assert!(l.nodes.len() <= 40, "{}", l.nodes.len());
     }
 
+    /// Cached bytes say the second of the response that sends them: the same
+    /// shared bytes within a second, a copy with the new date in the next,
+    /// and nothing but the date differs.
+    #[test]
+    fn dated_bytes_follow_the_second_of_each_response() {
+        use super::super::text::Now;
+        let made = Now::of(1_790_769_601);
+        let mut bytes = b"HTTP/1.1 200 OK\r\nDate: ".to_vec();
+        let at = bytes.len();
+        bytes.extend_from_slice(made.date_bytes());
+        bytes.extend_from_slice(b"\r\nContent-Length: 3\r\n\r\nabc");
+        let d = Dated::new(bytes.clone().into(), at, made.secs);
+        assert_eq!(d.len(), bytes.len());
+        let a = d.as_of(&made);
+        let b = d.as_of(&made);
+        assert!(Arc::ptr_eq(&a, &b), "within the second it is the same bytes, not a copy");
+        assert_eq!(&a[..], &bytes[..]);
+        let next = Now::of(made.secs + 1);
+        let c = d.as_of(&next);
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(&c[at..at + DATE_LEN], next.date_bytes());
+        assert_eq!((&c[..at], &c[at + DATE_LEN..]), (&bytes[..at], &bytes[at + DATE_LEN..]), "only the date moves");
+        assert_eq!(&a[..], &bytes[..], "bytes already handed out stay as they were");
+        assert!(Arc::ptr_eq(&c, &d.as_of(&next)));
+        // A clock set back is followed too: the date is the clock's.
+        let back = d.as_of(&made);
+        assert_eq!(&back[..], &bytes[..]);
+    }
+
     fn entry(body: usize) -> Arc<Entry> {
         Arc::new(Entry {
-            resp: vec![b'x'; 100 + body].into(),
+            resp: Dated::new(vec![b'x'; 100 + body].into(), 10, 0),
             file: None,
             head_len: 100,
             conn_at: 50,
-            not_modified: vec![b'y'; 80].into(),
+            not_modified: Dated::new(vec![b'y'; 80].into(), 5, 0),
             nm_conn_at: 40,
             etag: "W/\"1-2\"".into(),
             mtime: 2,
@@ -565,18 +652,18 @@ mod tests {
         // The cost counts the memfd's bytes like memory.
         let head = 300;
         let e = Entry {
-            resp: resp[..head].into(),
+            resp: Dated::new(resp[..head].into(), 50, 0),
             file: Some(Arc::new(d)),
             head_len: head,
             conn_at: 10,
-            not_modified: vec![b'y'; 80].into(),
+            not_modified: Dated::new(vec![b'y'; 80].into(), 5, 0),
             nm_conn_at: 40,
             etag: "W/\"1-2\"".into(),
             mtime: 2,
             body_len: body,
             deps: Vec::new(),
         };
-        assert!(e.cost("k") >= head + resp.len() + 80, "{}", e.cost("k"));
+        assert!(e.cost("k") >= head + body as usize + 80, "{}", e.cost("k"));
         drop((b, e));
         assert_eq!(c.memfds(), 0);
     }

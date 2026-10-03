@@ -2,11 +2,12 @@
 //! the lookup, the entry built on a miss, and answering from one. (`cache.rs`
 //! is the store itself.)
 
-use super::cache::{Cache, Dep, Entry, KEEP_ALIVE, Lookup, Stamp};
+use super::cache::{Cache, Dated, Dep, Entry, KEEP_ALIVE, Lookup, Stamp};
 use super::conn::{Conn, OutBuf, Source};
 use super::head::{ENCODINGS, Request, accepts};
 use super::open::{Opened, open, read_body};
 use super::response::{FileHead, HeadParts, file_head_into, head_buffer, is_not_modified, not_modified_head_into};
+use super::text::{Now, now, parse_http_date};
 use super::{Exchange, Site};
 use crate::config::Static;
 use std::sync::Arc;
@@ -32,12 +33,13 @@ pub(super) enum Cached {
     Skip,
 }
 
-/// Look the request up. The cache answers plain GET / HEAD (conditional or
-/// not) for a path that passed the checks before; ranges take the normal
-/// path. `key` is the connection's buffer for the key.
+/// Look the request up. The cache answers plain GET / HEAD (with
+/// If-None-Match or If-Modified-Since or neither) for a path that passed the
+/// checks before; ranges, and the rare If-Match and If-Unmodified-Since,
+/// take the normal path. `key` is the connection's buffer for the key.
 pub(super) async fn consult(x: Exchange<'_>, rel: &str, slash: bool, key: &mut String) -> Cached {
     let Some(cache) = &x.site.cache else { return Cached::Skip };
-    if x.req.header("range").is_some() {
+    if ["range", "if-match", "if-unmodified-since"].iter().any(|h| x.req.header(h).is_some()) {
         return Cached::Skip;
     }
     cache_key_into(key, rel, &x.site.cfg, x.req, slash);
@@ -134,24 +136,27 @@ pub(super) async fn store(
     let stamp = Stamp::of(&body.meta);
     let mut buf = head_buffer(parts, len as usize);
     let head = FileHead { code: 200, mime, count: len, conn: "keep-alive", encoding, range: None };
-    let conn_at = file_head_into(&mut buf, parts, &head);
+    let spots = file_head_into(&mut buf, parts, &head);
     let head_len = buf.len();
     let mut not_modified = head_buffer(parts, 0);
-    let nm_conn_at = not_modified_head_into(&mut not_modified, parts, "keep-alive");
+    let nm_spots = not_modified_head_into(&mut not_modified, parts, "keep-alive");
     buf.resize(head_len + len as usize, 0);
     let (file, buf) = read_body(body.file, buf, head_len, 0).await?;
     let unchanged = file.metadata().is_ok_and(|m| Stamp::of(&m) == stamp);
     // A big body goes into a memfd (sent by page reference); the head stays
-    // in memory too, for HEAD and `Connection: close`.
-    let mem = cache.memfd(&buf, len).map(Arc::new);
+    // in memory.
+    let mem = cache.memfd(&buf[head_len..], len).map(Arc::new);
     let resp: Arc<[u8]> = if mem.is_some() { buf[..head_len].into() } else { buf.into() };
+    // The second the heads were dated with (a date that does not read back
+    // just means the first response dates them anew).
+    let secs = parse_http_date(parts.date).unwrap_or(u64::MAX);
     let entry = Arc::new(Entry {
-        resp,
+        resp: Dated::new(resp, spots.date, secs),
         file: mem,
         head_len,
-        conn_at,
-        not_modified: not_modified.into(),
-        nm_conn_at,
+        conn_at: spots.conn,
+        not_modified: Dated::new(not_modified.into(), nm_spots.date, secs),
+        nm_conn_at: nm_spots.conn,
         etag: parts.etag.into(),
         mtime,
         body_len: len,
@@ -164,53 +169,57 @@ pub(super) async fn store(
 }
 
 /// Answer from a cached entry: 304, HEAD or the full response, the same
-/// bytes the normal path sends. Keep-alive: one send of the stored bytes.
+/// bytes the normal path sends, with the second of this response as their
+/// `Date` (never the one the entry was made in).
 pub(super) async fn respond_cached(w: &mut Conn<'_>, x: Exchange<'_>, e: &Arc<Entry>) -> std::io::Result<(u16, u64)> {
     let Exchange { req, keep, .. } = x;
-    let not_modified = is_not_modified(req, &e.etag, e.mtime);
+    let now = now();
+    let not_modified = is_not_modified(req, &e.etag, e.mtime, now.secs);
     if let (Some(mem), false, false) = (&e.file, not_modified, x.head_only()) {
-        // The whole response is in a memfd: one sendfile(2), no copy.
-        let (head, from, count) = if keep {
-            (Vec::new(), 0, (e.head_len as u64) + e.body_len)
-        } else {
-            let mut head = Vec::with_capacity(e.head_len);
-            head.extend_from_slice(&e.resp[..e.conn_at]);
-            head.extend_from_slice(b"close");
-            head.extend_from_slice(&e.resp[e.conn_at + KEEP_ALIVE.len()..e.head_len]);
-            (head, e.head_len as u64, e.body_len)
-        };
-        w.send_file(&head, Source::Memfd(mem.clone()), from, count).await?;
+        // The body is in a memfd: the head, then the body by page reference.
+        let resp = e.resp.as_of(&now);
+        let head: std::borrow::Cow<[u8]> =
+            if keep { (&resp[..e.head_len]).into() } else { closing(&resp[..e.head_len], e.conn_at).into() };
+        w.send_file(&head, Source::Memfd(mem.clone()), 0, e.body_len).await?;
         w.flush().await?;
         return Ok((200, e.body_len));
     }
-    let (out, status, bytes) = cached_bytes(req, e, keep, not_modified);
+    let (out, status, bytes) = cached_bytes(req, e, keep, not_modified, &now);
     w.write_all(out).await?;
     w.flush().await?;
     Ok((status, bytes))
 }
 
+/// `bytes` with `close` in place of the `keep-alive` at `conn_at`.
+fn closing(bytes: &[u8], conn_at: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(bytes.len());
+    v.extend_from_slice(&bytes[..conn_at]);
+    v.extend_from_slice(b"close");
+    v.extend_from_slice(&bytes[conn_at + KEEP_ALIVE.len()..]);
+    v
+}
+
 /// The bytes that answer `req` from the cached `e`, and the status and body
-/// length they carry: a 304, a HEAD's head, or the whole response, with the
-/// Connection value patched for `close` when the connection is not kept.
-/// (Not for a GET of an entry whose body is in a memfd: that is sent by
-/// sendfile, `respond_cached`.)
-pub(super) fn cached_bytes(req: &Request<'_>, e: &Entry, keep: bool, not_modified: bool) -> (OutBuf, u16, u64) {
-    let (buf, conn_at, end, status, bytes) = if not_modified {
+/// length they carry: a 304, a HEAD's head, or the whole response, dated
+/// `now`, with the Connection value patched for `close` when the connection
+/// is not kept. (Not for a GET of an entry whose body is in a memfd: that is
+/// sent by sendfile, `respond_cached`.)
+pub(super) fn cached_bytes(
+    req: &Request<'_>,
+    e: &Entry,
+    keep: bool,
+    not_modified: bool,
+    now: &Now,
+) -> (OutBuf, u16, u64) {
+    let (dated, conn_at, end, status, bytes) = if not_modified {
         (&e.not_modified, e.nm_conn_at, e.not_modified.len(), 304, 0)
     } else if req.method == "HEAD" {
         (&e.resp, e.conn_at, e.head_len, 200, 0)
     } else {
         (&e.resp, e.conn_at, e.resp.len(), 200, e.body_len)
     };
-    let out = if keep {
-        OutBuf::Shared(buf.clone(), 0..end)
-    } else {
-        let mut v = Vec::with_capacity(end);
-        v.extend_from_slice(&buf[..conn_at]);
-        v.extend_from_slice(b"close");
-        v.extend_from_slice(&buf[conn_at + KEEP_ALIVE.len()..end]);
-        OutBuf::Vec(v)
-    };
+    let buf = dated.as_of(now);
+    let out = if keep { OutBuf::Shared(buf, 0..end) } else { OutBuf::Vec(closing(&buf[..end], conn_at)) };
     (out, status, bytes)
 }
 

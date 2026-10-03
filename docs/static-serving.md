@@ -8,7 +8,8 @@ warden serve dist 8080 --name site --spa -i 4
 `warden serve dist 8080` (or a `[static]` section, see
 [`configuration.md`](configuration.md#static) and `warden.example.toml`) runs Warden's own file server as the app's workers:
 supervised, health-checked and reloaded like any app. It speaks HTTP/1.1
-with keep-alive: ETag / Last-Modified and 304s, single ranges,
+with keep-alive: `Date`, ETag / Last-Modified, 304s and the other
+conditional requests of RFC 9110 (see [Dates and validators](#dates-and-validators)), single ranges,
 precompressed `.br` / `.gz` siblings, SPA fallback, `404.html`, Basic auth.
 Paths can't leave the root (`..`, symlinks out, NUL), and files are opened
 with `openat2(RESOLVE_BENEATH)` on Linux.
@@ -120,12 +121,16 @@ and a list of your own replaces it.
 `cache_size = "16MB"` turns on a cache of complete responses. Each worker
 then keeps the headers and body of recently used files up to
 `cache_max_file` (64 KB), in at most `cache_size` (least recently used out
-first), so a hit is one system call: a `send(2)` from memory, or, for a body
-of 8 KB or more, a `sendfile(2)` from a sealed in-memory file (memfd), where
-the kernel takes the pages by reference instead of copying them. It saves
-the file's four system calls: 1 KB on a kept-alive connection 6.3 µs of CPU
-instead of 7.8, on a new one 12.6 instead of 14.2, so 10 to 20 % on small
-files and nothing on big ones. HEAD and 304s come from the same entry;
+first), so a hit is one `send(2)` from memory or, for a body of 24 KB or
+more, the head's `send(2)` and a `sendfile(2)` from a sealed in-memory file
+(memfd), where the kernel takes the pages by reference instead of copying
+them. It saves the file's four system calls: 1 KB on a kept-alive connection
+6.3 µs of CPU instead of 7.8, on a new one 12.6 instead of 14.2, so 10 to 20 %
+on small files and nothing on big ones. Each response gets its own `Date`
+(see [Dates and validators](#dates-and-validators)); the head of a memfd body
+is sent on its own for that reason, one system call more than before
+(9.42 µs against 9.04 for 48 KB), and below 24 KB a body in memory is the
+cheaper of the two. HEAD and 304s come from the same entry;
 ranges and anything unusual take the normal path. A cached file is checked
 against the disk at most every `cache_valid_ms` (1 s): an edit, a deletion
 or a symlink swapped in shows within that time (on NFS, within the
@@ -134,6 +139,54 @@ cached. A deploy that swaps a `current` symlink needs a rolling restart
 anyway (each worker resolves the root once), which starts with an empty
 cache. With `access_log = true` each line ends in `cache=hit` or
 `cache=miss`, and each worker prints its cache counters when it stops.
+
+## Dates and validators
+
+What the server says about a file is meant for browsers and caches to rely on:
+never that an old copy is current, never that a file is fresh for longer than
+it is. The rules are RFC 9110's.
+
+- **`Date` on every response**: files, 304s, ranges, errors, redirects. A
+  cached response says the time it is sent, not the time it was cached (its
+  stored head is dated anew once a second, by the first response of that
+  second; the others share it).
+- **`Cache-Control`**: HTML pages `no-cache` (unless `html_max_age`), other
+  files `no-cache` (unless `cache_max_age`): the browser asks every time and
+  gets a 304 while the file is unchanged, so a deploy shows at once.
+  Fingerprinted names (a content hash in the name: lowercase hex as webpack,
+  Parcel, Angular and Next write it, uppercase base32 as esbuild does, mixed
+  case with a digit before a letter as Vite and Rollup do) are
+  `max-age=31536000, immutable`: their content never changes under that name.
+  `report2024.pdf` or `background1.jpg` are not taken for one. With
+  `basic_auth`, `private` instead of `public`, so a shared cache (a CDN, a
+  proxy) never keeps a file that needed a password. Error pages: `no-cache`.
+- **`ETag`** `W/"<size>-<mtime>[.<nanoseconds>][-<encoding>]"`, in hex: two
+  edits of the same size within one second are two versions. It is the same
+  on every host that has the same files with the same times (as nginx's: no
+  inode, which differs from host to host behind a load balancer). A file with
+  whole-second times (a filesystem without finer ones, an archive that keeps
+  only seconds, as tar's default format does) can't be told from another
+  version of the same size made within the same second.
+- **`Last-Modified`** once the file's second is over, and never later than
+  `Date`: a file changed within the current second, or stamped in the future,
+  is sent without one (its ETag validates it), since a date that cannot tell
+  two versions apart would let a client keep the older one.
+- **`If-None-Match`** (weak comparison, `*` too) decides over
+  **`If-Modified-Since`**; a date later than the server's clock is ignored
+  (a full response). A 304 carries `Date`, `ETag`, `Last-Modified`,
+  `Cache-Control` and `Vary`, as the 200 would.
+- **`If-Range`** resumes a range only for the same version: a date equal to
+  the file's Last-Modified. A tag never qualifies (it is compared strongly,
+  and every tag here is weak), so the client gets the whole file.
+- **`If-Match`** (only `*` meets it, for the same reason) and
+  **`If-Unmodified-Since`** answer 412 for any other version.
+- Conditions apply only where the answer would be a 200: an error page is
+  never a 304.
+
+What remains: a client that sends `If-Modified-Since` alone, with a date of
+its own making rather than one the server sent, can be told 304 for a file
+changed again within that same second. Browsers send `If-None-Match` too,
+and it decides.
 
 ## Connections
 
@@ -173,7 +226,7 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `host` | `"0.0.0.0"` | Address to listen on (the port is `[app] port`) |
 | `spa` | `false` | Unknown paths get `index.html` (single-page apps) |
 | `index` | `"index.html"` | The file served for a directory |
-| `cache_max_age` | `3600` | Seconds. Fingerprinted names are cached a year |
+| `cache_max_age` | `0` | Seconds browsers may reuse a file that is neither an HTML page nor fingerprinted without asking. `0`: `no-cache`, revalidated on every use with its ETag (a 304 when unchanged), so a deploy shows at once; e.g. `3600` saves those requests, and a file changed in a deploy is shown old for up to that long. `public`, or `private` with `basic_auth`. Fingerprinted names (`app.3f9a2c1b.js`, `index-DkS8xW2q.css`) are cached a year, immutable |
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages (`warden serve --html-max-age N`). Unset or `0`: HTML is revalidated on every load with its ETag, a 304 when unchanged. 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
@@ -188,7 +241,7 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request (method, path, status, bytes, ms) |
-| `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 8 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
+| `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 24 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
 | `cache_max_file` | `"64KB"` | With a cache: larger files are not cached (sent with `sendfile`); at most 16M, since a miss reads the whole file into memory first |
 | `cache_valid_ms` | `1000` | With a cache: a cached file is re-checked on disk at most this often |
 

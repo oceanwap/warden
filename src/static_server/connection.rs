@@ -273,7 +273,7 @@ fn log_access(req: &Request<'_>, result: &std::io::Result<(u16, u64)>, t0: Insta
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::super::cache::{Cache, Entry};
+    use super::super::cache::{Cache, Dated, Entry};
     use super::super::cached::cached_bytes;
     use super::super::conn::INLINE_SEND_MAX;
     use super::super::head::parse_head;
@@ -317,22 +317,23 @@ mod tests {
         }
     }
 
-    /// A cache entry for `/t.js`: a response of `body` bytes, as the server builds them.
+    /// A cache entry for `/t.js`: a response of `body` bytes, as the server
+    /// builds them, made at `DATE` (each response says its own time instead).
     fn put_entry(site: &Site, body: usize) -> Arc<Entry> {
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {body}\r\nETag: W/\"1-2\"\r\n\
-             Last-Modified: Thu, 01 Jan 1970 00:00:02 GMT\r\nConnection: keep-alive\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nDate: {DATE}\r\nContent-Type: text/javascript\r\nContent-Length: {body}\r\n\
+             ETag: W/\"1-2\"\r\nLast-Modified: Thu, 01 Jan 1970 00:00:02 GMT\r\nConnection: keep-alive\r\n\r\n"
         );
-        let conn_at = head.find("keep-alive").unwrap();
-        let nm = "HTTP/1.1 304 Not Modified\r\nETag: W/\"1-2\"\r\nConnection: keep-alive\r\n\r\n";
+        let nm =
+            format!("HTTP/1.1 304 Not Modified\r\nDate: {DATE}\r\nETag: W/\"1-2\"\r\nConnection: keep-alive\r\n\r\n");
         let mut resp = head.clone().into_bytes();
         resp.extend((0..body).map(|i| b'a' + (i % 26) as u8));
         let e = Arc::new(Entry {
-            resp: resp.into(),
+            resp: Dated::new(resp.into(), head.find(DATE).unwrap(), 2),
             file: None,
             head_len: head.len(),
-            conn_at,
-            not_modified: nm.as_bytes().to_vec().into(),
+            conn_at: head.find("keep-alive").unwrap(),
+            not_modified: Dated::new(nm.as_bytes().into(), nm.find(DATE).unwrap(), 2),
             nm_conn_at: nm.find("keep-alive").unwrap(),
             etag: "W/\"1-2\"".into(),
             mtime: 2,
@@ -341,6 +342,24 @@ mod tests {
         });
         site.cache.as_ref().unwrap().insert("t.js\u{0}0".into(), e.clone(), Instant::now());
         e
+    }
+
+    /// The date a test entry is made with: long ago, so a response that
+    /// still says it was not stamped with its own time.
+    const DATE: &str = "Thu, 01 Jan 1970 00:00:02 GMT";
+
+    /// `got` with its Date value (which says when it was sent) checked for
+    /// being an HTTP date of about now, and replaced by `DATE`, to compare
+    /// with what a test expects byte for byte.
+    fn undated(got: &[u8]) -> Vec<u8> {
+        let mut got = got.to_vec();
+        let at = got.windows(8).position(|w| w == b"\r\nDate: ").expect("a Date header") + 8;
+        let date = std::str::from_utf8(&got[at..at + DATE.len()]).unwrap();
+        let secs = super::super::text::parse_http_date(date).unwrap_or_else(|| panic!("an HTTP date: {date:?}"));
+        let now = super::super::text::now().secs;
+        assert!(secs + 5 >= now && secs <= now, "the time of the response: {date}");
+        got[at..at + DATE.len()].copy_from_slice(DATE.as_bytes());
+        got
     }
 
     /// A connected pair: the client end, and the accepted end as the accept loop gets it.
@@ -371,9 +390,15 @@ mod tests {
         assert!(matches!(first_request(&site, fd, true), First::Done));
         let mut got = Vec::new();
         c.read_to_end(&mut got).unwrap();
-        let want =
-            cached_bytes(&parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(), &e, false, false).0;
-        assert_eq!(got, want.as_slice());
+        let want = cached_bytes(
+            &parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(),
+            &e,
+            false,
+            false,
+            &super::super::text::now(),
+        )
+        .0;
+        assert_eq!(undated(&got), undated(want.as_slice()));
         assert!(String::from_utf8_lossy(&got).contains("Connection: close\r\n"));
         assert_eq!(site.cache.as_ref().unwrap().hits.load(Ordering::Relaxed), 1);
         assert_eq!(site.inline.load(Ordering::Relaxed), 1, "counted");
@@ -391,7 +416,8 @@ mod tests {
         assert_eq!(&head.buf[head.pos..], b"GET /next HTTP/1.1\r\n");
         let mut got = vec![0u8; e.resp.len()];
         c.read_exact(&mut got).unwrap();
-        assert_eq!(&got[..], &e.resp[..], "the keep-alive response, byte for byte");
+        let made = e.resp.as_of(&super::super::text::Now::of(2));
+        assert_eq!(undated(&got), &made[..], "the keep-alive response, byte for byte, but for its own date");
 
         // HEAD and a 304 come from the same entry.
         let (mut c, fd) = accepted();
@@ -658,9 +684,15 @@ mod tests {
         c.read_exact(&mut sent).unwrap();
         let rest = out.advance(at);
         sent.extend_from_slice(rest.as_slice());
-        let want =
-            cached_bytes(&parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(), &e, false, false).0;
-        assert_eq!(sent, want.as_slice());
+        let want = cached_bytes(
+            &parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(),
+            &e,
+            false,
+            false,
+            &super::super::text::now(),
+        )
+        .0;
+        assert_eq!(undated(&sent), undated(want.as_slice()));
     }
 
     /// What `first_request` could not send is finished by the connection's
@@ -705,10 +737,16 @@ mod tests {
         task.await.unwrap();
         assert_eq!(site.active.load(Ordering::SeqCst), 0, "done");
         let got = reader.join().unwrap();
-        let want =
-            cached_bytes(&parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(), &e, false, false).0;
+        let want = cached_bytes(
+            &parse_head(b"GET /t.js HTTP/1.1\r\nConnection: close\r\n\r\n").unwrap(),
+            &e,
+            false,
+            false,
+            &super::super::text::now(),
+        )
+        .0;
         assert!(
-            got == want.as_slice(),
+            undated(&got) == undated(want.as_slice()),
             "the whole response, once, then the close ({} of {} bytes)",
             got.len(),
             want.as_slice().len()
