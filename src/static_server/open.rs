@@ -1,10 +1,12 @@
 //! Opening files under the root, and reading them.
 
 use super::Site;
+use super::store::{Entry, Store};
 use std::io::{Error, ErrorKind};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 // How files are opened. Starts at OPEN_CACHED and steps down if the kernel
@@ -60,7 +62,7 @@ fn openat2_rel(dir: BorrowedFd<'_>, rel: &str, resolve: u64) -> std::io::Result<
 /// or the realpath check says leave the root), PermissionDenied, others.
 pub(super) async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
     if site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY {
-        match open_beneath(site, rel).await {
+        match open_beneath(site, &site.dir, rel).await {
             Ok(fd) => return opened(fd),
             Err(e) => match e.raw_os_error() {
                 Some(libc::ENOSYS | libc::EPERM) => {
@@ -82,12 +84,12 @@ pub(super) async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
 
 /// openat2 with the kernel keeping the lookup inside the root, the way the
 /// open mode says (and stepping the mode down when the kernel cannot).
-async fn open_beneath(site: &Site, rel: &str) -> std::io::Result<OwnedFd> {
+async fn open_beneath(site: &Site, dir: &Arc<OwnedFd>, rel: &str) -> std::io::Result<OwnedFd> {
     let beneath = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
     if site.open_mode.load(Ordering::Relaxed) != OPEN_CACHED {
-        return openat2_rel(site.dir.as_fd(), rel, beneath);
+        return openat2_rel(dir.as_fd(), rel, beneath);
     }
-    match openat2_rel(site.dir.as_fd(), rel, beneath | crate::sys::RESOLVE_CACHED) {
+    match openat2_rel(dir.as_fd(), rel, beneath | crate::sys::RESOLVE_CACHED) {
         Ok(fd) => {
             site.cached_hits.fetch_add(1, Ordering::Relaxed);
             Ok(fd)
@@ -101,14 +103,14 @@ async fn open_beneath(site: &Site, rel: &str) -> std::io::Result<OwnedFd> {
                 // revalidates every lookup): stop asking.
                 site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
             }
-            let dir = site.dir.clone();
+            let dir = dir.clone();
             let rel = rel.to_string();
             tokio::task::spawn_blocking(move || openat2_rel(dir.as_fd(), &rel, beneath)).await.map_err(Error::other)?
         }
         // RESOLVE_CACHED is newer (5.12) than openat2 (5.6).
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
             site.open_mode.store(OPEN_BENEATH, Ordering::Relaxed);
-            openat2_rel(site.dir.as_fd(), rel, beneath)
+            openat2_rel(dir.as_fd(), rel, beneath)
         }
         Err(e) => Err(e),
     }
@@ -117,14 +119,53 @@ async fn open_beneath(site: &Site, rel: &str) -> std::io::Result<OwnedFd> {
 /// Without openat2: the path is resolved and checked to be inside the root
 /// (`inside`), then opened, on a thread.
 async fn open_by_realpath(site: &Site, rel: &str) -> std::io::Result<Opened> {
-    let path = if rel.is_empty() { site.root.clone() } else { site.root.join(rel) };
     let root = site.root.clone();
-    tokio::task::spawn_blocking(move || {
-        if !inside(&root, &path) {
-            return Err(Error::from(ErrorKind::NotFound));
+    let rel = rel.to_string();
+    tokio::task::spawn_blocking(move || open_checked(&root, &rel)).await.map_err(Error::other)?
+}
+
+/// `rel` under `root`, once its real path is known to be inside the root.
+fn open_checked(root: &Path, rel: &str) -> std::io::Result<Opened> {
+    let path = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
+    if !inside(root, &path) {
+        return Err(Error::from(ErrorKind::NotFound));
+    }
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(&path)?;
+    let meta = file.metadata()?;
+    Ok(Opened { file, meta })
+}
+
+/// `rel` under the root for a thread of its own, which may wait: the way
+/// requests open files (openat2 keeping the lookup inside the root, or the
+/// realpath check where there is no openat2).
+pub(super) fn open_source(dir: &OwnedFd, root: &Path, rel: &str) -> std::io::Result<Opened> {
+    let beneath = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
+    match openat2_rel(dir.as_fd(), rel, beneath) {
+        Ok(fd) => opened(fd),
+        Err(e)
+            if e.kind() == ErrorKind::Unsupported
+                || matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EXDEV)) =>
+        {
+            open_checked(root, rel)
         }
-        let file =
-            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(&path)?;
+        Err(e) => Err(e),
+    }
+}
+
+/// The compressed copy at `entry` in `store`: one system call when its path is
+/// in the kernel's cache, as for a file under the root (and the same
+/// fallbacks). NotFound when there is none (yet).
+pub(super) async fn open_stored(site: &Site, store: &Store, entry: &Entry) -> std::io::Result<Opened> {
+    if site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY {
+        match open_beneath(site, &store.dir, entry.as_str()).await {
+            Ok(fd) => return opened(fd),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EXDEV)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let path = store.path_of(entry);
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
         let meta = file.metadata()?;
         Ok(Opened { file, meta })
     })

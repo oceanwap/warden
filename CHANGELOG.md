@@ -220,6 +220,27 @@ on your Mac with `--macos local`; see [`docs/releasing.md`](docs/releasing.md)).
   takes 7.9. Text files without siblings still pay the two lookups (11.9 µs
   against 7.8); a site with no precompressed files at all can set
   `precompressed = false`.
+- Static serving compresses files in the background (`[static] compress`, on by
+  default). The first request for a text file with no compressed copy is
+  answered at once with the file as it is and queues a job; a few processes at
+  the lowest CPU and disk priority (`compress_jobs`, one per core by default)
+  make `.br` and `.gz` copies, and the next request is answered from them. The
+  copies are kept in a private folder of their own (`compress_dir`, by default
+  in Warden's state directory, never in the folder that is served) and belong
+  to one version of the file (device, inode, size, modification and change
+  times): an edited or replaced file is never answered from an old copy, there
+  is nothing to hash on the request path, and old copies are removed when the
+  new one is made. A copy is kept only when it is smaller than the file, files
+  outside `compress_min_file`..`compress_max_file` (1 KB to 8 MB) and the
+  formats of `precompressed_skip` are left alone, and the folder is held to
+  `compress_dir_size` (256 MB, oldest first). `file.br` / `file.gz` siblings
+  from your build are still used, and files that have one are not compressed
+  again. The worker stays one thread and a request that takes no copy costs
+  what it did (about 8.3 µs of server CPU for a 1 KB file with and without); a
+  request answered from a copy opens one more file (13.3 µs against 11.9 for
+  a 20 KB stylesheet, 2.8 KB sent instead of 20 KB). With a compressor pinned to
+  the core of a saturated worker, throughput fell 3 to 4 % and the 99th
+  percentile latency did not move. Adds the `brotli` crate (pure Rust).
 - `Accept-Encoding` is read the way RFC 9110 says: `br;q=0` refuses brotli (the
   precompressed `.br` file used to be sent anyway) and encoding names match in
   any letter case. The docs have a section on compression: precompressed

@@ -104,6 +104,9 @@ pub(super) async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let health = Health::bind(worker);
     announce(&site, &tcp, port, worker, health.as_ref());
     spawn_timers(&site, worker);
+    if let Some(c) = &site.compressor {
+        tokio::spawn(c.clone().run());
+    }
 
     let stop_name = std::env::var("WARDEN_STOP_SIGNAL").unwrap_or_else(|_| "SIGTERM".into());
     let stop_sig = crate::signals::parse(&stop_name).unwrap_or(libc::SIGTERM);
@@ -112,6 +115,9 @@ pub(super) async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
 
     accept_loop(&site, &tcp, health.as_ref(), &mut stop).await;
     drain(&site, tcp, health, worker).await;
+    if let Some(c) = &site.compressor {
+        c.stop().await;
+    }
     summary(&site);
     Ok(())
 }
@@ -138,6 +144,14 @@ fn announce(site: &Site, tcp: &Tcp, port: u16, worker: u64, health: Option<&Heal
         site.cfg.host,
         tcp.listener.name()
     );
+    if let Some(c) = &site.compressor {
+        println!(
+            "compressing files in the background: up to {} processes at a time at low priority, copies in {} (up to {} MB)",
+            c.jobs(),
+            c.store().path.display(),
+            site.cfg.compress_dir_size >> 20
+        );
+    }
 }
 
 /// The heartbeat Warden asks for (WARDEN_HEARTBEAT_MS), and the one sweep a
@@ -282,6 +296,9 @@ fn summary(site: &Site) {
             cap >> 10,
             c.memfds()
         );
+    }
+    if let Some(c) = &site.compressor {
+        println!("static compression: {}", c.report());
     }
     println!("static: {} requests answered in the accept loop", site.inline.load(Ordering::Relaxed));
 }

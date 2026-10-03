@@ -928,6 +928,9 @@ impl Supervisor {
                 if let Some(st) = &self.cfg.static_files {
                     let mut st = st.clone();
                     st.root = self.pinned_path(st.root);
+                    // Where the background compression keeps its copies: one folder per app.
+                    st.compress_dir
+                        .get_or_insert_with(|| crate::fleet::state_dir().join("compress").join(&self.cfg.app.name));
                     add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
                 }
             }
@@ -2787,7 +2790,7 @@ fn launched_by() -> String {
 
 /// This binary's path. After an in-place upgrade Linux reports the old
 /// inode as "<path> (deleted)"; the path itself now holds the new binary.
-fn own_exe() -> PathBuf {
+pub(crate) fn own_exe() -> PathBuf {
     let p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("warden"));
     let s = p.to_string_lossy();
     match s.strip_suffix(" (deleted)") {

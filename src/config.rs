@@ -84,6 +84,32 @@ pub struct Static {
     /// `[]` looks up every file.
     #[serde(default = "default_precompressed_skip", deserialize_with = "extensions")]
     pub precompressed_skip: Vec<String>,
+    /// Build `.br` and `.gz` copies of files in the background, and serve
+    /// them from the next request on (the request that finds none is answered
+    /// with the file as it is). Needs `precompressed`. The copies live in
+    /// `compress_dir`, never in `root`, and belong to one version of the file:
+    /// an edited file is not served from an old copy.
+    #[serde(default = "yes")]
+    pub compress: bool,
+    /// Compressions running at once, all workers of the site together
+    /// (they run at the lowest priority); 0: one per CPU core.
+    #[serde(default)]
+    pub compress_jobs: u32,
+    /// Where the copies are kept: a private folder (created with mode 0700,
+    /// refused when it is not yours or lies inside `root`). Unset: a folder
+    /// of Warden's state directory named after the app.
+    #[serde(default)]
+    pub compress_dir: Option<PathBuf>,
+    /// About this much room for copies (per site); the oldest are removed
+    /// first.
+    #[serde(default = "default_compress_dir_size", deserialize_with = "size_bytes")]
+    pub compress_dir_size: u64,
+    /// Files smaller than this are sent as they are.
+    #[serde(default = "default_compress_min_file", deserialize_with = "size_bytes")]
+    pub compress_min_file: u64,
+    /// Files larger than this are sent as they are.
+    #[serde(default = "default_compress_max_file", deserialize_with = "size_bytes")]
+    pub compress_max_file: u64,
     /// `user:password` for HTTP Basic auth.
     #[serde(default)]
     pub basic_auth: Option<String>,
@@ -146,6 +172,16 @@ fn extensions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::
             }
         })
         .collect()
+}
+
+fn default_compress_dir_size() -> u64 {
+    256 << 20
+}
+fn default_compress_min_file() -> u64 {
+    1 << 10
+}
+fn default_compress_max_file() -> u64 {
+    8 << 20
 }
 
 fn default_cache_size() -> u64 {
@@ -847,15 +883,19 @@ impl Config {
                 .map_err(|e| format!("{}: app.env_file {}: {e}", path.display(), file.display()))?;
             cfg.app.env_file = Some(file);
         }
-        // A relative static root: from the working directory, else the config file.
+        // A relative static root, and a relative compress_dir: from the working
+        // directory, else the config file.
         if let Some(st) = &mut cfg.static_files {
+            let base = cfg
+                .app
+                .working_directory
+                .clone()
+                .unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")));
             if st.root.is_relative() {
-                let base = cfg
-                    .app
-                    .working_directory
-                    .clone()
-                    .unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".")));
                 st.root = base.join(&st.root);
+            }
+            if let Some(dir) = st.compress_dir.as_mut().filter(|d| d.is_relative()) {
+                *dir = base.join(&*dir);
             }
         }
         Ok(cfg)
@@ -915,6 +955,27 @@ impl Config {
                 if value > max {
                     return Err(format!("{name} = {value} is out of range (maximum {unit})"));
                 }
+            }
+            if st.compress_jobs > 256 {
+                return Err(format!(
+                    "static.compress_jobs = {} is out of range (maximum 256; 0 is one per core)",
+                    st.compress_jobs
+                ));
+            }
+            if st.compress_max_file > 64 << 20 {
+                return Err(format!(
+                    "static.compress_max_file = {} is out of range (maximum 64M)",
+                    st.compress_max_file
+                ));
+            }
+            if st.compress_min_file > st.compress_max_file {
+                return Err("static.compress_min_file must not be above static.compress_max_file".into());
+            }
+            if st.compress_dir_size < st.compress_max_file.max(1 << 20) {
+                return Err("static.compress_dir_size must hold at least one file of compress_max_file (and 1M)".into());
+            }
+            if st.compress_dir.as_ref().is_some_and(|d| d.as_os_str().is_empty()) {
+                return Err("static.compress_dir must name a directory (unset it for the default)".into());
             }
             if let Some(n) = st.html_max_age.filter(|n| *n > MAX_HTML_MAX_AGE) {
                 return Err(format!(
@@ -1745,6 +1806,55 @@ mod tests {
         // A worker started with a configuration that has no such key has the default.
         let old = serde_json::json!({ "root": "/srv/site" }).to_string();
         assert_eq!(serde_json::from_str::<Static>(&old).unwrap().precompressed_skip, default);
+    }
+
+    #[test]
+    fn static_background_compression_is_on_by_default_and_checked() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        let st = |extra: &str| Config::parse(&format!("{base}{extra}\n"));
+        let d = st("").unwrap().static_files.unwrap();
+        assert!(d.compress && d.precompressed);
+        assert_eq!(
+            (d.compress_jobs, d.compress_dir.as_deref()),
+            (0, None),
+            "one per core; the supervisor picks a folder"
+        );
+        assert_eq!((d.compress_dir_size, d.compress_min_file, d.compress_max_file), (256 << 20, 1 << 10, 8 << 20));
+        let s = st(
+            "compress = false\ncompress_jobs = 3\ncompress_dir = \"/var/cache/site\"\ncompress_dir_size = \"1GB\"\n",
+        )
+        .unwrap()
+        .static_files
+        .unwrap();
+        assert!(!s.compress);
+        assert_eq!((s.compress_jobs, s.compress_dir_size), (3, 1 << 30));
+        assert_eq!(s.compress_dir.as_deref(), Some(Path::new("/var/cache/site")));
+        let s = st("compress_min_file = \"512\"\ncompress_max_file = \"2MB\"").unwrap().static_files.unwrap();
+        assert_eq!((s.compress_min_file, s.compress_max_file), (512, 2 << 20));
+        for (bad, why) in [
+            ("compress_jobs = 1000", "compress_jobs"),
+            ("compress_jobs = -1", "compress_jobs"),
+            ("compress_max_file = \"100MB\"", "compress_max_file"),
+            ("compress_min_file = \"2MB\"\ncompress_max_file = \"1MB\"", "compress_min_file"),
+            ("compress_dir_size = \"1MB\"\ncompress_max_file = \"8MB\"", "compress_dir_size"),
+            ("compress_dir = \"\"", "compress_dir"),
+            ("compress = \"yes please\"", "compress"),
+        ] {
+            let e = st(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A worker started without these keys has the same defaults.
+        let old = serde_json::json!({ "root": "/srv/site" }).to_string();
+        let w = serde_json::from_str::<Static>(&old).unwrap();
+        assert!(w.compress && w.compress_dir.is_none());
+        // A relative folder is read from the working directory like `root` is.
+        let dir = std::env::temp_dir().join(format!("warden-compress-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("warden.toml");
+        std::fs::write(&file, format!("{base}compress_dir = \"copies\"\n").replace("/srv/site", "site")).unwrap();
+        let loaded = Config::load(&file).unwrap().static_files.unwrap();
+        assert_eq!((loaded.root, loaded.compress_dir), (dir.join("site"), Some(dir.join("copies"))));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

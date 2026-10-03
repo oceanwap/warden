@@ -41,16 +41,19 @@
 mod accept;
 mod cache;
 mod cached;
+mod compress;
 mod conn;
 mod connection;
 mod handler;
 mod head;
 mod idle;
+mod job;
 mod names;
 mod open;
 mod path;
 mod response;
 mod serve;
+mod store;
 mod text;
 
 use crate::config::Static;
@@ -83,6 +86,9 @@ struct Site {
     /// Extensions of files that are not looked up for a compressed sibling
     /// (`precompressed_skip`).
     skip_siblings: names::ExtSet,
+    /// Makes compressed copies of files in the background (`compress`); None
+    /// when that is off or its directory could not be had.
+    compressor: Option<Arc<compress::Compressor>>,
     /// The `Authorization` value a request needs (`basic_auth`).
     auth: Option<String>,
     /// Prebuilt responses of small files (None: `cache_size = 0`, the default).
@@ -192,6 +198,20 @@ impl Site {
                 Some((Duration::from_secs(h.trim().parse().ok()?), Duration::from_secs(i.trim().parse().ok()?)))
             })
             .unwrap_or((HEAD_TIMEOUT, IDLE_TIMEOUT));
+        // Background compression needs its directory; without one (a worker
+        // started by hand) it is off. A directory that cannot be had is
+        // reported, and serving goes on without.
+        let compressor = if cfg.compress && cfg.precompressed && cfg.compress_dir.is_some() {
+            match compress::Compressor::start(&cfg, &root, crate::supervisor::own_exe()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("warden serve-static: compression in the background is off: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let site = Site {
             root,
             dir,
@@ -200,6 +220,7 @@ impl Site {
             cached_misses: AtomicU64::new(0),
             fixed: Fixed::new(&cfg),
             skip_siblings: names::ExtSet::new(&cfg.precompressed_skip),
+            compressor,
             cache: Cache::new(cfg.cache_size, cfg.cache_max_file, cfg.cache_valid_ms, crate::sys::nofile_limit().0),
             cfg,
             auth,
@@ -213,6 +234,12 @@ impl Site {
         };
         Ok((Arc::new(site), port))
     }
+}
+
+/// Entry point of `warden static-compress`: one background compression, run
+/// by a worker (`compress.rs`).
+pub fn compress_main() -> i32 {
+    job::main()
 }
 
 /// Entry point of `warden serve-static` (started by the supervisor). Exits 78

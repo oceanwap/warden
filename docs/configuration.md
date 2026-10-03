@@ -232,8 +232,14 @@ Every key but `root` is optional. What the server does and why:
 | `html_max_age` | unset | Seconds browsers may reuse HTML pages. Unset or `0`: HTML is revalidated on every load with its ETag (a 304 when unchanged). 0 to 31536000; `public`, or `private` with `basic_auth` |
 | `listing` | `false` | HTML listing for directories without an index |
 | `dotfiles` | `false` | Serve dotfiles (`.well-known` is always served) |
-| `precompressed` | `true` | Serve `file.br` / `file.gz` when the client accepts them. A request that accepts them looks for the sibling of every file whose extension is not in `precompressed_skip`: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files can set `false` |
+| `precompressed` | `true` | Serve compressed copies of files when the client accepts them: the ones `compress` makes, and `file.br` / `file.gz` siblings you made. A request that accepts them looks for the sibling of every file whose extension is not in `precompressed_skip`: two failed lookups (about 4 µs of CPU) when there is none, so a site without precompressed files, and with `compress = false`, can set `false` |
 | `precompressed_skip` | images, fonts, audio, video, archives, PDF and office documents (`png`, `jpg`, `jpeg`, `gif`, `webp`, `avif`, `heic`, `jxl`, `woff`, `woff2`, `mp3`, `m4a`, `aac`, `flac`, `ogg`, `opus`, `mp4`, `m4v`, `mov`, `mkv`, `webm`, `zip`, `gz`, `br`, `zst`, `bz2`, `xz`, `7z`, `rar`, `tgz`, `jar`, `apk`, `pdf`, `docx`, `xlsx`, `pptx`, `odt`, `ods`, `odp`, `epub`) | File extensions (last one of a name, any case, a dot in front is fine) that are never looked up for a `.br` / `.gz` sibling: formats that are compressed already, where a sibling saves nothing. A list **replaces** the default (to add one, write the default and yours); `[]` looks up every file |
+| `compress` | `true` | Make `.br` and `.gz` copies of files in the background, from the first request for them: that request gets the file as it is, the next ones the copy (see [Compression](static-serving.md#compression)). Needs `precompressed`. Never for the formats in `precompressed_skip` |
+| `compress_jobs` | `0` | Compressions running at once, all workers of the site together, each at the lowest priority; `0`: one per CPU core |
+| `compress_dir` | `<state dir>/compress/<app name>` | Where the copies are kept: a private folder (made with mode 0700; refused when it is not yours, is open to others, or lies inside `root`), so `root` stays as it is. A relative path is read from the working directory, else the config file's folder |
+| `compress_dir_size` | `"256MB"` | About this much room for copies; the oldest are removed first |
+| `compress_min_file` | `"1KB"` | Smaller files are sent as they are |
+| `compress_max_file` | `"8MB"` | Larger files are sent as they are (at most 64M) |
 | `basic_auth` | none | `"user:password"`; keep the config file private (0600) |
 | `headers` | `{}` | Extra response headers, e.g. `{ "X-Frame-Options" = "DENY" }` |
 | `access_log` | `false` | One stdout line per request |

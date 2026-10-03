@@ -772,6 +772,334 @@ fn an_encoding_refused_with_q_zero_is_not_served() {
     assert_eq!(get("*"), ("".into(), b"a{}".to_vec()));
 }
 
+// ---------------------------------------------------------------------------
+// Compression in the background
+// ---------------------------------------------------------------------------
+
+/// About `n` bytes of text that compresses well and differs with `seed`.
+fn text(n: usize, seed: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while out.len() < n {
+        out.extend_from_slice(
+            format!(".rule-{seed}-{i}{{color:#{:06x};margin:{}px}}\n", i * 7919 % 0xff_ffff, i % 40).as_bytes(),
+        );
+        i += 1;
+    }
+    out.truncate(n);
+    out
+}
+
+fn unbr(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    brotli::Decompressor::new(b, 4096).read_to_end(&mut out).expect("a brotli stream");
+    out
+}
+
+fn ungz(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(b).read_to_end(&mut out).expect("a gzip stream");
+    out
+}
+
+/// Ask for `path` until the answer is a compressed copy (at most 90 s), and
+/// give it. The file is not compressed before it has been still for 2 s, and
+/// the compressor runs at the lowest priority.
+fn until_encoded(port: u16, path: &str, accept: &str) -> Resp {
+    let t0 = Instant::now();
+    loop {
+        let r = Client::connect(port).get(path, &format!("Accept-Encoding: {accept}\r\nConnection: close\r\n"));
+        if !r.h("content-encoding").is_empty() {
+            return r;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(90), "no compressed copy of {path} after {:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// The folders of the store: one for each file that has copies.
+fn copy_folders(copies: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(copies)
+        .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
+}
+
+/// A file that is asked for is sent as it is, at once, and compressed in the
+/// background; later requests get the copy, which decodes to the file. An
+/// edit is never answered from the old copy.
+#[test]
+fn a_file_is_sent_plain_first_and_from_its_compressed_copy_later() {
+    let tmp = Tmp::new("background");
+    let site = tmp.site();
+    let copies = tmp.0.join("copies");
+    let css = text(20_000, 1);
+    write(&site, "app.css", &css);
+    write(&site, "other.css", &text(20_000, 2));
+    let w = Worker::start(&tmp, &site, json!({ "compress_dir": copies, "compress_jobs": 2 }));
+    let both = "Accept-Encoding: gzip, deflate, br\r\nConnection: close\r\n";
+    let get = |path: &str, extra: &str| Client::connect(w.port).get(path, extra);
+
+    let first = get("/app.css", both);
+    assert_eq!((first.status, first.h("content-encoding"), first.body.as_slice()), (200, "", css.as_slice()));
+    assert_eq!(first.h("vary"), "Accept-Encoding");
+
+    let br = until_encoded(w.port, "/app.css", "gzip, deflate, br");
+    assert_eq!((br.status, br.h("content-encoding"), br.h("vary")), (200, "br", "Accept-Encoding"));
+    assert_eq!(unbr(&br.body), css);
+    assert!(br.body.len() < css.len() / 2);
+    assert_eq!(br.h("content-length"), br.body.len().to_string());
+    assert!(br.h("etag").ends_with("-br\""), "{}", br.h("etag"));
+    // The copy has the file's date, and its own ETag and length.
+    assert_eq!(br.h("last-modified"), first.h("last-modified"));
+    assert_ne!(br.h("etag"), first.h("etag"));
+    // gzip when that is all the client takes; the file when it takes neither.
+    let gz = until_encoded(w.port, "/app.css", "gzip");
+    assert_eq!((gz.h("content-encoding"), ungz(&gz.body)), ("gzip", css.clone()));
+    for accept in ["identity", "br;q=0, gzip;q=0", "deflate"] {
+        let r = get("/app.css", &format!("Accept-Encoding: {accept}\r\nConnection: close\r\n"));
+        assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("", css.as_slice()), "{accept}");
+    }
+    let r = get("/app.css", "Connection: close\r\n");
+    assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("", css.as_slice()));
+    // A range is of the file itself.
+    let r = get("/app.css", "Accept-Encoding: br\r\nRange: bytes=10-19\r\nConnection: close\r\n");
+    assert_eq!((r.status, r.h("content-encoding"), r.body.as_slice()), (206, "", &css[10..20]));
+    // HEAD says what GET would send; the validators work on the copy.
+    let h = Client::connect(w.port).head("/app.css", both);
+    assert_eq!((h.h("content-encoding"), h.h("content-length")), ("br", br.h("content-length")));
+    let nm =
+        get("/app.css", &format!("Accept-Encoding: br\r\nIf-None-Match: {}\r\nConnection: close\r\n", br.h("etag")));
+    assert_eq!(nm.status, 304);
+    // The copies are in the store, and nothing was added to the site.
+    let folders = copy_folders(&copies);
+    assert!(!folders.is_empty());
+    assert_eq!(std::fs::read_dir(&site).unwrap().count(), 2, "the site is as it was");
+
+    // An edit: the next request has the new file, never the old copy, and a new copy follows.
+    let new = text(21_000, 3);
+    write(&site, "app.css", &new);
+    let r = get("/app.css", both);
+    assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("", new.as_slice()));
+    let again = until_encoded(w.port, "/app.css", "br");
+    assert_eq!(unbr(&again.body), new);
+    // The old version's copies are removed once the new one is in place.
+    let t0 = Instant::now();
+    let app_folder = |dir: &Path| std::fs::read_dir(dir).map(|d| d.flatten().count()).unwrap_or(0);
+    let count: Vec<usize> = copy_folders(&copies).iter().map(|f| app_folder(f)).collect();
+    assert!(count.iter().all(|n| *n <= 2), "{count:?} after {:?}", t0.elapsed());
+
+    // The compressing was done by other processes, not by threads of the worker (a thread
+    // makes every later system call of the worker dearer; the few the runtime starts for a
+    // lookup that has to wait are another matter).
+    #[cfg(target_os = "linux")]
+    for task in std::fs::read_dir(format!("/proc/{}/task", w.pid())).unwrap().flatten() {
+        let name = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        assert!(!name.contains("compress"), "a thread for compressing: {name}");
+    }
+    let out = w.stop();
+    assert!(out.contains("compressing files in the background: up to 2 processes at a time"), "{out}");
+    assert!(out.contains("static compression: compressed "), "{out}");
+}
+
+/// What is never queued: a worker with `compress = false`; files outside
+/// the size limits; requests that cannot be answered with a copy.
+#[test]
+fn background_compression_is_off_when_asked_and_leaves_what_it_should() {
+    let tmp = Tmp::new("background-limits");
+    let site = tmp.site();
+    let copies = tmp.0.join("copies");
+    write(&site, "small.css", &text(5_000, 1));
+    write(&site, "mid.css", &text(20_000, 2));
+    write(&site, "huge.css", &text(60_000, 3));
+    write(&site, "never.css", &text(20_000, 4));
+    write(&site, "logo.png", &text(20_000, 5));
+    let both = "Accept-Encoding: gzip, br\r\nConnection: close\r\n";
+
+    // Off: the directory is not even made.
+    let off = Worker::start(&tmp, &site, json!({ "compress": false, "compress_dir": copies }));
+    for _ in 0..4 {
+        let r = Client::connect(off.port).get("/mid.css", both);
+        assert_eq!(r.h("content-encoding"), "");
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    assert!(!copies.exists(), "compress = false makes nothing");
+    let out = off.stop();
+    assert!(!out.contains("compressing files"), "{out}");
+
+    // Limits: only mid.css is between 10 KB and 40 KB. The requests that cannot be answered
+    // with a copy never queue one, however late they come.
+    let w = Worker::start(
+        &tmp,
+        &site,
+        json!({ "compress_dir": copies, "compress_min_file": "10KB", "compress_max_file": "40KB" }),
+    );
+    let t0 = Instant::now();
+    let copy = loop {
+        for path in ["/small.css", "/huge.css", "/logo.png"] {
+            let r = Client::connect(w.port).get(path, both);
+            assert_eq!(r.h("content-encoding"), "", "{path}");
+        }
+        let h = Client::connect(w.port).head("/never.css", both);
+        let ranged = Client::connect(w.port)
+            .get("/never.css", "Accept-Encoding: br\r\nRange: bytes=0-9\r\nConnection: close\r\n");
+        assert_eq!((h.h("content-encoding"), ranged.status), ("", 206));
+        for accept in ["identity", "br;q=0, gzip;q=0"] {
+            let r = Client::connect(w.port)
+                .get("/never.css", &format!("Accept-Encoding: {accept}\r\nConnection: close\r\n"));
+            assert_eq!(r.h("content-encoding"), "");
+        }
+        let r = Client::connect(w.port).get("/never.css", "Connection: close\r\n");
+        assert_eq!(r.h("content-encoding"), "");
+        let r = Client::connect(w.port).get("/mid.css", both);
+        if r.h("content-encoding") == "br" {
+            break r;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(90), "no copy of mid.css");
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(unbr(&copy.body), text(20_000, 2));
+    // Everything those requests could have queued has had its chance by now.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(copy_folders(&copies).len(), 1, "only mid.css has copies");
+}
+
+/// A file with a compressed sibling of its own (made by the site's build) is
+/// served from that, and not compressed again.
+#[test]
+fn a_file_with_a_compressed_sibling_is_left_to_it() {
+    let tmp = Tmp::new("background-sibling");
+    let site = tmp.site();
+    let copies = tmp.0.join("copies");
+    write(&site, "site.js", &text(20_000, 1));
+    write(&site, "site.js.br", b"the site's own brotli");
+    let w = Worker::start(&tmp, &site, json!({ "compress_dir": copies }));
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(4500) {
+        let r = Client::connect(w.port).get("/site.js", "Accept-Encoding: br\r\nConnection: close\r\n");
+        assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("br", b"the site's own brotli".as_slice()));
+        // gzip only: no sibling for it, so the file; and still nothing is made.
+        let r = Client::connect(w.port).get("/site.js", "Accept-Encoding: gzip\r\nConnection: close\r\n");
+        assert_eq!(r.h("content-encoding"), "");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(copy_folders(&copies).is_empty(), "no copy of a file that has a sibling");
+}
+
+/// The response cache must not pin the plain response of a file whose copy is
+/// on its way, and serves the copy once there is one.
+#[test]
+fn the_response_cache_follows_the_file_to_its_compressed_copy() {
+    let tmp = Tmp::new("background-cache");
+    let site = tmp.site();
+    let css = text(20_000, 7);
+    write(&site, "app.css", &css);
+    write(&site, "page.html", b"<h1>small, and below the minimum</h1>");
+    let w = Worker::start(
+        &tmp,
+        &site,
+        json!({ "compress_dir": tmp.0.join("copies"), "cache_size": "16MB", "cache_valid_ms": 600_000, "access_log": true }),
+    );
+    let both = "Accept-Encoding: gzip, br\r\nConnection: close\r\n";
+    let r = Client::connect(w.port).get("/app.css", both);
+    assert_eq!((r.h("content-encoding"), r.body.as_slice()), ("", css.as_slice()));
+    // Several requests while the copy is made: all plain, none of them kept.
+    std::thread::sleep(Duration::from_millis(300));
+    let r = Client::connect(w.port).get("/app.css", both);
+    assert_eq!(r.h("content-encoding"), "");
+    let copy = until_encoded(w.port, "/app.css", "gzip, br");
+    assert_eq!(unbr(&copy.body), css);
+    // The copy is cached now (once it has been still for 2 s, like any file), and so is a
+    // file that is too small to have one.
+    quiet();
+    for _ in 0..3 {
+        let r = Client::connect(w.port).get("/app.css", both);
+        assert_eq!((r.h("content-encoding"), unbr(&r.body)), ("br", css.clone()));
+        let r = Client::connect(w.port).get("/page.html", both);
+        assert_eq!(r.h("content-encoding"), "");
+    }
+    let out = w.stop();
+    assert!(out.lines().any(|l| l.contains("GET /app.css 200") && l.contains("cache=hit")), "{out}");
+    assert!(out.lines().any(|l| l.contains("GET /page.html 200") && l.contains("cache=hit")), "{out}");
+}
+
+/// The folder of the copies must be the user's, closed to others, and not
+/// something the site serves; when it is not, serving goes on without.
+#[test]
+fn a_compression_folder_that_is_not_private_or_is_served_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = Tmp::new("background-refused");
+    let site = tmp.site();
+    write(&site, "app.css", &text(20_000, 1));
+    let open_dir = tmp.0.join("open");
+    std::fs::create_dir_all(&open_dir).unwrap();
+    std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (dir, why) in [(open_dir, "open to other users"), (site.join(".copies"), "inside static.root")] {
+        let w = Worker::start(&tmp, &site, json!({ "compress_dir": dir }));
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(3000) {
+            let r = Client::connect(w.port).get("/app.css", "Accept-Encoding: br\r\nConnection: close\r\n");
+            assert_eq!((r.status, r.h("content-encoding")), (200, ""));
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let out = w.stop();
+        assert!(out.contains("compression in the background is off") && out.contains(why), "{why}: {out}");
+        assert!(!out.contains("compressing files in the background"), "{out}");
+    }
+    assert_eq!(std::fs::read_dir(&site).unwrap().count(), 1, "nothing was put in the served folder");
+}
+
+/// The process that compresses starts with whatever descriptors its parent
+/// had (the supervisor's channel is one, and is not close-on-exec) and must
+/// close them: one that kept it would keep the supervisor from seeing the
+/// worker end.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_compression_process_closes_the_descriptors_it_inherited() {
+    use std::os::fd::AsRawFd;
+    let tmp = Tmp::new("job-fds");
+    let site = tmp.site();
+    write(&site, "a.css", &text(20_000, 1));
+    let copies = tmp.0.join("copies");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&copies).unwrap();
+    }
+    // Hold the only place for compressing, so that the job waits where it can be looked at.
+    let place = std::fs::OpenOptions::new().create(true).append(true).open(copies.join("place-0")).unwrap();
+    // SAFETY: flock(2) on a descriptor this test owns.
+    assert_eq!(unsafe { libc::flock(place.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let spec = json!({
+        "parent": std::process::id(), "root": site, "store": copies, "cap": 268_435_456u64,
+        "task": { "Compress": {
+            "rel": "a.css", "min": 1024, "max": 8_388_608, "jobs": 1,
+            "version": { "dev": 0, "ino": 0, "size": 0, "mtime": [0, 0], "ctime": [0, 0] },
+        } },
+    });
+    // bash opens a file on descriptor 9 and becomes the job: 9 is inherited and not close-on-exec.
+    let mut job = Command::new("bash")
+        .args(["-c", "exec 9</etc/hostname; exec \"$0\" static-compress", &bin()])
+        .env_clear()
+        .env("WARDEN_COMPRESS_JOB", spec.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(job.try_wait().unwrap().is_none(), "the job should be waiting for its place");
+    let held: Vec<String> = std::fs::read_dir(format!("/proc/{}/fd", job.id()))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().parse::<i32>().unwrap_or(0) > 2)
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .map(|p| p.display().to_string())
+        .collect();
+    let _ = job.kill();
+    let _ = job.wait();
+    // What it opened itself: the site, its folder of copies and the lock files.
+    assert!(held.iter().all(|p| p.starts_with(tmp.0.to_str().unwrap())), "descriptors of the parent kept: {held:?}");
+}
+
 /// A bug in a handler costs the connection it was serving and nothing else.
 /// The accept loop answers new connections itself, so a panic there must not
 /// take the worker down (a panic in a task never does). Uses the fault

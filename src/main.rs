@@ -48,6 +48,10 @@ fn main() {
     if argv.first().map(String::as_str) == Some("serve-static") {
         std::process::exit(static_server::main());
     }
+    // Internal: a compression in the background, started by such a worker.
+    if argv.first().map(String::as_str) == Some("static-compress") {
+        std::process::exit(static_server::compress_main());
+    }
     let mut args = match cli::parse(&argv) {
         Ok(a) => a,
         Err(e) => {

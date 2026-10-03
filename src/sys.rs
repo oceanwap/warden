@@ -69,6 +69,63 @@ pub fn is_root() -> bool {
     euid() == 0
 }
 
+/// This process gives way to everything else on the machine: on Linux the
+/// idle scheduling policy (it runs only when a CPU has nothing else to do; nice
+/// 19 where that is refused) and the idle disk class, on macOS nice 19 and the
+/// background quality-of-service class. For work that can wait, like
+/// compression; meant for a process (or thread) that does only that.
+pub fn lower_priority() {
+    // SAFETY: setpriority takes integers; PRIO_PROCESS with id 0 is the
+    // calling thread (Linux) or process.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: `param` is a live sched_param, which the call only reads.
+        unsafe {
+            libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+        }
+        // ioprio_set(IOPRIO_WHO_PROCESS, 0, IOPRIO_CLASS_IDLE << 13): no
+        // pointer arguments. Only some I/O schedulers act on it; a failure is
+        // no matter.
+        // SAFETY: a system call that takes three integers.
+        unsafe {
+            libc::syscall(libc::SYS_ioprio_set, 1 as libc::c_long, 0 as libc::c_long, (3 << 13) as libc::c_long);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: sets the QoS class of the calling thread; no memory involved.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+        }
+    }
+}
+
+/// Close every descriptor above stderr: for a process Warden started that
+/// must not hold what its parent had open (the IPC channel to the supervisor
+/// is not close-on-exec, and a child that kept it would keep the supervisor
+/// from seeing the worker end). Call before anything is opened.
+pub fn close_inherited_fds() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: close_range(2) takes integers; the range is those no one here holds yet.
+        if unsafe { libc::syscall(libc::SYS_close_range, 3 as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) } == 0
+        {
+            return;
+        }
+    }
+    let top = nofile_limit().0.min(65_536) as libc::c_int;
+    for fd in 3..top {
+        // SAFETY: closing a descriptor number nothing in this process owns.
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// (soft, hard) limit on open files for this process.
 pub fn nofile_limit() -> (u64, u64) {
     let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };

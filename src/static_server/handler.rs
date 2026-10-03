@@ -5,12 +5,13 @@ use super::cached::{self, Cached, Fill, respond_cached};
 use super::conn::{Conn, Source};
 use super::head::{ENCODINGS, Request, accepts, parse_range};
 use super::names::{extension_of, fingerprinted, mime};
-use super::open::{Opened, inside, open, open_error_status, read_body};
+use super::open::{Opened, inside, open, open_error_status, open_stored, read_body};
 use super::path::{join_rel, path_of, relative_cow};
 use super::response::{
     FileHead, HeadParts, Page, file_head_into, head_buffer, is_not_modified, not_modified_head_into, respond,
     respond_error,
 };
+use super::store::{Entry, Version};
 use super::text::{etag, http_date_short};
 use super::{Exchange, Site};
 use std::path::Path;
@@ -172,17 +173,58 @@ async fn listing(w: &mut Conn<'_>, dir: &Path, url_path: &str, x: Exchange<'_>) 
     respond(w, 200, x.keep, x.head_only(), page).await
 }
 
-/// The precompressed sibling of `rel` that the client accepts (`.br` before
-/// `.gz`), if there is one: its file and its encoding. Every lookup is noted
-/// for the cache (`fill`) to check again later.
-async fn precompressed(x: Exchange<'_>, rel: &str, mut fill: Option<&mut Fill>) -> Option<(Opened, &'static str)> {
+/// How long a file with a compressed sibling of its own is left out of the
+/// background compression, before that is looked into again.
+const LEAVE_FOR_SIBLINGS: u64 = 3600;
+
+/// What a file is sent as, besides itself.
+enum Compressed {
+    /// A compressed copy: the file and its encoding.
+    Copy(Opened, &'static str),
+    /// None yet, and a copy is being made: the file goes out as it is this
+    /// time, which no cache may keep for later requests.
+    Coming,
+    /// None, and none is coming.
+    No,
+}
+
+/// The compressed copy of the file `found` (at `rel`) that the client
+/// accepts, `.br` before `.gz`: the one the background compression made of
+/// this very version of the file (`store.rs`), else a sibling file next to it
+/// (`file.js.br`, made by the site's build). Without either, the file is
+/// queued for compression. The lookups a cache entry depends on are noted in
+/// `fill`.
+async fn compressed(x: Exchange<'_>, rel: &str, found: &Opened, mut fill: Option<&mut Fill>) -> Compressed {
+    let site = x.site;
     let accept = x.req.header("accept-encoding").unwrap_or("");
+    // A client that takes neither encoding (most requests for a script or a
+    // stylesheet come from one that does; an image tag's may not) costs nothing here.
+    if !ENCODINGS.iter().any(|(enc, _)| accepts(accept, enc)) {
+        return Compressed::No;
+    }
+    let version = Version::of(&found.meta);
+    let compressor = site.compressor.as_ref().filter(|c| found.meta.is_file() && c.wants(version.size()));
+    // Not for a version that is known to have no copy, and not coming.
+    let compressor_expects = compressor.filter(|c| c.expects(&version));
+    if let Some(c) = compressor_expects {
+        for (enc, suffix) in ENCODINGS {
+            if !accepts(accept, enc) {
+                continue;
+            }
+            let entry = Entry::new(rel, &version, suffix);
+            if let Ok(o) = open_stored(site, c.store(), &entry).await {
+                if o.meta.is_file() {
+                    return Compressed::Copy(o, enc);
+                }
+            }
+        }
+    }
     for (enc, suffix) in ENCODINGS {
         if !accepts(accept, enc) {
             continue;
         }
         let sibling = format!("{rel}.{suffix}");
-        let got = open(x.site, &sibling).await;
+        let got = open(site, &sibling).await;
         if let Some(f) = fill.as_mut() {
             let seen = match &got {
                 Ok(o) if o.meta.is_file() => Seen::File(Stamp::of(&o.meta)),
@@ -192,11 +234,19 @@ async fn precompressed(x: Exchange<'_>, rel: &str, mut fill: Option<&mut Fill>) 
         }
         if let Ok(o) = got {
             if o.meta.is_file() {
-                return Some((o, enc));
+                // Made by the site: nothing to make here.
+                if let Some(c) = compressor_expects {
+                    c.leave(version, LEAVE_FOR_SIBLINGS);
+                }
+                return Compressed::Copy(o, enc);
             }
         }
     }
-    None
+    let Some(c) = compressor else { return Compressed::No };
+    if !x.head_only() {
+        c.submit(rel, version);
+    }
+    Compressed::Coming
 }
 
 /// `rel` is the file's path under the root (its name picks the MIME type
@@ -214,18 +264,22 @@ async fn send_file(
     let Exchange { site, req, keep } = x;
     let mut ext_buf = [0u8; 12];
     let ext = extension_of(rel, &mut ext_buf);
-    let sibling = if site.cfg.precompressed
+    let variant = if site.cfg.precompressed
         && status == 200
         && !site.skip_siblings.contains(ext)
         && req.header("range").is_none()
     {
-        precompressed(x, rel, fill.as_mut()).await
+        compressed(x, rel, &found, fill.as_mut()).await
     } else {
-        None
+        Compressed::No
     };
-    let (body, encoding) = match sibling {
-        Some((sibling, enc)) => (sibling, Some(enc)),
-        None => (found, None),
+    let (body, encoding) = match variant {
+        Compressed::Copy(copy, enc) => (copy, Some(enc)),
+        Compressed::Coming => {
+            fill = None;
+            (found, None)
+        }
+        Compressed::No => (found, None),
     };
     let len = body.meta.len();
     let mtime = body.meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());

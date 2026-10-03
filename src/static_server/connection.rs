@@ -304,6 +304,7 @@ mod tests {
             cache: Cache::new(8 << 20, 1 << 16, 1000, 1024),
             fixed: Fixed::new(&cfg),
             skip_siblings: crate::static_server::names::ExtSet::new(&cfg.precompressed_skip),
+            compressor: None,
             cfg,
             auth: None,
             draining: AtomicBool::new(false),

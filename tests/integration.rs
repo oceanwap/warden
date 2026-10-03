@@ -7844,3 +7844,42 @@ fn warden_start_waits_for_a_sweep_that_outlasts_ready_timeout() {
     every_warning_has_a_hint(&log);
     assert!(!f.home.join(format!("state/orphans/slowboot.{dead}.json")).exists());
 }
+
+/// A static site made by `warden start` keeps the compressed copies it makes
+/// in the background in Warden's state folder (one per app), never in the
+/// folder it serves, and they are served: the default `compress_dir`.
+#[test]
+fn a_static_site_keeps_its_compressed_copies_in_the_state_folder() {
+    let base = std::env::temp_dir().join(format!("warden-it-copies-site-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (site, home) = (base.join("site"), base.join("home"));
+    std::fs::create_dir_all(&site).unwrap();
+    let css: String =
+        (0..1000).map(|i| format!(".rule-{i}{{color:#{:06x};margin:{}px}}\n", i * 7919 % 0xff_ffff, i % 40)).collect();
+    std::fs::write(site.join("app.css"), &css).unwrap();
+    let port = free_port();
+    let toml = format!(
+        "[app]\nname = \"copies\"\nport = {port}\n[workers]\ncount = 1\n[static]\nroot = \"{}\"\n",
+        site.display()
+    );
+    let w = Warden::start_env("static-copies", port, &toml, &[("WARDEN_HOME", home.to_str().unwrap())]);
+    w.wait_for("static worker ready", T, ready(1));
+    let t0 = Instant::now();
+    let copy = loop {
+        let (status, h, body) = get_close(port, "/app.css", "Accept-Encoding: br\r\n");
+        assert_eq!(status, 200);
+        if h.get("content-encoding").map(String::as_str) == Some("br") {
+            break (h, body);
+        }
+        assert_eq!(body, css.as_bytes(), "until the copy is made, the file itself");
+        assert!(t0.elapsed() < Duration::from_secs(90), "no compressed copy after {:?}", t0.elapsed());
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(copy.1.len() < css.len() / 2);
+    let store = home.join("state/compress/copies");
+    let files: Vec<_> = std::fs::read_dir(&store).unwrap().flatten().collect();
+    assert!(files.iter().any(|f| f.path().is_dir()), "the copies are in {}", store.display());
+    assert_eq!(std::fs::read_dir(&site).unwrap().count(), 1, "the served folder is as it was");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&base);
+}

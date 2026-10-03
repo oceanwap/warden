@@ -160,8 +160,8 @@ path = "/health"          # checked on each worker's private socket
 
 `warden serve dist 8080` runs Warden's own file server as the app's workers, so
 it is supervised, health-checked and reloaded like any app. It does ETag and 304s,
-ranges, precompressed `.br` / `.gz` files, SPA fallback, `404.html` and Basic
-auth, and keeps small files in memory. It is as fast as nginx, and faster on
+ranges, `.br` / `.gz` copies (made in the background, or yours), SPA fallback,
+`404.html` and Basic auth, and can keep small files in memory. It is as fast as nginx, and faster on
 small files. Details and the `[static]` keys: [docs/static-serving.md](docs/static-serving.md).
 
 ## GUI

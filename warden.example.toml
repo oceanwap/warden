@@ -181,7 +181,15 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 #                                            # so keep it short; max 31536000 (a year); 0 = always revalidate
 # listing = false                            # HTML listing for directories without an index
 # dotfiles = false                           # serve dotfiles (.well-known is always served)
-# precompressed = true                       # serve file.br / file.gz when the client accepts them
+# precompressed = true                       # serve .br / .gz copies of files when the client accepts them
+# compress = true                            # make those copies in the background: the first request for a file gets the file
+#                                            # as it is, the next ones the copy (docs/static-serving.md#compression)
+# compress_jobs = 0                          # compressions at once, at the lowest priority; 0 = one per CPU core
+# compress_dir = "/var/cache/mysite"         # example; where the copies are kept, a private folder outside `root`
+#                                            # (default: a folder of Warden's state directory named after the app)
+# compress_dir_size = "256MB"                # room for copies; the oldest go first
+# compress_min_file = "1KB"                  # smaller files are sent as they are
+# compress_max_file = "8MB"                  # larger files are sent as they are
 # precompressed_skip = ["png", "jpg", "pdf"]  # example; extensions never looked up for a .br/.gz (default: images, fonts, audio,
 #                                            # video, archives, PDF and office documents, see docs/static-serving.md); a list replaces
 #                                            # the default, [] looks up every file
