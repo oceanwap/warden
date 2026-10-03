@@ -587,6 +587,11 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
                         (into out_file, no budget)",
             );
         }
+        // A worker that writes faster than this reads keeps the pipe readable,
+        // and waiting for readiness does not count against the task's budget:
+        // without this the loop would never give the supervisor's other tasks
+        // (control socket, timers, the other workers) a turn.
+        tokio::task::coop::consume_budget().await;
     }
     if !line.is_empty() {
         let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
@@ -683,6 +688,9 @@ async fn pump_direct(
                 break;
             }
         }
+        // As in `pump_output`: a pipe that never runs dry must not keep the
+        // output thread from its other pipes and the log files.
+        tokio::task::coop::consume_budget().await;
     }
     if !partial.is_empty() {
         follow_direct(b"\n", &mut partial, &label, stream); // the last line had no newline
@@ -1007,6 +1015,41 @@ mod tests {
                         }
                     }
                 }
+            })
+            .await;
+    }
+
+    /// A worker that writes as fast as it can keeps its pipe readable; the
+    /// reader still gives the other tasks on the supervisor's thread a turn
+    /// (it starved them for seconds at a time before).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_flood_of_output_leaves_the_event_loop_running() {
+        use std::time::{Duration, Instant};
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let spec = Spec {
+                    program: "yes".into(),
+                    args: vec!["flood-line-with-some-text-in-it".into()],
+                    cwd: None,
+                    env: vec![],
+                    label: "flood".into(),
+                    output: Output::Capture,
+                    max_lines_per_sec: 10_000,
+                };
+                let h = spawn(spec, 1, tx).unwrap();
+                // A ticker beside it: the longest it waited for its turn.
+                let (t0, mut last, mut worst, mut ticks) = (Instant::now(), Instant::now(), Duration::ZERO, 0);
+                while t0.elapsed() < Duration::from_secs(1) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    worst = worst.max(last.elapsed());
+                    last = Instant::now();
+                    ticks += 1;
+                }
+                h.signal(libc::SIGKILL);
+                while !matches!(rx.recv().await, Some(ProcEvent::Exited { .. }) | None) {}
+                assert!(worst < Duration::from_millis(250), "the loop stalled for {worst:?} ({ticks} ticks in 1 s)");
             })
             .await;
     }
