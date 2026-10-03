@@ -861,7 +861,7 @@ fn worker_table(s: &Status, fmt: &Fmt) -> String {
                 Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                 Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
                 watching_cell(s.watching),
-                Cell::plain(ports::cell(&w.listening)),
+                Cell::lines(ports::cell(&w.listening)),
                 Cell::plain(loop_p99(w)),
                 Cell::plain(req_rate(w)),
                 errors_cell(w),
@@ -1113,9 +1113,9 @@ fn state_cell(state: &str) -> Cell {
     Cell::styled(state, style)
 }
 
-/// The watching column (PM2's): `enabled` when `[watch]` restarts the app on file changes.
+/// The watching column (PM2's): ✓ when `[watch]` restarts the app on file changes, ✗ when not.
 fn watching_cell(on: bool) -> Cell {
-    if on { Cell::styled("enabled", GREEN) } else { Cell::styled("disabled", DIM) }
+    if on { Cell::styled("✓", GREEN) } else { Cell::styled("✗", DIM) }
 }
 
 fn health_cell(h: Option<bool>) -> Cell {
@@ -1178,7 +1178,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                     };
                     let mut row = lead(n == 0, &s.namespace);
                     row.extend([
-                        Cell::plain(name),
+                        Cell::plain(name.clone()),
                         state_cell(&state),
                         Cell::plain(w.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())),
                         Cell::plain(w.uptime_secs.map(duration).unwrap_or_else(|| "-".into())),
@@ -1187,14 +1187,17 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                         Cell::plain(w.rss_bytes.map(bytes).unwrap_or_else(|| "-".into())),
                         Cell::plain(s.user.clone().unwrap_or_else(|| "-".into())),
                         watching_cell(s.watching),
-                        Cell::plain(ports::cell(&w.listening)),
+                        Cell::lines(ports::cell(&w.listening)),
                         Cell::plain(loop_p99(w)),
                         Cell::plain(req_rate(w)),
                         errors_cell(w),
                         health_cell(w.healthy),
-                        Cell::plain(clip(w.last_exit.as_deref().unwrap_or("-"), LAST_EXIT_MAX)),
                     ]);
                     rows.push(row);
+                    // Why a worker is down, under the table: the list has no room for it.
+                    if let ("CRASHED" | "FAILED", Some(why)) = (w.state.as_str(), &w.last_exit) {
+                        notes.push(format!("{} worker {name}: {}, last exit: {why}", app.name, w.state.to_lowercase()));
+                    }
                 }
                 if let Some(r) = &s.rollout {
                     notes.push(format!("{}: {} in progress, {}/{}: {}", app.name, r.kind, r.done, r.total, r.phase));
@@ -1217,7 +1220,7 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
                 let mut row = lead(true, &app.namespace);
                 row.push(Cell::plain("-"));
                 row.push(state_cell(what));
-                row.extend((0..13).map(|_| Cell::plain("-")));
+                row.extend((0..12).map(|_| Cell::plain("-")));
                 rows.push(row);
                 if what == "offline" {
                     offline.push(app);
@@ -1263,7 +1266,6 @@ pub fn render_list_with(all: &[(crate::fleet::App, Result<Status, String>)], fmt
             "req/s",
             "4xx/5xx",
             "health",
-            "last exit",
         ]),
         &rows,
         fmt,
@@ -2125,19 +2127,19 @@ mod tests {
         let head = cells(text.lines().nth(1).unwrap());
         let at = head.iter().position(|c| c == "watching").expect("a watching column");
         assert_eq!(head[at - 1], "user", "after the user: {head:?}");
-        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "disabled", "{text}");
+        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "✗", "{text}");
         assert_eq!(cells(text.lines().nth(4).unwrap())[at], "-", "an app that is not running: {text}");
         assert_eq!(cells(text.lines().nth(3).unwrap()).len(), head.len());
         assert_eq!(cells(text.lines().nth(4).unwrap()).len(), head.len());
         s.watching = true;
         let text = list(&s);
-        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "enabled", "{text}");
+        assert_eq!(cells(text.lines().nth(3).unwrap())[at], "✓", "{text}");
         let painted =
             render_list_with(&[(listed_app("api", Some(0)), Ok(s.clone()))], &Fmt { color: true, width: None });
-        assert!(painted.contains("\x1b[32menabled"), "green: {painted:?}");
-        // The workers table and the status box.
+        assert!(painted.contains("\x1b[32m✓"), "green: {painted:?}");
+        // The workers table (a mark too) and the status box (words).
         assert!(render_status(&s, true).contains("│ watching "), "{}", render_status(&s, true));
-        assert!(render_status(&s, true).contains(" enabled "));
+        assert!(render_status(&s, true).contains(" ✓ "));
         assert!(render_status(&s, false).contains("│ watching  │ enabled"), "{}", render_status(&s, false));
         s.watching = false;
         assert!(render_status(&s, false).contains("│ watching  │ disabled"));
@@ -2160,6 +2162,14 @@ mod tests {
                 && d.contains("every 1000 ms, at most 10000 files"),
             "{d}"
         );
+    }
+
+    /// The cells of one line of a box, empty ones included.
+    fn box_cells(line: &str) -> Vec<String> {
+        let mut v: Vec<String> = line.split('│').map(|c| c.trim().to_string()).collect();
+        v.remove(0);
+        v.pop();
+        v
     }
 
     fn api_status() -> Status {
@@ -2190,8 +2200,12 @@ mod tests {
         let app = listed_app("api", Some(3));
 
         let list = render_list_with(&[(app.clone(), Ok(s.clone()))], &Fmt::PLAIN);
-        // Cut at 26 characters: the unix socket is the "+1" (`warden ports` has it).
-        assert!(list.contains("│ ports") && list.contains("3000,localhost:9229,+1"), "{list}");
+        // One socket per line, under each other in the worker's row.
+        let ports_at =
+            box_cells(list.lines().nth(1).unwrap()).iter().position(|c| c == "ports").expect("a ports column");
+        let column: Vec<String> =
+            list.lines().skip(3).filter(|l| l.starts_with('│')).map(|l| box_cells(l)[ports_at].clone()).collect();
+        assert_eq!(column, ["3000", "localhost:9229", "unix:/tmp/api.sock", "3000"], "{list}");
         assert!(list.lines().any(|l| l.contains("│ 2 ") && l.contains("│ 3000 ")), "{list}");
         // Status box: every socket once, with where it is reachable.
         let status = render_status(&s, false);
@@ -2313,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_last_exit_is_cut_and_the_box_stays_whole() {
+    fn a_long_last_exit_is_cut_in_the_workers_table_and_a_down_worker_s_is_noted_under_the_list() {
         let mut s: Status = serde_json::from_value(serde_json::json!({
             "app": "api", "mode": "process", "pid": 7, "uptime_secs": 9, "workers_configured": 2, "workers_ready": 0,
             "healthy": null, "supervisor_rss_bytes": null, "host": null, "reloading": false, "shutting_down": false,
@@ -2323,14 +2337,25 @@ mod tests {
         let mut w = row(1, "CRASHED", 0);
         w.last_exit =
             Some("killed by SIGKILL (the kernel's OOM killer: the cgroup's memory limit was reached)\nline 2".into());
-        s.workers = vec![w, row(2, "RUNNING", 5)];
-        let text = render_list_with(&[(listed_app("api", Some(9)), Ok(s))], &Fmt::PLAIN);
+        let mut fine = row(2, "RUNNING", 5);
+        fine.last_exit = Some("exit code 0 after Warden's SIGTERM".into());
+        s.workers = vec![w, fine];
+        // The list has no last exit column; a down worker's is a note under it, a running one's is not.
+        let text = render_list_with(&[(listed_app("api", Some(9)), Ok(s.clone()))], &Fmt::PLAIN);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines[3].contains("killed by SIGKILL") && lines[3].contains('…') && !text.contains("line 2"), "{text}");
+        assert!(!lines[1].contains("last exit"), "{text}");
+        assert!(text.contains("  api worker 1: crashed, last exit: killed by SIGKILL"), "{text}");
+        assert!(!text.contains("worker 2:") && !text.contains("after Warden's SIGTERM"), "{text}");
         let width = lines[0].chars().count();
         assert!(lines[..6].iter().all(|l| l.chars().count() == width), "{text}");
         // Both workers carry the id and name, so each row stands alone.
         assert!(lines[3].starts_with("│ 9  │ api ") && lines[4].starts_with("│ 9  │ api "), "{text}");
+        // The workers table (`warden status api`, `describe`) keeps the column, cut to one line.
+        let table = render_status(&s, true);
+        let tl: Vec<&str> = table.lines().collect();
+        assert!(tl[1].contains("last exit"), "{table}");
+        assert!(tl[3].contains("killed by SIGKILL") && tl[3].contains('…') && !table.contains("line 2"), "{table}");
+        assert!(tl.iter().all(|l| l.chars().count() == tl[0].chars().count()), "{table}");
         assert_eq!(clip("abc", 3), "abc");
         assert_eq!(clip("abcd", 3), "ab…");
     }

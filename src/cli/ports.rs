@@ -8,10 +8,13 @@ use crate::table::{Cell, Fmt, KEY, NAME, boxed, clip};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-/// The `ports` column of `list` is cut here (the rest is `,+N`): a
-/// monorepo's six ports must not make the table wider than a terminal.
-/// `warden ports` has all of them.
+/// The `ports` column of `list` holds one socket per line, each cut to this
+/// many characters, so one long address does not widen the table.
 const CELL_MAX: usize = 26;
+
+/// And at most this many lines (the last one `+N more`): a monorepo's ten
+/// ports must not make a row ten lines tall. `warden ports` has all of them.
+const LINES_MAX: usize = 4;
 
 /// Which interfaces a TCP listener is reachable on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -57,9 +60,9 @@ pub(super) fn app_listeners(s: &Status) -> Vec<Listener> {
     sorted(s.workers.iter().flat_map(|w| w.listening.iter().cloned()).collect())
 }
 
-/// The `ports` column: `3000,localhost:3001,unix:/tmp/a.sock`. A port
-/// everyone can reach is the bare number; anything narrower says where.
-/// `-` when there is nothing.
+/// The `ports` column, one socket per line (the table stacks them):
+/// `3000`, `localhost:3001`, `unix:/tmp/a.sock`. A port everyone can reach is
+/// the bare number; anything narrower says where. `-` when there is nothing.
 pub(super) fn cell(listening: &[Listener]) -> String {
     let mut seen: Vec<(u16, Scope)> = Vec::new();
     let mut items: Vec<String> = Vec::new();
@@ -93,38 +96,21 @@ pub(super) fn cell(listening: &[Listener]) -> String {
             clip(&format!("unix:…/{base}"), CELL_MAX)
         }
     }));
-    fit(&items, CELL_MAX)
+    stack(&items)
 }
 
-/// All of `items` when they fit in `max` characters, else as many whole ones
-/// as fit with `,+N` for the rest (the first is cut if it alone is too long).
-fn fit(items: &[String], max: usize) -> String {
+/// `items` one per line, each cut to [`CELL_MAX`], at most [`LINES_MAX`]
+/// lines: when there are more, the last line says how many are left out.
+fn stack(items: &[String]) -> String {
     if items.is_empty() {
         return "-".into();
     }
-    let joined = items.join(",");
-    if joined.chars().count() <= max {
-        return joined;
+    let shown = if items.len() <= LINES_MAX { items.len() } else { LINES_MAX - 1 };
+    let mut lines: Vec<String> = items[..shown].iter().map(|i| clip(i, CELL_MAX)).collect();
+    if shown < items.len() {
+        lines.push(format!("+{} more", items.len() - shown));
     }
-    let mut shown = 0;
-    let mut len = 0;
-    for item in items {
-        let add = item.chars().count() + usize::from(shown > 0);
-        // What follows the last one shown: `,+N` for the N left out.
-        let left = items.len() - shown - 1;
-        let tail = if left == 0 { 0 } else { format!(",+{left}").chars().count() };
-        if shown > 0 && len + add + tail > max {
-            break;
-        }
-        len += add;
-        shown += 1;
-    }
-    let left = items.len() - shown;
-    let tail = if left == 0 { String::new() } else { format!(",+{left}") };
-    let head = items.get(..shown).unwrap_or(items).join(",");
-    // The first item alone can be longer than the cell.
-    let room = max.saturating_sub(tail.chars().count());
-    format!("{}{tail}", if shown == 1 { clip(&head, room) } else { head })
+    lines.join("\n")
 }
 
 /// A path as it is printed: a control character (an escape sequence in a
@@ -327,37 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn the_ports_cell_is_numbers_then_sockets_and_says_where_when_it_is_not_everywhere() {
+    fn the_ports_cell_is_numbers_then_sockets_one_per_line_and_says_where_when_it_is_not_everywhere() {
         assert_eq!(cell(&[]), "-");
         assert_eq!(cell(&[tcp("0.0.0.0", 3000)]), "3000");
         // v4 and v6 of one port: one number; order by port, not by arrival.
-        assert_eq!(cell(&[tcp("::", 3001), tcp("0.0.0.0", 3001), tcp("0.0.0.0", 3000)]), "3000,3001");
+        assert_eq!(cell(&[tcp("::", 3001), tcp("0.0.0.0", 3001), tcp("0.0.0.0", 3000)]), "3000\n3001");
         assert_eq!(cell(&[tcp("127.0.0.1", 9229), tcp("::1", 9229)]), "localhost:9229");
         assert_eq!(cell(&[tcp("10.0.0.5", 80)]), "10.0.0.5:80");
         assert_eq!(cell(&[tcp("fe80::1", 80)]), "[fe80::1]:80");
-        assert_eq!(cell(&[unix("/tmp/a.sock"), tcp("0.0.0.0", 3000)]), "3000,unix:/tmp/a.sock");
+        assert_eq!(cell(&[unix("/tmp/a.sock"), tcp("0.0.0.0", 3000)]), "3000\nunix:/tmp/a.sock");
+        assert_eq!(
+            cell(&[tcp("0.0.0.0", 4001), tcp("127.0.0.1", 5173), tcp("0.0.0.0", 4000)]),
+            "4000\n4001\nlocalhost:5173"
+        );
     }
 
     #[test]
-    fn a_long_list_is_cut_with_the_count_left_over() {
-        let many: Vec<Listener> = (3000..3010).map(|p| tcp("0.0.0.0", p)).collect();
-        let c = cell(&many);
-        assert!(c.chars().count() <= CELL_MAX && c.starts_with("3000,3001,") && c.contains(",+"), "{c}");
-        let shown = c.split(',').filter(|p| !p.starts_with('+')).count();
-        assert!(c.ends_with(&format!(",+{}", 10 - shown)), "{c}: {shown} shown of 10");
-        // One that fits exactly is not cut.
+    fn a_long_list_is_four_lines_at_most_with_the_count_left_over() {
+        let four: Vec<Listener> = (3000..3004).map(|p| tcp("0.0.0.0", p)).collect();
+        assert_eq!(cell(&four), "3000\n3001\n3002\n3003", "four fit");
+        let ten: Vec<Listener> = (3000..3010).map(|p| tcp("0.0.0.0", p)).collect();
+        assert_eq!(cell(&ten), "3000\n3001\n3002\n+7 more");
         let five: Vec<Listener> = (3000..3005).map(|p| tcp("0.0.0.0", p)).collect();
-        assert_eq!(cell(&five), "3000,3001,3002,3003,3004");
-        // Exactly the width: whole. One character more: cut, with the count.
-        let six: Vec<Listener> = (3000..3005).map(|p| tcp("0.0.0.0", p)).chain([tcp("0.0.0.0", 5)]).collect();
-        // (ports are sorted: the 5 comes first)
-        assert_eq!(cell(&six), "5,3000,3001,3002,3003,3004");
-        assert_eq!(cell(&six).chars().count(), CELL_MAX);
-        let seven: Vec<Listener> =
-            (3000..3005).map(|p| tcp("0.0.0.0", p)).chain([tcp("0.0.0.0", 55), tcp("0.0.0.0", 66)]).collect();
-        let c = cell(&seven);
-        // Sorted: 55,66,3000,3001,3002 fit with ",+2" (20 + 3 characters); 3003 would not.
-        assert_eq!(c, "55,66,3000,3001,3002,+2");
+        assert_eq!(cell(&five), "3000\n3001\n3002\n+2 more", "never a line for one left out alone");
     }
 
     #[test]
@@ -383,9 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn a_long_first_item_is_cut_to_the_cell_and_a_control_character_never_reaches_the_terminal() {
-        let c = cell(&[tcp("fe80::e558:fff:d8b4:ff6", 80), tcp("0.0.0.0", 81)]);
-        assert!(c.chars().count() <= CELL_MAX && c.ends_with(",+1"), "{c}");
+    fn a_long_item_is_cut_to_the_cell_and_a_control_character_never_reaches_the_terminal() {
+        let c = cell(&[tcp("fe80::e558:fff:d8b4:ff6:1234", 80), tcp("0.0.0.0", 81)]);
+        let lines: Vec<&str> = c.lines().collect();
+        // Sorted by port: the long address of 80, then 81.
+        assert!(lines[0].chars().count() == CELL_MAX && lines[0].ends_with('…'), "{c}");
+        assert_eq!(lines[1], "81", "{c}");
         let c = cell(&[unix("/tmp/\u{1b}[31mred.sock")]);
         assert!(!c.contains('\u{1b}') && c.contains("?[31mred"), "{c:?}");
         let d = detail(&[unix("/tmp/\u{1b}]0;x\u{7}")]);

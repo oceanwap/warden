@@ -1928,9 +1928,12 @@ while True:
 
     // The list's column, the boxes, and `warden ports` (table and JSON).
     let list = f.ok(&["list"]);
-    let row = list.lines().find(|l| l.contains(" multi ") && l.contains("RUNNING")).expect("the multi row");
-    // p2 (all interfaces) is the plain port; the localhost-only ones carry their host.
-    assert!(row.contains(&format!("localhost:{p1}")) && row.contains(&p2.to_string()), "{list}");
+    let at = list.lines().position(|l| l.contains(" multi ") && l.contains("RUNNING")).expect("the multi row");
+    // One socket per line in the row: p2 (all interfaces) is the plain port; the localhost-only
+    // ones carry their host.
+    let row: Vec<&str> = list.lines().skip(at).take(4).collect();
+    let has = |cell: String| row.iter().any(|l| l.contains(&format!("│ {cell} ")));
+    assert!(has(format!("localhost:{p1}")) && has(p2.to_string()) && has(format!("localhost:{p3}")), "{list}");
     assert!(list.contains(&format!("{web}")), "{list}");
     let describe = f.ok(&["describe", "multi"]);
     assert!(
@@ -7430,7 +7433,7 @@ fn watched_files_restart_the_app_and_the_default_is_off() {
     let list = f.ok(&["list"]);
     let cell = |app: &str| list.lines().find(|l| l.contains(&format!(" {app} "))).unwrap_or_default().to_string();
     assert!(list.contains("watching"), "a column: {list}");
-    assert!(cell("watched").contains("enabled") && cell("quiet").contains("disabled"), "{list}");
+    assert!(cell("watched").contains("│ ✓ ") && cell("quiet").contains("│ ✗ "), "{list}");
     let d = f.ok(&["describe", "watched"]);
     assert!(d.contains("enabled: a rolling restart 200 ms after the files in ."), "{d}");
     assert!(f.ok(&["describe", "quiet"]).contains("disabled (`[watch] enabled = true`"));

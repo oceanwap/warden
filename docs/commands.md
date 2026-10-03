@@ -230,6 +230,14 @@ client and server errors of the last minute (yellow with 4xx, red with a
 each port's open connections, the ones waiting to be accepted out of how
 many may wait, and the ones the kernel dropped, from the kernel.
 
+In the tables, `watching` is ✓ when `[watch]` restarts the app on file
+changes and ✗ when it does not, and `ports` lists each socket on a line of
+its own (four at most; `+N more` says what `warden ports` shows in full).
+`last exit`, how the worker's previous process ended (`exit code 1`, a
+signal, an OOM kill, Warden stopping it), is a column of the worker table
+of `warden status <app>` and `describe`; `warden list` leaves it out and
+says it under the table for a worker that is down (`crashed` or `failed`).
+
 Every problem Warden logs says what happened, why, what it did and how to fix
 it; [`troubleshooting.md`](troubleshooting.md) collects them by symptom.
 

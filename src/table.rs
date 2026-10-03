@@ -59,15 +59,24 @@ pub fn term_width(fd: RawFd) -> Option<usize> {
 pub(crate) struct Cell {
     pub(crate) text: String,
     pub(crate) style: &'static str,
+    /// The text is several lines (`\n`), shown one under the other in any
+    /// column: the row grows to fit. Otherwise a cell is one line.
+    pub(crate) lines: bool,
 }
 
 impl Cell {
     pub(crate) fn plain(text: impl Into<String>) -> Cell {
-        Cell { text: text.into(), style: "" }
+        Cell { text: text.into(), style: "", lines: false }
     }
 
     pub(crate) fn styled(text: impl Into<String>, style: &'static str) -> Cell {
-        Cell { text: text.into(), style }
+        Cell { text: text.into(), style, lines: false }
+    }
+
+    /// A cell of several lines, `\n` between them (a column of short items
+    /// takes less width one under the other than side by side).
+    pub(crate) fn lines(text: impl Into<String>) -> Cell {
+        Cell { text: text.into(), style: "", lines: true }
     }
 }
 
@@ -102,7 +111,8 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 /// A box-drawn table. `header`: a heading row and a rule under it (none for
 /// a key | value box). `flex`: the column whose cells may hold several lines
-/// (`\n`) and are wrapped to fit `fmt.width`; every other cell is one line.
+/// (`\n`) and are wrapped to fit `fmt.width`; any other cell is one line,
+/// unless it was made with [`Cell::lines`].
 /// Cells are left-aligned with a space each side; widths come from the text,
 /// never from the colors.
 pub(crate) fn boxed(header: Option<&[&str]>, rows: &[Vec<Cell>], fmt: &Fmt, flex: Option<usize>) -> String {
@@ -119,7 +129,7 @@ pub(crate) fn boxed(header: Option<&[&str]>, rows: &[Vec<Cell>], fmt: &Fmt, flex
             (0..ncols)
                 .map(|c| {
                     let t = r.get(c).map(|c| c.text.as_str()).unwrap_or("");
-                    if Some(c) == flex {
+                    if Some(c) == flex || r.get(c).is_some_and(|c| c.lines) {
                         t.split('\n').map(|l| l.replace(['\r', '\t'], " ")).collect()
                     } else {
                         vec![one_line(t)]
@@ -273,5 +283,23 @@ mod tests {
         let path = "/a/very/long/path/".repeat(8);
         let t = boxed(None, &[vec![Cell::plain("config"), Cell::plain(path.clone())]], &fmt, Some(1));
         assert!(t.contains(&path), "{t}");
+    }
+
+    #[test]
+    fn a_cell_of_lines_stacks_them_in_any_column_and_is_as_wide_as_its_longest() {
+        let rows = vec![
+            vec![Cell::plain("api"), Cell::lines("4000\n4001\nlocalhost:5173"), Cell::plain("ok")],
+            vec![Cell::plain("web"), Cell::lines("3000"), Cell::plain("ok\nnot split")],
+        ];
+        let t = boxed(Some(&["name", "ports", "health"]), &rows, &Fmt::PLAIN, None);
+        let lines: Vec<&str> = t.lines().collect();
+        // Rule, header, rule, 3 lines for api, 1 for web, rule.
+        assert_eq!(lines.len(), 1 + 1 + 1 + 3 + 1 + 1, "{t}");
+        assert_eq!(lines[3], "│ api  │ 4000           │ ok           │", "{t}");
+        assert_eq!(lines[4], "│      │ 4001           │              │", "{t}");
+        assert_eq!(lines[5], "│      │ localhost:5173 │              │", "{t}");
+        // A plain cell stays one line: its newline is a space.
+        assert_eq!(lines[6], "│ web  │ 3000           │ ok not split │", "{t}");
+        assert!(widths_of(&t).windows(2).all(|w| w[0] == w[1]), "every line as wide:\n{t}");
     }
 }
