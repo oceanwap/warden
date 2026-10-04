@@ -3,6 +3,29 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.1] — 2026-10-04
+
+### Added
+
+- Every GUI package carries the CLI: the Linux `warden-gui` packages (deb, rpm,
+  Arch) ship `/usr/bin/warden`, provide and replace `warden`, and removing
+  `warden-gui` removes the CLI with it. The GUI archives and `Warden.app`
+  already did.
+- `warden gui-install`: installs the GUI for this `warden`'s version
+  (`Warden.app` on macOS; `warden-gui`, a menu entry and an icon on Linux).
+  `--dry-run`, `--uninstall`, `--version`, `--dir`, `--app-dir`.
+- `install-gui.sh`: `install.sh --gui`, checked against the release's
+  `SHA256SUMS`; `install.sh --gui-only` leaves an existing CLI as it is.
+
+### Changed
+
+- `warden list`: watching is ✓ / ✗, ports are listed one per line, and the
+  last-exit column is gone (uptime says what it said).
+- Static serving: cached bodies of 8 KB and up are sent from the accept loop.
+- Only a pushed `v*` tag releases; the Release workflow run by hand is always
+  a dry run.
+- `install.sh`'s next steps no longer point into the archive's `contrib/`.
+
 ## [0.1.0] — 2026-10-03
 
 The first release.
