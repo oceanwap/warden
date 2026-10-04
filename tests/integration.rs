@@ -4196,7 +4196,8 @@ fn direct_config(name: &str, script: &str, logging: &str) -> String {
 fn eventually(w: &Warden, what: &str, f: impl Fn() -> bool) {
     let t0 = Instant::now();
     while !f() {
-        if t0.elapsed() > T {
+        // Time the host froze Warden for is not counted (see Warden::wait_for).
+        if t0.elapsed() > T + w.frozen().min(Duration::from_secs(60)) {
             panic!("timed out waiting for {what}\nlog:\n{}", w.log());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -4432,6 +4433,11 @@ fn flush_empties_the_log_files_in_both_modes() {
             let t = ticks(n);
             assert!(t.windows(2).all(|p| p[1] == p[0] + 1), "{mode}: out-{n}.log: {t:?}");
         }
+        // The log file is written by a thread of its own: the line that says the flush is done
+        // follows the command's answer by a moment.
+        eventually(&w, "the flush line in warden.log", || {
+            std::fs::read_to_string(logs.join("warden.log")).is_ok_and(|l| l.contains("logs flushed on request"))
+        });
         let log = std::fs::read_to_string(logs.join("warden.log")).unwrap();
         assert!(!log.contains('\0') && !log.contains("burst 1 ") && !log.contains("worker ready"), "{mode}: {log}");
         assert!(log.contains("logs flushed on request files=6 failed=0"), "{mode}: {log}");
