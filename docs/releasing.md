@@ -136,8 +136,9 @@ commit, a failure undoes the version edit, so the tree is as it was.
    out), each job printed as its state changes; at the end the release URL
    and its assets, or the failed jobs and the run URL.
 
-`GITHUB_TOKEN` or `GH_TOKEN`, if set, authenticates the API calls (a higher
-rate limit, and a private repository works); the token goes to curl on
+The API calls are authenticated with the first token found: `gh auth token`
+(when the GitHub CLI is installed and logged in), then `GITHUB_TOKEN`, then
+`GH_TOKEN` (a higher rate limit, and a private repository works); the token goes to curl on
 stdin, never on a command line. Without one, the API allows 60 requests an
 hour, enough to follow a release at a slower pace.
 

@@ -55,8 +55,9 @@ OPTIONS:
     -y, --yes          Don't ask for confirmation
     -h, --help         This help
 
-GITHUB_TOKEN or GH_TOKEN, if set, authenticates the GitHub API calls (CI status,
-following the workflow): a higher rate limit, and private repositories work.
+The GitHub API calls (CI status, following the workflow) are authenticated, for a
+higher rate limit and private repositories, with the first token found: `gh auth
+token` (if the GitHub CLI is installed and logged in), then GITHUB_TOKEN, then GH_TOKEN.
 NEEDS: git; curl (unless --no-ci-check --no-wait); the right to push tags to origin;
 with --macos local, on a Mac: rustup, cargo-about and the GitHub CLI (gh auth login).
 ";
@@ -203,16 +204,32 @@ pub(crate) struct Env {
 
 pub(crate) fn main(args: &[String], root: &Path) -> Result<(), String> {
     let Some(o) = parse(args)? else { return Ok(()) };
-    let token = ["GITHUB_TOKEN", "GH_TOKEN"]
-        .iter()
-        .filter_map(|k| std::env::var(k).ok())
-        .map(|t| t.trim().to_string())
-        .find(|t| !t.is_empty());
+    let token = pick_token(gh_auth_token(), |k| std::env::var(k).ok());
     release(
         &o,
         root,
         &Env { interactive: std::io::stdin().is_terminal(), token, cargo: cargo_bin(), mac: cfg!(target_os = "macos") },
     )
+}
+
+/// The token the GitHub CLI holds (`gh auth token`), if `gh` is installed and logged in.
+fn gh_auth_token() -> Option<String> {
+    let out = Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The GitHub API token: the GitHub CLI's first (`gh auth token`), then `GITHUB_TOKEN`, then `GH_TOKEN`.
+fn pick_token(gh: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    gh.into_iter()
+        .chain(["GITHUB_TOKEN", "GH_TOKEN"].iter().filter_map(|k| env(k)))
+        .map(|t| t.trim().to_string())
+        .find(|t| !t.is_empty())
 }
 
 /// `cargo xtask dist-macos`: the macOS archives, built here on a Mac and
@@ -811,7 +828,8 @@ impl GitHub {
                 return Ok(resp);
             }
             let wait = resp.retry_after.unwrap_or_else(|| resp.reset.map_or(60, |t| t.saturating_sub(now_secs()) + 1));
-            let hint = if self.token.is_none() { " (GITHUB_TOKEN or GH_TOKEN raises the limit)" } else { "" };
+            let hint =
+                if self.token.is_none() { " (gh auth login, GITHUB_TOKEN or GH_TOKEN raises the limit)" } else { "" };
             if !self.patient || waited || wait > 3600 {
                 return Err(format!("GitHub API rate limit reached, for {} more min{hint}", wait.div_ceil(60)));
             }
@@ -835,9 +853,11 @@ impl GitHub {
             .and_then(|v| v["message"].as_str().map(String::from))
             .unwrap_or_default();
         match resp.status {
-            401 => format!("GitHub refused the token in GITHUB_TOKEN/GH_TOKEN (401 {msg}): renew it, or unset it"),
+            401 => format!(
+                "GitHub refused the token (from gh auth token, GITHUB_TOKEN or GH_TOKEN; 401 {msg}): renew it (gh auth login), or unset it"
+            ),
             404 if self.token.is_none() => format!(
-                "GitHub answered 404 for {}: the repository is private (set GITHUB_TOKEN or GH_TOKEN) or doesn't exist",
+                "GitHub answered 404 for {}: the repository is private (run gh auth login, or set GITHUB_TOKEN or GH_TOKEN) or doesn't exist",
                 self.repo
             ),
             404 => {
@@ -1564,7 +1584,9 @@ fn release(o: &Options, root: &Path, env: &Env) -> Result<(), String> {
 fn ci_check(r: &mut Report, api: &mut GitHub, sha: &str, o: &Options) -> Result<(), String> {
     let short = &sha[..sha.len().min(7)];
     if api.token.is_none() {
-        r.note("(no GITHUB_TOKEN or GH_TOKEN: unauthenticated GitHub API, 60 requests an hour)");
+        r.note(
+            "(no token from gh auth token, GITHUB_TOKEN or GH_TOKEN: unauthenticated GitHub API, 60 requests an hour)",
+        );
     }
     api.patient = o.wait_ci && !o.dry_run;
     let t0 = Instant::now();
@@ -1835,7 +1857,7 @@ fn follow(r: &mut Report, api: &mut GitHub, tag: &str, sha: &str) -> Result<(), 
     let t0 = Instant::now();
     let workflow_url = format!("https://github.com/{}/actions/workflows/release.yml", api.repo);
     if api.token.is_none() {
-        r.note("(no GITHUB_TOKEN or GH_TOKEN: polling slowly enough for 60 API requests an hour)");
+        r.note("(no token from gh auth token, GITHUB_TOKEN or GH_TOKEN: polling slowly enough for 60 API requests an hour)");
     }
     // GitHub starts the run a few seconds after the push.
     let run = loop {
@@ -1939,6 +1961,22 @@ mod tests {
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_github_cli_token_comes_before_the_variables() {
+        let env = |k: &str| match k {
+            "GITHUB_TOKEN" => Some(" from-github-token\n".to_string()),
+            "GH_TOKEN" => Some("from-gh-token".to_string()),
+            _ => None,
+        };
+        assert_eq!(pick_token(Some("from-gh-cli\n".into()), env).as_deref(), Some("from-gh-cli"));
+        // No gh, or gh logged out (an empty answer): the variables, in order.
+        assert_eq!(pick_token(None, env).as_deref(), Some("from-github-token"));
+        assert_eq!(pick_token(Some("  \n".into()), env).as_deref(), Some("from-github-token"));
+        let only_gh_token = |k: &str| (k == "GH_TOKEN").then(|| "from-gh-token".to_string());
+        assert_eq!(pick_token(None, only_gh_token).as_deref(), Some("from-gh-token"));
+        assert_eq!(pick_token(None, |_| None), None);
     }
 
     #[test]
