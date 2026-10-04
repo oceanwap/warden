@@ -71,6 +71,7 @@ impl Supervisor {
             warn!(
                 "event loop was blocked",
                 for_ms = gap.saturating_sub(TICK).as_millis(),
+                host = host_load(),
                 hint = "Warden itself did not run for that long: it was stopped (SIGSTOP, a debugger), the host or VM \
                         was paused or overloaded, or its stdout blocked. Workers kept serving, and the watchdog does \
                         not count that time against them. If it repeats, check the host's load and what reads \
@@ -279,6 +280,24 @@ impl Supervisor {
 
 /// The maintenance tick's period, and the tick gap above which Warden
 /// counts as having stalled (it did not run, so it read no heartbeat).
+/// What the host looked like just after a stall: the load averages and, where the
+/// kernel has them, how long tasks waited for the CPU and for memory in the last 10 s
+/// (pressure stall information). A stall with a high load or pressure was the host's.
+fn host_load() -> String {
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let load = read("/proc/loadavg");
+    let load = load.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let psi = |kind: &str| {
+        read(&format!("/proc/pressure/{kind}"))
+            .lines()
+            .find(|l| l.starts_with("some"))
+            .and_then(|l| l.split_whitespace().find_map(|w| w.strip_prefix("avg10=")))
+            .unwrap_or("n/a")
+            .to_string()
+    };
+    format!("load {load}, cpu pressure {}%, memory pressure {}%, io pressure {}%", psi("cpu"), psi("memory"), psi("io"))
+}
+
 const TICK: Duration = Duration::from_secs(1);
 const STALL: Duration = Duration::from_millis(1500);
 

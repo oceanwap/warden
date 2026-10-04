@@ -94,10 +94,26 @@ impl Warden {
         serde_json::from_str(&out).ok()
     }
 
+    /// How long Warden says it was frozen (SIGSTOP, an overloaded or paused CI
+    /// VM): its "event loop was blocked for_ms=N" warnings, summed.
+    fn frozen(&self) -> Duration {
+        let log = self.log();
+        let ms: u64 = log
+            .lines()
+            .filter(|l| l.contains("event loop was blocked"))
+            .filter_map(|l| l.split("for_ms=").nth(1)?.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u64>().ok())
+            .sum();
+        Duration::from_millis(ms)
+    }
+
+    /// The time a wait has: `timeout`, and more for each stretch the host froze
+    /// Warden (the way the watchdog forgives it): the test is about what Warden
+    /// does, not about the host's pauses. At most a minute extra.
     fn wait_for(&self, what: &str, timeout: Duration, f: impl Fn(&Value) -> bool) -> Value {
         let start = Instant::now();
         let mut last = None;
-        while start.elapsed() < timeout {
+        let mut deadline = timeout;
+        while start.elapsed() < deadline {
             if let Some(s) = self.status() {
                 if f(&s) {
                     return s;
@@ -105,6 +121,7 @@ impl Warden {
                 last = Some(s);
             }
             std::thread::sleep(Duration::from_millis(100));
+            deadline = timeout + self.frozen().min(Duration::from_secs(60));
         }
         panic!("timed out waiting for {what}; last status: {last:#?}\nlog:\n{}", self.log());
     }
@@ -1050,6 +1067,7 @@ fn systemd_ready_and_watchdog_pings_stop_when_frozen() {
     let after = recv_for(Duration::from_secs(3));
     assert!(after.iter().filter(|m| *m == "WATCHDOG=1").count() >= 1, "pings resume: {after:?}");
     assert!(w.log().contains("event loop was blocked"));
+    assert!(w.frozen() >= Duration::from_secs(1), "the freeze is read back from the log: {:?}", w.frozen());
 }
 
 fn fault_warden(name: &str, fault: &str, count: usize) -> (Warden, u16) {
