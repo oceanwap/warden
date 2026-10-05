@@ -641,6 +641,78 @@ pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: 
     Err(io::Error::new(io::ErrorKind::Unsupported, "openat2 is Linux-only"))
 }
 
+/// macOS 15 (Darwin 24) and later: open(2) refuses, with ENOTCAPABLE, a
+/// lookup that would leave the directory it starts from (`..` above it, an
+/// absolute path or an absolute symlink), in the kernel, so nothing can be
+/// swapped in between a check and the open. The `libc` crate lacks it; the
+/// value is xnu's `bsd/sys/fcntl.h`: `#define O_RESOLVE_BENEATH 0x00001000`.
+/// Older kernels ignore the bit (it is FMARK there, kernel-internal, masked
+/// off at open), so it is only used once [`resolve_beneath_works`] said so.
+#[cfg(target_os = "macos")]
+pub const O_RESOLVE_BENEATH: libc::c_int = 0x1000;
+
+/// openat(2) of `path` relative to `dir`, close-on-exec. No O_CREAT: no
+/// mode argument.
+#[cfg(target_os = "macos")]
+pub fn openat(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: `path` is NUL-terminated and outlives the call; `dir` is
+    // borrowed, so it stays open for it. Without O_CREAT the variadic mode
+    // argument is not read.
+    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), path.as_ptr(), flags | libc::O_CLOEXEC) })?;
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether open(2) honours O_RESOLVE_BENEATH (macOS 15+), asked once: an
+/// absolute path is always refused under it (ENOTCAPABLE), so a kernel that
+/// opens "/" ignored the flag. Any other answer counts as no.
+#[cfg(target_os = "macos")]
+pub fn resolve_beneath_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| refuses(c"/", O_RESOLVE_BENEATH, libc::ENOTCAPABLE))
+}
+
+/// Whether open(2) honours O_NOFOLLOW_ANY (macOS 11+: ELOOP at any symlink
+/// in the path), asked once on `/tmp`, a symlink on every macOS. If it ever
+/// were not one, the answer is no, and callers take their slower way.
+#[cfg(target_os = "macos")]
+pub fn nofollow_any_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| refuses(c"/tmp", libc::O_NOFOLLOW_ANY, libc::ELOOP))
+}
+
+/// open(2) of `path` with `flag` fails with `errno` (a descriptor it opened
+/// is closed at once).
+#[cfg(target_os = "macos")]
+fn refuses(path: &std::ffi::CStr, flag: libc::c_int, errno: libc::c_int) -> bool {
+    // SAFETY: `path` is NUL-terminated and outlives the call; no O_CREAT.
+    match check(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | flag) }) {
+        Ok(fd) => {
+            // SAFETY: open returned a new descriptor that nothing else owns.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            false
+        }
+        Err(e) => e.raw_os_error() == Some(errno),
+    }
+}
+
+/// The path the kernel has for an open descriptor (fcntl F_GETPATH). Asked
+/// of the descriptor, not of a path, it names the file that will be read
+/// even if a symlink was swapped since. A file with several hard links may
+/// be named by any of them.
+#[cfg(target_os = "macos")]
+pub fn fd_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // MAXPATHLEN (sys/param.h), which is what F_GETPATH writes at most.
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most MAXPATHLEN
+    // (= PATH_MAX, 1024) bytes into `buf`, which is that long and lives for
+    // the call; `fd` is borrowed, so it stays open for it.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) })?;
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(std::ffi::OsStr::from_bytes(&buf[..len]).into())
+}
+
 /// pidfd_open(2): a descriptor that becomes readable when process `pid`
 /// exits, for watching a process that is not our child (`wardend` watching
 /// supervisors) without polling and without pid-reuse races. ENOSYS before
@@ -2422,7 +2494,7 @@ mod tests {
         openat2(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags, resolve)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn read_all(fd: OwnedFd) -> String {
         let mut s = String::new();
         std::fs::File::from(fd).read_to_string(&mut s).unwrap();
@@ -2450,6 +2522,54 @@ mod tests {
         file.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"abc");
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// macOS: O_RESOLVE_BENEATH is detected exactly where the kernel has
+    /// it (Darwin 24, macOS 15, and later), O_NOFOLLOW_ANY on every
+    /// supported macOS (11+).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_open_flags_are_detected_by_kernel_version() {
+        let out = std::process::Command::new("uname").arg("-r").output().unwrap();
+        let release = String::from_utf8_lossy(&out.stdout).to_string();
+        let major: u32 = release.split('.').next().unwrap().trim().parse().unwrap();
+        assert_eq!(resolve_beneath_works(), major >= 24, "Darwin {release}");
+        assert!(nofollow_any_works(), "Darwin {release}");
+    }
+
+    /// macOS: openat with O_RESOLVE_BENEATH stays under the directory (where
+    /// the kernel has it), O_NOFOLLOW_ANY refuses every symlink, and
+    /// F_GETPATH names the file a descriptor has open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_openat_flags_and_fd_path() {
+        use std::os::fd::AsFd;
+        let (base, dir) = tree();
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY;
+        let at = |p: &str, extra: libc::c_int| openat(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags | extra);
+        assert_eq!(read_all(at("in", 0).unwrap()), "A");
+        assert_eq!(read_all(at("up", 0).unwrap()), "secret", "plain openat follows anything");
+        if resolve_beneath_works() {
+            assert_eq!(read_all(at("in", O_RESOLVE_BENEATH).unwrap()), "A");
+            assert_eq!(read_all(at("sub/b.txt", O_RESOLVE_BENEATH).unwrap()), "B");
+            for out in ["up", "abs", "outdir/outside.txt", "..", "sub/../../outside.txt"] {
+                let e = at(out, O_RESOLVE_BENEATH).unwrap_err();
+                assert_eq!(e.raw_os_error(), Some(libc::ENOTCAPABLE), "{out}: {e}");
+            }
+        }
+        assert_eq!(read_all(at("sub/b.txt", libc::O_NOFOLLOW_ANY).unwrap()), "B");
+        for link in ["in", "abs", "up", "outdir/outside.txt"] {
+            assert_eq!(at(link, libc::O_NOFOLLOW_ANY).unwrap_err().raw_os_error(), Some(libc::ELOOP), "{link}");
+        }
+        let root = std::fs::canonicalize(base.join("root")).unwrap();
+        assert_eq!(fd_path(dir.as_fd()).unwrap(), root);
+        assert_eq!(fd_path(at("in", 0).unwrap().as_fd()).unwrap(), root.join("a.txt"), "the target, not the link");
+        assert_eq!(
+            fd_path(at("up", 0).unwrap().as_fd()).unwrap(),
+            std::fs::canonicalize(base.join("outside.txt")).unwrap()
+        );
+        assert_eq!(at("missing", 0).unwrap_err().kind(), io::ErrorKind::NotFound);
         let _ = std::fs::remove_dir_all(base);
     }
 

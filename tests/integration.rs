@@ -4464,6 +4464,49 @@ fn direct_output_flush_and_logs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `warden logs -f` keeps up with a burst: 2,000 lines in one write used to
+/// overflow the follow channel (256 one-line slots) at once, and a client
+/// reading promptly saw "... lines skipped".
+#[test]
+fn logs_follow_takes_a_burst_whole() {
+    let dir = direct_dir("follow-burst");
+    let (input, go) = (dir.join("burst.txt"), dir.join("go"));
+    let text: String = (1..=2000).map(|i| format!("burst {i}\n")).collect();
+    std::fs::write(&input, text).unwrap();
+    let script =
+        format!("while [ ! -e {} ]; do sleep 0.05; done; cat {}; exec sleep 300", go.display(), input.display());
+    let cfg = format!(
+        "[app]\nname = \"follow-burst\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+         [workers]\nmin_uptime = 100\n[logging]\nmax_lines_per_sec = 0\n"
+    );
+    let w = Warden::start("follow-burst", 0, &cfg);
+    w.wait_log("worker ready", T);
+    let mut follow =
+        Command::new(BIN).args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
+    let mut reader = std::io::BufReader::new(follow.stdout.take().unwrap());
+    let mut line = String::new();
+    // The snapshot line: the follower is subscribed from here on.
+    assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0);
+    std::fs::write(&go, "").unwrap();
+    let (mut got, mut other) = (Vec::new(), Vec::new());
+    let t0 = Instant::now();
+    while got.last() != Some(&2000) && t0.elapsed() < T {
+        line.clear();
+        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        match line.trim_end().rsplit_once("stdout: burst ").and_then(|(_, n)| n.parse::<u32>().ok()) {
+            Some(n) => got.push(n),
+            None => other.push(line.clone()),
+        }
+    }
+    let _ = follow.kill();
+    let _ = follow.wait();
+    assert!(other.iter().all(|l| !l.contains("skipped")), "{other:?}");
+    assert_eq!(got, (1..=2000).collect::<Vec<u32>>(), "every line, in order; also seen: {other:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `warden flush` empties every current log file in both output modes,
 /// like `pm2 flush`: Warden's log, each worker's out and err file (also one
 /// no running worker writes), keeps the rotated ones, and writing goes on

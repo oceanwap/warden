@@ -20,8 +20,8 @@ pub(super) const OPEN_CACHED: u8 = 0;
 /// lookups are never served from cache).
 pub(super) const OPEN_BENEATH: u8 = 1;
 
-/// No openat2 (kernel before 5.6, or blocked by seccomp): realpath check
-/// then open, on a thread.
+/// No openat2, on a thread: on Linux (kernel before 5.6, or blocked by
+/// seccomp) a realpath check then the open; on macOS see `open_checked`.
 pub(super) const OPEN_LEGACY: u8 = 2;
 
 /// An open file (or directory) under the root and its metadata.
@@ -79,7 +79,8 @@ pub(super) async fn open(site: &Site, rel: &str) -> std::io::Result<Opened> {
             },
         }
     }
-    open_by_realpath(site, rel).await
+    let beneath = site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY;
+    open_on_thread(site, rel, beneath).await
 }
 
 /// openat2 with the kernel keeping the lookup inside the root, the way the
@@ -116,23 +117,130 @@ async fn open_beneath(site: &Site, dir: &Arc<OwnedFd>, rel: &str) -> std::io::Re
     }
 }
 
-/// Without openat2: the path is resolved and checked to be inside the root
-/// (`inside`), then opened, on a thread.
-async fn open_by_realpath(site: &Site, rel: &str) -> std::io::Result<Opened> {
-    let root = site.root.clone();
-    let rel = rel.to_string();
-    tokio::task::spawn_blocking(move || open_checked(&root, &rel)).await.map_err(Error::other)?
+/// How files are opened in OPEN_LEGACY, for the line `warden serve` starts with.
+pub(super) fn legacy_open_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::sys::resolve_beneath_works() {
+            return "openat, O_RESOLVE_BENEATH";
+        }
+        if crate::sys::nofollow_any_works() {
+            return "openat, O_NOFOLLOW_ANY";
+        }
+        "openat, then F_GETPATH"
+    }
+    #[cfg(not(target_os = "macos"))]
+    "realpath check"
 }
 
-/// `rel` under `root`, once its real path is known to be inside the root.
-fn open_checked(root: &Path, rel: &str) -> std::io::Result<Opened> {
+/// `open_checked`, on a thread. `beneath`: openat2 works here.
+async fn open_on_thread(site: &Site, rel: &str, beneath: bool) -> std::io::Result<Opened> {
+    let dir = site.dir.clone();
+    let root = site.root.clone();
+    let rel = rel.to_string();
+    tokio::task::spawn_blocking(move || open_checked(&dir, &root, &rel, beneath)).await.map_err(Error::other)?
+}
+
+/// Where `rel` leads once every symlink is followed (realpath), relative
+/// to the root and without symlinks; NotFound if that is outside the root.
+fn resolved(root: &Path, rel: &str) -> std::io::Result<std::path::PathBuf> {
     let path = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
-    if !inside(root, &path) {
-        return Err(Error::from(ErrorKind::NotFound));
+    match std::fs::canonicalize(&path).map(|c| c.strip_prefix(root).map(Path::to_path_buf)) {
+        Ok(Ok(real)) => Ok(real),
+        _ => Err(Error::from(ErrorKind::NotFound)),
     }
+}
+
+/// `path` (empty: the root itself) as a C string for a system call.
+fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = if path.as_os_str().is_empty() { b".".as_slice() } else { path.as_os_str().as_bytes() };
+    std::ffi::CString::new(bytes).map_err(|_| Error::from(ErrorKind::InvalidInput))
+}
+
+/// Linux, `rel` through a symlink openat2 refused (an absolute one, which
+/// may point back inside the root), or anything without openat2: served if
+/// its real path is inside the root. With openat2 (`beneath`), that real
+/// path (no symlinks left) is then opened kept inside the root, so a
+/// symlink swapped in after the check cannot lead out (it is refused).
+/// Without, the check and the open are two steps.
+#[cfg(not(target_os = "macos"))]
+fn open_checked(dir: &OwnedFd, root: &Path, rel: &str, beneath: bool) -> std::io::Result<Opened> {
+    let real = resolved(root, rel)?;
+    if beneath {
+        let resolve = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
+        return match crate::sys::openat2(dir.as_fd(), &c_path(&real)?, OPEN_FLAGS, resolve) {
+            Ok(fd) => opened(fd),
+            Err(e) if e.raw_os_error() == Some(libc::EXDEV) => Err(Error::from(ErrorKind::NotFound)),
+            Err(e) => Err(e),
+        };
+    }
+    let path = if rel.is_empty() { root.to_path_buf() } else { root.join(rel) };
     let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(&path)?;
     let meta = file.metadata()?;
     Ok(Opened { file, meta })
+}
+
+/// macOS: `rel` under the root `dir`, with no window between a check and
+/// the open (a symlink swapped in between could otherwise lead outside).
+/// One openat, confined by the kernel:
+/// - macOS 15+: O_RESOLVE_BENEATH keeps the lookup inside the root, as
+///   openat2 does on Linux;
+/// - macOS 11–14: O_NOFOLLOW_ANY refuses any symlink on the way, so with no
+///   `..` in `rel` it cannot leave the root.
+///
+/// A path through a symlink the flag refuses (one leading out of the root or
+/// absolute from 15, any before) is resolved with realpath; if that ends
+/// inside the root, the real path (no symlinks left) is opened confined the
+/// same way, so a symlink swapped in after the check is refused. NotFound
+/// for a path that leaves the root. (`beneath` is for Linux.)
+#[cfg(target_os = "macos")]
+fn open_checked(dir: &OwnedFd, root: &Path, rel: &str, beneath: bool) -> std::io::Result<Opened> {
+    let _ = beneath;
+    let confine = if crate::sys::resolve_beneath_works() {
+        Some((crate::sys::O_RESOLVE_BENEATH, libc::ENOTCAPABLE))
+    } else if crate::sys::nofollow_any_works() {
+        Some((libc::O_NOFOLLOW_ANY, libc::ELOOP))
+    } else {
+        None
+    };
+    // (Request paths never have `..`; a configured name might.)
+    let direct = confine.filter(|(flag, _)| *flag != libc::O_NOFOLLOW_ANY || !rel.split('/').any(|c| c == ".."));
+    if let Some((flag, refused)) = direct {
+        match crate::sys::openat(dir.as_fd(), &c_path(Path::new(rel))?, OPEN_FLAGS | flag) {
+            Ok(fd) => return opened(fd),
+            // (ELOOP is also a symlink loop: realpath fails on it below.)
+            Err(e) if e.raw_os_error() == Some(refused) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let real = c_path(&resolved(root, rel)?)?;
+    match confine {
+        Some((flag, refused)) => match crate::sys::openat(dir.as_fd(), &real, OPEN_FLAGS | flag) {
+            Ok(fd) => opened(fd),
+            Err(e) if e.raw_os_error() == Some(refused) => Err(Error::from(ErrorKind::NotFound)),
+            Err(e) => Err(e),
+        },
+        // Neither flag (not expected on macOS 11+): ask the open descriptor
+        // where its file is, which no swap can change any more.
+        None => {
+            let fd = crate::sys::openat(dir.as_fd(), &real, OPEN_FLAGS)?;
+            if !fd_beneath(dir, root, &fd)? {
+                return Err(Error::from(ErrorKind::NotFound));
+            }
+            opened(fd)
+        }
+    }
+}
+
+/// Whether the file open at `fd` is under the root (`root`, open at
+/// `dir`), by the path the kernel has for each (F_GETPATH). The root's is
+/// asked only when `root` (from realpath) does not match: the two may
+/// spell it differently (letter case on a case-insensitive volume).
+#[cfg(target_os = "macos")]
+fn fd_beneath(dir: &OwnedFd, root: &Path, fd: &OwnedFd) -> std::io::Result<bool> {
+    let at = crate::sys::fd_path(fd.as_fd())?;
+    Ok(at.starts_with(root) || at.starts_with(crate::sys::fd_path(dir.as_fd())?))
 }
 
 /// `rel` under the root for a thread of its own, which may wait: the way
@@ -142,11 +250,11 @@ pub(super) fn open_source(dir: &OwnedFd, root: &Path, rel: &str) -> std::io::Res
     let beneath = crate::sys::RESOLVE_BENEATH | crate::sys::RESOLVE_NO_MAGICLINKS;
     match openat2_rel(dir.as_fd(), rel, beneath) {
         Ok(fd) => opened(fd),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => open_checked(dir, root, rel, true),
         Err(e)
-            if e.kind() == ErrorKind::Unsupported
-                || matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM | libc::EXDEV)) =>
+            if e.kind() == ErrorKind::Unsupported || matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) =>
         {
-            open_checked(root, rel)
+            open_checked(dir, root, rel, false)
         }
         Err(e) => Err(e),
     }
@@ -216,4 +324,114 @@ pub(super) fn open_error_status(e: &std::io::Error) -> u16 {
 /// inside root.
 pub(super) fn inside(root: &Path, p: &Path) -> bool {
     std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    /// root/{a.txt, sub/b.txt, rel -> a.txt, abs -> <root>/a.txt,
+    /// subabs -> <root>/sub, up -> ../outside.txt, out -> <base>/outside.txt,
+    /// outdir -> <base>}, outside.txt next to the root. (root, its fd, base)
+    fn tree(name: &str) -> (std::path::PathBuf, OwnedFd, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("warden-open-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("root/sub")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let root = base.join("root");
+        std::fs::write(root.join("a.txt"), "A").unwrap();
+        std::fs::write(root.join("sub/b.txt"), "B").unwrap();
+        std::fs::write(base.join("outside.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("rel")).unwrap();
+        std::os::unix::fs::symlink(root.join("a.txt"), root.join("abs")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub"), root.join("subabs")).unwrap();
+        std::os::unix::fs::symlink("../outside.txt", root.join("up")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("out")).unwrap();
+        std::os::unix::fs::symlink(&base, root.join("outdir")).unwrap();
+        let dir = OwnedFd::from(std::fs::File::open(&root).unwrap());
+        (root, dir, base)
+    }
+
+    fn content(o: std::io::Result<Opened>) -> std::io::Result<String> {
+        let mut s = String::new();
+        o?.file.read_to_string(&mut s)?;
+        Ok(s)
+    }
+
+    /// Every platform's way of opening by path (openat2 on Linux, falling
+    /// back to the realpath check; O_RESOLVE_BENEATH or O_NOFOLLOW_ANY then
+    /// the descriptor's path on macOS) serves symlinks that stay inside the
+    /// root and refuses the ones that leave it.
+    #[test]
+    fn symlinks_inside_the_root_work_and_the_others_do_not() {
+        let (root, dir, base) = tree("semantics");
+        let open = |rel: &str| content(open_source(&dir, &root, rel));
+        assert_eq!(open("a.txt").unwrap(), "A");
+        assert_eq!(open("sub/b.txt").unwrap(), "B");
+        assert_eq!(open("rel").unwrap(), "A", "relative symlink inside");
+        assert_eq!(open("abs").unwrap(), "A", "absolute symlink inside");
+        assert_eq!(open("subabs/b.txt").unwrap(), "B", "absolute directory symlink inside");
+        assert!(open_source(&dir, &root, "").unwrap().meta.is_dir());
+        for bad in ["up", "out", "outdir/outside.txt", "missing"] {
+            assert_eq!(open(bad).unwrap_err().kind(), ErrorKind::NotFound, "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// The race the check-then-open had: a symlink flipped between a target
+    /// inside the root and one outside while requests open it. Whatever the
+    /// timing, nothing outside is ever served.
+    #[test]
+    fn a_symlink_swapped_during_opens_never_leads_outside() {
+        let (root, dir, base) = tree("swap");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let swapper = {
+            let (root, base, stop) = (root.clone(), base.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (link, tmp) = (root.join("flip"), root.join("flip.tmp"));
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let target = if i % 2 == 0 { root.join("a.txt") } else { base.join("outside.txt") };
+                    let _ = std::fs::remove_file(&tmp);
+                    std::os::unix::fs::symlink(target, &tmp).unwrap();
+                    std::fs::rename(&tmp, &link).unwrap(); // an atomic swap
+                    i += 1;
+                }
+            })
+        };
+        let mut served = 0;
+        for _ in 0..20_000 {
+            // Refusals are fine (NotFound, or the kernel's EAGAIN for a
+            // confined lookup racing a rename). So is the directory holding
+            // the link: Linux can see a link being replaced as empty, which
+            // resolves to that directory, still inside the root.
+            let Ok(o) = open_source(&dir, &root, "flip") else { continue };
+            if o.meta.is_dir() {
+                assert_eq!(o.meta.ino(), std::fs::metadata(&root).unwrap().ino(), "a directory inside the root");
+                continue;
+            }
+            assert_eq!(content(Ok(o)).unwrap(), "A", "served a file outside the root");
+            served += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert!(served > 0, "the inside target was served at times");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// macOS: the check of an open descriptor (the last resort, where
+    /// neither O_RESOLVE_BENEATH nor O_NOFOLLOW_ANY works) tells a file
+    /// inside the root from one outside.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_open_descriptor_is_placed_inside_or_outside() {
+        let (root, dir, base) = tree("darwin");
+        let outside = OwnedFd::from(std::fs::File::open(base.join("outside.txt")).unwrap());
+        assert!(!fd_beneath(&dir, &root, &outside).unwrap());
+        let inside = OwnedFd::from(std::fs::File::open(root.join("sub/b.txt")).unwrap());
+        assert!(fd_beneath(&dir, &root, &inside).unwrap());
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

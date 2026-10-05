@@ -132,7 +132,7 @@ fn announce(site: &Site, tcp: &Tcp, port: u16, worker: u64, health: Option<&Heal
     let how = match site.open_mode.load(Ordering::Relaxed) {
         OPEN_CACHED => "openat2, cache-first",
         OPEN_BENEATH => "openat2",
-        _ => "realpath check",
+        _ => super::open::legacy_open_name(),
     };
     let cache = match &site.cache {
         Some(_) => format!("cache {} KB per worker", site.cfg.cache_size >> 10),
@@ -226,7 +226,7 @@ fn new_connection(site: &Arc<Site>, tcp: &Tcp, slots: &Arc<Semaphore>, fd: Owned
         let _ = crate::sys::set_tcp_nodelay(fd.as_fd(), true);
     }
     let _ = crate::sys::set_nosigpipe(fd.as_fd());
-    // Without openat2 every open is a call on a thread (`realpath`): the
+    // Without openat2 every open is a call on a thread (`open_checked`): the
     // quick path would wait for it, give up, and the task would do it a
     // second time.
     let inline = tcp.inline_first && site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY;

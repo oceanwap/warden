@@ -11,8 +11,11 @@ supervised, health-checked and reloaded like any app. It speaks HTTP/1.1
 with keep-alive: `Date`, ETag / Last-Modified, 304s and the other
 conditional requests of RFC 9110 (see [Dates and validators](#dates-and-validators)), single ranges,
 precompressed `.br` / `.gz` siblings, SPA fallback, `404.html`, Basic auth.
-Paths can't leave the root (`..`, symlinks out, NUL), and files are opened
-with `openat2(RESOLVE_BENEATH)` on Linux.
+Paths can't leave the root (`..`, symlinks out, NUL), and the kernel keeps
+every open inside it, so a symlink swapped in meanwhile can't lead out:
+`openat2(RESOLVE_BENEATH)` on Linux, `O_RESOLVE_BENEATH` on macOS 15+ and
+`O_NOFOLLOW_ANY` on macOS 11-14. Symlinks that stay inside the root are
+followed.
 
 `warden serve [dir] [port]` serves `.` on 8080 by default. Its options:
 `--name`, `--spa`, `--listing`, `-i N` (workers) and `--basic-auth user:pass`
@@ -245,8 +248,11 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `cache_max_file` | `"64KB"` | With a cache: larger files are not cached (sent with `sendfile`); at most 16M, since a miss reads the whole file into memory first |
 | `cache_valid_ms` | `1000` | With a cache: a cached file is re-checked on disk at most this often |
 
-On macOS, `warden serve` checks static paths with realpath instead of
-`openat2` (same confinement, slower); see [`platforms.md`](platforms.md).
+On macOS there is no `openat2`: files are opened on a thread with
+`openat(O_RESOLVE_BENEATH)` (macOS 15+) or `openat(O_NOFOLLOW_ANY)` (macOS
+11-14), and a path through a symlink is resolved with realpath, then its
+real path opened the same way (same confinement); see
+[`platforms.md`](platforms.md).
 
 ## See also
 

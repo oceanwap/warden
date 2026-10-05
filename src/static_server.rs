@@ -245,7 +245,7 @@ impl Site {
         let auth = cfg.basic_auth.as_deref().map(|a| format!("Basic {}", text::base64(a.as_bytes())));
         // Troubleshooting and tests: force a slower way of opening files.
         let open_mode = match std::env::var("WARDEN_STATIC_OPEN").as_deref() {
-            // Not Linux: no openat2 (sys::openat2 is Unsupported), realpath only.
+            // Not Linux: no openat2 (sys::openat2 is Unsupported); open.rs `open_checked`.
             _ if !cfg!(target_os = "linux") => OPEN_LEGACY,
             Ok("beneath") => OPEN_BENEATH,
             Ok("legacy") => OPEN_LEGACY,

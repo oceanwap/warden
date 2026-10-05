@@ -59,6 +59,21 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   startup` now writes `ProcessType = Interactive`, and a job an older warden
   wrote gets it the next time warden starts wardend through launchd (`warden
   update`, the GUI's Update), with nothing to run by hand.
+- Security: `warden serve` could serve a file outside its root when a
+  symlink under the root was swapped between the check of a path and its
+  open. On macOS every request had that window (the path was checked with
+  realpath, then opened); on Linux only paths through an absolute symlink
+  did. Now the kernel keeps the open inside the root: `O_RESOLVE_BENEATH` on
+  macOS 15+, `O_NOFOLLOW_ANY` (no symlinks) on macOS 11-14, `openat2` on
+  Linux; a path through a symlink is resolved, and its real path opened the
+  same way. Symlinks that stay inside the root work as before, and a Mac
+  now opens most files in one system call instead of a realpath walk.
+- `warden logs -f` and the GUI's log no longer say "lines skipped" to a
+  client that reads promptly when a worker writes many lines at once (more
+  than 256 in one write did it): followers get a write's lines together, and
+  only one that really falls behind is told how many lines it missed.
+  wardend, relaying logs to the GUI, also gives its clients a turn during a
+  burst.
 
 ## [0.1.2] — 2026-10-05
 
