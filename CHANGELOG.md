@@ -52,6 +52,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- A stopped supervisor (SIGSTOP, a frozen VM, a bug) no longer freezes its
+  workers. They report to it over a socket, and once its buffer was full
+  (macOS: 8 KB, about a minute of heartbeats; Linux: a few minutes) the next
+  report blocked the worker's event loop until the supervisor read again. Now
+  the socket holds far more (hours of heartbeats where the system allows it),
+  and under the shim and the static server it never blocks: when full, only
+  the latest heartbeat waits, and every other message (`listening`, `ready`,
+  `draining`) waits whole and in order until the supervisor reads.
+- macOS: a connection a worker refused (`NODE_HANDLE_NACK`, e.g. at its
+  file-descriptor limit) was handed out again forever, a busy loop. Like
+  Node's cluster module, it now goes round at most 3 more times, to the least
+  busy worker, and is then closed, with a warning (at most once a minute)
+  saying how many were closed and what to raise.
 - macOS: apps that wardend starts (at login, after `warden update`, or when
   it restarts a supervisor) ran at background priority (20 instead of 31):
   launchd ran wardend as a background job and every app inherited it, so on a

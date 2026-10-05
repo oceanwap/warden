@@ -169,7 +169,14 @@ in worker mode. Enabled by default when `command` is `bun`. It:
 
 fd 3 is a Unix socketpair (`sys::socketpair_cloexec`): the worker writes its
 reports as JSON lines; Warden writes to it only to promote a standby, and
-only a standby's shim reads it.
+only a standby's shim reads it. It has room for hours of heartbeats, and
+under Warden's own code (the shim, the host, the static server) the
+worker's end is non-blocking (`sys::prepare_ipc_socket`,
+`Spec::ipc_nonblocking`): a stopped Warden (SIGSTOP, a frozen VM, a bug)
+never freezes a worker on a full socket. When it is full, that code keeps
+only the latest heartbeat and every other line, whole and in order, until
+there is room. A Bun standby reads it through a `Bun.file(3)` stream.
+Other programs get a blocking socket, as a plain read or write expects.
 
 Apps that are not Bun (Node) run without the shim: they must pass
 `reusePort: true` themselves (Node ≥ 22.12) or use `port_strategy = "offset"`.

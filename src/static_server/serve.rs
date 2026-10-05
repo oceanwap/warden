@@ -17,13 +17,75 @@ use tokio::sync::Semaphore;
 /// Connections one worker serves at once; more are dropped when accepted.
 const MAX_CONNECTIONS: usize = 10_000;
 
-/// One JSON line to Warden on the IPC pipe (fd from WARDEN_IPC_FD).
+/// One JSON line to Warden on the IPC socket (fd from WARDEN_IPC_FD). The
+/// socket never blocks (Warden may be stopped, `sys::prepare_ipc_socket`):
+/// a heartbeat that finds it full is dropped (the next one says the same),
+/// anything else waits in `IPC_BACKLOG`, in order, until there is room.
 fn report(msg: serde_json::Value) {
     let Some(fd) = std::env::var("WARDEN_IPC_FD").ok().and_then(|v| v.parse::<i32>().ok()) else { return };
+    let droppable = msg["ev"] == "heartbeat";
     let mut line = msg.to_string();
     line.push('\n');
-    // A lost message only delays readiness/heartbeat; Warden handles that.
-    let _ = crate::sys::write_fd(fd, line.as_bytes());
+    let mut backlog = IPC_BACKLOG.lock().unwrap_or_else(|e| e.into_inner());
+    let was_empty = backlog.is_empty();
+    if ipc_queue(fd, &mut backlog, line.as_bytes(), droppable) && was_empty {
+        // Retried off the event loop until it is all out.
+        let _ = std::thread::Builder::new().name("ipc-retry".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                let mut backlog = IPC_BACKLOG.lock().unwrap_or_else(|e| e.into_inner());
+                if !ipc_flush(fd, &mut backlog) {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+static IPC_BACKLOG: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Lines beyond this many waiting bytes are dropped (they never pile up in
+/// practice: the static server sends few that are not heartbeats).
+const IPC_BACKLOG_MAX: usize = 1 << 20;
+
+/// Send `line` after whatever `backlog` holds, keeping in `backlog` what
+/// does not fit (a droppable line that finds no room is dropped whole).
+/// True when something is left waiting.
+fn ipc_queue(fd: i32, backlog: &mut Vec<u8>, line: &[u8], droppable: bool) -> bool {
+    if ipc_flush(fd, backlog) {
+        if !droppable && backlog.len() < IPC_BACKLOG_MAX {
+            backlog.extend_from_slice(line);
+        }
+        return true;
+    }
+    let sent = ipc_write(fd, line);
+    if sent < line.len() && !(droppable && sent == 0) {
+        backlog.extend_from_slice(&line[sent..]);
+    }
+    !backlog.is_empty()
+}
+
+/// Send what `backlog` holds; true when some of it is still waiting.
+fn ipc_flush(fd: i32, backlog: &mut Vec<u8>) -> bool {
+    let sent = ipc_write(fd, backlog);
+    backlog.drain(..sent);
+    !backlog.is_empty()
+}
+
+/// Write as much of `buf` as the socket takes now. An error other than a
+/// full socket (Warden is gone) counts as all sent: there is no one to wait for.
+fn ipc_write(fd: i32, buf: &[u8]) -> usize {
+    let mut sent = 0;
+    while sent < buf.len() {
+        match crate::sys::write_fd(fd, &buf[sent..]) {
+            Ok(0) => return buf.len(),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return sent,
+            Err(_) => return buf.len(),
+        }
+    }
+    sent
 }
 
 /// A number from the environment, when the variable is set and holds one.
@@ -307,4 +369,48 @@ fn summary(site: &Site) {
         println!("static compression: {}", c.report());
     }
     println!("static: {} requests answered in the accept loop", site.inline.load(Ordering::Relaxed));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// With Warden not reading, a full IPC socket drops heartbeats and keeps
+    /// every other line, whole and in order, for when Warden reads again.
+    #[test]
+    fn a_full_ipc_socket_drops_heartbeats_and_keeps_the_rest() {
+        let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
+        crate::sys::prepare_ipc_socket(ours.as_fd(), theirs.as_fd(), true).unwrap();
+        let fd = theirs.as_raw_fd();
+        let filler = [b'.'; 4096];
+        let mut filled = 0;
+        while ipc_write(fd, &filler) == filler.len() {
+            filled += filler.len();
+        }
+        let mut backlog = Vec::new();
+        assert!(!ipc_queue(fd, &mut backlog, b"{\"ev\":\"heartbeat\"}\n", true), "a heartbeat is dropped");
+        assert!(ipc_queue(fd, &mut backlog, b"{\"ev\":\"draining\"}\n", false));
+        assert!(ipc_queue(fd, &mut backlog, b"{\"ev\":\"heartbeat\"}\n", true), "still waiting");
+        assert!(ipc_queue(fd, &mut backlog, b"{\"ev\":\"bye\"}\n", false));
+        // Warden reads everything; the backlog goes out.
+        let mut warden = std::os::unix::net::UnixStream::from(ours);
+        warden.set_nonblocking(true).unwrap();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        for _ in 0..10_000 {
+            match warden.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(_) => {
+                    if !ipc_flush(fd, &mut backlog) && got.ends_with(b"{\"ev\":\"bye\"}\n") {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        assert!(got.len() >= filled);
+        let text = String::from_utf8_lossy(&got);
+        assert_eq!(text.trim_start_matches('.'), "{\"ev\":\"draining\"}\n{\"ev\":\"bye\"}\n");
+    }
 }

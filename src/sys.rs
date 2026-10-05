@@ -947,6 +947,57 @@ pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// A worker's IPC socket (fd 3), set up so that the worker does not wait
+/// for Warden, whatever Warden does (stopped, a frozen VM, a bug): room for
+/// `IPC_BUFFER` bytes (send buffer on the worker's end, receive buffer on
+/// Warden's), as much as the system allows (macOS starts AF_UNIX sockets
+/// with 8 KB, about a minute of heartbeats; never made smaller), and with
+/// `nonblocking`, O_NONBLOCK on the worker's end: a full socket answers
+/// EAGAIN, and the shim keeps what it must not lose until there is room.
+pub fn prepare_ipc_socket(ours: BorrowedFd<'_>, theirs: BorrowedFd<'_>, nonblocking: bool) -> io::Result<()> {
+    let _ = grow_socket_buffer(theirs, libc::SO_SNDBUF, IPC_BUFFER);
+    let _ = grow_socket_buffer(ours, libc::SO_RCVBUF, IPC_BUFFER);
+    if !nonblocking {
+        return Ok(());
+    }
+    // SAFETY: fcntl on a borrowed descriptor, which stays open for the call,
+    // with integer arguments only.
+    unsafe {
+        let fl = check(libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL))?;
+        check(libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK))?;
+    }
+    Ok(())
+}
+
+/// What a worker's IPC socket asks for (`prepare_ipc_socket`): with a
+/// heartbeat a second, hours of them while Warden reads nothing.
+pub const IPC_BUFFER: libc::c_int = 4 << 20;
+
+/// `opt` (SO_SNDBUF or SO_RCVBUF) of `sock` raised towards `want`: halved
+/// while the system refuses it (macOS: above kern.ipc.maxsockbuf; Linux caps
+/// it silently at net.core.wmem_max / rmem_max). Returns the size it has.
+pub fn grow_socket_buffer(sock: BorrowedFd<'_>, opt: libc::c_int, want: libc::c_int) -> io::Result<libc::c_int> {
+    let had = getsockopt_int(sock, libc::SOL_SOCKET, opt)?;
+    let mut want = want;
+    while want > had {
+        if setsockopt_int(sock, libc::SOL_SOCKET, opt, want).is_ok() {
+            break;
+        }
+        want /= 2;
+    }
+    getsockopt_int(sock, libc::SOL_SOCKET, opt)
+}
+
+fn getsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `len` are live and sized for a c_int, as passed.
+    check(unsafe {
+        libc::getsockopt(fd.as_raw_fd(), level, name, &mut value as *mut libc::c_int as *mut libc::c_void, &mut len)
+    })?;
+    Ok(value)
+}
+
 fn setsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
     // SAFETY: `value` is a live c_int and the length passed is its size.
     check(unsafe {
@@ -2307,6 +2358,52 @@ mod tests {
         use std::os::fd::AsFd;
         let (tx, _rx) = socket_pair();
         assert_eq!(set_tcp_cork(tx.as_fd(), true).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// A worker's end of its IPC socket: a write never blocks (EAGAIN when
+    /// full, so a stopped Warden can't freeze the worker), and it holds at
+    /// least what a plain socket holds (macOS: far more than its 8 KB).
+    #[test]
+    fn a_workers_ipc_end_never_blocks_and_holds_more_than_a_plain_socket() {
+        use std::os::fd::AsFd;
+        let line = [b'x'; 120];
+        // Bytes written before the socket is full (EAGAIN), Warden reading nothing.
+        let fill = |fd: BorrowedFd<'_>| {
+            let mut total = 0usize;
+            loop {
+                match send(fd, &line, false) {
+                    Ok(n) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return total,
+                    Err(e) => panic!("{e}"),
+                }
+                assert!(total < 256 << 20, "never full");
+            }
+        };
+        let (_plain_ours, plain) = socketpair_cloexec().unwrap();
+        // SAFETY (test): fcntl with integer arguments on a live descriptor.
+        unsafe {
+            let fl = libc::fcntl(plain.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(plain.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let plain_room = fill(plain.as_fd());
+
+        let (ours, theirs) = socketpair_cloexec().unwrap();
+        prepare_ipc_socket(ours.as_fd(), theirs.as_fd(), true).unwrap();
+        // SAFETY (test): fcntl with integer arguments on a live descriptor.
+        let fl = unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL) };
+        assert!(fl & libc::O_NONBLOCK != 0, "the worker's end must not block");
+        let room = fill(theirs.as_fd());
+        eprintln!("IPC room: {room} bytes (a plain socket: {plain_room})");
+        assert!(room >= plain_room, "{room} < {plain_room}");
+        #[cfg(target_os = "macos")]
+        assert!(room >= 512 << 10, "macOS: {room} bytes, about a minute of heartbeats");
+        // Warden reads again: there is room again.
+        let mut buf = Vec::with_capacity(64 << 10);
+        recv_into(ours.as_fd(), &mut buf).unwrap();
+        assert!(send(theirs.as_fd(), &line, false).is_ok());
+        // A second call never shrinks what the first set.
+        let had = getsockopt_int(theirs.as_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF).unwrap();
+        assert!(grow_socket_buffer(theirs.as_fd(), libc::SO_SNDBUF, 4096).unwrap() >= had);
     }
 
     #[test]

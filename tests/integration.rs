@@ -1218,6 +1218,57 @@ fn stalled_stdout_does_not_block_supervision() {
     assert!(out.lines().all(|l| l.contains("worker=2")), "{out}");
 }
 
+/// A stopped Warden (SIGSTOP, a frozen VM, a bug) never freezes its workers.
+/// With fd 3 full (what hours of heartbeats do while Warden reads nothing,
+/// done at once by the fixture's `/fill-ipc`), the worker keeps serving: its
+/// writes to fd 3 don't block its event loop, the shim's heartbeats wait.
+/// Once Warden runs again they flow again: the watchdog (4 s) keeps it.
+#[test]
+fn a_stopped_supervisor_never_freezes_its_workers() {
+    if have_bun() {
+        let port = free_port();
+        stopped_supervisor_case("ipcstall", port, &simple("ipcstall", port, 1, "[watchdog]\ntimeout = 4\n"));
+    }
+    if have_node() {
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"ipcstalln\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 1\n\
+             [watchdog]\ntimeout = 4\n",
+            fixture("node_app.mjs")
+        );
+        stopped_supervisor_case("ipcstalln", port, &cfg);
+    }
+}
+
+fn stopped_supervisor_case(name: &str, port: u16, cfg: &str) {
+    let w = Warden::start(name, port, cfg);
+    let s = w.wait_for("1 ready worker", T, ready(1));
+    let pid = s["workers"][0]["pid"].clone();
+    {
+        let _frozen = w.freeze();
+        let filled = get(port, "/fill-ipc").unwrap_or_else(|| panic!("{name}: no answer: a write to fd 3 blocked"));
+        let filled: u64 = filled.parse().unwrap();
+        assert!(filled > 0, "{name}: nothing written");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(3) {
+            assert!(
+                get(port, "/whoami").is_some(),
+                "{name}: the worker stopped answering while Warden was stopped (its heartbeats blocked it?)"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    // Warden reads the backlog, the heartbeats flow again: nobody is hung.
+    std::thread::sleep(Duration::from_secs(9));
+    let s = w.status().unwrap();
+    let log = w.log();
+    assert_eq!(s["workers"][0]["pid"], pid, "{name}: the worker was replaced\n{log}");
+    assert_eq!(s["workers"][0]["state"], "RUNNING", "{name}\n{log}");
+    assert!(!log.contains("worker hung"), "{name}\n{log}");
+    assert!(get(port, "/whoami").is_some());
+    every_warning_has_a_hint(&log);
+}
+
 /// CP6: a worker that floods fd 3 with messages and junk is rate-limited,
 /// summarised in a bounded number of lines, and Warden's memory stays flat.
 #[test]

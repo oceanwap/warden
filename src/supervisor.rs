@@ -898,18 +898,23 @@ impl Supervisor {
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
         let env = self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        // Warden's own code reports on fd 3 (`process::Spec::ipc_nonblocking`).
+        let ipc_nonblocking;
         let (program, args) = match self.cfg.workers.mode {
             // A standby (slot 0) runs the workers' command; the shim defers
             // its listen until promoted. In the pinned release, as workers
             // (`release.rs`).
             Mode::Process if self.cfg.static_files.is_some() && slot_id != STANDBY_SLOT => {
+                ipc_nonblocking = true;
                 (self.exe.display().to_string(), vec!["serve-static".to_string()])
             }
             Mode::Process => {
+                ipc_nonblocking = self.shim_path.is_some();
                 let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
                 (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
             }
             Mode::Worker => {
+                ipc_nonblocking = self.host_path.is_some();
                 let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 (self.pinned_arg(&a.command), vec![host])
             }
@@ -923,6 +928,7 @@ impl Supervisor {
             output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
             handoff: self.handoff_on && slot_id != STANDBY_SLOT,
+            ipc_nonblocking,
         }
     }
 
