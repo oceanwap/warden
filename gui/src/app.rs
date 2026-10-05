@@ -845,16 +845,22 @@ impl Gui {
                 }
             }
             Message::AskRestartAll => {
+                // Asked from an app's "outdated supervisor" banner too: the question is in Settings.
+                let opened = if matches!(self.modal, Modal::Settings) {
+                    Task::none()
+                } else {
+                    self.update(Message::OpenSettings)
+                };
                 if self.restart_all != RestartAll::Idle {
-                    return Task::none();
+                    return opened;
                 }
                 self.restart_all = RestartAll::Asking;
                 self.restart_who = None;
                 // Which warden would run, before anything is stopped.
                 let (host, tag) = (self.target.host.clone(), self.tag());
-                Task::perform(async move { commands::warden_who(&host).await }, move |r| {
+                opened.chain(Task::perform(async move { commands::warden_who(&host).await }, move |r| {
                     tag.wrap(Message::RestartWho(r))
-                })
+                }))
             }
             Message::RestartWho(r) => {
                 if self.restart_all == RestartAll::Asking {
@@ -1747,6 +1753,10 @@ mod tests {
         assert_eq!(g.restart_all, RestartAll::Idle, "a confirm without a question does nothing");
         let _ = g.update(Message::AskRestartAll);
         assert_eq!(g.restart_all, RestartAll::Asking);
+        assert!(
+            matches!(g.modal, Modal::Settings),
+            "asked from an app's banner, it opens Settings, where the question is"
+        );
         assert!(g.restart_who.is_none(), "it is being looked up");
         let _ = g.update(Message::RestartAll);
         assert_eq!(g.restart_all, RestartAll::Asking, "not before it is known which warden would run");
