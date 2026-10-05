@@ -208,7 +208,10 @@ the policy at work.
 `READY` is the transition event into `RUNNING`, logged as `worker=N ready`.
 Readiness sources, first one wins: the shim's `listening` message; on Linux, the
 worker pid owning a `LISTEN` socket on the configured port (`/proc/<pid>/fd` ×
-`/proc/net/tcp{,6}`); without a port, the spawn itself. A worker that is not
+the namespace's TCP listeners from one `NETLINK_SOCK_DIAG` request, asked every
+20 ms; a worker in another network namespace, or a kernel that won't answer, is
+read from `/proc/<pid>/net/tcp{,6}`, every 20 ms growing to 250 ms); without a
+port, the spawn itself. A worker that is not
 ready within `ready_timeout` is killed and counted as a crash. FAILED workers
 are retried after `failed_cooldown` (default 300 s).
 

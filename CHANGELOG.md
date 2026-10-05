@@ -49,6 +49,16 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   `health_interval_ms`. A first check that fails resets the passes but
   doesn't count toward failing the worker, so a slow starter gets no less
   time than before.
+- Linux: a supervisor no longer reads the host's whole socket table to find
+  what its workers listen on (`status`, `warden ports`) or whether a new
+  worker listens yet. It asks the kernel for the listening sockets only (one
+  netlink request for all the workers, as `port_lost` already did), where
+  `/proc/net/tcp` has a row per connection: with 20,000 idle keep-alive
+  connections on a 4-worker app, the supervisor went from 14 % to 3.7 %
+  of a core (what is left is reading which sockets each worker holds). A
+  worker without the shim is now seen listening within 20 ms (it was up to
+  250 ms). Workers in another network namespace are read from `/proc` as
+  before; the answers are the same.
 
 ### Fixed
 

@@ -1161,6 +1161,22 @@ mod diag {
     /// struct nlmsghdr, and struct inet_diag_msg before its attributes.
     pub(super) const NLMSG_HDR: usize = 16;
     pub(super) const MSG: usize = 72;
+    /// struct unix_diag_msg before its attributes; the name it is bound to
+    /// (`UDIAG_SHOW_NAME`, answered as `UNIX_DIAG_NAME`).
+    pub(super) const UNIX_MSG: usize = 16;
+    pub(super) const UDIAG_SHOW_NAME: u32 = 1;
+    pub(super) const UNIX_DIAG_NAME: u16 = 0;
+}
+
+/// A Unix socket in LISTEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnixListen {
+    /// Its inode, as for [`TcpListen`].
+    pub inode: u64,
+    /// The address it is bound to, as the kernel keeps it (`sun_path`, its
+    /// length included: a path ends with its NUL, an abstract name starts
+    /// with one); `None`: unnamed.
+    pub name: Option<Vec<u8>>,
 }
 
 /// The TCP sockets in LISTEN of this network namespace, IPv4 and IPv6. Not
@@ -1185,6 +1201,67 @@ pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
 #[cfg(not(target_os = "linux"))]
 pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// The Unix sockets in LISTEN of this network namespace, with their names:
+/// the kernel walks its table and answers only those (`/proc/net/unix` has a
+/// row per socket). Not Linux: `Unsupported`.
+#[cfg(target_os = "linux")]
+pub fn unix_listeners() -> io::Result<Vec<UnixListen>> {
+    // SAFETY: as in `tcp_listeners`.
+    let fd = check(unsafe {
+        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_SOCK_DIAG)
+    })?;
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut found = Vec::new();
+    let req = unix_diag_request(1 << diag::TCP_LISTEN, diag::UDIAG_SHOW_NAME);
+    diag_dump(std::os::fd::AsFd::as_fd(&sock), &req, |msg| found.extend(parse_unix_listen(msg)))?;
+    Ok(found)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unix_listeners() -> io::Result<Vec<UnixListen>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// A dump request: struct nlmsghdr, then struct unix_diag_req for Unix
+/// sockets in `states` (a bit per state, TCP's numbers) with what `show`
+/// asks for (`UDIAG_SHOW_*`), every inode.
+#[cfg(target_os = "linux")]
+fn unix_diag_request(states: u32, show: u32) -> [u8; 40] {
+    let mut r = [0u8; 40];
+    r[0..4].copy_from_slice(&40u32.to_ne_bytes());
+    r[4..6].copy_from_slice(&diag::SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    r[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    r[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    r[16] = libc::AF_UNIX as u8;
+    r[20..24].copy_from_slice(&states.to_ne_bytes());
+    r[28..32].copy_from_slice(&show.to_ne_bytes());
+    r
+}
+
+/// One struct unix_diag_msg (and its attributes): its inode and its name.
+#[cfg(target_os = "linux")]
+fn parse_unix_listen(msg: &[u8]) -> Option<UnixListen> {
+    if msg.len() < diag::UNIX_MSG || i32::from(msg[0]) != libc::AF_UNIX {
+        return None;
+    }
+    let inode = u64::from(u32::from_ne_bytes(msg[4..8].try_into().ok()?));
+    let mut name = None;
+    let mut at = diag::UNIX_MSG;
+    while at + 4 <= msg.len() {
+        let len = usize::from(u16::from_ne_bytes([msg[at], msg[at + 1]]));
+        let kind = u16::from_ne_bytes([msg[at + 2], msg[at + 3]]);
+        if len < 4 || at + len > msg.len() {
+            break;
+        }
+        if kind == diag::UNIX_DIAG_NAME {
+            name = Some(msg[at + 4..at + len].to_vec());
+        }
+        at += (len + 3) & !3;
+    }
+    Some(UnixListen { inode, name })
 }
 
 /// How many TCP connections are established on local port `port` (IPv4 and
@@ -3293,5 +3370,76 @@ mod tests {
         // Without the attribute, no drops; a cut attribute is ignored.
         assert_eq!(parse_tcp_listen(&listen[..diag::MSG]).unwrap().drops, 0);
         assert_eq!(parse_tcp_listen(&listen[..diag::MSG + 10]).unwrap().drops, 0);
+    }
+
+    /// The kernel's Unix listeners: a named one (path and abstract) with its
+    /// inode and its name as the kernel keeps it; a bound socket that does
+    /// not listen, and a connection, are not listed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_see_a_unix_listener_and_its_name() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
+        let inode_of = |fd: RawFd| -> u64 {
+            let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+            let link = link.to_string_lossy();
+            link.trim_start_matches("socket:[").trim_end_matches(']').parse().unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("wsd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("l.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let name = format!("warden-test-{}", std::process::id());
+        let abs = UnixListener::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
+        let dgram = UnixDatagram::bind(dir.join("d.sock")).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let found = unix_listeners();
+        let _ = std::fs::remove_dir_all(&dir);
+        // A kernel without unix_diag (a minimal VM's) has no such table: ENOENT.
+        let found = match found {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return,
+            found => found.unwrap(),
+        };
+        let by_inode = |fd: RawFd| found.iter().find(|s| s.inode == inode_of(fd)).cloned();
+        let mut want = path.as_os_str().as_encoded_bytes().to_vec();
+        want.push(0);
+        assert_eq!(by_inode(l.as_raw_fd()).unwrap().name, Some(want), "a path ends with its NUL");
+        let mut want = vec![0];
+        want.extend_from_slice(name.as_bytes());
+        assert_eq!(by_inode(abs.as_raw_fd()).unwrap().name, Some(want), "an abstract name starts with one");
+        assert_eq!(by_inode(dgram.as_raw_fd()), None, "bound, not listening");
+        assert_eq!(by_inode(client.as_raw_fd()), None, "a connection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_unix_messages_are_read_with_care() {
+        assert_eq!(&unix_diag_request(1 << 10, 1)[16..32], &[1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        // A unix_diag_msg of inode 4242 with its name, then another attribute.
+        let mut m = vec![0u8; diag::UNIX_MSG];
+        m[0] = libc::AF_UNIX as u8;
+        m[4..8].copy_from_slice(&4242u32.to_ne_bytes());
+        let attr = |kind: u16, data: &[u8]| {
+            let mut a = Vec::new();
+            a.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            a.extend_from_slice(&kind.to_ne_bytes());
+            a.extend_from_slice(data);
+            while a.len() % 4 != 0 {
+                a.push(0);
+            }
+            a
+        };
+        let bare = m.clone();
+        m.extend_from_slice(&attr(diag::UNIX_DIAG_NAME, b"/run/a.sock\0"));
+        m.extend_from_slice(&attr(5, &[1, 2, 3, 4]));
+        assert_eq!(parse_unix_listen(&m), Some(UnixListen { inode: 4242, name: Some(b"/run/a.sock\0".to_vec()) }));
+        assert_eq!(parse_unix_listen(&bare), Some(UnixListen { inode: 4242, name: None }), "unnamed");
+        let mut cut = bare.clone();
+        cut.extend_from_slice(&attr(diag::UNIX_DIAG_NAME, b"/run/a.sock\0")[..8]);
+        assert_eq!(parse_unix_listen(&cut).unwrap().name, None, "a cut attribute is ignored");
+        assert_eq!(parse_unix_listen(&bare[..8]), None, "too short");
+        let mut inet = bare;
+        inet[0] = libc::AF_INET as u8;
+        assert_eq!(parse_unix_listen(&inet), None);
     }
 }

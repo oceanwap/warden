@@ -1,6 +1,8 @@
-//! The Linux adapter: everything from `/proc`.
+//! The Linux adapter: everything from `/proc`, and the listening sockets
+//! from the kernel's socket diagnostics (netlink) where it answers.
 
 use super::{Capabilities, CpuTimes, Environ, HostSnapshot, Listener, Platform, ProcIdentity, ProcStats};
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufRead, Read};
@@ -8,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -66,16 +69,22 @@ impl Platform for Linux {
     }
 
     fn listening_ports(&self, pid: u32) -> Option<Vec<u16>> {
+        self.listening_ports_cheap(pid).map(|(ports, _)| ports)
+    }
+
+    fn listening_ports_cheap(&self, pid: u32) -> Option<(Vec<u16>, bool)> {
         let inodes = socket_inodes(pid)?;
         if inodes.is_empty() {
-            return Some(Vec::new());
+            return Some((Vec::new(), true));
         }
-        let tcp = tcp_listeners(pid, &inodes);
-        Some(
-            tcp.into_iter()
-                .filter_map(|l| if let Listener::Tcp { port, .. } = l { Some(port) } else { None })
-                .collect(),
-        )
+        let ns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+        let diag = Diag::default();
+        let (tcp, cheap) = match diag.tcp(&ns) {
+            Some(table) => (diag_tcp(table, &inodes), true),
+            None => (tcp_listeners(pid, &inodes), false),
+        };
+        let ports = tcp.into_iter().filter_map(|l| if let Listener::Tcp { port, .. } = l { Some(port) } else { None });
+        Some((ports.collect(), cheap))
     }
 
     fn listeners(&self, pid: u32) -> Option<Vec<Listener>> {
@@ -83,32 +92,13 @@ impl Platform for Linux {
     }
 
     fn listeners_of(&self, pids: &[u32]) -> Option<Vec<Listener>> {
-        // The socket tables belong to a network namespace and have a row per
-        // connection (megabytes on a busy host): each is read once for all the
-        // processes in the namespace, not once per process.
-        let mut spaces: Vec<(Option<PathBuf>, u32, HashSet<u64>)> = Vec::new();
-        for (i, pid) in pids.iter().enumerate() {
-            let Some(inodes) = socket_inodes(*pid) else {
-                if i == 0 {
-                    return None;
-                }
-                continue;
-            };
-            if inodes.is_empty() {
-                continue;
-            }
-            let ns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
-            match spaces.iter_mut().find(|s| s.0 == ns) {
-                Some(s) => s.2.extend(inodes),
-                None => spaces.push((ns, *pid, inodes)),
-            }
-        }
-        let mut found = Vec::new();
-        for (_, pid, inodes) in &spaces {
-            found.extend(tcp_listeners(*pid, inodes));
-            for_each_row(&format!("/proc/{pid}/net/unix"), |row| found.extend(parse_unix_row(row, inodes)));
-        }
-        Some(found)
+        listeners_in(pids, &Diag::default())
+    }
+
+    fn listeners_of_each(&self, groups: &[Vec<u32>]) -> Vec<Option<Vec<Listener>>> {
+        // One request to the kernel for all of them.
+        let diag = Diag::default();
+        groups.iter().map(|pids| listeners_in(pids, &diag)).collect()
     }
 
     fn socket_inodes(&self, pid: u32) -> Option<HashSet<u64>> {
@@ -191,6 +181,135 @@ pub(crate) fn parse_environ(raw: &[u8]) -> Environ {
             Some((OsString::from_vec(kv[..i].to_vec()), OsString::from_vec(kv[i + 1..].to_vec())))
         })
         .collect()
+}
+
+/// The sockets several processes accept connections on (see
+/// `Platform::listeners_of`), the tables asked through `diag`.
+fn listeners_in(pids: &[u32], diag: &Diag) -> Option<Vec<Listener>> {
+    // The socket tables belong to a network namespace: the processes in one
+    // are matched against one reading. Warden's own namespace is asked with
+    // sock_diag, which answers only the listeners; another's (or when the
+    // kernel won't say) is read from /proc/<pid>/net, which has a row per
+    // connection (megabytes on a busy host), once for all its processes.
+    let mut spaces: Vec<(Option<PathBuf>, u32, HashSet<u64>)> = Vec::new();
+    for (i, pid) in pids.iter().enumerate() {
+        let Some(inodes) = socket_inodes(*pid) else {
+            if i == 0 {
+                return None;
+            }
+            continue;
+        };
+        if inodes.is_empty() {
+            continue;
+        }
+        let ns = std::fs::read_link(format!("/proc/{pid}/ns/net")).ok();
+        match spaces.iter_mut().find(|s| s.0 == ns) {
+            Some(s) => s.2.extend(inodes),
+            None => spaces.push((ns, *pid, inodes)),
+        }
+    }
+    let mut found = Vec::new();
+    for (ns, pid, inodes) in &spaces {
+        match diag.tcp(ns) {
+            Some(table) => found.extend(diag_tcp(table, inodes)),
+            None => found.extend(tcp_listeners(*pid, inodes)),
+        }
+        match diag.unix(ns) {
+            Some(table) => found
+                .extend(table.iter().filter(|s| inodes.contains(&s.0)).map(|s| Listener::Unix { path: s.1.clone() })),
+            None => for_each_row(&format!("/proc/{pid}/net/unix"), |row| found.extend(parse_unix_row(row, inodes))),
+        }
+    }
+    Some(found)
+}
+
+/// The network namespace Warden runs in (it never moves); read once.
+fn own_namespace() -> Option<&'static PathBuf> {
+    static NS: OnceLock<Option<PathBuf>> = OnceLock::new();
+    NS.get_or_init(|| std::fs::read_link("/proc/self/ns/net").ok()).as_ref()
+}
+
+/// The listening sockets of Warden's own network namespace, from sock_diag:
+/// each table asked at most once, when first needed, and only for processes
+/// in that namespace (`ns`, read from their `/proc/<pid>/ns/net`). `None`:
+/// another namespace (or one that can't be read), or the kernel would not say
+/// (no `inet_diag` or `unix_diag`, a seccomp filter): the caller reads `/proc`.
+#[derive(Default)]
+struct Diag {
+    tcp: OnceCell<Option<Vec<crate::sys::TcpListen>>>,
+    /// The named ones, by inode, with the path as `/proc/net/unix` prints it.
+    unix: OnceCell<Option<Vec<(u64, String)>>>,
+}
+
+impl Diag {
+    fn tcp(&self, ns: &Option<PathBuf>) -> Option<&[crate::sys::TcpListen]> {
+        static ABSENT: AtomicBool = AtomicBool::new(false);
+        if !here(ns) {
+            return None;
+        }
+        self.tcp.get_or_init(|| unless_absent(&ABSENT, crate::sys::tcp_listeners)).as_deref()
+    }
+
+    fn unix(&self, ns: &Option<PathBuf>) -> Option<&[(u64, String)]> {
+        static ABSENT: AtomicBool = AtomicBool::new(false);
+        if !here(ns) {
+            return None;
+        }
+        let read = || {
+            let found = unless_absent(&ABSENT, crate::sys::unix_listeners)?;
+            Some(found.into_iter().filter_map(|s| Some((s.inode, unix_path(s.name.as_deref()?)?))).collect())
+        };
+        self.unix.get_or_init(read).as_deref()
+    }
+}
+
+/// `dump`, unless the kernel said before that it has no such table: a
+/// kernel built without `unix_diag` (or `inet_diag`) answers ENOENT, and is
+/// then not asked again; /proc answers instead, the same way.
+fn unless_absent<T>(absent: &AtomicBool, dump: fn() -> std::io::Result<Vec<T>>) -> Option<Vec<T>> {
+    if absent.load(Ordering::Relaxed) {
+        return None;
+    }
+    dump()
+        .inspect_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                absent.store(true, Ordering::Relaxed);
+            }
+        })
+        .ok()
+}
+
+/// `ns` is Warden's own network namespace.
+fn here(ns: &Option<PathBuf>) -> bool {
+    ns.is_some() && ns.as_ref() == own_namespace()
+}
+
+/// The TCP listeners of a sock_diag table whose inode is in `inodes`.
+fn diag_tcp(table: &[crate::sys::TcpListen], inodes: &HashSet<u64>) -> Vec<Listener> {
+    table.iter().filter(|l| inodes.contains(&l.inode)).map(|l| Listener::Tcp { port: l.port, addr: l.addr }).collect()
+}
+
+/// The path of a Unix socket's name (`sun_path` as the kernel keeps it, its
+/// length included) the way `/proc/net/unix` prints it, so both readings
+/// agree: a path without its final byte (the NUL), an abstract name as `@`
+/// and the rest, every NUL in it printed `@`. As `parse_unix_row` reads
+/// that text: up to a line break, leading blanks dropped, lossy UTF-8, and
+/// nothing when empty.
+fn unix_path(name: &[u8]) -> Option<String> {
+    let mut printed: Vec<u8> = match name.split_first() {
+        Some((0, rest)) => std::iter::once(b'@').chain(rest.iter().copied()).collect(),
+        _ => name[..name.len().saturating_sub(1)].to_vec(),
+    };
+    for b in &mut printed {
+        if *b == 0 {
+            *b = b'@';
+        }
+    }
+    if let Some(end) = printed.iter().position(|b| *b == b'\n') {
+        printed.truncate(end);
+    }
+    let path = String::from_utf8_lossy(&printed).trim_start().to_string();
+    (!path.is_empty()).then_some(path)
 }
 
 /// The inodes of the sockets a process holds open.
@@ -515,6 +634,84 @@ ffff9d0ac7e4b400: 00000002 00000000 00010000 0001 01 55555 /not/ours.sock";
             paths[0] == "/run/ok.sock" && paths[1].starts_with('@') && paths[2] == "/run/also-ok.sock",
             "{paths:?}"
         );
+    }
+
+    #[test]
+    fn unix_names_read_as_proc_net_unix_prints_them() {
+        let path = |name: &[u8]| unix_path(name);
+        assert_eq!(path(b"/run/a.sock\0").as_deref(), Some("/run/a.sock"), "without its NUL");
+        assert_eq!(path(b"/tmp/path with spaces/x.sock\0").as_deref(), Some("/tmp/path with spaces/x.sock"));
+        assert_eq!(path(b"rel.sock\0").as_deref(), Some("rel.sock"));
+        assert_eq!(path(b"\0dbus-abc").as_deref(), Some("@dbus-abc"), "abstract: @ and every byte");
+        assert_eq!(path(b"\0a\0b\0").as_deref(), Some("@a@b@"), "its NULs printed @");
+        assert_eq!(path(b"\0").as_deref(), Some("@"));
+        assert_eq!(path(b"/tmp/a\nb\0").as_deref(), Some("/tmp/a"), "the row ends at a line break");
+        assert_eq!(path(b"  lead.sock\0").as_deref(), Some("lead.sock"), "the row's blanks before it");
+        assert_eq!(path(b"/run/\xff.sock\0").as_deref(), Some("/run/\u{fffd}.sock"));
+        assert_eq!(path(b""), None);
+        assert_eq!(path(b" \0"), None, "nothing left: unnamed");
+        // The same text through the /proc/net/unix parser.
+        let mine: HashSet<u64> = [7].into_iter().collect();
+        for name in [&b"\0a\0b\0"[..], b"/tmp/path with spaces/x.sock\0", b"  lead.sock\0", b"/tmp/a\nb\0"] {
+            let printed: Vec<u8> = match name.split_first() {
+                Some((0, rest)) => [b"@", rest].concat(),
+                _ => name[..name.len() - 1].to_vec(),
+            };
+            let printed: Vec<u8> = printed.into_iter().map(|b| if b == 0 { b'@' } else { b }).collect();
+            let row = format!("0000: 00000002 00000000 00010000 0001 01 7 {}", String::from_utf8_lossy(&printed));
+            let row = row.split('\n').next().unwrap();
+            let want =
+                parse_unix_row(row, &mine).map(|l| if let Listener::Unix { path } = l { path } else { panic!() });
+            assert_eq!(path(name), want, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn only_wardens_own_namespace_is_asked_with_sock_diag() {
+        assert!(!here(&None), "unreadable: /proc");
+        assert!(!here(&Some(PathBuf::from("net:[1]"))), "another namespace: /proc");
+        if let Some(mine) = own_namespace() {
+            assert!(here(&Some(mine.clone())));
+        }
+    }
+
+    /// The kernel's lists of listeners and the /proc tables give the same
+    /// answer: TCP, a Unix path (with a space), an abstract name; not a
+    /// connection or a bound socket that does not listen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sock_diag_and_the_proc_tables_agree() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
+        let me = std::process::id();
+        let dir = std::env::temp_dir().join(format!("wl agree-{me}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let path = dir.join("l.sock");
+        let _l = UnixListener::bind(&path).unwrap();
+        let name = format!("warden-agree-{me}");
+        let _abs = UnixListener::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
+        let _d = UnixDatagram::bind(dir.join("d.sock")).unwrap();
+        let _c = UnixStream::connect(&path).unwrap();
+        let diag = Diag::default();
+        let ns = std::fs::read_link(format!("/proc/{me}/ns/net")).ok();
+        let (has_tcp, has_unix) = (diag.tcp(&ns).is_some(), diag.unix(&ns).is_some());
+        let mut by_diag = listeners_in(&[me], &diag).unwrap();
+        let inodes = socket_inodes(me).unwrap();
+        let mut by_proc = tcp_listeners(me, &inodes);
+        for_each_row(&format!("/proc/{me}/net/unix"), |row| by_proc.extend(parse_unix_row(row, &inodes)));
+        let _ = std::fs::remove_dir_all(&dir);
+        by_diag.sort();
+        by_proc.sort();
+        assert_eq!(by_diag, by_proc);
+        let unix = |p: String| Listener::Unix { path: p };
+        assert!(by_diag.contains(&unix(path.display().to_string())), "{by_diag:?}");
+        assert!(by_diag.contains(&unix(format!("@{name}"))), "{by_diag:?}");
+        // Where the kernel answers (it does on any distro kernel), the answer was its.
+        eprintln!("sock_diag: tcp {has_tcp}, unix {has_unix}");
+        let (ports, cheap) = Linux.listening_ports_cheap(me).unwrap();
+        assert_eq!(cheap, has_tcp);
+        assert_eq!(Some(ports), Linux.listening_ports(me));
     }
 
     // These read this machine's /proc: Linux only (the parsing tests run everywhere).

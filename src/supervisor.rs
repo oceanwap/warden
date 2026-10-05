@@ -33,6 +33,8 @@ use listening::ListenerCache;
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -1083,18 +1085,25 @@ impl Supervisor {
             }
             None => {} // worker mode: wait for every Worker's shim report
             Some(port) => {
+                let Some(flag) = self.insts.get(&inst).map(|i| Arc::downgrade(&i.ready_flag)) else { return };
                 tokio::task::spawn_local(async move {
                     let start = Instant::now();
                     let mut delay = Duration::from_millis(20);
                     while start.elapsed() < deadline {
                         tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_millis(250));
-                        match networking::count_listeners(pid, port) {
-                            Some(n) if n >= expected => break,
-                            Some(_) => continue,
+                        // Ready by the shim's report, or gone: nothing to wait for.
+                        if flag.upgrade().is_none_or(|f| f.load(Ordering::Relaxed)) {
+                            return;
+                        }
+                        let found = tokio::task::spawn_blocking(move || networking::count_listeners_cheap(pid, port));
+                        match found.await.ok().flatten() {
+                            Some((n, _)) if n >= expected => break,
+                            // The kernel's list of listeners: cheap, asked every 20 ms. A
+                            // read of /proc/net/tcp (a row per connection) backs off.
+                            Some((_, true)) => delay = Duration::from_millis(20),
                             // No /proc: a connect probe is only meaningful for the first worker.
                             None if first_worker && networking::port_accepts(port) => break,
-                            None => continue,
+                            _ => delay = (delay * 2).min(Duration::from_millis(250)),
                         }
                     }
                     if start.elapsed() < deadline {
@@ -1383,6 +1392,7 @@ impl Supervisor {
         }
         let now = Instant::now();
         inst.ready_at = Some(now);
+        inst.ready_flag.store(true, Ordering::Relaxed);
         // Handed-over connections: it never listens on the port, so there is
         // nothing for `port_lost` to watch; it joins the rotation instead.
         if inst.handoff {
@@ -2917,7 +2927,8 @@ impl Supervisor {
         // What the workers listen on (the standbys do not yet, the draining ones have closed theirs).
         let own = listening::Own { runtime_dir: self.runtime_dir.clone(), app: self.cfg.app.name.clone() };
         let mut live = std::collections::HashSet::new();
-        for w in workers.iter_mut() {
+        let mut asks = Vec::new();
+        for (i, w) in workers.iter().enumerate() {
             let Some(pid) = w.pid else { continue };
             live.insert(pid);
             // Worker mode: the threads share their host's process; only one that is up holds the port.
@@ -2925,7 +2936,11 @@ impl Supervisor {
                 continue;
             }
             let young = w.uptime_secs.is_none_or(|u| u < listening::YOUNG.as_secs());
-            w.listening = self.listeners.of(pid, now, young, &own);
+            asks.push((i, (pid, young)));
+        }
+        let pids: Vec<(u32, bool)> = asks.iter().map(|a| a.1).collect();
+        for ((i, _), found) in asks.iter().zip(self.listeners.of_each(&pids, now, &own)) {
+            workers[*i].listening = found;
         }
         self.listeners.retain(&live);
         let ports = self.port_stats(&workers);

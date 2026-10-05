@@ -19,6 +19,8 @@ use crate::process::Handle;
 use crate::restart::Tracker;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +268,9 @@ pub struct Instance {
     pub handle: Handle,
     pub started: Instant,
     pub ready_at: Option<Instant>,
+    /// Set once it is ready: the poll for its port (`watch_readiness`) stops
+    /// then, or when the instance is gone (it holds only a weak reference).
+    pub ready_flag: Arc<AtomicBool>,
     pub role: Role,
     /// We asked it to stop; its exit is not a crash.
     pub stopping: bool,
@@ -332,6 +337,7 @@ impl Instance {
             handle,
             started: Instant::now(),
             ready_at: None,
+            ready_flag: Arc::default(),
             role,
             stopping: false,
             timed_out: false,

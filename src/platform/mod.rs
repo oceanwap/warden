@@ -143,6 +143,13 @@ pub trait Platform: Sync {
     /// socket (a socket on 0.0.0.0 and one on :: are two).
     fn listening_ports(&self, pid: u32) -> Option<Vec<u16>>;
 
+    /// [`Platform::listening_ports`], and whether the answer was cheap: the
+    /// kernel answered with the listening sockets only, not a table with a
+    /// row per connection, so a caller may ask often.
+    fn listening_ports_cheap(&self, pid: u32) -> Option<(Vec<u16>, bool)> {
+        self.listening_ports(pid).map(|ports| (ports, false))
+    }
+
     /// The sockets this one process accepts connections on: TCP in LISTEN
     /// with the address, and Unix sockets (not UDP, not connected ones).
     fn listeners(&self, pid: u32) -> Option<Vec<Listener>>;
@@ -158,6 +165,13 @@ pub trait Platform: Sync {
             found.extend(self.listeners(*pid).unwrap_or_default());
         }
         Some(found)
+    }
+
+    /// [`Platform::listeners_of`] for several groups of processes, an answer
+    /// for each. An adapter whose OS answers for the whole host asks once
+    /// for all of them.
+    fn listeners_of_each(&self, groups: &[Vec<u32>]) -> Vec<Option<Vec<Listener>>> {
+        groups.iter().map(|pids| self.listeners_of(pids)).collect()
     }
 
     /// The processes this one started (its children, not their children).
@@ -232,12 +246,19 @@ pub fn listening_ports(pid: u32) -> Option<Vec<u16>> {
     current().listening_ports(pid)
 }
 
-/// What the process and the processes below it listen on, sorted: the
+/// [`listening_ports`], and whether the answer was cheap enough to ask for
+/// often (see [`Platform::listening_ports_cheap`]).
+pub fn listening_ports_cheap(pid: u32) -> Option<(Vec<u16>, bool)> {
+    current().listening_ports_cheap(pid)
+}
+
+/// What each process and the processes below it listen on, sorted: the
 /// server is often not the process Warden started (`npm run start`, `turbo`,
-/// a shell script). At most 64 processes, 4 levels deep. `None` when the
-/// process itself cannot be read.
-pub fn listeners(pid: u32) -> Option<Vec<Listener>> {
-    listeners::of_tree(current(), pid)
+/// a shell script). At most 64 processes, 4 levels deep. `None` for a
+/// process that itself cannot be read. The OS's socket tables are read once
+/// for all of them where it has them per host.
+pub fn listeners_each(pids: &[u32]) -> Vec<Option<Vec<Listener>>> {
+    listeners::of_trees(current(), pids)
 }
 
 /// The sockets (inodes) the process and the processes below it hold open.
@@ -519,7 +540,7 @@ pub(crate) mod contract_tests {
         let got = BufReader::new(sh.stdout.take().unwrap()).read_line(&mut line).unwrap_or(0);
         // No python3 here: nothing to look at. Once it printed its port, the tree must be readable.
         let port: Option<u16> = if got == 0 { None } else { line.trim().parse().ok() };
-        let tree = port.map(|_| listeners(sh.id()));
+        let tree = port.map(|_| listeners_each(&[sh.id()]).remove(0));
         // python reads its stdin to the end: closing it lets it go.
         drop(sh.stdin.take());
         let _ = sh.kill();
