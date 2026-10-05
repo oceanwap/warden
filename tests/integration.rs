@@ -5487,7 +5487,14 @@ fn assert_clean_handover(w: &Warden, run: &LongLivedRun, max_took: Duration) {
     assert!(run.fail <= allowed_resets(), "plain requests failed during the reload: {}", run.fail);
     assert!(log.contains("closed long-lived connections so their clients reconnect to new workers"), "{log}");
     assert!(!log.contains("did not exit within grace period"), "{log}");
-    assert!(run.took < max_took, "reload took {:?} (limit {max_took:?})\n{log}", run.took);
+    // Not the time the host froze Warden (an overloaded CI runner), as the waits allow for it.
+    let frozen = w.frozen();
+    let took = run.took.saturating_sub(frozen);
+    assert!(
+        took < max_took,
+        "reload took {:?}, {took:?} without {frozen:?} frozen (limit {max_took:?})\n{log}",
+        run.took
+    );
 }
 
 fn long_lived_config(name: &str, port: u16, app: &str, extra: &str) -> String {
