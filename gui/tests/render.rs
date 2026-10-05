@@ -476,10 +476,10 @@ fn settings_restarts_everything_after_asking() {
 }
 
 /// A supervisor keeps the code it started with: after a rebuild it shows `-` for what a newer
-/// Warden knows, and the page says so, with the command that fixes it.
+/// Warden knows, and the page says so, with a button that restarts everything (asking first).
 #[test]
-fn an_older_supervisor_is_named_with_the_command_that_restarts_it() {
-    const COMMAND: &str = "warden update";
+fn an_older_supervisor_is_named_with_the_button_that_restarts_it() {
+    const BUTTON: &str = "Restart all apps\u{2026}";
     let mut g = connected();
     let _ = g.update(Message::Select("web".into()));
     let mut ui = sim(&g);
@@ -500,12 +500,13 @@ fn an_older_supervisor_is_named_with_the_command_that_restarts_it() {
         let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
         let _ = g.update(Message::Select("web".into()));
         let mut ui = sim(&g);
-        let line = format!("This app's supervisor {what}: CPU, memory and ports may show \u{2013}. Restart it:");
+        let line = format!("This app's supervisor {what}: CPU, memory and ports may show \u{2013}.");
         assert!(ui.find(line.as_str()).is_ok(), "the banner for {what:?} is missing");
-        assert!(ui.find(COMMAND).is_ok(), "and the command");
         if edit.is_null() {
             save(&mut ui, "older-supervisor");
         }
+        let _ = ui.click(BUTTON).expect("and the button");
+        assert!(matches!(messages(ui).as_slice(), [Message::AskRestartAll]), "it asks, as Settings does");
     }
 }
 

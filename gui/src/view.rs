@@ -738,19 +738,17 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     // a newer Warden has (CPU, memory, ports) show "-" until it is restarted.
     let outdated = a.status.as_ref().and_then(|s| s.outdated(env!("CARGO_PKG_VERSION")));
     if let Some(why) = outdated {
-        const RESTART: &str = "warden update";
         c = c.push(
             container(
                 row![
                     icon(Icon::Info).size(16).style(Tone::Warn.style()),
-                    text(format!("This app's supervisor {why}: CPU, memory and ports may show \u{2013}. Restart it:"))
-                        .size(13),
+                    text(format!("This app's supervisor {why}: CPU, memory and ports may show \u{2013}.")).size(13),
                     tip(
-                        button(text(RESTART).font(MONO).size(12))
+                        button(labeled(Icon::Restart, "Restart all apps\u{2026}"))
                             .padding([3, 10])
                             .style(look::chip)
-                            .on_press(Message::Copy(RESTART.into())),
-                        "Copy the command",
+                            .on_press(Message::AskRestartAll),
+                        "Restarts every app and wardend from the installed warden (asks first)",
                     ),
                 ]
                 .spacing(10)
