@@ -2,74 +2,74 @@
 <!-- No benchmark numbers; labels follow docs/how-it-works.md and docs/architecture.md -->
 <title id="t">Warden architecture</title>
 <desc id="d">Requests go from the client through an optional proxy to the port, where the kernel spreads connections over the workers. The warden supervisor, restarted by systemd, spawns and watches the workers over a heartbeat on fd 3 and private health sockets, and reports to wardend, which feeds the GUI and warden events. The CLI talks to each supervisor's own Unix socket. Warden is not on the request path.</desc>
-<rect x="0.5" y="0.5" width="999" height="599" rx="16" fill="#0f111a" stroke="#2a3060" stroke-width="1" />
-<defs><marker id="aa9b1d6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a9b1d6"/></marker><marker id="aa0a7ff" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#a0a7ff"/></marker><marker id="a34d399" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#34d399"/></marker></defs>
-<text x="32" y="58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#f1f3ff" text-anchor="start" >Architecture</text>
-<text x="32" y="86" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#a9b1d6" text-anchor="start" >Warden supervises. The kernel balances. Requests never pass through Warden.</text>
-<rect x="32" y="108" width="936" height="162" rx="14" fill="#12162a" stroke="#2a3060" stroke-width="1" />
-<text x="52" y="134" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#a0a7ff" text-anchor="start" letter-spacing="1.5">DATA PLANE · THE REQUEST PATH</text>
-<rect x="32" y="286" width="936" height="272" rx="14" fill="#12162a" stroke="#2a3060" stroke-width="1" />
+<rect x="0.5" y="0.5" width="999" height="599" rx="16" fill="#121312" stroke="#2c2f2c" stroke-width="1" />
+<defs><marker id="aa9b1d6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#b0b6b1"/></marker><marker id="aa0a7ff" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#8ee6b0"/></marker><marker id="a34d399" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#34d399"/></marker></defs>
+<text x="32" y="58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#f2f4f2" text-anchor="start" >Architecture</text>
+<text x="32" y="86" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#b0b6b1" text-anchor="start" >Warden supervises. The kernel balances. Requests never pass through Warden.</text>
+<rect x="32" y="108" width="936" height="162" rx="14" fill="#141614" stroke="#2c2f2c" stroke-width="1" />
+<text x="52" y="134" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#8ee6b0" text-anchor="start" letter-spacing="1.5">DATA PLANE · THE REQUEST PATH</text>
+<rect x="32" y="286" width="936" height="272" rx="14" fill="#141614" stroke="#2c2f2c" stroke-width="1" />
 <text x="52" y="312" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#34d399" text-anchor="start" letter-spacing="1.5">CONTROL PLANE · NEVER ON THE REQUEST PATH</text>
-<rect x="762" y="98" width="206" height="354" rx="16" fill="#1a1f3a" stroke="#6b76f5" stroke-width="1.5" />
-<text x="865" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#a0a7ff" text-anchor="middle" letter-spacing="1.5">WORKERS</text>
-<rect x="780" y="140" width="170" height="66" rx="12" fill="#161a2b" stroke="#6b76f5" stroke-width="1.5" />
-<text x="865" y="170.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >worker 1</text>
-<text x="865" y="190.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >Bun · Node · static</text>
-<rect x="780" y="222" width="170" height="66" rx="12" fill="#161a2b" stroke="#6b76f5" stroke-width="1.5" />
-<text x="865" y="252.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >worker 2</text>
-<text x="865" y="272.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >Bun · Node · static</text>
-<rect x="780" y="304" width="170" height="66" rx="12" fill="#161a2b" stroke="#6b76f5" stroke-width="1.5" />
-<text x="865" y="334.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >worker N</text>
-<text x="865" y="354.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >Bun · Node · static</text>
-<text x="865" y="394" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >private health socket</text>
-<text x="865" y="411" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >per worker</text>
-<rect x="52" y="160" width="118" height="76" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="111" y="195.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >Client</text>
-<text x="111" y="215.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >browser · API</text>
-<rect x="188" y="160" width="166" height="76" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="271" y="187.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >Proxy</text>
-<text x="271" y="207.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >optional</text>
-<text x="271" y="224.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >Cloudflare · nginx · ALB</text>
-<rect x="392" y="160" width="230" height="76" rx="12" fill="#161a2b" stroke="#a0a7ff" stroke-width="1.5" />
-<text x="507" y="195.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#a0a7ff" text-anchor="middle" >127.0.0.1:3000</text>
-<text x="507" y="215.8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >kernel · SO_REUSEPORT</text>
-<line x1="170" y1="198" x2="186" y2="198" stroke="#a9b1d6" stroke-width="2" marker-end="url(#aa9b1d6)"/>
-<line x1="354" y1="198" x2="390" y2="198" stroke="#a9b1d6" stroke-width="2" marker-end="url(#aa9b1d6)"/>
-<line x1="622" y1="198" x2="778" y2="173" stroke="#a0a7ff" stroke-width="2" marker-end="url(#aa0a7ff)"/>
-<line x1="622" y1="198" x2="778" y2="255" stroke="#a0a7ff" stroke-width="2" marker-end="url(#aa0a7ff)"/>
-<line x1="622" y1="198" x2="778" y2="337" stroke="#a0a7ff" stroke-width="2" marker-end="url(#aa0a7ff)"/>
-<text x="640" y="146" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >the kernel spreads connections</text>
-<rect x="52" y="336" width="112" height="78" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="108" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >systemd</text>
-<text x="108" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >restarts the</text>
-<text x="108" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >supervisor</text>
-<rect x="184" y="336" width="204" height="78" rx="12" fill="#1d2347" stroke="#a0a7ff" stroke-width="1.5" />
-<text x="286" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >warden</text>
-<text x="286" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >spawn · watch · restart</text>
-<text x="286" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >drain · gate · report</text>
-<rect x="430" y="336" width="130" height="78" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="495" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >wardend</text>
-<text x="495" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >events · history</text>
-<text x="495" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >alerts</text>
-<rect x="604" y="336" width="134" height="78" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="671" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >GUI</text>
-<text x="671" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >warden-gui</text>
-<text x="671" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >warden events</text>
-<line x1="164" y1="375" x2="182" y2="375" stroke="#a9b1d6" stroke-width="2" marker-end="url(#aa9b1d6)"/>
-<line x1="388" y1="375" x2="428" y2="375" stroke="#a9b1d6" stroke-width="2" marker-start="url(#aa9b1d6)" marker-end="url(#aa9b1d6)"/>
-<line x1="560" y1="375" x2="602" y2="375" stroke="#a9b1d6" stroke-width="2" marker-start="url(#aa9b1d6)" marker-end="url(#aa9b1d6)"/>
-<text x="494" y="434" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8d96ba" text-anchor="middle" >apps never depend on wardend:</text>
-<text x="494" y="451" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8d96ba" text-anchor="middle" >killing it stops nothing</text>
-<rect x="52" y="456" width="112" height="66" rx="12" fill="#161a2b" stroke="#2a3060" stroke-width="1.5" />
-<text x="108" y="478.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f1f3ff" text-anchor="middle" >CLI</text>
-<text x="108" y="498.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >warden list</text>
-<text x="108" y="515.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="middle" >restart · deploy</text>
-<path d="M164 489 L228 489 L228 416" fill="none" stroke="#a9b1d6" stroke-width="2" marker-end="url(#aa9b1d6)"/>
-<text x="238" y="484" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="start" >one Unix socket</text>
-<text x="238" y="501" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#a9b1d6" text-anchor="start" >per app</text>
+<rect x="762" y="98" width="206" height="354" rx="16" fill="#1c1f1c" stroke="#4eae78" stroke-width="1.5" />
+<text x="865" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="700" fill="#8ee6b0" text-anchor="middle" letter-spacing="1.5">WORKERS</text>
+<rect x="780" y="140" width="170" height="66" rx="12" fill="#1a1c1a" stroke="#4eae78" stroke-width="1.5" />
+<text x="865" y="170.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >worker 1</text>
+<text x="865" y="190.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >Bun · Node · static</text>
+<rect x="780" y="222" width="170" height="66" rx="12" fill="#1a1c1a" stroke="#4eae78" stroke-width="1.5" />
+<text x="865" y="252.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >worker 2</text>
+<text x="865" y="272.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >Bun · Node · static</text>
+<rect x="780" y="304" width="170" height="66" rx="12" fill="#1a1c1a" stroke="#4eae78" stroke-width="1.5" />
+<text x="865" y="334.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >worker N</text>
+<text x="865" y="354.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >Bun · Node · static</text>
+<text x="865" y="394" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >private health socket</text>
+<text x="865" y="411" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >per worker</text>
+<rect x="52" y="160" width="118" height="76" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="111" y="195.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >Client</text>
+<text x="111" y="215.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >browser · API</text>
+<rect x="188" y="160" width="166" height="76" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="271" y="187.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >Proxy</text>
+<text x="271" y="207.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >optional</text>
+<text x="271" y="224.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >Cloudflare · nginx · ALB</text>
+<rect x="392" y="160" width="230" height="76" rx="12" fill="#1a1c1a" stroke="#8ee6b0" stroke-width="1.5" />
+<text x="507" y="195.8" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#8ee6b0" text-anchor="middle" >127.0.0.1:3000</text>
+<text x="507" y="215.8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >kernel · SO_REUSEPORT</text>
+<line x1="170" y1="198" x2="186" y2="198" stroke="#b0b6b1" stroke-width="2" marker-end="url(#aa9b1d6)"/>
+<line x1="354" y1="198" x2="390" y2="198" stroke="#b0b6b1" stroke-width="2" marker-end="url(#aa9b1d6)"/>
+<line x1="622" y1="198" x2="778" y2="173" stroke="#8ee6b0" stroke-width="2" marker-end="url(#aa0a7ff)"/>
+<line x1="622" y1="198" x2="778" y2="255" stroke="#8ee6b0" stroke-width="2" marker-end="url(#aa0a7ff)"/>
+<line x1="622" y1="198" x2="778" y2="337" stroke="#8ee6b0" stroke-width="2" marker-end="url(#aa0a7ff)"/>
+<text x="640" y="146" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >the kernel spreads connections</text>
+<rect x="52" y="336" width="112" height="78" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="108" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >systemd</text>
+<text x="108" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >restarts the</text>
+<text x="108" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >supervisor</text>
+<rect x="184" y="336" width="204" height="78" rx="12" fill="#1f2a23" stroke="#8ee6b0" stroke-width="1.5" />
+<text x="286" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >warden</text>
+<text x="286" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >spawn · watch · restart</text>
+<text x="286" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >drain · gate · report</text>
+<rect x="430" y="336" width="130" height="78" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="495" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >wardend</text>
+<text x="495" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >events · history</text>
+<text x="495" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >alerts</text>
+<rect x="604" y="336" width="134" height="78" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="671" y="364.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >GUI</text>
+<text x="671" y="384.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >warden-gui</text>
+<text x="671" y="401.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >warden events</text>
+<line x1="164" y1="375" x2="182" y2="375" stroke="#b0b6b1" stroke-width="2" marker-end="url(#aa9b1d6)"/>
+<line x1="388" y1="375" x2="428" y2="375" stroke="#b0b6b1" stroke-width="2" marker-start="url(#aa9b1d6)" marker-end="url(#aa9b1d6)"/>
+<line x1="560" y1="375" x2="602" y2="375" stroke="#b0b6b1" stroke-width="2" marker-start="url(#aa9b1d6)" marker-end="url(#aa9b1d6)"/>
+<text x="494" y="434" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#949b95" text-anchor="middle" >apps never depend on wardend:</text>
+<text x="494" y="451" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#949b95" text-anchor="middle" >killing it stops nothing</text>
+<rect x="52" y="456" width="112" height="66" rx="12" fill="#1a1c1a" stroke="#2c2f2c" stroke-width="1.5" />
+<text x="108" y="478.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="16" font-weight="700" fill="#f2f4f2" text-anchor="middle" >CLI</text>
+<text x="108" y="498.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >warden list</text>
+<text x="108" y="515.3" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="middle" >restart · deploy</text>
+<path d="M164 489 L228 489 L228 416" fill="none" stroke="#b0b6b1" stroke-width="2" marker-end="url(#aa9b1d6)"/>
+<text x="238" y="484" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="start" >one Unix socket</text>
+<text x="238" y="501" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#b0b6b1" text-anchor="start" >per app</text>
 <path d="M360 416 L360 510 L865 510 L865 454" fill="none" stroke="#34d399" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#a34d399)" marker-start="url(#a34d399)"/>
 <text x="560" y="484" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >to the workers: spawn · drain · replace</text>
 <text x="560" y="502" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="600" fill="#34d399" text-anchor="middle" >from the workers: heartbeat (fd 3) · health checks</text>
-<text x="52" y="548" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >One binary of about 5 MB, no JavaScript runtime embedded.</text>
-<text x="32" y="578" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >Details: docs/how-it-works.md and docs/architecture.md</text>
+<text x="52" y="548" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >One binary of about 5 MB, no JavaScript runtime embedded.</text>
+<text x="32" y="578" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >Details: docs/how-it-works.md and docs/architecture.md</text>
 </svg>

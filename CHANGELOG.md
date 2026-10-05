@@ -27,6 +27,20 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   the log in a terminal window (`warden logs <app>`, over `ssh -t` for a
   remote machine).
 - GUI: Delete, beside Start and Reset, after typing the app's name.
+- `warden upgrade`: installs the latest release (or `--version`) over this
+  `warden` and its GUI, then restarts every supervisor and wardend onto it; no
+  other step. `--check` (and `--json`) only says whether one is out.
+- GUI: a new release shows a banner and, once per release, a desktop
+  notification; Update installs it, restarts everything and reopens the window
+  on the new version. Settings > Updates checks on demand and has an opt-in
+  "Install updates automatically" switch.
+
+### Changed
+
+- The logo is the app icon's W shield everywhere, in green on a neutral dark
+  plate: the macOS icon (now edge to edge, no frame in the Dock), the PNGs, the
+  window's header, and the README images.
+- GUI: the dark background is a more neutral gray, with less green.
 
 ## [0.1.1] — 2026-10-04
 

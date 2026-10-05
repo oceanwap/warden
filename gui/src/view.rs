@@ -1882,8 +1882,8 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
         ]
         .spacing(8),
         cli_section(g),
-        updates_section(g),
         restart_all_section(g),
+        updates_section(g),
         small(format!("This desktop: {}.", g.system.describe())),
     ]
     .spacing(18)

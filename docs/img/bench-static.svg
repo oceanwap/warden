@@ -2,47 +2,47 @@
 <!-- Numbers: docs/benchmarks.md (nginx runs of 2026-10-03) -->
 <title id="t">Plain files: Warden against nginx</title>
 <desc id="d">Bar chart of server CPU per request for plain files, Warden against nginx 1.24: 1.5 KB page 8.19 against 11.28 microseconds (27 percent less), 20 KB stylesheet 8.60 against 10.58 (19 percent less), 100 KB script 18.19 against 18.58 (level). Requests per second are shown beside each bar.</desc>
-<rect x="0.5" y="0.5" width="999" height="536" rx="16" fill="#0f111a" stroke="#2a3060" stroke-width="1" />
-<text x="32" y="58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#f1f3ff" text-anchor="start" >Plain files: Warden against nginx 1.24</text>
-<text x="32" y="86" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#a9b1d6" text-anchor="start" >Server CPU per request, bars start at zero, shorter is better. One worker each, no response cache.</text>
-<text x="968" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f1f3ff" text-anchor="end" >nginx</text>
-<rect x="902.219" y="44" width="14" height="14" rx="3" fill="#66708f" />
-<text x="880.219" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f1f3ff" text-anchor="end" >Warden</text>
-<rect x="797.438" y="44" width="14" height="14" rx="3" fill="#6b76f5" />
-<text x="236" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8d96ba" text-anchor="start" >µs of server CPU per request</text>
-<text x="740" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#8d96ba" text-anchor="end" >requests/s</text>
-<text x="32" y="170" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f3ff" text-anchor="start" >1.5 KB page</text>
-<rect x="236" y="140" width="118.755" height="24" rx="4" fill="#6b76f5" />
-<text x="364.755" y="157.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7ff" text-anchor="start" >8.19 µs</text>
-<text x="740" y="157.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >121.3k req/s</text>
-<rect x="236" y="172" width="163.56" height="24" rx="4" fill="#66708f" />
-<text x="409.56" y="189.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >11.28 µs *</text>
-<text x="740" y="189.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >86.9k req/s</text>
+<rect x="0.5" y="0.5" width="999" height="536" rx="16" fill="#121312" stroke="#2c2f2c" stroke-width="1" />
+<text x="32" y="58" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="28" font-weight="700" fill="#f2f4f2" text-anchor="start" >Plain files: Warden against nginx 1.24</text>
+<text x="32" y="86" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="400" fill="#b0b6b1" text-anchor="start" >Server CPU per request, bars start at zero, shorter is better. One worker each, no response cache.</text>
+<text x="968" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f2f4f2" text-anchor="end" >nginx</text>
+<rect x="902.219" y="44" width="14" height="14" rx="3" fill="#6c736d" />
+<text x="880.219" y="56" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14" font-weight="600" fill="#f2f4f2" text-anchor="end" >Warden</text>
+<rect x="797.438" y="44" width="14" height="14" rx="3" fill="#4eae78" />
+<text x="236" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#949b95" text-anchor="start" >µs of server CPU per request</text>
+<text x="740" y="124" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="12.5" font-weight="400" fill="#949b95" text-anchor="end" >requests/s</text>
+<text x="32" y="170" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f2f4f2" text-anchor="start" >1.5 KB page</text>
+<rect x="236" y="140" width="118.755" height="24" rx="4" fill="#4eae78" />
+<text x="364.755" y="157.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#8ee6b0" text-anchor="start" >8.19 µs</text>
+<text x="740" y="157.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >121.3k req/s</text>
+<rect x="236" y="172" width="163.56" height="24" rx="4" fill="#6c736d" />
+<text x="409.56" y="189.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7a1" text-anchor="start" >11.28 µs *</text>
+<text x="740" y="189.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >86.9k req/s</text>
 <rect x="778" y="156" width="190" height="32" rx="16" fill="#12332b" stroke="#34d399" stroke-width="1.2" />
 <text x="873" y="177.4" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#34d399" text-anchor="middle" >27 % less CPU</text>
-<line x1="32" y1="222" x2="968" y2="222" stroke="#2a3060" stroke-width="1"/>
-<text x="32" y="266" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f3ff" text-anchor="start" >20 KB stylesheet</text>
-<rect x="236" y="236" width="124.767" height="24" rx="4" fill="#6b76f5" />
-<text x="370.767" y="253.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7ff" text-anchor="start" >8.60 µs</text>
-<text x="740" y="253.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >112.0k req/s</text>
-<rect x="236" y="268" width="153.471" height="24" rx="4" fill="#66708f" />
-<text x="399.471" y="285.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >10.58 µs</text>
-<text x="740" y="285.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >93.3k req/s</text>
+<line x1="32" y1="222" x2="968" y2="222" stroke="#2c2f2c" stroke-width="1"/>
+<text x="32" y="266" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f2f4f2" text-anchor="start" >20 KB stylesheet</text>
+<rect x="236" y="236" width="124.767" height="24" rx="4" fill="#4eae78" />
+<text x="370.767" y="253.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#8ee6b0" text-anchor="start" >8.60 µs</text>
+<text x="740" y="253.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >112.0k req/s</text>
+<rect x="236" y="268" width="153.471" height="24" rx="4" fill="#6c736d" />
+<text x="399.471" y="285.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7a1" text-anchor="start" >10.58 µs</text>
+<text x="740" y="285.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >93.3k req/s</text>
 <rect x="778" y="252" width="190" height="32" rx="16" fill="#12332b" stroke="#34d399" stroke-width="1.2" />
 <text x="873" y="273.4" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#34d399" text-anchor="middle" >19 % less CPU</text>
-<line x1="32" y1="318" x2="968" y2="318" stroke="#2a3060" stroke-width="1"/>
-<text x="32" y="362" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f1f3ff" text-anchor="start" >100 KB script</text>
-<rect x="236" y="332" width="263.755" height="24" rx="4" fill="#6b76f5" />
-<text x="509.755" y="349.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7ff" text-anchor="start" >18.19 µs</text>
-<text x="740" y="349.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >46.4k req/s</text>
-<rect x="236" y="364" width="269.458" height="24" rx="4" fill="#66708f" />
-<text x="515.458" y="381.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#9aa3c2" text-anchor="start" >18.58 µs</text>
-<text x="740" y="381.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#a9b1d6" text-anchor="end" >43.3k req/s</text>
-<rect x="778" y="348" width="190" height="32" rx="16" fill="#161a2b" stroke="#66708f" stroke-width="1.2" />
-<text x="873" y="369.4" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#a9b1d6" text-anchor="middle" >level</text>
-<text x="32" y="436" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >* 1.5 KB: nginx with sendfile off and tcp_nopush off, the fastest of four settings tried. With sendfile on and tcp_nopush on, as at 20 and</text>
-<text x="32" y="455" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >100 KB, it takes 14.00 µs (71.3k req/s). At 20 and 100 KB sendfile off was slower (13.4 to 13.8 and 40.5 to 40.8 µs).</text>
-<text x="32" y="474" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >Level at 100 KB: 18.19 against 18.58 µs, inside the spread of the rounds.</text>
-<text x="32" y="493" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >32 connections, wrk on the other CPU, medians of 5 interleaved rounds, 2-vCPU VM. Measured 2026-10-03. Source and method:</text>
-<text x="32" y="512" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#8d96ba" text-anchor="start" >docs/benchmarks.md</text>
+<line x1="32" y1="318" x2="968" y2="318" stroke="#2c2f2c" stroke-width="1"/>
+<text x="32" y="362" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="17" font-weight="700" fill="#f2f4f2" text-anchor="start" >100 KB script</text>
+<rect x="236" y="332" width="263.755" height="24" rx="4" fill="#4eae78" />
+<text x="509.755" y="349.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#8ee6b0" text-anchor="start" >18.19 µs</text>
+<text x="740" y="349.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >46.4k req/s</text>
+<rect x="236" y="364" width="269.458" height="24" rx="4" fill="#6c736d" />
+<text x="515.458" y="381.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="14.5" font-weight="700" fill="#a0a7a1" text-anchor="start" >18.58 µs</text>
+<text x="740" y="381.5" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13.5" font-weight="400" fill="#b0b6b1" text-anchor="end" >43.3k req/s</text>
+<rect x="778" y="348" width="190" height="32" rx="16" fill="#1a1c1a" stroke="#6c736d" stroke-width="1.2" />
+<text x="873" y="369.4" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="700" fill="#b0b6b1" text-anchor="middle" >level</text>
+<text x="32" y="436" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >* 1.5 KB: nginx with sendfile off and tcp_nopush off, the fastest of four settings tried. With sendfile on and tcp_nopush on, as at 20 and</text>
+<text x="32" y="455" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >100 KB, it takes 14.00 µs (71.3k req/s). At 20 and 100 KB sendfile off was slower (13.4 to 13.8 and 40.5 to 40.8 µs).</text>
+<text x="32" y="474" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >Level at 100 KB: 18.19 against 18.58 µs, inside the spread of the rounds.</text>
+<text x="32" y="493" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >32 connections, wrk on the other CPU, medians of 5 interleaved rounds, 2-vCPU VM. Measured 2026-10-03. Source and method:</text>
+<text x="32" y="512" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif" font-size="13" font-weight="400" fill="#949b95" text-anchor="start" >docs/benchmarks.md</text>
 </svg>

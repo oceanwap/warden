@@ -31,6 +31,7 @@ pub mod format;
 pub mod history;
 pub mod hosts;
 pub mod icons;
+pub mod logo;
 pub mod logs;
 pub mod look;
 pub mod model;

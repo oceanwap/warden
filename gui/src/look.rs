@@ -359,21 +359,9 @@ pub fn section_icon<'a, Message: 'a>(i: Icon, label: &str) -> Element<'a, Messag
     row![icon(i).size(13).style(muted), section(label)].spacing(6).align_y(Center).into()
 }
 
-/// The mark of the app: the shield on a rounded square of the accent.
+/// The mark of the app: the app icon, drawn (`logo`).
 pub fn brand_mark<'a, Message: 'a>(size: f32) -> Element<'a, Message> {
-    container(
-        icon(Icon::Shield).size(size * 0.58).style(|theme: &Theme| text::Style { color: Some(pal(theme).on_accent) }),
-    )
-    .width(size)
-    .height(size)
-    .center_x(size)
-    .center_y(size)
-    .style(move |theme: &Theme| container::Style {
-        background: Some(Background::Color(pal(theme).accent)),
-        border: border::rounded(size * 0.32),
-        ..container::Style::default()
-    })
-    .into()
+    iced::widget::canvas(crate::logo::Logo).width(size).height(size).into()
 }
 
 /// Text with a tooltip under it.
