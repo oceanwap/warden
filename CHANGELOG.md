@@ -39,6 +39,16 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   (an older supervisor, too many live streams). `warden start` notices the
   supervisor and its ready workers sooner, and wardend starts the next saved
   app at boot sooner. Output and exit codes are unchanged.
+- Reloads with a `[health] path` are faster: a new worker's first health check
+  runs as soon as it listens, each next one `health_interval_ms` after the
+  previous one ended, and the worker takes over the moment its last check,
+  `verify_command` or soak passes. They used to wait for a shared 500 ms tick
+  at each step: listening to taking over went from about 1.9 s to 1.0 s with
+  the defaults, and `warden reload` of 4 node:http workers from 8.5 s to 5 s.
+  The gates are the same: `health_passes` checks in a row, never closer than
+  `health_interval_ms`. A first check that fails resets the passes but
+  doesn't count toward failing the worker, so a slow starter gets no less
+  time than before.
 
 ### Fixed
 

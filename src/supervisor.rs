@@ -1302,6 +1302,11 @@ impl Supervisor {
                 if ready && (!self.cfg.workers.wait_ready || promoted) {
                     self.mark_ready(inst_id);
                 }
+                // Found listening on its port before the shim reported its
+                // private socket: its first gate check waited for this.
+                if msg.socket.is_some() {
+                    self.rollout_socket_reported(inst_id);
+                }
             }
             "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
             "ready" => {
