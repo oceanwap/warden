@@ -1051,6 +1051,10 @@ impl Supervisor {
         // `wait_ready`: only the app's `process.send('ready')` counts (on_ipc).
         let port = if self.cfg.workers.wait_ready { None } else { port };
         match port {
+            // Handed-over connections: the worker never listens on the port
+            // (polling for it would read the host's socket table until the
+            // deadline); the shim's `listening` says when it is ready.
+            Some(_) if self.handoff_on => {}
             None if self.cfg.workers.wait_ready => {}
             // No port: ready once it has stayed up `min_uptime` (a crash on
             // boot then counts as a failed start, not as a running worker).
