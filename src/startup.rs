@@ -232,18 +232,45 @@ pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, 
 
 // ------------------------------------------------------------------ helpers
 
-/// Run a program; the last line of its error output when it fails.
+/// Run a program; the last line of its error output when it fails. Stopped after
+/// [`RUN_LIMIT`]: a `launchctl kickstart` that never returns must not hang `warden update`.
 fn run(bin: &Path, args: &[&str]) -> Result<(), String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
     let shown = format!("{} {}", bin.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), args.join(" "));
-    let out = std::process::Command::new(bin).args(args).output().map_err(|e| format!("`{shown}`: {e}"))?;
-    if out.status.success() {
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("`{shown}`: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if t0.elapsed() < RUN_LIMIT => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("`{shown}` did not finish within {} s; it was stopped", RUN_LIMIT.as_secs()));
+            }
+            Err(e) => return Err(format!("`{shown}`: {e}")),
+        }
+    };
+    if status.success() {
         return Ok(());
     }
-    let err = String::from_utf8_lossy(&out.stderr);
+    // ponytail: stderr is read after the exit; a program that fills the pipe (64 KiB) first would
+    // be stopped at the limit instead. launchctl and systemctl say a line or two.
+    let mut err = String::new();
+    let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut err));
     let why =
-        err.trim().lines().last().filter(|l| !l.is_empty()).map(String::from).unwrap_or_else(|| out.status.to_string());
+        err.trim().lines().last().filter(|l| !l.is_empty()).map(String::from).unwrap_or_else(|| status.to_string());
     Err(format!("`{shown}` failed: {why}"))
 }
+
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Write a file unless it already has `text`; say which. `fix`: what to do
 /// when it cannot be written.
@@ -379,6 +406,27 @@ pub(crate) fn wardend_managed() -> bool {
         return [false, true].into_iter().any(|s| plist_path(s).exists());
     }
     fleet::systemctl_bin().is_some() && [Scope::System, Scope::User].into_iter().any(|s| s.has_unit("wardend.service"))
+}
+
+/// Why the launchd job `warden startup` wrote cannot start wardend, if it cannot: it runs a
+/// warden that is gone, or an older one's command (`daemon`). `warden startup` rewrites it.
+pub(crate) fn launchd_job_broken() -> Option<String> {
+    if !launchd_host() {
+        return None;
+    }
+    let path = [false, true].into_iter().map(plist_path).find(|p| p.exists())?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    plist_problem(&text).map(|why| format!("the launchd job {} {why}", path.display()))
+}
+
+fn plist_problem(plist: &str) -> Option<String> {
+    let args = plist.split("<key>ProgramArguments</key>").nth(1)?.split("</array>").next()?;
+    let mut strings = args.split("<string>").skip(1).filter_map(|s| s.split("</string>").next());
+    let (exe, cmd) = (strings.next()?, strings.next().unwrap_or(""));
+    if !Path::new(exe).is_file() {
+        return Some(format!("runs {exe}, which does not exist"));
+    }
+    (cmd != "wardend").then(|| format!("runs `{exe} {cmd}`, not `warden wardend`"))
 }
 
 /// Start wardend through the service manager that owns it (launchd: `kickstart`, or load
@@ -884,6 +932,18 @@ mod tests {
             vec![("PATH".into(), "/bin".into()), ("WARDEN_RUNTIME_DIR".into(), "/r".into())]
         );
         assert_eq!(carried_env(&get, false), vec![("WARDEN_RUNTIME_DIR".to_string(), "/r".to_string())]);
+    }
+
+    #[test]
+    fn a_launchd_job_for_a_missing_or_older_warden_is_found() {
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let log = Path::new("/tmp/wardend.log");
+        assert_eq!(plist_problem(&launchd_plist(LAUNCHD_LABEL, &exe, log, &[])), None, "what `warden startup` writes");
+        let gone = launchd_plist(LAUNCHD_LABEL, "/usr/local/bin/warden-gone", log, &[]);
+        assert_eq!(plist_problem(&gone).as_deref(), Some("runs /usr/local/bin/warden-gone, which does not exist"));
+        let older =
+            launchd_plist(LAUNCHD_LABEL, &exe, log, &[]).replace("<string>wardend</string>", "<string>daemon</string>");
+        assert_eq!(plist_problem(&older), Some(format!("runs `{exe} daemon`, not `warden wardend`")));
     }
 
     #[test]

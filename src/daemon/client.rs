@@ -100,7 +100,13 @@ pub(crate) async fn autostart() {
     // only fight it for the socket, so the manager starts it. (After `warden kill` it
     // is stopped and stays so until the next login or boot: `resurrect` must not
     // leave the apps without it.)
-    if crate::startup::wardend_managed() {
+    // A job that cannot start it (a warden that is gone, an older one's command) is not waited
+    // for: wardend is started by hand, as without one.
+    let broken = crate::startup::launchd_job_broken();
+    if let Some(why) = &broken {
+        eprintln!("warden: {why}, so it cannot start wardend; starting it by hand. `warden startup` rewrites the job");
+    }
+    if broken.is_none() && crate::startup::wardend_managed() {
         let started = tokio::task::spawn_blocking(crate::startup::start_wardend_managed)
             .await
             .unwrap_or_else(|e| Err(e.to_string()));
