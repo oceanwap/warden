@@ -5,7 +5,7 @@
 
 Writes (all committed, so building Warden needs no Python):
   assets/icon/png/warden-<size>.png   the full icon with its margin (README, Linux packages)
-  assets/icon/Warden.icns             macOS (Warden.app, Contents/Resources)
+  assets/icon/Warden.icns             macOS (Warden.app, Contents/Resources): full bleed, see below
   gui/assets/icon-128.rgba            the window icon of warden-gui (128 x 128, raw RGBA)
 """
 import io
@@ -43,13 +43,39 @@ def at(size: int) -> Image.Image:
 for size in (16, 32, 64, 128, 256, 512, 1024):
     (here / "png" / f"warden-{size}.png").write_bytes(png_bytes(at(size)))
 
-# macOS .icns: PNG-compressed entries (macOS 10.7 and later).
+# macOS .icns: full bleed. Since macOS 26 the system draws the rounded square itself, and an icon
+# that leaves a margin (the older template, as in warden.svg) is shrunk onto a gray plate. So the
+# plate's gradient fills the whole canvas, square, without the shadow, and the shield and W are
+# scaled up with it (1024 / 824), keeping their size on the plate.
+def full_bleed_svg() -> str:
+    text = svg.read_text()
+    start = text.index("  <!-- the macOS icon plate")
+    end = text.index("  <!-- shield -->")
+    plate = (
+        '  <rect width="1024" height="1024" fill="url(#plate)"/>\n'
+        '  <rect width="1024" height="1024" fill="url(#glow)"/>\n'
+        '  <g transform="translate(512 512) scale(1.2427) translate(-512 -512)">\n'
+    )
+    text = text[:start] + plate + text[end:]
+    return text.replace("</svg>", "  </g>\n</svg>")
+
+
+bleed = Image.open(
+    io.BytesIO(cairosvg.svg2png(bytestring=full_bleed_svg().encode(), output_width=2048, output_height=2048))
+).convert("RGBA")
+
+
+def bleed_at(size: int) -> Image.Image:
+    return bleed.resize((size, size), Image.LANCZOS)
+
+
+# PNG-compressed entries (macOS 10.7 and later).
 entries = [
     (b"icp4", 16), (b"icp5", 32), (b"icp6", 64),
     (b"ic07", 128), (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024),
     (b"ic11", 32), (b"ic12", 64), (b"ic13", 256), (b"ic14", 512),
 ]
-chunks = b"".join(kind + struct.pack(">I", 8 + len(data)) + data for kind, data in ((k, png_bytes(at(s))) for k, s in entries))
+chunks = b"".join(kind + struct.pack(">I", 8 + len(data)) + data for kind, data in ((k, png_bytes(bleed_at(s))) for k, s in entries))
 (here / "Warden.icns").write_bytes(b"icns" + struct.pack(">I", 8 + len(chunks)) + chunks)
 
 # The window icon: the plate fills the image (the margin and shadow of the

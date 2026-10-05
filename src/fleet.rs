@@ -438,6 +438,11 @@ fn reachable(app: &App) -> bool {
     std::os::unix::net::UnixStream::connect(&app.socket).is_ok()
 }
 
+/// Some app's supervisor answers.
+pub(crate) fn any_reachable(args: &Args) -> bool {
+    context(args).apps.iter().any(reachable)
+}
+
 /// Status of every app, queried in parallel.
 pub async fn statuses(apps: &[App]) -> Vec<(App, Result<Status, String>)> {
     let mut set = tokio::task::JoinSet::new();

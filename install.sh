@@ -676,6 +676,8 @@ install_gui_macos() {
 # wardend (always on once an app starts) and every app's supervisor keep the
 # code they started with: a new file on disk does not reach them.
 note_running() {
+    # `warden upgrade` runs `warden update` itself next.
+    if [ "${WARDEN_RESTARTS_ITSELF:-}" = 1 ]; then return 0; fi
     if ! "$dir/warden" daemon status >/dev/null 2>&1 </dev/null; then return 0; fi
     if "$dir/warden" --help 2>&1 </dev/null | grep -q '^ *update '; then
         restart="$cmd update"

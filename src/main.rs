@@ -35,6 +35,7 @@ mod supervisor;
 mod sys;
 mod systemd;
 mod table;
+mod upgrade;
 mod watch;
 mod worker;
 
@@ -123,6 +124,7 @@ fn main() {
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
         Command::WattpmMigrate(ref o) => rt.block_on(migrate_wattpm::run(&args, o)),
         Command::GuiInstall(ref o) => gui_install::run(o),
+        Command::Upgrade(ref o) => rt.block_on(upgrade::run(o, &args)),
         Command::Wardend(cli::WardendCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
         Command::Wardend(cli::WardendCmd::Run { background: true, resurrect }) => {
             rt.block_on(daemon::client::start_background(resurrect))
