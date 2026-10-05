@@ -3,6 +3,18 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- macOS: apps that wardend starts (at login, after `warden update`, or when
+  it restarts a supervisor) ran at background priority (20 instead of 31):
+  launchd ran wardend as a background job and every app inherited it, so on a
+  busy Mac they got less CPU and more often the efficiency cores. `warden
+  startup` now writes `ProcessType = Interactive`, and a job an older warden
+  wrote gets it the next time warden starts wardend through launchd (`warden
+  update`, the GUI's Update), with nothing to run by hand.
+
 ## [0.1.2] — 2026-10-05
 
 ### Fixed

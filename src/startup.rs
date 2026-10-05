@@ -198,6 +198,24 @@ fn xml(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
+/// launchd runs a job without a `ProcessType` as a background daemon: lower priority (20, not
+/// the 31 of a program started from a terminal), its CPU and I/O throttled, and on Apple
+/// Silicon more often on the efficiency cores. Every supervisor and app wardend starts inherits
+/// that, so the apps would answer slower than the same apps started by hand.
+const PROCESS_TYPE: &str = "  <!-- The apps wardend starts inherit this: Interactive keeps them at normal priority, \
+                            not throttled as a background job. -->\n  <key>ProcessType</key>\n  \
+                            <string>Interactive</string>\n";
+
+/// A plist an older `warden startup` wrote, with the `ProcessType` it lacks; `None` when it has
+/// one (or is not a plist this can add it to).
+fn with_process_type(plist: &str) -> Option<String> {
+    if plist.contains("<key>ProcessType</key>") {
+        return None;
+    }
+    let at = plist.find("  <key>StandardOutPath</key>").or_else(|| plist.rfind("</dict>\n</plist>"))?;
+    Some(format!("{}{PROCESS_TYPE}{}", &plist[..at], &plist[at..]))
+}
+
 /// The launchd job: `warden wardend --resurrect`, at load (login or boot) and
 /// again whenever it did not exit cleanly.
 pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, String)]) -> String {
@@ -217,6 +235,7 @@ pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, 
     s += "  <!-- Started again after a crash or kill -9, but not after a clean exit: `warden kill`\n       \
           keeps it stopped until the next login or boot. -->\n";
     s += "  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n";
+    s += PROCESS_TYPE;
     s += &format!("  <key>StandardOutPath</key>\n  <string>{log}</string>\n");
     s += &format!("  <key>StandardErrorPath</key>\n  <string>{log}</string>\n");
     if !env.is_empty() {
@@ -462,6 +481,16 @@ pub(crate) fn start_wardend_managed() -> Result<String, String> {
                 continue;
             }
             let (domain, target) = (launchd_domain(system), format!("{}/{LAUNCHD_LABEL}", launchd_domain(system)));
+            // A job an older warden wrote runs the apps as a background daemon: add the
+            // `ProcessType` and load it again (wardend is not running, so nothing stops), as a
+            // loaded job keeps the plist it was loaded with.
+            let refreshed = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|p| with_process_type(&p))
+                .is_some_and(|p| std::fs::write(&path, p).is_ok());
+            if refreshed {
+                let _ = run(&lc, &["bootout", &target]);
+            }
             // Loaded (the usual case after wardend exited): start it. Not loaded: load it
             // again, which starts it (RunAtLoad). A job disabled earlier stays disabled.
             let _ = run(&lc, &["enable", &target]);
@@ -943,6 +972,22 @@ mod tests {
                    <string>daemon</string>\n<string>--resurrect</string>\n</array>";
         assert_eq!(plist_program(old).unwrap(), ["/usr/local/bin/warden", "daemon", "--resurrect"]);
         assert_eq!(plist_program("<plist/>"), None);
+    }
+
+    #[test]
+    fn the_launchd_job_runs_the_apps_at_normal_priority() {
+        let p = launchd_plist(LAUNCHD_LABEL, "/Users/me/bin/warden", Path::new("/tmp/w.log"), &[]);
+        let flat: String = p.lines().map(str::trim).collect();
+        assert!(flat.contains("<key>ProcessType</key><string>Interactive</string>"), "{p}");
+        assert_eq!(with_process_type(&p), None, "what `warden startup` writes has it");
+        // What an older `warden startup` wrote gets it where `warden startup` puts it, nothing else changes.
+        let older = p.replace(PROCESS_TYPE, "");
+        assert!(!older.contains("ProcessType"));
+        assert_eq!(with_process_type(&older).as_deref(), Some(p.as_str()));
+        let bare = "<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>x</string>\n</dict>\n</plist>\n";
+        let added = with_process_type(bare).unwrap();
+        assert!(added.ends_with(&format!("{PROCESS_TYPE}</dict>\n</plist>\n")), "{added}");
+        assert_eq!(with_process_type("not a plist"), None);
     }
 
     #[test]
