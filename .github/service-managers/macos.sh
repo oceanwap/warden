@@ -156,9 +156,13 @@ STARTUP_OUT=$OUT
 check "$PLIST written" test -f "$PLIST"
 check "the plist is valid (plutil -lint)" plutil -lint "$PLIST"
 check "the plist runs warden wardend --resurrect" grep -q "<string>--resurrect</string>" "$PLIST"
+check "the plist runs it as Interactive (not a throttled background job)" grep -q "<string>Interactive</string>" "$PLIST"
 contains "startup says the job is loaded" "$STARTUP_OUT" "$TARGET: loaded"
 check "launchd has the job ($TARGET)" lc print "$TARGET"
 wait_for "launchd runs wardend for the job" 20 wardend_is_job
+# A background job runs at priority 20 and its children inherit that; Interactive keeps 31.
+normal_priority() { [ "$(ps -o pri= -p "$(wardend_pid)" | tr -d ' ')" -ge 31 ]; }
+check "wardend runs at normal priority ($(ps -o pri= -p "$(wardend_pid)" | tr -d ' '))" normal_priority
 wait_for "wardend sees $API running" 20 wardend_sees "$API"
 wait_for "wardend sees $SITE running" 20 wardend_sees "$SITE"
 expect_eq "$API not started twice (--resurrect left the running supervisor)" "$API_SUP" "$(sup_pid "$API")"
