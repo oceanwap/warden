@@ -829,6 +829,11 @@ async fn follow_rollout(socket: &std::path::Path, seq: u64, last: &mut String) -
         let Ok(ev) = serde_json::from_str::<Event>(&line) else { continue };
         match ev {
             Event::RolloutDone { outcome, .. } if outcome.seq >= seq => return Some(rollout_result(&outcome)),
+            // Each phase change, so a fast rollout shows every batch (a 250 ms sample can miss one).
+            Event::Rollout { rollout, .. } => {
+                rollout_progress(&rollout, seq, last);
+                snapshot = false;
+            }
             Event::Status { status, .. } => {
                 if let Some(code) = rollout_check(&status, seq, last, !snapshot) {
                     return Some(code);
@@ -878,13 +883,18 @@ fn rollout_check(st: &Status, seq: u64, last: &mut String, progress: bool) -> Op
     if !progress {
         return None;
     }
-    if let Some(r) = st.rollout.as_ref().filter(|r| r.seq == seq) {
-        if r.phase != *last {
-            println!("  [{}/{}] {}", r.done, r.total, r.phase);
-            *last = r.phase.clone();
-        }
+    if let Some(r) = st.rollout.as_ref() {
+        rollout_progress(r, seq, last);
     }
     None
+}
+
+/// A progress line for rollout `seq` when its phase changed.
+fn rollout_progress(r: &control::RolloutStatus, seq: u64, last: &mut String) {
+    if r.seq == seq && r.phase != *last {
+        println!("  [{}/{}] {}", r.done, r.total, r.phase);
+        *last = r.phase.clone();
+    }
 }
 
 /// Print how a rollout ended; its exit code.

@@ -38,7 +38,8 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   519 → 470 ms). They fall back to polling when the stream is not available
   (an older supervisor, too many live streams). `warden start` notices the
   supervisor and its ready workers sooner, and wardend starts the next saved
-  app at boot sooner. Output and exit codes are unchanged.
+  app at boot sooner. Progress lines now show every phase of a rollout (a
+  250 ms sample could skip a short batch); exit codes are unchanged.
 - Reloads with a `[health] path` are faster: a new worker's first health check
   runs as soon as it listens, each next one `health_interval_ms` after the
   previous one ended, and the worker takes over the moment its last check,
