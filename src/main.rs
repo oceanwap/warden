@@ -14,6 +14,7 @@ mod events;
 mod fleet;
 mod guard;
 mod gui_install;
+mod handoff;
 mod health;
 mod ids;
 mod logging;

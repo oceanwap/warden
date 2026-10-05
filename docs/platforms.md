@@ -6,13 +6,23 @@
   config. CI builds it and runs clippy and the unit tests (Apple Silicon).
   What it lacks:
   - `SO_REUSEPORT` does not load-balance on macOS: several workers can
-    share the port, but connections are not spread across them. Use
-    `[workers] count = 1` locally.
-  - Node has no `reusePort` on macOS at all (libuv offers it only where the
-    kernel balances), so only one Node worker can listen on the port, and a
-    reload, which starts the new worker next to the old one, fails: use
-    `warden restart --hard`, or `port_strategy = "offset"`. Warden says so
-    at start. Bun apps share the port as on Linux.
+    share the port, but one of them gets every connection. So with more than
+    one worker, Warden owns the port itself, accepts, and hands each
+    connection to the worker with the fewest in flight, over the worker's
+    Node IPC channel (fd 4, `NODE_CHANNEL_FD`: the message Node's own
+    cluster module sends, socket attached). From then on client and worker
+    talk directly: Warden never touches the traffic, and the app sees the
+    client's address. It works for `node:http` servers (Express, Fastify,
+    NestJS, …) under Node and under Bun 1.4 or newer (older Bun cannot take a
+    handed-over socket: its workers listen as before); measured on an M-series Mac, 4
+    workers of a 1 ms-per-request app served 3.2–3.4× what 1 worker did
+    (p99 3 ms instead of 7–10), and a trivial app the same within noise.
+    Apps on `Bun.serve` itself (Elysia, Hono on Bun) cannot take a handed-over
+    connection: they share the port as before (one worker gets the
+    traffic), so keep `count = 1` for them locally. `WARDEN_HANDOFF=0` in
+    Warden's environment turns the handoff off (`=1` turns it on elsewhere,
+    as the tests do on Linux). It is decided when the supervisor starts: an
+    app scaled from 1 worker to more needs a `warden restart`.
   - No parent-death signal: workers outlive a supervisor killed with
     SIGKILL (or one that crashed, or that launchd killed in the middle of a
     shutdown). Warden stops them the next time the app starts, before it

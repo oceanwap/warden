@@ -98,6 +98,11 @@ struct HealthState {
 }
 
 pub struct Supervisor {
+    /// macOS, more than one worker: Warden owns the port and hands each
+    /// connection to a worker (`crate::handoff`). Decided at start.
+    handoff_on: bool,
+    /// The dispatcher, once a worker said it takes handed-over connections.
+    handoff: Option<crate::handoff::Handoff>,
     cfg: Config,
     cfg_path: Option<PathBuf>,
     policy: Policy,
@@ -339,7 +344,9 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         );
     }
     warn_if_no_migrate_req(&sup.cfg);
-    warn_if_node_cannot_share_the_port(&sup.cfg);
+    if !sup.handoff_on {
+        warn_if_node_cannot_share_the_port(&sup.cfg);
+    }
     if !sup.cfg.any_worker_path() {
         info!("no health path configured: new workers are gated on listening only (set [health] path)");
     }
@@ -498,6 +505,25 @@ fn warn_if_node_cannot_share_the_port(cfg: &Config) {
     );
 }
 
+/// Whether connections are handed to the workers (`crate::handoff`): by
+/// default where the kernel does not spread a shared port (`macos`), for a
+/// process-mode app with the shim, a port and more than one worker.
+/// `WARDEN_HANDOFF=1` / `0` (the supervisor's environment) turns it on or off
+/// anywhere. Standbys and `[static]` keep listening themselves.
+fn handoff_wanted(cfg: &Config, var: Option<&str>, macos: bool) -> bool {
+    let on = match var {
+        Some("1") => true,
+        Some("0") => false,
+        _ => macos && cfg.workers.count > 1,
+    };
+    on && cfg.app.port.is_some()
+        && cfg.shim_enabled()
+        && cfg.workers.mode == Mode::Process
+        && cfg.workers.standby == 0
+        && cfg.workers.port_strategy == PortStrategy::Shared
+        && cfg.static_files.is_none()
+}
+
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::Process => "process",
@@ -515,6 +541,12 @@ impl Supervisor {
         proc_tx: mpsc::UnboundedSender<ProcEvent>,
     ) -> Supervisor {
         Supervisor {
+            handoff_on: handoff_wanted(
+                &cfg,
+                std::env::var("WARDEN_HANDOFF").ok().as_deref(),
+                cfg!(target_os = "macos"),
+            ),
+            handoff: None,
             policy: Policy::from(&cfg.restart),
             count: cfg.workers.count,
             slots: BTreeMap::new(),
@@ -876,6 +908,7 @@ impl Supervisor {
             label: standby.map(|(n, _)| standby_label(n)).unwrap_or_else(|| self.label(slot_id)),
             output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
+            handoff: self.handoff_on && slot_id != STANDBY_SLOT,
         }
     }
 
@@ -921,6 +954,12 @@ impl Supervisor {
         }
         if self.cfg.workers.port_strategy == PortStrategy::Shared {
             add("WARDEN_REUSE_PORT", "1".into());
+        }
+        if self.handoff_on && slot_id != STANDBY_SLOT {
+            // Connections arrive on fd 4, Node's IPC channel (`crate::handoff`).
+            add("WARDEN_HANDOFF", "1".into());
+            add("NODE_CHANNEL_FD", "4".into());
+            add("NODE_CHANNEL_SERIALIZATION_MODE", "json".into());
         }
         if let Some(p) = a.port {
             // Standbys (slot 0) need a shared port (config validation).
@@ -1012,6 +1051,10 @@ impl Supervisor {
         // `wait_ready`: only the app's `process.send('ready')` counts (on_ipc).
         let port = if self.cfg.workers.wait_ready { None } else { port };
         match port {
+            // Handed-over connections: the worker never listens on the port
+            // (polling for it would read the host's socket table until the
+            // deadline); the shim's `listening` says when it is ready.
+            Some(_) if self.handoff_on => {}
             None if self.cfg.workers.wait_ready => {}
             // No port: ready once it has stayed up `min_uptime` (a crash on
             // boot then counts as a failed start, not as a running worker).
@@ -1203,6 +1246,23 @@ impl Supervisor {
                     self.disable_pool(format!("standby pid {pid} reported listening before its promotion"));
                     return;
                 }
+                if msg.handoff == Some(true) && !inst.handoff {
+                    inst.handoff = true;
+                    if let Err(e) = self.open_handoff(msg.host.as_deref()) {
+                        let pid = self.insts.get(&inst_id).map(|i| i.handle.pid).unwrap_or(0);
+                        error!(
+                            "cannot listen on the app's port for its workers",
+                            port = port.unwrap_or(0),
+                            pid = pid,
+                            error = e,
+                            hint = "another process holds the port (`lsof -iTCP:<port> -sTCP:LISTEN`); the worker is \
+                                    restarted. WARDEN_HANDOFF=0 in Warden's environment turns the handoff off",
+                        );
+                        self.kill_instance(inst_id);
+                        return;
+                    }
+                }
+                let Some(inst) = self.insts.get_mut(&inst_id) else { return };
                 let promoted = inst.promoted_at.is_some();
                 if let Some(sock) = &msg.socket {
                     inst.sockets.insert(worker, PathBuf::from(sock));
@@ -1298,9 +1358,15 @@ impl Supervisor {
         }
         let now = Instant::now();
         inst.ready_at = Some(now);
+        // Handed-over connections: it never listens on the port, so there is
+        // nothing for `port_lost` to watch; it joins the rotation instead.
+        if inst.handoff {
+            if let (Some(h), Some(ch)) = (self.handoff.as_ref(), inst.handle.take_handoff()) {
+                h.add(inst_id, ch);
+            }
         // It listened, so `[watchdog] port_lost` watches it from now on, even
         // if its server closes before the first look at its sockets.
-        if port.is_some() || !inst.listening.is_empty() {
+        } else if port.is_some() || !inst.listening.is_empty() {
             inst.listen.seen_at = Some(now);
             inst.listen.ports = match port {
                 Some(p) => vec![networking::worker_port(p, strategy, inst.slot.max(1))],
@@ -1408,6 +1474,9 @@ impl Supervisor {
         sent: process::exit::Sent,
     ) {
         let Some(inst) = self.insts.remove(&inst_id) else { return };
+        if let (true, Some(h)) = (inst.handoff, self.handoff.as_ref()) {
+            h.remove(inst_id);
+        }
         self.note_workers();
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
@@ -1758,6 +1827,37 @@ impl Supervisor {
 
     // ------------------------------------------------------------- stopping
 
+    /// Listen on the app's port for the workers (`crate::handoff`), once:
+    /// where the app asked (`host`; any address when it did not).
+    fn open_handoff(&mut self, host: Option<&str>) -> std::io::Result<()> {
+        if self.handoff.is_some() {
+            return Ok(());
+        }
+        let port = self.cfg.app.port.unwrap_or(0);
+        let ip: std::net::IpAddr = match host {
+            None | Some("") | Some("::") => std::net::Ipv6Addr::UNSPECIFIED.into(),
+            Some("localhost") => std::net::Ipv4Addr::LOCALHOST.into(),
+            Some(h) => h.parse().map_err(|_| std::io::Error::other(format!("not an IP address: {h}")))?,
+        };
+        let h = crate::handoff::Handoff::start(&self.cfg.app.name, std::net::SocketAddr::new(ip, port))
+            // No IPv6 here: any IPv4 address.
+            .or_else(|e| match host {
+                None | Some("") | Some("::") => crate::handoff::Handoff::start(
+                    &self.cfg.app.name,
+                    std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
+                ),
+                _ => Err(e),
+            })?;
+        info!(
+            "workers take connections from Warden",
+            address = h.addr,
+            hint = "the kernel does not spread a shared port over workers here, so Warden accepts and hands each \
+                    connection to a worker; the traffic itself goes straight between client and worker",
+        );
+        self.handoff = Some(h);
+        Ok(())
+    }
+
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
         let stop_signal = self.cfg.stop_signal();
@@ -1768,6 +1868,10 @@ impl Supervisor {
             return;
         }
         i.stopping = true;
+        // Out of the rotation before it drains: no new connection for it.
+        if let (true, Some(h)) = (i.handoff, self.handoff.as_ref()) {
+            h.remove(inst_id);
+        }
         i.handle.signal_group(stop_signal);
         if i.role == Role::Standby {
             // Never promoted now: end the shim's pending read of commands
@@ -1787,6 +1891,9 @@ impl Supervisor {
 
     fn kill_instance(&mut self, inst_id: u64) {
         let Some(who) = self.insts.get(&inst_id).map(|i| self.event_who(i)) else { return };
+        if let Some(h) = self.handoff.as_ref() {
+            h.remove(inst_id);
+        }
         if let Some(i) = self.insts.get_mut(&inst_id) {
             i.stopping = true;
             i.handle.signal(libc::SIGKILL);
@@ -2946,6 +3053,21 @@ fn skip_entries(path: PathBuf, log: bool) -> Vec<watch::Skip> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_is_on_by_default_only_on_macos_with_several_workers() {
+        let cfg = |extra: &str| {
+            Config::parse(&format!("[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\nport = 3000\n{extra}"))
+                .unwrap()
+        };
+        let two = cfg("[workers]\ncount = 2\n");
+        assert!(handoff_wanted(&two, None, true), "macOS, 2 workers");
+        assert!(!handoff_wanted(&two, None, false), "the kernel spreads the port elsewhere");
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 1\n"), None, true), "one worker: nothing to spread");
+        assert!(handoff_wanted(&two, Some("1"), false) && !handoff_wanted(&two, Some("0"), true), "WARDEN_HANDOFF");
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nport_strategy = \"offset\"\n"), None, true));
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nstandby = 1\n"), None, true), "standbys listen");
+    }
 
     #[test]
     fn preload_placement() {
