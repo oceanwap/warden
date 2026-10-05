@@ -16,6 +16,9 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   Every save keeps the list it replaces in `dump.json.bak`.
 - A wardend that finds another one running exits 0, so launchd no longer
   restarts it every 10 s beside one the GUI started.
+- A supervisor started before `warden startup` no longer brings a killed
+  wardend back itself once launchd or systemd runs it, so their restart is the
+  one that runs.
 - GUI: the top bar's CPU, memory and load readings keep their width, so the
   bar no longer shifts.
 
