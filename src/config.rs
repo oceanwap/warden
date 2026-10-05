@@ -761,6 +761,40 @@ pub fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// A hint for an app in worker mode where its threads cost speed (`warden doctor`, the GUI, a
+/// warning at start): on macOS the threads share the port but the kernel gives one of them most
+/// connections, and before Bun 1.4 they ran 20-50 % slower than processes (NestJS, measured
+/// 2026-10-05; on 1.4.2 they are level, with 14-22 % less memory). `bun`: the runtime's
+/// version, when known.
+pub fn worker_mode_hint(cfg: &Config, macos: bool, bun: Option<(u32, u32)>) -> Option<String> {
+    if cfg.workers.mode != Mode::Worker {
+        return None;
+    }
+    if macos {
+        return Some(
+            "worker mode on macOS: the threads share the port, but macOS gives one of them most connections; \
+             `mode = \"process\"` spreads them over the workers"
+                .into(),
+        );
+    }
+    match bun {
+        Some((major, minor)) if (major, minor) < (1, 4) => Some(format!(
+            "worker mode on Bun {major}.{minor}: before Bun 1.4 its threads run 20-50 % slower than processes; \
+             upgrade Bun, or use `mode = \"process\"`"
+        )),
+        _ => None,
+    }
+}
+
+/// `<command> --version` as (major, minor), when it answers.
+pub fn runtime_version(command: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new(command).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    crate::doctor::major_minor(&String::from_utf8_lossy(&out.stdout))
+}
+
 /// A hint for an app that runs one worker on a Linux host with more cores: there the workers
 /// share the port and the kernel spreads the connections over them, so throughput grows with
 /// them, and one worker leaves the other cores idle under load. Only a
@@ -2192,5 +2226,19 @@ level = "info"
         assert_eq!(more_workers_hint(&no_port, 1, true, 8), None, "no port to share");
         let offset = Config::parse(&format!("{MIN}port = 3000\n[workers]\nport_strategy = \"offset\"\n")).unwrap();
         assert_eq!(more_workers_hint(&offset, 1, true, 8), None, "a port per worker");
+    }
+
+    #[test]
+    fn worker_mode_is_hinted_on_macos_and_before_bun_1_4() {
+        let worker = Config::parse(
+            "[app]\nname = \"w\"\nentry = \"main.ts\"\nport = 3000\n[workers]\nmode = \"worker\"\ncount = 4\n",
+        )
+        .unwrap();
+        assert!(worker_mode_hint(&worker, true, Some((1, 4))).unwrap().contains("macOS"));
+        assert!(worker_mode_hint(&worker, false, Some((1, 3))).unwrap().contains("Bun 1.3"));
+        assert_eq!(worker_mode_hint(&worker, false, Some((1, 4))), None, "Bun 1.4 on Linux: level with processes");
+        assert_eq!(worker_mode_hint(&worker, false, None), None, "version unknown: nothing to say");
+        let process = Config::parse(&format!("{MIN}port = 3000\n")).unwrap();
+        assert_eq!(worker_mode_hint(&process, true, Some((1, 3))), None);
     }
 }

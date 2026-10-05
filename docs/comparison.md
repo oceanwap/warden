@@ -110,8 +110,11 @@ Warden is inspired by Watt's worker model, but it is a single binary of about 5 
 that embeds no JavaScript runtime. Watt runs the app inside its own runtime:
 in the benchmark that was about 4.5 times the memory of 4 processes for the
 Node app (PSS 478 vs 106 MB) and 2-3 % idle CPU. Warden's worker mode
-(experimental, Bun only) is the thread variant: about half the memory of
-process mode, but one crash takes all workers down. The measurements, for
+(Bun only, Linux) is the thread variant: on Bun 1.4 it serves NestJS as fast
+as processes with 14-22 % less memory, but one crash takes all workers down.
+Watt's threads, on the same Linux machine, served 26-51 % fewer requests
+than Warden's processes for a `node:http` app with 2-5 times the memory, and
+on macOS Watt runs one worker (it needs `SO_REUSEPORT` balancing). The measurements, for
 the same apps on the same machine, are in [`benchmarks.md`](benchmarks.md).
 
 Watt is an application server, not only a process manager: it composes several

@@ -604,8 +604,9 @@ Phase 1–2 (process mode) is the production path: spawn, readiness, restart wit
 backoff, drain, gated rollouts (reload / safe-reload), self-healing, CLI,
 metrics, health. Phase 3 (worker mode) ships as experimental: it depends on the
 shim to paper over F7/F9 and on the host process never crashing natively.
-[Benchmarks](benchmarks.md): worker mode halves memory with equal throughput,
-but costs fault isolation and (for NestJS) p99 latency.
+[Benchmarks](benchmarks.md): on Bun 1.4 worker mode serves NestJS as fast as
+processes with 14-22 % less memory (before 1.4 it was 20-50 % slower), but
+costs fault isolation, and on macOS the threads do not share the load.
 
 ## 6. Open questions / next steps
 
@@ -627,8 +628,9 @@ but costs fault isolation and (for NestJS) p99 latency.
 - NestJS inside Bun Workers works for a minimal app (F10); the real app's
   dependencies (Prisma/pg drivers, native modules) must be tested in Workers.
 - Worker-mode graduation: harden fault isolation and document when process
-  mode remains the production default (Benchmarks: worker mode halves memory
-  with equal throughput, but costs isolation and, for NestJS, p99).
+  mode remains the production default (Benchmarks: on Bun 1.4 worker mode is
+  level with processes for NestJS with 14-22 % less memory, but costs
+  isolation; slower before Bun 1.4, and no load sharing on macOS).
 - `surge = "all"` is blue/green for one batch, but a deploy is still not
   reversible once a batch has been promoted: keeping the old workers stopped
   but restartable (or SIGSTOPped) until the whole rollout passed would be.

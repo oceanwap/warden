@@ -454,7 +454,17 @@ async fn apps(args: &Args) -> Vec<Finding> {
             continue;
         }
         let hint = cfg.as_ref().and_then(|c| {
-            crate::config::more_workers_hint(c, c.workers.count, cfg!(target_os = "linux"), crate::config::cpu_count())
+            let bun = (c.workers.mode == crate::config::Mode::Worker)
+                .then(|| crate::config::runtime_version(&c.app.command))
+                .flatten();
+            crate::config::worker_mode_hint(c, cfg!(target_os = "macos"), bun).or_else(|| {
+                crate::config::more_workers_hint(
+                    c,
+                    c.workers.count,
+                    cfg!(target_os = "linux"),
+                    crate::config::cpu_count(),
+                )
+            })
         });
         if let Some(hint) = hint {
             v.push(workers_hint(&app.name, hint, app.config.as_deref()));
@@ -489,10 +499,17 @@ async fn apps(args: &Args) -> Vec<Finding> {
     v
 }
 
-/// Info, not a warning: one worker works, and may be what the app needs.
+/// Info, not a warning: the app works as it is (one worker may be what it needs; worker mode
+/// saves memory).
 fn workers_hint(name: &str, hint: String, config: Option<&Path>) -> Finding {
     let file = config.map_or_else(|| "its config".to_string(), |p| p.display().to_string());
-    let fix = format!("set `count = \"max\"` under [workers] in {file}, then `warden reload {name}`");
+    let fix = if hint.starts_with("worker mode") {
+        format!(
+            "set `mode = \"process\"` and `args = [<entry>]` in place of `entry` in {file}, then `warden reload {name}`"
+        )
+    } else {
+        format!("set `count = \"max\"` under [workers] in {file}, then `warden reload {name}`")
+    };
     f(Level::Info, &format!("app {name}"), hint, Some(&fix))
 }
 

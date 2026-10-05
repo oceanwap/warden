@@ -7,6 +7,11 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- Worker mode (Bun threads) warns at start, in `warden doctor` and in the GUI
+  where its threads cost speed: on macOS (the threads share the port, but one
+  gets most connections) and on Bun older than 1.4 (20-50 % slower than
+  processes for NestJS). On Bun 1.4 on Linux it serves as fast as processes
+  with 14-22 % less memory; docs/benchmarks.md has both runs.
 - Linux: `warden doctor` and the GUI (a quiet line on the app's page) say when
   an app runs 1 worker on a host with more cores, and that `count = "max"`
   under `[workers]` runs one per core. There the kernel spreads connections
