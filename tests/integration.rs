@@ -1542,6 +1542,14 @@ fn pm2_style_fleet_workflow() {
     assert_eq!(code, 2, "a deleted app is unknown");
 }
 
+/// Bun's (major, minor) version; (0, 0) if it cannot be read.
+fn bun_version() -> (u32, u32) {
+    let out = Command::new("bun").arg("--version").output().ok();
+    let v = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let mut n = v.split('.').map(|x| x.parse::<u32>().unwrap_or(0));
+    (n.next().unwrap_or(0), n.next().unwrap_or(0))
+}
+
 fn have_node() -> bool {
     Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success())
 }
@@ -1704,13 +1712,19 @@ fn handed_over_connections_reach_every_worker_and_survive_a_rolling_restart() {
         );
         let w = Warden::start_env(&name, port, &cfg, &[("WARDEN_HANDOFF", "1")]);
         w.wait_for("2 ready", T, ready(2));
-        assert!(w.log().contains("workers take connections from Warden"), "{runtime}: {}", w.log());
+        // Bun before 1.4 cannot take a handed-over socket: its workers listen
+        // on the port as without the handoff (the rest of the test holds).
+        let takes = runtime == "node" || bun_version() >= (1, 4);
+        assert_eq!(w.log().contains("workers take connections from Warden"), takes, "{runtime}: {}", w.log());
         let mut seen = HashSet::new();
         for _ in 0..40 {
             seen.insert(get(port, "/whoami").unwrap_or_else(|| panic!("{runtime}: request failed\n{}", w.log())));
         }
         let instances: HashSet<String> = seen.iter().map(|s| s.split(':').nth(1).unwrap().to_string()).collect();
-        assert_eq!(instances, HashSet::from(["0".to_string(), "1".to_string()]), "{runtime}: {seen:?}");
+        // Spread by the handoff, or by the kernel where it balances a shared port.
+        if takes || cfg!(target_os = "linux") {
+            assert_eq!(instances, HashSet::from(["0".to_string(), "1".to_string()]), "{runtime}: {seen:?}");
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));

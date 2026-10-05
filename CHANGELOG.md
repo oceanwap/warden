@@ -12,7 +12,7 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   port and hands each connection to the least busy worker, the way Node's
   cluster module does (the socket itself, over Node's IPC channel); the
   traffic then goes straight between client and worker. For `node:http`
-  apps under Node and Bun: about 3.3× the requests of one worker for a
+  apps under Node and Bun 1.4+: about 3.3× the requests of one worker for a
   1 ms-per-request app, p99 a third. Node apps can now run several workers
   on macOS at all, and reload without `EADDRINUSE`. `Bun.serve` apps are
   unchanged. On by default with more than one worker; `WARDEN_HANDOFF=0`

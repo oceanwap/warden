@@ -62,7 +62,10 @@ const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos
 // over Node's IPC channel (src/handoff.rs): where the kernel does not spread
 // a shared port (macOS) and the app has several workers. A node:http server
 // on the app's port then takes those connections instead of listening.
-const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function";
+// Bun takes a handed-over socket from 1.4.0 on (1.3.x: "TODO case
+// net.Socket", and the connection is lost): older ones listen as before.
+const bunTakesSockets = !isBun || (([maj, min]) => maj > 1 || (maj === 1 && min >= 4))(Bun.version.split(".").map(Number));
+const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function" && bunTakesSockets;
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);
