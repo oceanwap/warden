@@ -349,6 +349,11 @@ pub async fn resurrect_all(host: &Host, dir: Option<&Path>) -> Restart {
     restart_report(r, "Started the saved apps again.", &resurrect_by_hand(host))
 }
 
+/// `warden delete <app>`: stop it and move its config to `deleted/` in the config directory.
+pub async fn delete_app(host: &Host, app: &str, dir: Option<&Path>) -> Result<Output, String> {
+    run_aimed(host, &["delete".into(), app.into()], dir).await.map_err(|n| n.text)
+}
+
 // ------------------------------------------------------------ log in a terminal
 
 /// The shell command line that follows `app`'s log in a terminal: `warden logs <app>` (recent

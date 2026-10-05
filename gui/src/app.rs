@@ -221,6 +221,25 @@ pub enum Modal {
     Editor(Editor),
     /// Colours and mode.
     Settings,
+    Delete(DeleteForm),
+}
+
+/// Deleting an app: stop it and move its config to `deleted/` (`warden delete`), once its name
+/// is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteForm {
+    pub app: String,
+    pub typed: String,
+    pub running: bool,
+    /// What a failed `warden delete` said.
+    pub error: Option<String>,
+}
+
+impl DeleteForm {
+    /// The name was typed exactly, and nothing runs yet.
+    pub fn ready(&self) -> bool {
+        self.typed == self.app && !self.running
+    }
 }
 
 /// Settings' "Restart everything".
@@ -343,6 +362,11 @@ pub enum Message {
     LogsStderr(bool),
     LogsEvents(bool),
     LogsClear,
+    /// The Delete button: the dialog that asks for the app's name.
+    AskDelete(String),
+    DeleteTyped(String),
+    ConfirmDelete,
+    Deleted(Result<commands::Output, String>),
     /// The logs fill the window (true), or go back under the app (false).
     LogsExpand(bool),
     /// Follow this app's log in a terminal window (`warden logs <app>`).
@@ -820,6 +844,50 @@ impl Gui {
             Message::LogsStderr(b) => self.with_logs(|l| l.stderr = b),
             Message::LogsEvents(b) => self.with_logs(|l| l.events = b),
             Message::LogsClear => self.with_logs(LogPane::clear),
+            Message::AskDelete(app) => {
+                self.menu = None;
+                self.modal = Modal::Delete(DeleteForm { app, typed: String::new(), running: false, error: None });
+                Task::none()
+            }
+            Message::DeleteTyped(t) => {
+                if let Modal::Delete(d) = &mut self.modal
+                    && !d.running
+                {
+                    d.typed = t;
+                }
+                Task::none()
+            }
+            Message::ConfirmDelete => {
+                let Modal::Delete(d) = &mut self.modal else { return Task::none() };
+                if !d.ready() {
+                    return Task::none();
+                }
+                d.running = true;
+                d.error = None;
+                let (host, app, dir, tag) = (self.target.host.clone(), d.app.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::delete_app(&host, &app, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::Deleted(r))
+                })
+            }
+            Message::Deleted(r) => {
+                let Modal::Delete(d) = &mut self.modal else { return Task::none() };
+                d.running = false;
+                match r {
+                    Ok(out) if out.ok => {
+                        let app = d.app.clone();
+                        self.modal = Modal::None;
+                        self.toast(true, format!("{app} deleted; its config is in the deleted folder"))
+                    }
+                    Ok(out) => {
+                        d.error = Some(format!("{} (`{}`)", out.text(), out.command));
+                        Task::none()
+                    }
+                    Err(e) => {
+                        d.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
             Message::LogsExpand(on) => {
                 self.logs_expanded = on;
                 Task::none()
@@ -1110,7 +1178,8 @@ impl Gui {
             Message::CloseModal => {
                 // A running command keeps its dialog until it ends.
                 let busy = matches!(&self.modal, Modal::Add(a) if a.status == AddStatus::Running)
-                    || matches!(&self.modal, Modal::Editor(e) if e.status == EditorStatus::Saving);
+                    || matches!(&self.modal, Modal::Editor(e) if e.status == EditorStatus::Saving)
+                    || matches!(&self.modal, Modal::Delete(d) if d.running);
                 if !busy {
                     self.modal = Modal::None;
                 }
@@ -1763,6 +1832,42 @@ mod tests {
         let mut g = connected();
         g.target.endpoint = Endpoint::Socket("/tmp/wg-test-run/wardend.sock".into());
         g
+    }
+
+    #[test]
+    fn delete_runs_only_once_the_apps_name_is_typed() {
+        let mut g = connected_to_a_runtime_dir();
+        let _ = g.update(Message::AskDelete("api".into()));
+        let form = |g: &Gui| match &g.modal {
+            Modal::Delete(d) => d.clone(),
+            _ => panic!("no delete dialog"),
+        };
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "nothing typed: nothing runs");
+        let _ = g.update(Message::DeleteTyped("ap".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "a part of the name is not enough");
+        let _ = g.update(Message::DeleteTyped("API".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "exactly the name");
+        let _ = g.update(Message::DeleteTyped("api".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(form(&g).running);
+        let _ = g.update(Message::CloseModal);
+        assert!(matches!(g.modal, Modal::Delete(_)), "kept while it runs");
+        let _ = g.update(Message::Deleted(Err("no app named api".into())));
+        assert_eq!(form(&g).error.as_deref(), Some("no app named api"));
+        let ok = commands::Output {
+            command: "warden delete api".into(),
+            ok: true,
+            code: Some(0),
+            stdout: "api: stopped".into(),
+            stderr: String::new(),
+        };
+        let _ = g.update(Message::ConfirmDelete);
+        let _ = g.update(Message::Deleted(Ok(ok)));
+        assert!(matches!(g.modal, Modal::None));
+        assert!(g.toasts.iter().any(|t| t.text.contains("api deleted")));
     }
 
     #[test]

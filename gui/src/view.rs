@@ -4,8 +4,8 @@
 //! toasts on top. Long lists (events, logs) draw only the rows in view.
 
 use crate::app::{
-    Act, AddStatus, Conn, Editor, EditorStatus, FEED_ID, Gui, LOGS_ID, MachineForm, MenuKind, Message, Modal, Pending,
-    Tab,
+    Act, AddStatus, Conn, DeleteForm, Editor, EditorStatus, FEED_ID, Gui, LOGS_ID, MachineForm, MenuKind, Message,
+    Modal, Pending, Tab,
 };
 use crate::charts::{Chart, Hue, Sparkline, Unit};
 use crate::cli_install::{Status, Work};
@@ -88,6 +88,7 @@ pub fn view(g: &Gui) -> Element<'_, Message> {
         Modal::Add(a) => layers.push(overlay(add_dialog(g, a), None)),
         Modal::Editor(e) => layers.push(overlay(editor_dialog(e), None)),
         Modal::Settings => layers.push(overlay(settings_dialog(g), Some(Message::CloseModal))),
+        Modal::Delete(d) => layers.push(overlay(delete_dialog(d), Some(Message::CloseModal))),
     }
     if let Some(p) = &g.confirm {
         layers.push(overlay(confirm_dialog(p), Some(Message::Cancelled)));
@@ -1100,6 +1101,15 @@ fn actions<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             "Clear crash counters and the failed state",
         ));
     }
+    if g.connected() {
+        r = r.push(
+            button(container(labeled(Icon::Trash, "Delete")).center_y(32))
+                .height(32)
+                .padding([0, 12])
+                .style(look::quiet_tone(Tone::Bad))
+                .on_press(Message::AskDelete(name.clone())),
+        );
+    }
     row![r, space::horizontal(), scale].spacing(12).align_y(Center).into()
 }
 
@@ -1747,6 +1757,48 @@ fn act_icon(a: Act) -> Icon {
         Act::Start => Icon::Play,
         Act::Reset => Icon::Reset,
     }
+}
+
+/// Delete: what it does, and the app's name to type before the button works.
+fn delete_dialog(d: &DeleteForm) -> Element<'_, Message> {
+    let mut c = column![
+        row![icon(Icon::Trash).size(20).style(Tone::Bad.style()), heading(format!("Delete {}", d.app)).size(16)]
+            .spacing(10)
+            .align_y(Center),
+        text(
+            "Stops every worker and the supervisor, and moves the app's config to the deleted folder in the config \
+             directory, so Warden no longer runs or lists it. Its logs stay. Getting it back means moving the config \
+             back by hand."
+        )
+        .size(14),
+        text(format!("Type {} to confirm.", d.app)).size(13).font(MEDIUM),
+        text_input(&d.app, &d.typed)
+            .on_input_maybe((!d.running).then_some(Message::DeleteTyped))
+            .on_submit_maybe(d.ready().then_some(Message::ConfirmDelete))
+            .size(14)
+            .padding([7, 10])
+            .style(look::input),
+    ]
+    .spacing(14);
+    if let Some(e) = &d.error {
+        c = c.push(said(Icon::AlertCircle, Tone::Bad, format!("Not deleted: {e}")));
+    }
+    c.push(
+        row![
+            space::horizontal(),
+            button(text("Cancel").size(13).font(MEDIUM))
+                .padding([6, 14])
+                .style(look::quiet)
+                .on_press_maybe((!d.running).then_some(Message::CloseModal)),
+            button(labeled(Icon::Trash, if d.running { "Deleting\u{2026}" } else { "Delete" }))
+                .padding([6, 14])
+                .style(look::solid(Tone::Bad))
+                .on_press_maybe(d.ready().then_some(Message::ConfirmDelete)),
+        ]
+        .spacing(10),
+    )
+    .width(500)
+    .into()
 }
 
 fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
