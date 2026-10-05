@@ -257,6 +257,7 @@ pub(crate) mod tests {
             watching: false,
             requests: None,
             ports: vec![],
+            hint: None,
         }
     }
 

@@ -17,6 +17,12 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   on macOS at all, and reload without `EADDRINUSE`. `Bun.serve` apps are
   unchanged. On by default with more than one worker; `WARDEN_HANDOFF=0`
   turns it off.
+- Linux: `warden doctor` and the GUI (a quiet line on the app's page) say when
+  an app runs 1 worker on a host with more cores, and that `count = "max"`
+  under `[workers]` runs one per core. There the kernel spreads connections
+  over the workers sharing a port, so under load the other cores sit idle
+  with one. Only a hint: an app that keeps state in memory needs its one
+  worker. Supervisors send it as `status.hint`.
 
 ### Fixed
 

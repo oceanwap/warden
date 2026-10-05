@@ -531,6 +531,27 @@ fn the_project_folder_is_shown_under_its_name() {
     assert!(ui.find("/srv/web/current").is_err(), "nothing to show without it");
 }
 
+/// A supervisor's hint (one worker on a Linux host with more cores) is one quiet line on the
+/// app's screen, and not there without one.
+#[test]
+fn a_hint_to_run_more_workers_is_shown_on_the_app() {
+    let mut g = connected();
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    assert!(!text_has(&mut ui, "1 worker on a host with 8 cores"), "no hint, no line");
+    drop(ui);
+
+    let mut g = connected();
+    let mut st = status("web", vec![worker(1, "RUNNING", Some(5101), 64, 3.0, 0, None)], 1, json!(null));
+    st["hint"] = json!("1 worker on a host with 8 cores");
+    let ev: Event = serde_json::from_value(json!({"type": "status", "app": "web", "status": st})).unwrap();
+    let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
+    let _ = g.update(Message::Select("web".into()));
+    let mut ui = sim(&g);
+    assert!(text_has(&mut ui, "1 worker on a host with 8 cores"), "the hint under the name");
+    save(&mut ui, "app-with-a-workers-hint");
+}
+
 fn text_has(ui: &mut Simulator<'_, Message>, needle: &str) -> bool {
     ui.find(needle).is_ok()
 }

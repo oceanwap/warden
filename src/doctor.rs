@@ -444,11 +444,21 @@ async fn apps(args: &Args) -> Vec<Finding> {
             continue;
         }
         let running = std::os::unix::net::UnixStream::connect(&app.socket).is_ok();
+        let cfg = app.config.as_deref().and_then(|p| crate::config::Config::load(p).ok());
         if running {
             v.push(f(Level::Ok, &check, "running", None));
+            // Its supervisor knows the workers it runs now (after `warden scale`).
+            if let Some(hint) = fleet::status_of(app).await.ok().and_then(|s| s.hint) {
+                v.push(workers_hint(&app.name, hint, app.config.as_deref()));
+            }
             continue;
         }
-        let cfg = app.config.as_deref().and_then(|p| crate::config::Config::load(p).ok());
+        let hint = cfg.as_ref().and_then(|c| {
+            crate::config::more_workers_hint(c, c.workers.count, cfg!(target_os = "linux"), crate::config::cpu_count())
+        });
+        if let Some(hint) = hint {
+            v.push(workers_hint(&app.name, hint, app.config.as_deref()));
+        }
         // Not running: will its port be free when it starts?
         if let Some(port) = cfg.as_ref().and_then(|c| c.app.port) {
             let host: std::net::IpAddr = cfg
@@ -477,6 +487,13 @@ async fn apps(args: &Args) -> Vec<Finding> {
         ));
     }
     v
+}
+
+/// Info, not a warning: one worker works, and may be what the app needs.
+fn workers_hint(name: &str, hint: String, config: Option<&Path>) -> Finding {
+    let file = config.map_or_else(|| "its config".to_string(), |p| p.display().to_string());
+    let fix = format!("set `count = \"max\"` under [workers] in {file}, then `warden reload {name}`");
+    f(Level::Info, &format!("app {name}"), hint, Some(&fix))
 }
 
 /// wardend is always on: running, or the reason it is not.
