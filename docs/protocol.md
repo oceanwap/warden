@@ -162,6 +162,13 @@ the `config` request's answer is what the config asks for. The settings
 (`paths`, `ignore`, `debounce_ms`, `interval_ms`, `max_files`) are there too,
 under `config.watch`.
 
+`status.hint` (a string, absent when there is none and from an older Warden):
+a way to make the app faster that the supervisor sees, for `warden doctor` and
+the GUI. Today one: the app runs 1 worker (counting `warden scale`) on a Linux
+host with more cores, with a port the workers share, where `count = "max"`
+lets the kernel spread connections over one worker per core. Not a problem:
+an app that keeps state in memory needs its one worker.
+
 `status.workers[].listening` (an array, absent when empty; an addition older
 clients ignore): the sockets the worker's process listens on, and the
 processes it started (up to 64, 4 levels down: a wrapper such as `npm run
