@@ -1845,7 +1845,14 @@ mod tests {
                 libc::setsockopt(fd, libc::SOL_SOCKET, opt, &small as *const _ as *const libc::c_void, 4);
             }
         }
+        // The reader starts only once a send has found the buffers full: a reader that keeps up
+        // (a fast macOS runner) would otherwise leave nothing to wait for.
+        let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = full.clone();
         let reader = std::thread::spawn(move || {
+            while !started.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let mut got = Vec::new();
             let mut buf = [0u8; 65536];
             loop {
@@ -1865,6 +1872,7 @@ mod tests {
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     would_block += 1;
+                    full.store(true, std::sync::atomic::Ordering::Release);
                     std::thread::yield_now();
                 }
                 Err(e) => panic!("{e}"),

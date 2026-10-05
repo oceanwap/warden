@@ -61,11 +61,13 @@ pub enum Icon {
     Monitor,
     Save,
     Trash,
+    Maximize,
+    Minimize,
 }
 
 impl Icon {
     /// Every icon, in the order of the list in build.py (a test draws each).
-    pub const ALL: [Icon; 57] = [
+    pub const ALL: [Icon; 59] = [
         Icon::ChevronDown,
         Icon::ChevronRight,
         Icon::ChevronUp,
@@ -123,6 +125,8 @@ impl Icon {
         Icon::Monitor,
         Icon::Save,
         Icon::Trash,
+        Icon::Maximize,
+        Icon::Minimize,
     ];
 
     pub const fn glyph(self) -> char {
@@ -184,6 +188,8 @@ impl Icon {
             Icon::Monitor => '\u{e11d}',      // monitor
             Icon::Save => '\u{e14d}',         // save
             Icon::Trash => '\u{e18e}',        // trash-2
+            Icon::Maximize => '\u{e113}',     // maximize-2
+            Icon::Minimize => '\u{e11b}',     // minimize-2
         }
     }
 }

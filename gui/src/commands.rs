@@ -343,10 +343,104 @@ pub async fn restart_everything(host: &Host, dir: Option<&Path>) -> Restart {
     restart_report(r, "Restarted every supervisor and wardend from the installed warden.", &resurrect_by_hand(host))
 }
 
+/// `warden upgrade --yes`: the newest release installed on `host`, everything restarted onto it.
+pub async fn upgrade(host: &Host, dir: Option<&Path>) -> Result<Output, String> {
+    run_aimed(host, &["upgrade".into(), "--yes".into()], dir).await.map_err(|n| n.text)
+}
+
 /// `warden resurrect`: start what the last `warden save` (the first step of a restart) remembered.
 pub async fn resurrect_all(host: &Host, dir: Option<&Path>) -> Restart {
     let r = run_aimed(host, &["resurrect".into()], dir).await;
     restart_report(r, "Started the saved apps again.", &resurrect_by_hand(host))
+}
+
+/// `warden delete <app>`: stop it and move its config to `deleted/` in the config directory.
+pub async fn delete_app(host: &Host, app: &str, dir: Option<&Path>) -> Result<Output, String> {
+    run_aimed(host, &["delete".into(), app.into()], dir).await.map_err(|n| n.text)
+}
+
+// ------------------------------------------------------------ log in a terminal
+
+/// The shell command line that follows `app`'s log in a terminal: `warden logs <app>` (recent
+/// lines, then follow), aimed like a restart at the wardend in `dir`; over ssh with a terminal
+/// (`-t`), so Ctrl-C reaches the remote `warden`.
+pub fn log_tail_line(host: &Host, app: &str, dir: Option<&Path>) -> Result<String, String> {
+    let (prog, mut argv, env) = aimed(host, &["logs".into(), app.into()], dir)?;
+    if let (Host::Ssh { .. }, Some(first)) = (host, argv.first_mut()) {
+        *first = "-t".into();
+    }
+    let mut line: String = env.iter().map(|(k, v)| format!("{k}={} ", ssh::shell_quote(v))).collect();
+    let mut shown = vec![prog.display().to_string()];
+    shown.extend(argv);
+    line.push_str(&ssh::shell_join(&shown));
+    Ok(line)
+}
+
+/// The program and arguments that open a terminal window running `line`: Terminal on macOS;
+/// elsewhere `$TERMINAL`, then the first of the usual terminals on PATH.
+fn terminal_command(line: &str, found: impl Fn(&str) -> bool) -> Result<(String, Vec<String>), String> {
+    if cfg!(target_os = "macos") {
+        let quoted = line.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = ["tell application \"Terminal\"", "activate", &format!("do script \"{quoted}\""), "end tell"];
+        return Ok((
+            "/usr/bin/osascript".into(),
+            script.iter().flat_map(|l| ["-e".to_string(), l.to_string()]).collect(),
+        ));
+    }
+    let sh = ["sh".to_string(), "-c".into(), line.to_string()];
+    let env_term = std::env::var("TERMINAL").ok().filter(|t| !t.is_empty());
+    let (prog, mut args): (String, Vec<String>) = match env_term {
+        Some(t) => (t, vec!["-e".into()]),
+        None => {
+            let choices = [
+                ("x-terminal-emulator", "-e"),
+                ("gnome-terminal", "--"),
+                ("ptyxis", "--"),
+                ("konsole", "-e"),
+                ("xfce4-terminal", "-x"),
+                ("kitty", "--"),
+                ("alacritty", "-e"),
+                ("foot", "--"),
+                ("xterm", "-e"),
+            ];
+            let (p, flag) = choices
+                .into_iter()
+                .find(|(p, _)| found(p))
+                .ok_or("no terminal found (set $TERMINAL to one that takes `-e <command>`)")?;
+            (p.to_string(), vec![flag.to_string()])
+        }
+    };
+    args.extend(sh);
+    Ok((prog, args))
+}
+
+/// Open a terminal window that follows `app`'s log.
+pub async fn open_log_terminal(host: &Host, app: &str, dir: Option<&Path>) -> Result<(), String> {
+    let line = log_tail_line(host, app, dir)?;
+    let on_path = |p: &str| {
+        std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|d| is_executable(&d.join(p))))
+    };
+    let (prog, args) = terminal_command(&line, on_path)?;
+    // The terminal outlives the window's wait: it is not waited for beyond starting.
+    let mut child = tokio::process::Command::new(&prog)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{prog}: {e}"))?;
+    // osascript says why it failed (Terminal not allowed to be controlled, say) and exits.
+    if cfg!(target_os = "macos") {
+        let out = child.wait_with_output().await.map_err(|e| format!("{prog}: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+        }
+    } else {
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+    }
+    Ok(())
 }
 
 // ----------------------------------------------------------------- add app
@@ -897,6 +991,22 @@ mod tests {
             bin
         })
         .clone()
+    }
+
+    #[test]
+    fn a_log_tail_runs_warden_logs_aimed_at_the_shown_wardend() {
+        let ssh = Host::Ssh { dest: "me@box".into(), warden: "~/.local/bin/warden".into() };
+        let line = log_tail_line(&ssh, "api", Some(Path::new("/run/warden"))).unwrap();
+        assert!(line.starts_with("ssh -t "), "{line}");
+        assert!(line.contains("WARDEN_RUNTIME_DIR=/run/warden") && line.contains("logs api"), "{line}");
+        if !cfg!(target_os = "macos") {
+            let (prog, args) = terminal_command("warden logs api", |p| p == "konsole").unwrap();
+            assert_eq!(
+                (prog.as_str(), args),
+                ("konsole", vec!["-e".into(), "sh".into(), "-c".into(), "warden logs api".into()])
+            );
+            assert!(std::env::var_os("TERMINAL").is_some() || terminal_command("x", |_| false).is_err());
+        }
     }
 
     #[test]

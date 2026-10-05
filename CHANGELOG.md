@@ -3,6 +3,48 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- `warden update`, `start` and `resurrect` no longer hang on a launchd job an
+  older `warden startup` wrote (a warden that is gone, or the old `daemon`
+  command): warden says so, names `warden startup` to rewrite it, and starts
+  wardend itself. `launchctl` and `systemctl` calls stop after 20 s.
+- `warden update` run while apps are down keeps them in the saved list and
+  starts them again; `warden save` with nothing running keeps the saved list.
+  Every save keeps the list it replaces in `dump.json.bak`.
+- A wardend that finds another one running exits 0, so launchd no longer
+  restarts it every 10 s beside one the GUI started.
+- A supervisor started before `warden startup` no longer brings a killed
+  wardend back itself once launchd or systemd runs it, so their restart is the
+  one that runs.
+- GUI: the top bar's CPU, memory and load readings keep their width, so the
+  bar no longer shifts.
+
+### Added
+
+- GUI: an outdated supervisor's banner restarts everything itself (no command
+  to copy).
+- GUI logs: long lines wrap; a full-screen button; "Open in Terminal" follows
+  the log in a terminal window (`warden logs <app>`, over `ssh -t` for a
+  remote machine).
+- GUI: Delete, beside Start and Reset, after typing the app's name.
+- `warden upgrade`: installs the latest release (or `--version`) over this
+  `warden` and its GUI, then restarts every supervisor and wardend onto it; no
+  other step. `--check` (and `--json`) only says whether one is out.
+- GUI: a new release shows a banner and, once per release, a desktop
+  notification; Update installs it, restarts everything and reopens the window
+  on the new version. Settings > Updates checks on demand and has an opt-in
+  "Install updates automatically" switch.
+
+### Changed
+
+- The logo is the app icon's W shield everywhere, in green on a neutral dark
+  plate: the macOS icon (now edge to edge, no frame in the Dock), the PNGs, the
+  window's header, and the README images.
+- GUI: the dark background is a more neutral gray, with less green.
+
 ## [0.1.1] — 2026-10-04
 
 ### Added

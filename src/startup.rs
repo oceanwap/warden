@@ -232,18 +232,45 @@ pub(crate) fn launchd_plist(label: &str, exe: &str, log: &Path, env: &[(String, 
 
 // ------------------------------------------------------------------ helpers
 
-/// Run a program; the last line of its error output when it fails.
+/// Run a program; the last line of its error output when it fails. Stopped after
+/// [`RUN_LIMIT`]: a `launchctl kickstart` that never returns must not hang `warden update`.
 fn run(bin: &Path, args: &[&str]) -> Result<(), String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
     let shown = format!("{} {}", bin.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(), args.join(" "));
-    let out = std::process::Command::new(bin).args(args).output().map_err(|e| format!("`{shown}`: {e}"))?;
-    if out.status.success() {
+    let mut child = std::process::Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("`{shown}`: {e}"))?;
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if t0.elapsed() < RUN_LIMIT => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("`{shown}` did not finish within {} s; it was stopped", RUN_LIMIT.as_secs()));
+            }
+            Err(e) => return Err(format!("`{shown}`: {e}")),
+        }
+    };
+    if status.success() {
         return Ok(());
     }
-    let err = String::from_utf8_lossy(&out.stderr);
+    // ponytail: stderr is read after the exit; a program that fills the pipe (64 KiB) first would
+    // be stopped at the limit instead. launchctl and systemctl say a line or two.
+    let mut err = String::new();
+    let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut err));
     let why =
-        err.trim().lines().last().filter(|l| !l.is_empty()).map(String::from).unwrap_or_else(|| out.status.to_string());
+        err.trim().lines().last().filter(|l| !l.is_empty()).map(String::from).unwrap_or_else(|| status.to_string());
     Err(format!("`{shown}` failed: {why}"))
 }
+
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Write a file unless it already has `text`; say which. `fix`: what to do
 /// when it cannot be written.
@@ -376,9 +403,48 @@ pub(crate) fn installed() -> Option<String> {
 /// Does a service manager run wardend here (so `warden start` leaves it be)?
 pub(crate) fn wardend_managed() -> bool {
     if launchd_host() {
-        return [false, true].into_iter().any(|s| plist_path(s).exists());
+        return [false, true].into_iter().any(|s| plist_path(s).exists() && launchd_job_problem(s).is_none());
     }
     fleet::systemctl_bin().is_some() && [Scope::System, Scope::User].into_iter().any(|s| s.has_unit("wardend.service"))
+}
+
+/// The program and arguments of a launchd job, as its plist lists them; `None` when they
+/// cannot be read.
+fn plist_program(text: &str) -> Option<Vec<String>> {
+    let rest = &text[text.find("<key>ProgramArguments</key>")?..];
+    let array = &rest[..rest.find("</array>")?];
+    let unxml = |s: &str| {
+        s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+    };
+    Some(array.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(unxml).collect())
+}
+
+/// Why the launchd job for wardend cannot start it: one written by an older `warden startup`
+/// can name a warden that is gone (an upgrade moved it) or a command it no longer has (it
+/// was `daemon`). launchd would retry it forever and wardend would never answer, so such a
+/// job is not counted as wardend's manager. `None`: it runs `<warden> wardend`, or its
+/// program cannot be read (then it is trusted, as before).
+pub(crate) fn launchd_job_problem(system: bool) -> Option<String> {
+    if !launchd_host() {
+        return None;
+    }
+    let path = plist_path(system);
+    let problem = plist_problem(&std::fs::read_to_string(&path).ok()?)?;
+    Some(format!("the launchd job {} {problem}; `warden startup` writes it again", path.display()))
+}
+
+/// What is wrong with the program a launchd job's plist runs, if anything ([`launchd_job_problem`]).
+fn plist_problem(plist: &str) -> Option<String> {
+    let argv = plist_program(plist)?;
+    let shown = argv.join(" ");
+    match argv.first() {
+        None => Some("runs nothing".into()),
+        Some(p) if !Path::new(p).is_file() => Some(format!("runs `{shown}`, but {p} does not exist")),
+        Some(_) if argv.get(1).map(String::as_str) != Some("wardend") => {
+            Some(format!("runs `{shown}`, which is not `warden wardend` (an older warden's job)"))
+        }
+        Some(_) => None,
+    }
 }
 
 /// Start wardend through the service manager that owns it (launchd: `kickstart`, or load
@@ -392,7 +458,7 @@ pub(crate) fn start_wardend_managed() -> Result<String, String> {
         let mut last = "no launchd job for wardend".to_string();
         for system in [false, true] {
             let path = plist_path(system);
-            if !path.exists() {
+            if !path.exists() || launchd_job_problem(system).is_some() {
                 continue;
             }
             let (domain, target) = (launchd_domain(system), format!("{}/{LAUNCHD_LABEL}", launchd_domain(system)));
@@ -870,6 +936,16 @@ mod tests {
     }
 
     #[test]
+    fn a_launchd_jobs_program_is_read_back_from_its_plist() {
+        let p = launchd_plist(LAUNCHD_LABEL, "/Users/me/a & b/warden", Path::new("/tmp/w.log"), &[]);
+        assert_eq!(plist_program(&p).unwrap(), ["/Users/me/a & b/warden", "wardend", "--resurrect"]);
+        let old = "<key>ProgramArguments</key>\n<array>\n<string>/usr/local/bin/warden</string>\n\
+                   <string>daemon</string>\n<string>--resurrect</string>\n</array>";
+        assert_eq!(plist_program(old).unwrap(), ["/usr/local/bin/warden", "daemon", "--resurrect"]);
+        assert_eq!(plist_program("<plist/>"), None);
+    }
+
+    #[test]
     fn unit_values_are_quoted() {
         assert_eq!(unit_quote(r#"/a b/"c"\d%i"#), r#""/a b/\"c\"\\d%%i""#);
         let u = warden_unit(Scope::System, "/x y/warden", Path::new("/etc/my warden"), &[]);
@@ -884,6 +960,26 @@ mod tests {
             vec![("PATH".into(), "/bin".into()), ("WARDEN_RUNTIME_DIR".into(), "/r".into())]
         );
         assert_eq!(carried_env(&get, false), vec![("WARDEN_RUNTIME_DIR".to_string(), "/r".to_string())]);
+    }
+
+    #[test]
+    fn a_launchd_job_for_a_missing_or_older_warden_is_found() {
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let log = Path::new("/tmp/wardend.log");
+        assert_eq!(plist_problem(&launchd_plist(LAUNCHD_LABEL, &exe, log, &[])), None, "what `warden startup` writes");
+        let gone = launchd_plist(LAUNCHD_LABEL, "/usr/local/bin/warden-gone", log, &[]);
+        assert_eq!(
+            plist_problem(&gone).as_deref(),
+            Some(
+                "runs `/usr/local/bin/warden-gone wardend --resurrect`, but /usr/local/bin/warden-gone does not exist"
+            )
+        );
+        let older =
+            launchd_plist(LAUNCHD_LABEL, &exe, log, &[]).replace("<string>wardend</string>", "<string>daemon</string>");
+        assert_eq!(
+            plist_problem(&older),
+            Some(format!("runs `{exe} daemon --resurrect`, which is not `warden wardend` (an older warden's job)"))
+        );
     }
 
     #[test]

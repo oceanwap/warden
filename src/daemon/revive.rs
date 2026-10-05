@@ -59,16 +59,10 @@ fn every() -> Duration {
         .map_or(EVERY, Duration::from_millis)
 }
 
-/// Should this supervisor watch wardend at all? Not with `WARDEN_NO_DAEMON=1`, and not when
-/// launchd or systemd runs wardend: they restart it, and a second one started by hand would
-/// only fight theirs for the socket.
-fn watching() -> bool {
-    !client::disabled() && !crate::startup::wardend_managed()
-}
-
-/// Every few seconds: if wardend died, start it again. Runs for the supervisor's whole life.
+/// Every few seconds: if wardend died, start it again. Runs for the supervisor's whole life,
+/// except with `WARDEN_NO_DAEMON=1`.
 pub(crate) async fn watch() {
-    if !watching() {
+    if client::disabled() {
         return;
     }
     let every = every();
@@ -77,7 +71,10 @@ pub(crate) async fn watch() {
     loop {
         // Offset by pid, so the supervisors of a host do not all look at the same moment.
         tokio::time::sleep(wait + Duration::from_millis(u64::from(std::process::id() % 500))).await;
-        if probe(&socket_path()).await != Probe::Died {
+        // Not when launchd or systemd runs wardend: they restart it, and one started here would
+        // win the race and leave theirs stopped. Asked each time, as `warden startup` and
+        // `unstartup` can come after this supervisor started.
+        if probe(&socket_path()).await != Probe::Died || crate::startup::wardend_managed() {
             failures = 0;
             wait = every;
             continue;

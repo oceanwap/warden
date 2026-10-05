@@ -438,6 +438,11 @@ fn reachable(app: &App) -> bool {
     std::os::unix::net::UnixStream::connect(&app.socket).is_ok()
 }
 
+/// Some app's supervisor answers.
+pub(crate) fn any_reachable(args: &Args) -> bool {
+    context(args).apps.iter().any(reachable)
+}
+
 /// Status of every app, queried in parallel.
 pub async fn statuses(apps: &[App]) -> Vec<(App, Result<Status, String>)> {
     let mut set = tokio::task::JoinSet::new();
@@ -2426,6 +2431,23 @@ pub fn saved_state(name: &str, cfg: Option<&Path>) -> Option<Saved> {
 }
 
 pub async fn save(args: &Args) -> i32 {
+    save_with(args, false).await
+}
+
+/// The saved apps not in `now` whose config is still there: `warden update` keeps them, so an
+/// update run while some (or all) apps are down does not forget them.
+fn not_running_but_saved(old: &[Saved], now: &[Saved]) -> Vec<Saved> {
+    old.iter().filter(|o| o.config.is_file() && !now.iter().any(|n| n.name == o.name)).cloned().collect()
+}
+
+/// `warden save`; `keep`: also keep what was saved before and is not running now (`warden update`).
+/// The list it replaces, when it had apps (or could not be read), is kept as dump.json.bak.
+async fn save_with(args: &Args, keep: bool) -> i32 {
+    // A file that cannot be read as a list is backed up too: it may still hold one.
+    let (old, unreadable) = match read_dump() {
+        Ok(d) => (d.map(|d| d.apps).unwrap_or_default(), false),
+        Err(_) => (Vec::new(), dump_path().exists()),
+    };
     let ctx = context(args);
     let all = statuses(&ctx.apps).await;
     let mut saved = Vec::new();
@@ -2438,7 +2460,34 @@ pub async fn save(args: &Args) -> i32 {
         let cfg = std::fs::canonicalize(&cfg).unwrap_or(cfg);
         saved.push(Saved { name: app.name.clone(), config: cfg, workers: st.workers_configured, stopped: st.stopped });
     }
-    let dump = Dump { version: 1, saved_at: crate::logging::timestamp_now(), apps: saved.clone() };
+    // `warden save` with nothing running (a reboot without `warden startup`, a `kill`, an update
+    // that stopped halfway): an empty save would forget every app saved before, so the saved
+    // list stays, as `pm2 save` does. `warden resurrect` starts it; removing the file forgets it.
+    if !keep && saved.is_empty() && !old.is_empty() {
+        println!(
+            "no app is running, so nothing was saved: {} keeps the {} app(s) saved before ({}). `warden resurrect` \
+             starts them; to forget them, remove that file",
+            dump_path().display(),
+            old.len(),
+            old.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+        );
+        return 0;
+    }
+    let kept = if keep { not_running_but_saved(&old, &saved) } else { Vec::new() };
+    let dump = Dump {
+        version: 1,
+        saved_at: crate::logging::timestamp_now(),
+        apps: saved.iter().chain(&kept).cloned().collect(),
+    };
+    if !old.is_empty() || unreadable {
+        let bak = dump_path().with_extension("json.bak");
+        // A copy keeps dump.json's own mode (0600).
+        if let Err(e) = std::fs::copy(dump_path(), &bak) {
+            eprintln!("warden: could not keep the previous list as {} ({e}); nothing was saved", bak.display());
+            return 1;
+        }
+        println!("the previous list is kept in {}", bak.display());
+    }
     let text = serde_json::to_string_pretty(&dump).unwrap_or_default();
     if let Err(e) = write_private(&dump_path(), &text, 0o600) {
         eprintln!("warden: {e}");
@@ -2455,7 +2504,10 @@ pub async fn save(args: &Args) -> i32 {
             None => println!("{}: saved ({} workers{})", s.name, s.workers, stopped_note(s)),
         }
     }
-    println!("saved {} app(s) to {}", saved.len(), dump_path().display());
+    for k in &kept {
+        println!("{}: not running; kept in the saved list, so it starts again", k.name);
+    }
+    println!("saved {} app(s) to {}", dump.apps.len(), dump_path().display());
     if !saved.is_empty() && crate::startup::installed().is_none() {
         println!(
             "nothing starts them after a reboot yet: `warden startup` sets that up (systemd or launchd), or run \
@@ -2497,7 +2549,7 @@ pub async fn update(args: &Args) -> i32 {
         }
     }
     println!("update: saving what runs");
-    let code = save(args).await;
+    let code = save_with(args, true).await;
     if code != 0 {
         eprintln!("warden: the save failed, so nothing was stopped");
         return code;
@@ -2586,6 +2638,32 @@ pub async fn top(args: &Args) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_keeps_saved_apps_that_are_not_running() {
+        let dir = std::env::temp_dir().join(format!("warden-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = |n: &str| {
+            let p = dir.join(format!("{n}.toml"));
+            std::fs::write(&p, "").unwrap();
+            p
+        };
+        let s = |n: &str, config: PathBuf| Saved { name: n.into(), config, workers: 1, stopped: false };
+        let old = vec![s("api", cfg("api")), s("web", cfg("web")), s("gone", dir.join("gone.toml"))];
+        let names = |v: Vec<Saved>| v.into_iter().map(|s| s.name).collect::<Vec<_>>();
+        assert_eq!(
+            names(not_running_but_saved(&old, &[])),
+            ["api", "web"],
+            "nothing runs: all kept but a deleted config"
+        );
+        assert_eq!(
+            names(not_running_but_saved(&old, &[s("api", cfg("api"))])),
+            ["web"],
+            "the running one is saved as it is now"
+        );
+        assert!(not_running_but_saved(&[], &[]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn app(name: &str, ns: &str) -> App {
         App {

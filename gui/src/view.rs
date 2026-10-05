@@ -4,8 +4,8 @@
 //! toasts on top. Long lists (events, logs) draw only the rows in view.
 
 use crate::app::{
-    Act, AddStatus, Conn, Editor, EditorStatus, FEED_ID, Gui, LOGS_ID, MachineForm, MenuKind, Message, Modal, Pending,
-    Tab,
+    Act, AddStatus, Conn, DeleteForm, Editor, EditorStatus, FEED_ID, Gui, LOGS_ID, MachineForm, MenuKind, Message,
+    Modal, Pending, Tab,
 };
 use crate::charts::{Chart, Hue, Sparkline, Unit};
 use crate::cli_install::{Status, Work};
@@ -19,6 +19,7 @@ use crate::look::{
     state_pill, tile, tip,
 };
 use crate::model::App;
+use crate::release::Release;
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
     Column, Id, Row, button, canvas, center, checkbox, column, container, mouse_area, opaque, progress_bar, responsive,
@@ -59,6 +60,11 @@ const SETTINGS_FRAME_H: f32 = 190.0;
 const SETTINGS_MIN_H: f32 = 140.0;
 /// The "older supervisor" banner: a sentence and the command under it.
 const OUTDATED_H: f32 = 74.0;
+/// The top bar's readings at 13 px, wide enough for `100.0%`, `999.99 GB / 999.99 GB` and
+/// `99.99 99.99 99.99`.
+const CPU_VALUE_W: f32 = 50.0;
+const MEM_VALUE_W: f32 = 150.0;
+const LOAD_VALUE_W: f32 = 118.0;
 const IDLE_H: f32 = 92.0;
 const PORTS_H: f32 = 24.0;
 const ACTIONS_H: f32 = 32.0;
@@ -75,6 +81,9 @@ pub fn view(g: &Gui) -> Element<'_, Message> {
     if g.cli.banner(g.saved.cli_banner_dismissed) {
         main = main.push(cli_banner(g));
     }
+    if release_banner_shown(g) {
+        main = main.push(release_banner(g));
+    }
     let main = main.push(body(g));
     let mut layers: Vec<Element<'_, Message>> = vec![main.into()];
     match &g.modal {
@@ -83,6 +92,7 @@ pub fn view(g: &Gui) -> Element<'_, Message> {
         Modal::Add(a) => layers.push(overlay(add_dialog(g, a), None)),
         Modal::Editor(e) => layers.push(overlay(editor_dialog(e), None)),
         Modal::Settings => layers.push(overlay(settings_dialog(g), Some(Message::CloseModal))),
+        Modal::Delete(d) => layers.push(overlay(delete_dialog(d), Some(Message::CloseModal))),
     }
     if let Some(p) = &g.confirm {
         layers.push(overlay(confirm_dialog(p), Some(Message::Cancelled)));
@@ -268,24 +278,40 @@ fn topbar(g: &Gui) -> Element<'_, Message> {
             let spark = |s, hue, top: Option<f32>, floor| {
                 canvas(Sparkline { series: s, hue, top, floor }).width(SPARK_W).height(SPARK_H)
             };
-            let metric =
-                |i: Icon, t: String| row![icon(i).size(13).style(muted), text(t).size(13)].spacing(5).align_y(Center);
+            // Each value has a fixed width, as wide as its longest reading, so the bar does not
+            // shift as the numbers change (`9.9%` to `10.4%`).
+            let metric = |i: Icon, label: &'static str, value: String, w: f32| {
+                row![
+                    icon(i).size(13).style(muted),
+                    text(label).size(13),
+                    text(value).size(13).width(w).align_x(iced::alignment::Horizontal::Right)
+                ]
+                .spacing(5)
+                .align_y(Center)
+            };
             let mut r = Row::new().spacing(8).align_y(Center);
-            r = r.push(metric(Icon::Cpu, format!("CPU {}", format::percent(h.cpu_percent))));
+            r = r.push(metric(Icon::Cpu, "CPU", format::percent(h.cpu_percent), CPU_VALUE_W));
             if sparks {
                 r = r.push(spark(&series[history::HOST_CPU], Hue::Blue, None, 10.0));
             }
             if mem {
                 r = r.push(metric(
                     Icon::Memory,
-                    format!("Mem {} / {}", format::bytes(h.mem_used_bytes), format::bytes(h.mem_total_bytes)),
+                    "Mem",
+                    format!("{} / {}", format::bytes(h.mem_used_bytes), format::bytes(h.mem_total_bytes)),
+                    MEM_VALUE_W,
                 ));
                 if sparks {
                     r = r.push(spark(&series[history::HOST_MEM], Hue::Aqua, Some(h.mem_total_bytes as f32), 0.0));
                 }
             }
             if load {
-                r = r.push(metric(Icon::Activity, format!("Load {:.2} {:.2} {:.2}", h.load[0], h.load[1], h.load[2])));
+                r = r.push(metric(
+                    Icon::Activity,
+                    "Load",
+                    format!("{:.2} {:.2} {:.2}", h.load[0], h.load[1], h.load[2]),
+                    LOAD_VALUE_W,
+                ));
             }
             r.into()
         }
@@ -491,12 +517,9 @@ fn body(g: &Gui) -> Element<'_, Message> {
             .into(),
         };
     }
-    let list = app_list(g);
-    let detail: Element<'_, Message> = match g.selected_app() {
-        Some(a) => detail(g, a),
-        None => center(text("Select an app")).into(),
-    };
-    let main = row![list, rule::vertical(1), detail].height(Fill);
+    let expanded = g.logs_expanded && g.tab == Tab::Logs && g.logs.is_some() && g.selected_app().is_some();
+    let main: Element<'_, Message> =
+        if expanded { container(logs_pane(g)).padding([18, 22]).width(Fill).height(Fill).into() } else { split(g) };
     match &g.conn {
         Conn::Down { error, .. } => column![
             container(
@@ -513,8 +536,17 @@ fn body(g: &Gui) -> Element<'_, Message> {
             main
         ]
         .into(),
-        _ => main.into(),
+        _ => main,
     }
+}
+
+/// The app list beside the selected app.
+fn split(g: &Gui) -> Element<'_, Message> {
+    let detail: Element<'_, Message> = match g.selected_app() {
+        Some(a) => detail(g, a),
+        None => center(text("Select an app")).into(),
+    };
+    row![app_list(g), rule::vertical(1), detail].height(Fill).into()
 }
 
 fn not_running<'a>(g: &'a Gui, error: &'a str, attempt: u32) -> Element<'a, Message> {
@@ -738,19 +770,17 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     // a newer Warden has (CPU, memory, ports) show "-" until it is restarted.
     let outdated = a.status.as_ref().and_then(|s| s.outdated(env!("CARGO_PKG_VERSION")));
     if let Some(why) = outdated {
-        const RESTART: &str = "warden update";
         c = c.push(
             container(
                 row![
                     icon(Icon::Info).size(16).style(Tone::Warn.style()),
-                    text(format!("This app's supervisor {why}: CPU, memory and ports may show \u{2013}. Restart it:"))
-                        .size(13),
+                    text(format!("This app's supervisor {why}: CPU, memory and ports may show \u{2013}.")).size(13),
                     tip(
-                        button(text(RESTART).font(MONO).size(12))
+                        button(labeled(Icon::Restart, "Restart all apps\u{2026}"))
                             .padding([3, 10])
                             .style(look::chip)
-                            .on_press(Message::Copy(RESTART.into())),
-                        "Copy the command",
+                            .on_press(Message::AskRestartAll),
+                        "Restarts every app and wardend from the installed warden (asks first)",
                     ),
                 ]
                 .spacing(10)
@@ -766,6 +796,9 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     // whether the pane keeps a usable height).
     let mut top = TOPBAR_H + PAGE_PAD + HEAD_H + 8.0 + FACTS_H + GAP;
     if g.cli.banner(g.saved.cli_banner_dismissed) {
+        top += CLI_BANNER_H;
+    }
+    if release_banner_shown(g) {
         top += CLI_BANNER_H;
     }
     if cwd.is_some() {
@@ -1075,6 +1108,15 @@ fn actions<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
             "Clear crash counters and the failed state",
         ));
     }
+    if g.connected() {
+        r = r.push(
+            button(container(labeled(Icon::Trash, "Delete")).center_y(32))
+                .height(32)
+                .padding([0, 12])
+                .style(look::quiet_tone(Tone::Bad))
+                .on_press(Message::AskDelete(name.clone())),
+        );
+    }
     row![r, space::horizontal(), scale].spacing(12).align_y(Center).into()
 }
 
@@ -1327,42 +1369,49 @@ impl Line<'_> {
 
 /// A list drawn only where it is visible: every row is `LINE_H` tall, the
 /// rest is spacers. Anchored at the bottom, like a terminal. A line wider
-/// than the list is cut with `…` and shows in full in a tooltip.
+/// than the list wraps onto more rows.
 fn lines<'a>(
     items: Vec<Line<'a>>,
     scroll: Scroll,
     id: &'static str,
     on_scroll: fn(f32) -> Message,
 ) -> Element<'a, Message> {
-    let total = items.len();
     let list = responsive(move |size| {
+        let rows = wrap_rows(&items, size.width);
+        let total = rows.len();
         let (start, end) = scroll.window(total, LINE_H, size.height);
         let mut col = Column::new().width(Fill);
         if start > 0 {
             col = col.push(space().height(start as f32 * LINE_H));
         }
-        for item in &items[start..end] {
+        for &(i, piece, first) in &rows[start..end] {
+            let item = &items[i];
             let (tone, dot_tone) = item.look();
-            let used =
-                16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if dot_tone.is_some() { 16.0 } else { 0.0 };
-            let font = if item.mono { 12.0 } else { 13.0 };
-            let (shown, cut) = fit(item.text, font, item.mono, (size.width - used - 14.0).max(90.0));
             let mut r = Row::new().spacing(8).align_y(Center).height(LINE_H);
             if let Some(t) = item.time {
-                r = r.push(
-                    text(t).font(MONO).size(11).style(muted).width(60).line_height(LineHeight::Absolute(LINE_H.into())),
-                );
+                r = r.push(if first {
+                    Element::from(
+                        text(t)
+                            .font(MONO)
+                            .size(11)
+                            .style(muted)
+                            .width(60)
+                            .line_height(LineHeight::Absolute(LINE_H.into())),
+                    )
+                } else {
+                    space().width(60).into()
+                });
             }
             if let Some(d) = dot_tone {
-                r = r.push(dot(d, 6.0));
+                r = r.push(if first { dot(d, 6.0) } else { space().width(6).into() });
             }
-            let body = text(shown.into_owned())
+            let body = text(piece)
                 .size(if item.mono { 12 } else { 13 })
                 .line_height(LineHeight::Absolute(LINE_H.into()))
                 .wrapping(Wrapping::None)
                 .style(tone.style());
             r = r.push(if item.mono { body.font(MONO) } else { body });
-            col = col.push(if cut { tip(r, item.text.to_string()) } else { r.into() });
+            col = col.push(r);
         }
         if end < total {
             col = col.push(space().height((total - end) as f32 * LINE_H));
@@ -1378,6 +1427,48 @@ fn lines<'a>(
             .into()
     });
     container(list).style(look::card).width(Fill).height(Fill).into()
+}
+
+/// Each line as the rows it takes in a list `width` wide: (line, the row's text, whether it is
+/// the line's first row). A row breaks after a space when there is one in its second half, else
+/// where it is full. (Widths are estimated, the mono font's closely; a proportional row keeps
+/// a little room spare.)
+fn wrap_rows<'a>(items: &[Line<'a>], width: f32) -> Vec<(usize, &'a str, bool)> {
+    let mut rows = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let dot = item.by_words || item.dot.is_some();
+        let used = 16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if dot { 16.0 } else { 0.0 };
+        let size = if item.mono { 12.0 } else { 13.0 };
+        let room = (width - used - 14.0).max(90.0) * if item.mono { 1.0 } else { 0.96 };
+        let mut rest: &'a str = item.text;
+        let mut first = true;
+        loop {
+            let (mut used, mut cut, mut space_at) = (0.0, rest.len(), None);
+            for (at, c) in rest.char_indices() {
+                used += em_of(c, item.mono) * size;
+                if used > room && at > 0 {
+                    cut = at;
+                    break;
+                }
+                if c == ' ' {
+                    space_at = Some(at + 1);
+                }
+            }
+            if cut < rest.len()
+                && let Some(sp) = space_at.filter(|&sp| sp > cut / 2)
+            {
+                cut = sp;
+            }
+            let (row, next) = rest.split_at(cut);
+            rows.push((i, row.trim_end(), first));
+            first = false;
+            if next.is_empty() {
+                break;
+            }
+            rest = next;
+        }
+    }
+    rows
 }
 
 fn events(a: &App, scroll: Scroll) -> Element<'_, Message> {
@@ -1437,9 +1528,26 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
         pause,
         button(labeled(Icon::Close, "Clear")).padding([4, 10]).style(look::quiet).on_press(Message::LogsClear),
         small(notes.join(" · ")),
+        space::horizontal(),
+        button(labeled(Icon::Terminal, "Open in Terminal"))
+            .padding([4, 10])
+            .style(look::quiet)
+            .on_press(Message::LogsTerminal),
+        if g.logs_expanded {
+            button(labeled(Icon::Minimize, "Exit full screen"))
+                .padding([4, 10])
+                .style(look::quiet)
+                .on_press(Message::LogsExpand(false))
+        } else {
+            button(labeled(Icon::Maximize, "Full screen"))
+                .padding([4, 10])
+                .style(look::quiet)
+                .on_press(Message::LogsExpand(true))
+        },
     ]
     .spacing(12)
-    .align_y(Center);
+    .align_y(Center)
+    .wrap();
     let visible = p.visible();
     let body = if visible.is_empty() {
         container(small(if p.is_empty() { "No log lines yet." } else { "No line matches." }))
@@ -1465,7 +1573,11 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
             .collect();
         lines(items, p.scroll, LOGS_ID, Message::LogsScrolled)
     };
-    column![bar, body].spacing(8).height(Fill).into()
+    let mut c = Column::new().spacing(8).height(Fill);
+    if g.logs_expanded {
+        c = c.push(heading(p.app.as_str()).size(18));
+    }
+    c.push(bar).push(body).into()
 }
 
 // ----------------------------------------------------------------- history
@@ -1654,6 +1766,48 @@ fn act_icon(a: Act) -> Icon {
     }
 }
 
+/// Delete: what it does, and the app's name to type before the button works.
+fn delete_dialog(d: &DeleteForm) -> Element<'_, Message> {
+    let mut c = column![
+        row![icon(Icon::Trash).size(20).style(Tone::Bad.style()), heading(format!("Delete {}", d.app)).size(16)]
+            .spacing(10)
+            .align_y(Center),
+        text(
+            "Stops every worker and the supervisor, and moves the app's config to the deleted folder in the config \
+             directory, so Warden no longer runs or lists it. Its logs stay. Getting it back means moving the config \
+             back by hand."
+        )
+        .size(14),
+        text(format!("Type {} to confirm.", d.app)).size(13).font(MEDIUM),
+        text_input(&d.app, &d.typed)
+            .on_input_maybe((!d.running).then_some(Message::DeleteTyped))
+            .on_submit_maybe(d.ready().then_some(Message::ConfirmDelete))
+            .size(14)
+            .padding([7, 10])
+            .style(look::input),
+    ]
+    .spacing(14);
+    if let Some(e) = &d.error {
+        c = c.push(said(Icon::AlertCircle, Tone::Bad, format!("Not deleted: {e}")));
+    }
+    c.push(
+        row![
+            space::horizontal(),
+            button(text("Cancel").size(13).font(MEDIUM))
+                .padding([6, 14])
+                .style(look::quiet)
+                .on_press_maybe((!d.running).then_some(Message::CloseModal)),
+            button(labeled(Icon::Trash, if d.running { "Deleting\u{2026}" } else { "Delete" }))
+                .padding([6, 14])
+                .style(look::solid(Tone::Bad))
+                .on_press_maybe(d.ready().then_some(Message::ConfirmDelete)),
+        ]
+        .spacing(10),
+    )
+    .width(500)
+    .into()
+}
+
 fn confirm_dialog(p: &Pending) -> Element<'_, Message> {
     column![
         row![icon(Icon::Alert).size(20).style(Tone::Warn.style()), heading(p.act.label()).size(16)]
@@ -1729,6 +1883,7 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
         .spacing(8),
         cli_section(g),
         restart_all_section(g),
+        updates_section(g),
         small(format!("This desktop: {}.", g.system.describe())),
     ]
     .spacing(18)
@@ -1872,6 +2027,109 @@ fn cli_section(g: &Gui) -> Element<'_, Message> {
 }
 
 /// The first-run offer, under the top bar: from an app bundle, with no `warden` in Terminal's reach.
+/// A newer release (until "Not now"), or the update to it running.
+fn release_banner_shown(g: &Gui) -> bool {
+    match &g.release {
+        Release::Available(_) => !g.release_hidden,
+        Release::Updating { .. } => true,
+        _ => false,
+    }
+}
+
+/// "Warden 0.2.0 is out": Update installs it and restarts everything onto it.
+fn release_banner(g: &Gui) -> Element<'_, Message> {
+    let line: Element<'_, Message> = match &g.release {
+        Release::Updating { to, secs } => row![
+            icon(Icon::Loader).size(16).style(Tone::Accent.style()),
+            text(format!(
+                "Updating to Warden {to}\u{2026} {secs} s: installing it, then restarting every app on it (they stop \
+                 for a few seconds). The window reconnects, and starts again on {to} at the end."
+            ))
+            .size(13)
+            .width(Fill),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .into(),
+        Release::Available(c) => row![
+            icon(Icon::Info).size(16).style(Tone::Accent.style()),
+            text(format!(
+                "Warden {} is out ({} runs {}). Update installs it and restarts everything on it: nothing else to do.",
+                c.latest,
+                g.target.machine_name(),
+                c.current
+            ))
+            .size(13)
+            .width(Fill),
+            button(text("Update").size(13).font(SEMIBOLD))
+                .padding([5, 14])
+                .style(look::solid(Tone::Accent))
+                .on_press_maybe((g.restart_all == crate::app::RestartAll::Idle).then_some(Message::UpgradeNow)),
+            button(text("Not now").size(13).font(MEDIUM))
+                .padding([5, 14])
+                .style(look::quiet)
+                .on_press(Message::HideRelease),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .into(),
+        _ => space().into(),
+    };
+    container(container(line).padding([7, 14]).width(Fill).style(look::banner(Tone::Accent)))
+        .padding(iced::Padding { top: 10.0, right: 18.0, bottom: 0.0, left: 18.0 })
+        .into()
+}
+
+/// Settings' updates: what the check said, Check now, and the automatic switch.
+fn updates_section(g: &Gui) -> Element<'_, Message> {
+    let state = match &g.release {
+        Release::Unknown => said(Icon::Info, Tone::Muted, "Not checked yet."),
+        Release::Checking => said(Icon::Loader, Tone::Muted, "Checking for a newer release\u{2026}"),
+        Release::UpToDate(v) => said(Icon::CheckCircle, Tone::Good, format!("Warden {v} is the newest release.")),
+        Release::Available(c) => said(
+            Icon::Info,
+            Tone::Accent,
+            format!("Warden {} is out; {} runs {}.", c.latest, g.target.machine_name(), c.current),
+        ),
+        Release::Updating { to, secs } => said(Icon::Loader, Tone::Muted, format!("Updating to {to}\u{2026} {secs} s")),
+        Release::Failed(e) => said(Icon::Alert, Tone::Warn, format!("Could not check or update: {e}")),
+    };
+    let busy = matches!(g.release, Release::Checking | Release::Updating { .. });
+    let mut r = row![
+        button(labeled(Icon::Reload, "Check now"))
+            .padding([6, 14])
+            .style(look::quiet)
+            .on_press_maybe((!busy).then_some(Message::CheckRelease))
+    ]
+    .spacing(10);
+    if g.release.available().is_some() {
+        r = r.push(
+            button(labeled(Icon::Restart, "Update"))
+                .padding([6, 14])
+                .style(look::solid(Tone::Accent))
+                .on_press(Message::UpgradeNow),
+        );
+    }
+    column![
+        look::section_icon(Icon::Reload, "Updates"),
+        small(
+            "Warden looks for a new release when it connects and every 6 hours, and says so here, in a banner and \
+             once in a desktop notification. Update installs it (checked against the release's checksums) and \
+             restarts every app's supervisor and wardend on it; the apps stop for a few seconds."
+        ),
+        state,
+        r,
+        checkbox(g.saved.auto_update)
+            .label("Install updates automatically")
+            .on_toggle(Message::SetAutoUpdate)
+            .size(14)
+            .text_size(13)
+            .style(look::check),
+    ]
+    .spacing(8)
+    .into()
+}
+
 fn cli_banner(g: &Gui) -> Element<'_, Message> {
     let installing = g.cli.work == Work::Installing;
     container(
@@ -2296,6 +2554,32 @@ mod tests {
         let (upper, _) = fit(&w60, 13.0, false, 300.0);
         assert!(upper.chars().count() < lower.chars().count(), "{upper} / {lower}");
         assert!(width_of(&upper, 13.0, false) <= 300.0 && width_of(&lower, 13.0, false) <= 300.0);
+    }
+
+    #[test]
+    fn long_log_lines_wrap_onto_rows_and_short_ones_keep_one() {
+        let long =
+            "worker=1 stdout: [MetaLeadSyncService] syncSince: form 1776923023350598 returned 2 leads since 1789654236";
+        let items = vec![
+            Line { time: None, text: "short", tone: Tone::Plain, dot: None, mono: true, by_words: false },
+            Line { time: None, text: long, tone: Tone::Plain, dot: None, mono: true, by_words: false },
+        ];
+        let rows = wrap_rows(&items, 400.0);
+        assert_eq!(rows[0], (0, "short", true));
+        let pieces: Vec<&str> = rows.iter().filter(|r| r.0 == 1).map(|r| r.1).collect();
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        assert_eq!(rows.iter().filter(|r| r.0 == 1 && r.2).count(), 1, "one first row");
+        assert_eq!(
+            pieces.join(" ").split_whitespace().collect::<Vec<_>>(),
+            long.split_whitespace().collect::<Vec<_>>()
+        );
+        for p in &pieces {
+            assert!(width_of(p, 12.0, true) <= 400.0 - 16.0 - 14.0, "{p:?} fits");
+        }
+        let unbroken = "x".repeat(300);
+        let items =
+            vec![Line { time: None, text: &unbroken, tone: Tone::Plain, dot: None, mono: true, by_words: false }];
+        assert_eq!(wrap_rows(&items, 400.0).iter().map(|r| r.1.len()).sum::<usize>(), 300, "cut where full");
     }
 
     #[test]

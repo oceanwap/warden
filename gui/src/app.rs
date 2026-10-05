@@ -9,6 +9,7 @@ use crate::history::{AppChart, HostSpark, Load, Range};
 use crate::hosts::{self, Machine, Saved};
 use crate::logs::{self, LogPane, Scroll};
 use crate::model::Model;
+use crate::release::{self, Release};
 use crate::ssh;
 use crate::system;
 use iced::widget::{Id, operation, text_editor};
@@ -221,6 +222,25 @@ pub enum Modal {
     Editor(Editor),
     /// Colours and mode.
     Settings,
+    Delete(DeleteForm),
+}
+
+/// Deleting an app: stop it and move its config to `deleted/` (`warden delete`), once its name
+/// is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteForm {
+    pub app: String,
+    pub typed: String,
+    pub running: bool,
+    /// What a failed `warden delete` said.
+    pub error: Option<String>,
+}
+
+impl DeleteForm {
+    /// The name was typed exactly, and nothing runs yet.
+    pub fn ready(&self) -> bool {
+        self.typed == self.app && !self.running
+    }
 }
 
 /// Settings' "Restart everything".
@@ -268,6 +288,8 @@ pub struct Gui {
     pub logs: Option<LogPane>,
     /// The logs stream is connected (a gap is noted when it drops).
     pub logs_live: bool,
+    /// The Logs tab fills the window.
+    pub logs_expanded: bool,
     pub toasts: Vec<Toast>,
     next_toast: u64,
     pub confirm: Option<Pending>,
@@ -279,6 +301,10 @@ pub struct Gui {
     pub restart_who: Option<Result<commands::Who, String>>,
     /// Seconds since "Restart now" (it ticks while the restart runs).
     pub restart_secs: u64,
+    /// A newer release, and updating to it.
+    pub release: Release,
+    /// "Not now" on the release banner (until the window starts again).
+    pub release_hidden: bool,
     /// A restart that did not finish: the apps may be stopped. Shown, with the way back, until the next try.
     pub restart_note: Option<String>,
     /// What runs is "start the saved apps again", not a restart.
@@ -341,6 +367,24 @@ pub enum Message {
     LogsStderr(bool),
     LogsEvents(bool),
     LogsClear,
+    CheckRelease,
+    ReleaseChecked(Result<release::Check, String>),
+    /// The banner's Update: `warden upgrade --yes`.
+    UpgradeNow,
+    UpgradeTick,
+    Upgraded(Result<Output, String>),
+    HideRelease,
+    SetAutoUpdate(bool),
+    /// The Delete button: the dialog that asks for the app's name.
+    AskDelete(String),
+    DeleteTyped(String),
+    ConfirmDelete,
+    Deleted(Result<commands::Output, String>),
+    /// The logs fill the window (true), or go back under the app (false).
+    LogsExpand(bool),
+    /// Follow this app's log in a terminal window (`warden logs <app>`).
+    LogsTerminal,
+    LogsTerminalOpened(Result<(), String>),
     LogHistory {
         app: String,
         result: Result<Vec<String>, String>,
@@ -510,6 +554,7 @@ impl Gui {
             feed_scroll: Scroll::default(),
             logs: None,
             logs_live: false,
+            logs_expanded: false,
             toasts: Vec::new(),
             next_toast: 0,
             confirm: None,
@@ -518,6 +563,8 @@ impl Gui {
             restart_all: RestartAll::Idle,
             restart_who: None,
             restart_secs: 0,
+            release: Release::Unknown,
+            release_hidden: false,
             restart_note: None,
             resurrecting: false,
             epoch: 0,
@@ -812,6 +859,154 @@ impl Gui {
             Message::LogsStderr(b) => self.with_logs(|l| l.stderr = b),
             Message::LogsEvents(b) => self.with_logs(|l| l.events = b),
             Message::LogsClear => self.with_logs(LogPane::clear),
+            Message::CheckRelease => self.check_release(),
+            Message::ReleaseChecked(r) => {
+                if self.release != Release::Checking {
+                    return Task::none();
+                }
+                match r {
+                    Ok(c) if c.update => {
+                        self.release = Release::Available(c.clone());
+                        let mut tasks = Vec::new();
+                        if self.saved.notified_release.as_deref() != Some(c.latest.as_str()) {
+                            release::notify(
+                                &format!("Warden {} is out", c.latest),
+                                &format!(
+                                    "{} runs {}. Open Warden and click Update.",
+                                    self.target.machine_name(),
+                                    c.current
+                                ),
+                            );
+                            self.saved.notified_release = Some(c.latest.clone());
+                            tasks.push(self.persist());
+                        }
+                        if self.saved.auto_update {
+                            tasks.push(self.update(Message::UpgradeNow));
+                        }
+                        Task::batch(tasks)
+                    }
+                    Ok(c) => {
+                        self.release = Release::UpToDate(c.current);
+                        Task::none()
+                    }
+                    // A warden from before `upgrade`, no network: nothing to say on the main screen.
+                    Err(e) => {
+                        self.release = Release::Failed(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::UpgradeNow => {
+                let Some(c) = self.release.available() else { return Task::none() };
+                if self.restart_all != RestartAll::Idle {
+                    return Task::none();
+                }
+                self.release = Release::Updating { to: c.latest.clone(), secs: 0 };
+                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::upgrade(&host, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::Upgraded(r))
+                })
+            }
+            Message::UpgradeTick => {
+                if let Release::Updating { secs, .. } = &mut self.release {
+                    *secs += 1;
+                }
+                Task::none()
+            }
+            Message::Upgraded(r) => {
+                let Release::Updating { to, .. } = self.release.clone() else { return Task::none() };
+                match r {
+                    Ok(out) if out.ok => {
+                        self.release = Release::UpToDate(to.clone());
+                        // This window is the old version too, on this machine: it starts again.
+                        if self.target.host.is_local() && version_lt(env!("CARGO_PKG_VERSION"), &to) {
+                            if let Err(e) = release::relaunch() {
+                                return self.toast(false, format!("Updated to {to}; {e}"));
+                            }
+                            return iced::exit();
+                        }
+                        self.toast(true, format!("Updated to Warden {to}: everything runs on it"))
+                    }
+                    Ok(out) => {
+                        let e = format!("{} (`{}`)", out.text(), out.command);
+                        self.release = Release::Failed(e.clone());
+                        self.toast(false, format!("Update to {to} failed: {e}"))
+                    }
+                    Err(e) => {
+                        self.release = Release::Failed(e.clone());
+                        self.toast(false, format!("Update to {to} failed: {e}"))
+                    }
+                }
+            }
+            Message::HideRelease => {
+                self.release_hidden = true;
+                Task::none()
+            }
+            Message::SetAutoUpdate(on) => {
+                self.saved.auto_update = on;
+                let save = self.persist();
+                if on && self.release.available().is_some() {
+                    return Task::batch([save, self.update(Message::UpgradeNow)]);
+                }
+                save
+            }
+            Message::AskDelete(app) => {
+                self.menu = None;
+                self.modal = Modal::Delete(DeleteForm { app, typed: String::new(), running: false, error: None });
+                Task::none()
+            }
+            Message::DeleteTyped(t) => {
+                if let Modal::Delete(d) = &mut self.modal
+                    && !d.running
+                {
+                    d.typed = t;
+                }
+                Task::none()
+            }
+            Message::ConfirmDelete => {
+                let Modal::Delete(d) = &mut self.modal else { return Task::none() };
+                if !d.ready() {
+                    return Task::none();
+                }
+                d.running = true;
+                d.error = None;
+                let (host, app, dir, tag) = (self.target.host.clone(), d.app.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::delete_app(&host, &app, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::Deleted(r))
+                })
+            }
+            Message::Deleted(r) => {
+                let Modal::Delete(d) = &mut self.modal else { return Task::none() };
+                d.running = false;
+                match r {
+                    Ok(out) if out.ok => {
+                        let app = d.app.clone();
+                        self.modal = Modal::None;
+                        self.toast(true, format!("{app} deleted; its config is in the deleted folder"))
+                    }
+                    Ok(out) => {
+                        d.error = Some(format!("{} (`{}`)", out.text(), out.command));
+                        Task::none()
+                    }
+                    Err(e) => {
+                        d.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::LogsExpand(on) => {
+                self.logs_expanded = on;
+                Task::none()
+            }
+            Message::LogsTerminal => {
+                let Some(app) = self.logs.as_ref().map(|p| p.app.clone()) else { return Task::none() };
+                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::open_log_terminal(&host, &app, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::LogsTerminalOpened(r))
+                })
+            }
+            Message::LogsTerminalOpened(Ok(())) => Task::none(),
+            Message::LogsTerminalOpened(Err(e)) => self.toast(false, format!("cannot open a terminal: {e}")),
             Message::LogHistory { app, result } => {
                 let Some(pane) = self.logs.as_mut().filter(|p| p.app == app) else { return Task::none() };
                 match result {
@@ -845,16 +1040,22 @@ impl Gui {
                 }
             }
             Message::AskRestartAll => {
+                // Asked from an app's "outdated supervisor" banner too: the question is in Settings.
+                let opened = if matches!(self.modal, Modal::Settings) {
+                    Task::none()
+                } else {
+                    self.update(Message::OpenSettings)
+                };
                 if self.restart_all != RestartAll::Idle {
-                    return Task::none();
+                    return opened;
                 }
                 self.restart_all = RestartAll::Asking;
                 self.restart_who = None;
                 // Which warden would run, before anything is stopped.
                 let (host, tag) = (self.target.host.clone(), self.tag());
-                Task::perform(async move { commands::warden_who(&host).await }, move |r| {
+                opened.chain(Task::perform(async move { commands::warden_who(&host).await }, move |r| {
                     tag.wrap(Message::RestartWho(r))
-                })
+                }))
             }
             Message::RestartWho(r) => {
                 if self.restart_all == RestartAll::Asking {
@@ -1083,7 +1284,8 @@ impl Gui {
             Message::CloseModal => {
                 // A running command keeps its dialog until it ends.
                 let busy = matches!(&self.modal, Modal::Add(a) if a.status == AddStatus::Running)
-                    || matches!(&self.modal, Modal::Editor(e) if e.status == EditorStatus::Saving);
+                    || matches!(&self.modal, Modal::Editor(e) if e.status == EditorStatus::Saving)
+                    || matches!(&self.modal, Modal::Delete(d) if d.running);
                 if !busy {
                     self.modal = Modal::None;
                 }
@@ -1229,6 +1431,15 @@ impl Gui {
     }
 
     /// Write the list of machines; a failure is told, the list stays in memory.
+    fn check_release(&mut self) -> Task<Message> {
+        if matches!(self.release, Release::Checking | Release::Updating { .. }) {
+            return Task::none();
+        }
+        self.release = Release::Checking;
+        let (host, tag) = (self.target.host.clone(), self.tag());
+        Task::perform(async move { release::check(&host).await }, move |r| tag.wrap(Message::ReleaseChecked(r)))
+    }
+
     fn persist(&mut self) -> Task<Message> {
         let Some(path) = self.saved_path.clone() else { return Task::none() };
         match hosts::save(&path, &self.saved) {
@@ -1313,8 +1524,10 @@ impl Gui {
             FeedMsg::Connected { socket } => {
                 self.conn = Conn::Connected;
                 self.socket = Some(socket);
-                // What happened while away (or before this window opened).
-                Task::batch([self.fetch_host(), self.fetch_chart()])
+                // What happened while away (or before this window opened); a newer release,
+                // once per host.
+                let release = if self.release == Release::Unknown { self.check_release() } else { Task::none() };
+                Task::batch([self.fetch_host(), self.fetch_chart(), release])
             }
             FeedMsg::Batch(b) => {
                 let now = now_ms();
@@ -1449,6 +1662,10 @@ impl Gui {
         if self.restart_all == RestartAll::Running {
             all.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::RestartTick));
         }
+        if matches!(self.release, Release::Updating { .. }) {
+            all.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::UpgradeTick));
+        }
+        all.push(iced::time::every(release::EVERY).map(|_| Message::CheckRelease));
         if self.source.follows_system() {
             // The desktop's look: GNOME says when it changes; elsewhere it is read
             // again when the window is focused or the mode changes.
@@ -1461,6 +1678,17 @@ impl Gui {
         }
         Subscription::batch(all)
     }
+}
+
+/// `a` is an older version than `b` (`0.1.1` < `0.2.0`; a pre-release before its release).
+fn version_lt(a: &str, b: &str) -> bool {
+    let key = |v: &str| {
+        let v = v.trim_start_matches('v');
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+        let nums: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (nums, pre.is_none(), pre)
+    };
+    key(a) < key(b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1739,6 +1967,76 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_release_is_offered_once_and_update_runs_it() {
+        let mut g = connected_to_a_runtime_dir();
+        assert_eq!(g.release, Release::Checking, "asked when it connected");
+        g.release = Release::Unknown;
+        let c = release::Check { current: "0.1.1".into(), latest: "0.2.0".into(), update: true };
+        let _ = g.update(Message::ReleaseChecked(Ok(c.clone())));
+        assert_eq!(g.release, Release::Unknown, "an answer nobody asked for is dropped");
+        let _ = g.update(Message::CheckRelease);
+        assert_eq!(g.release, Release::Checking);
+        let _ = g.update(Message::ReleaseChecked(Ok(c.clone())));
+        assert_eq!(g.release.available(), Some(&c));
+        assert_eq!(g.saved.notified_release.as_deref(), Some("0.2.0"), "notified once for 0.2.0");
+        let _ = g.update(Message::HideRelease);
+        assert!(g.release_hidden && g.release.available().is_some(), "still in Settings");
+        let _ = g.update(Message::UpgradeNow);
+        assert_eq!(g.release, Release::Updating { to: "0.2.0".into(), secs: 0 });
+        let _ = g.update(Message::UpgradeTick);
+        assert!(matches!(g.release, Release::Updating { secs: 1, .. }));
+        let _ = g.update(Message::Upgraded(Err("no network".into())));
+        assert_eq!(g.release, Release::Failed("no network".into()));
+        assert!(g.toasts.iter().any(|t| !t.ok && t.text.contains("Update to 0.2.0 failed")));
+        // Up to date: nothing to offer.
+        let _ = g.update(Message::CheckRelease);
+        let _ = g.update(Message::ReleaseChecked(Ok(release::Check { update: false, latest: "0.1.1".into(), ..c })));
+        assert_eq!(g.release, Release::UpToDate("0.1.1".into()));
+    }
+
+    #[test]
+    fn versions_compare_in_release_order() {
+        assert!(version_lt("0.1.1", "0.2.0") && version_lt("0.1.9", "0.1.10") && version_lt("1.0.0-rc.1", "1.0.0"));
+        assert!(!version_lt("0.2.0", "0.2.0") && !version_lt("0.3.0", "0.2.9"));
+    }
+
+    #[test]
+    fn delete_runs_only_once_the_apps_name_is_typed() {
+        let mut g = connected_to_a_runtime_dir();
+        let _ = g.update(Message::AskDelete("api".into()));
+        let form = |g: &Gui| match &g.modal {
+            Modal::Delete(d) => d.clone(),
+            _ => panic!("no delete dialog"),
+        };
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "nothing typed: nothing runs");
+        let _ = g.update(Message::DeleteTyped("ap".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "a part of the name is not enough");
+        let _ = g.update(Message::DeleteTyped("API".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(!form(&g).running, "exactly the name");
+        let _ = g.update(Message::DeleteTyped("api".into()));
+        let _ = g.update(Message::ConfirmDelete);
+        assert!(form(&g).running);
+        let _ = g.update(Message::CloseModal);
+        assert!(matches!(g.modal, Modal::Delete(_)), "kept while it runs");
+        let _ = g.update(Message::Deleted(Err("no app named api".into())));
+        assert_eq!(form(&g).error.as_deref(), Some("no app named api"));
+        let ok = commands::Output {
+            command: "warden delete api".into(),
+            ok: true,
+            code: Some(0),
+            stdout: "api: stopped".into(),
+            stderr: String::new(),
+        };
+        let _ = g.update(Message::ConfirmDelete);
+        let _ = g.update(Message::Deleted(Ok(ok)));
+        assert!(matches!(g.modal, Modal::None));
+        assert!(g.toasts.iter().any(|t| t.text.contains("api deleted")));
+    }
+
+    #[test]
     fn restarting_everything_asks_first_names_the_warden_and_reconnects_after() {
         let mut g = connected_to_a_runtime_dir();
         assert_eq!(g.restart_all, RestartAll::Idle);
@@ -1747,6 +2045,10 @@ mod tests {
         assert_eq!(g.restart_all, RestartAll::Idle, "a confirm without a question does nothing");
         let _ = g.update(Message::AskRestartAll);
         assert_eq!(g.restart_all, RestartAll::Asking);
+        assert!(
+            matches!(g.modal, Modal::Settings),
+            "asked from an app's banner, it opens Settings, where the question is"
+        );
         assert!(g.restart_who.is_none(), "it is being looked up");
         let _ = g.update(Message::RestartAll);
         assert_eq!(g.restart_all, RestartAll::Asking, "not before it is known which warden would run");

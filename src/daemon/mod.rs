@@ -1011,7 +1011,8 @@ pub fn main(rt: &tokio::runtime::Runtime, resurrect: bool) -> i32 {
 /// `<runtime dir>/wardend.lock`, held (advisory lock) for as long as this wardend lives. The
 /// kernel drops it when the process ends however it ends, so a killed wardend never leaves a
 /// lock behind, and a second wardend finds it taken instead of unlinking the first one's socket.
-fn lock_instance(socket: &std::path::Path) -> Result<std::fs::File, String> {
+/// `Ok(None)`: another wardend holds it.
+fn lock_instance(socket: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = socket.parent().unwrap_or(std::path::Path::new("."));
     control::ensure_private_dir(dir)?;
@@ -1024,8 +1025,8 @@ fn lock_instance(socket: &std::path::Path) -> Result<std::fs::File, String> {
         .open(&lock)
         .map_err(|e| format!("opening {}: {e}", lock.display()))?;
     match crate::sys::try_lock_exclusive(&file) {
-        Ok(true) => Ok(file),
-        Ok(false) => Err(format!("wardend is already running: another one holds {}", lock.display())),
+        Ok(true) => Ok(Some(file)),
+        Ok(false) => Ok(None),
         Err(e) => Err(format!("locking {}: {e}", lock.display())),
     }
 }
@@ -1033,12 +1034,26 @@ fn lock_instance(socket: &std::path::Path) -> Result<std::fs::File, String> {
 async fn run(resurrect: bool) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
     let path = socket_path();
+    // Another wardend already does the job: this one is not needed, which is no failure. It exits
+    // 0, so launchd (KeepAlive on a failed exit) does not start it again every 10 s beside a
+    // wardend the window or a terminal started.
+    let already = |who: String| {
+        crate::info!(
+            "wardend is already running; this one exits",
+            running = who,
+            socket = path.display(),
+            hint = "`warden wardend status` shows it; `warden kill` stops it",
+        );
+        Ok(())
+    };
     if let Some(pid) = client::hello_pid(&path).await {
-        return Err(format!("wardend is already running (pid {pid}) on {}", path.display()));
+        return already(format!("pid {pid}"));
     }
     // Before the socket is touched: the lock is what makes one wardend of two that start at
     // the same moment (supervisors reviving it, launchd or systemd beside a hand-started one).
-    let _instance = lock_instance(&path)?;
+    let Some(_instance) = lock_instance(&path)? else {
+        return already("another one holds wardend.lock".into());
+    };
     let listener = control::bind(&path).await?;
     let mut term = signal(SignalKind::terminate()).map_err(|e| format!("installing signal handlers: {e}"))?;
     let mut int = signal(SignalKind::interrupt()).map_err(|e| format!("installing signal handlers: {e}"))?;

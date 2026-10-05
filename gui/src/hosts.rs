@@ -48,6 +48,12 @@ pub struct Saved {
     /// "Not now" on the first-run banner that offers the command line tool: it stays away.
     #[serde(default)]
     pub cli_banner_dismissed: bool,
+    /// The release a desktop notification was shown for (one per release).
+    #[serde(default)]
+    pub notified_release: Option<String>,
+    /// Settings' "Install updates automatically".
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 impl Saved {
@@ -187,6 +193,16 @@ fn parse(text: &str) -> Result<(Saved, Vec<String>), String> {
         None | Some(Value::Null) => {}
         Some(Value::Bool(b)) => saved.cli_banner_dismissed = *b,
         Some(_) => notes.push("\"cli_banner_dismissed\" is not true or false".into()),
+    }
+    match doc.get("notified_release") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(v)) => saved.notified_release = Some(v.clone()),
+        Some(_) => notes.push("\"notified_release\" is not a string".into()),
+    }
+    match doc.get("auto_update") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(b)) => saved.auto_update = *b,
+        Some(_) => notes.push("\"auto_update\" is not true or false".into()),
     }
     Ok((saved, notes))
 }

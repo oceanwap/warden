@@ -100,6 +100,11 @@ pub(crate) async fn autostart() {
     // only fight it for the socket, so the manager starts it. (After `warden kill` it
     // is stopped and stays so until the next login or boot: `resurrect` must not
     // leave the apps without it.)
+    for system in [false, true] {
+        if let Some(problem) = crate::startup::launchd_job_problem(system) {
+            eprintln!("warden: {problem}; starting wardend without it meanwhile");
+        }
+    }
     if crate::startup::wardend_managed() {
         let started = tokio::task::spawn_blocking(crate::startup::start_wardend_managed)
             .await

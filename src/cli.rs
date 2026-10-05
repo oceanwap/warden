@@ -69,6 +69,9 @@ APPS (familiar from PM2):
                      (save, kill, resurrect: like `pm2 update`). A supervisor keeps the code
                      it started with, so this is what picks up a rebuild or an upgrade. The
                      apps stop for a few seconds; asks first on a terminal  [--yes]
+    upgrade          Install the newest release (checked against its SHA256SUMS; the desktop
+                     app too when installed) and restart everything onto it, as `update`
+                     does  [--check] [--yes] [--version V] [--dry-run] (--help)
     startup          Bring the saved apps and wardend back after a reboot or a crash:
                      systemd units (root: system units; a user or --user: your own,
                      with lingering), a launchd job on macOS. Without a service
@@ -178,6 +181,8 @@ pub enum Command {
     WattpmMigrate(Box<crate::migrate_wattpm::Opts>),
     /// `warden gui-install`: the desktop app of this release (install.sh --gui-only).
     GuiInstall(Box<crate::gui_install::Opts>),
+    /// `warden upgrade`: the newest release installed, everything restarted onto it.
+    Upgrade(Box<crate::upgrade::Opts>),
     /// wardend, the internal entry point (not in `--help`): launchd, systemd, the
     /// supervisors and the GUI start it; people use `start`, `resurrect` and `kill`.
     Wardend(WardendCmd),
@@ -365,6 +370,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     // Its --version is a release (as install.sh's), not "print the version".
     if argv.first().map(String::as_str) == Some("gui-install") {
         return crate::gui_install::parse_args(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("upgrade") {
+        return crate::upgrade::parse_args(&argv[1..]);
     }
     let mut config: Option<PathBuf> = None;
     let mut socket = None;

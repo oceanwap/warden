@@ -250,9 +250,10 @@ fn main_screen_with_fake_data() {
     let mut ui = sim(&g);
     for t in [
         "wardend 0.1.0 · pid 4211",
-        "CPU 23.4%",
-        "Mem 3.10 GB / 7.66 GB",
-        "Load 0.52 0.40 0.31",
+        "CPU",
+        "23.4%",
+        "3.10 GB / 7.66 GB",
+        "0.52 0.40 0.31",
         "api",
         "jobs",
         "gave up",
@@ -476,10 +477,10 @@ fn settings_restarts_everything_after_asking() {
 }
 
 /// A supervisor keeps the code it started with: after a rebuild it shows `-` for what a newer
-/// Warden knows, and the page says so, with the command that fixes it.
+/// Warden knows, and the page says so, with a button that restarts everything (asking first).
 #[test]
-fn an_older_supervisor_is_named_with_the_command_that_restarts_it() {
-    const COMMAND: &str = "warden update";
+fn an_older_supervisor_is_named_with_the_button_that_restarts_it() {
+    const BUTTON: &str = "Restart all apps\u{2026}";
     let mut g = connected();
     let _ = g.update(Message::Select("web".into()));
     let mut ui = sim(&g);
@@ -500,12 +501,13 @@ fn an_older_supervisor_is_named_with_the_command_that_restarts_it() {
         let _ = g.update(Message::Feed(FeedMsg::Batch(Batch { events: vec![ev], ..Batch::default() })));
         let _ = g.update(Message::Select("web".into()));
         let mut ui = sim(&g);
-        let line = format!("This app's supervisor {what}: CPU, memory and ports may show \u{2013}. Restart it:");
+        let line = format!("This app's supervisor {what}: CPU, memory and ports may show \u{2013}.");
         assert!(ui.find(line.as_str()).is_ok(), "the banner for {what:?} is missing");
-        assert!(ui.find(COMMAND).is_ok(), "and the command");
         if edit.is_null() {
             save(&mut ui, "older-supervisor");
         }
+        let _ = ui.click(BUTTON).expect("and the button");
+        assert!(matches!(messages(ui).as_slice(), [Message::AskRestartAll]), "it asks, as Settings does");
     }
 }
 
@@ -839,10 +841,10 @@ fn narrow_window_still_draws_the_table() {
     let mut g = connected();
     let _ = g.update(Message::Resized(iced::Size::new(900.0, 700.0)));
     let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, 700.0), warden_gui::view::view(&g));
-    for t in ["Worker", "State", "RSS", "RUNNING", "Connected", "Add app", "CPU 23.4%"] {
+    for t in ["Worker", "State", "RSS", "RUNNING", "Connected", "Add app", "23.4%"] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the narrow screen");
     }
-    for t in ["Load 0.52 0.40 0.31", "wardend 0.1.0 · pid 4211"] {
+    for t in ["0.52 0.40 0.31", "wardend 0.1.0 · pid 4211"] {
         assert!(ui.find(t).is_err(), "{t:?} is dropped from the top bar when there is no room");
     }
     save(&mut ui, "main-screen-narrow");

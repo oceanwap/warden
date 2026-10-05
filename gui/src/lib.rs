@@ -31,11 +31,13 @@ pub mod format;
 pub mod history;
 pub mod hosts;
 pub mod icons;
+pub mod logo;
 pub mod logs;
 pub mod look;
 pub mod model;
 #[allow(unsafe_code)]
 mod parent_death;
+pub mod release;
 pub mod ring;
 pub mod ssh;
 pub mod system;
