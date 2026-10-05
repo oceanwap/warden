@@ -8098,3 +8098,58 @@ fn a_static_site_keeps_its_compressed_copies_in_the_state_folder() {
     drop(w);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `warden save` with nothing running keeps the list saved before (an update that stopped
+/// halfway, run again, must not forget every app), and a save keeps the list it replaces.
+#[test]
+fn an_empty_save_keeps_the_saved_apps() {
+    let f = Fleet::new("save-keeps");
+    sleeper_config(&f, "one");
+    sleeper_config(&f, "two");
+    f.ok(&["start", "all"]);
+    f.ok(&["save"]);
+    let dump = f.home.join("state/dump.json");
+    let saved = std::fs::read_to_string(&dump).unwrap();
+    f.ok(&["kill", "--yes"]);
+    f.wait("all offline", |f| f.list().iter().all(|a| a["status"].is_null()));
+
+    let out = f.ok(&["save"]);
+    assert!(out.contains("nothing was saved") && out.contains("one, two"), "{out}");
+    assert_eq!(std::fs::read_to_string(&dump).unwrap(), saved, "the saved list stays");
+
+    f.ok(&["start", "one"]);
+    f.ok(&["save"]);
+    assert_eq!(std::fs::read_to_string(f.home.join("state/dump.json.bak")).unwrap(), saved, "one save back");
+    let out = f.ok(&["resurrect"]);
+    assert!(!out.contains("two:"), "two was not running at the last save: {out}");
+}
+
+/// A launchd job an older `warden startup` wrote names a warden that is gone (or the old
+/// `daemon` command): launchd retries it forever, so `warden start` must not wait for it to
+/// bring wardend back. It says so and starts wardend itself.
+#[test]
+fn a_stale_launchd_job_is_not_waited_for() {
+    let f = Fleet::new("st-stale-job");
+    sleeper_config(&f, "api");
+    let fakes = Fakes::new(&f, &[]);
+    std::fs::write(
+        f.home.join("launchd/io.github.oceanwap.warden.daemon.plist"),
+        "<plist><dict><key>ProgramArguments</key><array><string>/nonexistent/warden</string>\
+         <string>daemon</string><string>--resurrect</string></array></dict></plist>",
+    )
+    .unwrap();
+    let mut env = fakes.launchd_env();
+    env.push(("WARDEN_NO_DAEMON".into(), "0".into()));
+    let t0 = Instant::now();
+    let (code, out) = run_with(&f, &["start", "api"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("/nonexistent/warden does not exist") && out.contains("`warden startup` writes it again"),
+        "{out}"
+    );
+    assert!(out.contains("wardend started in the background"), "{out}");
+    assert!(!fakes.take().contains("kickstart"), "the stale job is not kickstarted");
+    assert!(t0.elapsed() < Duration::from_secs(10), "no 10 s wait for launchd: {:?}", t0.elapsed());
+    assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 0, "wardend answers");
+    let _ = run_with(&f, &["kill", "--yes"], &env);
+}

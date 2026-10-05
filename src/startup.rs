@@ -376,9 +376,43 @@ pub(crate) fn installed() -> Option<String> {
 /// Does a service manager run wardend here (so `warden start` leaves it be)?
 pub(crate) fn wardend_managed() -> bool {
     if launchd_host() {
-        return [false, true].into_iter().any(|s| plist_path(s).exists());
+        return [false, true].into_iter().any(|s| plist_path(s).exists() && launchd_job_problem(s).is_none());
     }
     fleet::systemctl_bin().is_some() && [Scope::System, Scope::User].into_iter().any(|s| s.has_unit("wardend.service"))
+}
+
+/// The program and arguments of a launchd job, as its plist lists them; `None` when they
+/// cannot be read.
+fn plist_program(text: &str) -> Option<Vec<String>> {
+    let rest = &text[text.find("<key>ProgramArguments</key>")?..];
+    let array = &rest[..rest.find("</array>")?];
+    let unxml = |s: &str| {
+        s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+    };
+    Some(array.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(unxml).collect())
+}
+
+/// Why the launchd job for wardend cannot start it: one written by an older `warden startup`
+/// can name a warden that is gone (an upgrade moved it) or a command it no longer has (it
+/// was `daemon`). launchd would retry it forever and wardend would never answer, so such a
+/// job is not counted as wardend's manager. `None`: it runs `<warden> wardend`, or its
+/// program cannot be read (then it is trusted, as before).
+pub(crate) fn launchd_job_problem(system: bool) -> Option<String> {
+    if !launchd_host() {
+        return None;
+    }
+    let path = plist_path(system);
+    let argv = plist_program(&std::fs::read_to_string(&path).ok()?)?;
+    let shown = argv.join(" ");
+    let problem = match argv.first() {
+        None => "runs nothing".to_string(),
+        Some(p) if !Path::new(p).is_file() => format!("runs `{shown}`, but {p} does not exist"),
+        Some(_) if argv.get(1).map(String::as_str) != Some("wardend") => {
+            format!("runs `{shown}`, which is not `warden wardend` (an older warden's job)")
+        }
+        Some(_) => return None,
+    };
+    Some(format!("the launchd job {} {problem}; `warden startup` writes it again", path.display()))
 }
 
 /// Start wardend through the service manager that owns it (launchd: `kickstart`, or load
@@ -392,7 +426,7 @@ pub(crate) fn start_wardend_managed() -> Result<String, String> {
         let mut last = "no launchd job for wardend".to_string();
         for system in [false, true] {
             let path = plist_path(system);
-            if !path.exists() {
+            if !path.exists() || launchd_job_problem(system).is_some() {
                 continue;
             }
             let (domain, target) = (launchd_domain(system), format!("{}/{LAUNCHD_LABEL}", launchd_domain(system)));
@@ -867,6 +901,16 @@ mod tests {
         let d = wardend_unit(Scope::User, "/home/me/bin/warden", &env);
         assert!(!d.contains("LimitNOFILE") && !d.contains("network-online") && d.contains("WantedBy=default.target"));
         assert!(d.contains("KillMode=process") && d.contains("RuntimeDirectory=warden"), "{d}");
+    }
+
+    #[test]
+    fn a_launchd_jobs_program_is_read_back_from_its_plist() {
+        let p = launchd_plist(LAUNCHD_LABEL, "/Users/me/a & b/warden", Path::new("/tmp/w.log"), &[]);
+        assert_eq!(plist_program(&p).unwrap(), ["/Users/me/a & b/warden", "wardend", "--resurrect"]);
+        let old = "<key>ProgramArguments</key>\n<array>\n<string>/usr/local/bin/warden</string>\n\
+                   <string>daemon</string>\n<string>--resurrect</string>\n</array>";
+        assert_eq!(plist_program(old).unwrap(), ["/usr/local/bin/warden", "daemon", "--resurrect"]);
+        assert_eq!(plist_program("<plist/>"), None);
     }
 
     #[test]

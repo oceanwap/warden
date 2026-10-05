@@ -87,6 +87,11 @@ fn dump_path() -> PathBuf {
     state_dir().join("dump.json")
 }
 
+/// The saved list before the last `warden save` replaced it.
+fn dump_backup_path() -> PathBuf {
+    state_dir().join("dump.json.bak")
+}
+
 /// A background supervisor's log file (`warden start` and wardend).
 pub(crate) fn log_path(name: &str) -> PathBuf {
     state_dir().join("logs").join(format!("{name}.log"))
@@ -2438,8 +2443,34 @@ pub async fn save(args: &Args) -> i32 {
         let cfg = std::fs::canonicalize(&cfg).unwrap_or(cfg);
         saved.push(Saved { name: app.name.clone(), config: cfg, workers: st.workers_configured, stopped: st.stopped });
     }
+    // Nothing runs (a reboot without `warden startup`, a `kill`, an update that stopped
+    // halfway): an empty save would forget every app saved before, so the saved list stays,
+    // as `pm2 save` does. `warden resurrect` starts it; removing the file forgets it.
+    let before = if saved.is_empty() { read_dump().ok().flatten().filter(|d| !d.apps.is_empty()) } else { None };
+    if let Some(before) = before {
+        println!(
+            "no app is running, so nothing was saved: {} keeps the {} app(s) saved at {} ({}). `warden resurrect` \
+             starts them; to forget them, remove that file",
+            dump_path().display(),
+            before.apps.len(),
+            before.saved_at,
+            before.apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", "),
+        );
+        return 0;
+    }
     let dump = Dump { version: 1, saved_at: crate::logging::timestamp_now(), apps: saved.clone() };
     let text = serde_json::to_string_pretty(&dump).unwrap_or_default();
+    // The list it replaces stays one save back, in dump.json.bak.
+    if dump_path().is_file() {
+        if let Err(e) = std::fs::copy(dump_path(), dump_backup_path()) {
+            eprintln!(
+                "warden: cannot keep a copy of {} in {}: {e}; nothing was saved",
+                dump_path().display(),
+                dump_backup_path().display()
+            );
+            return 1;
+        }
+    }
     if let Err(e) = write_private(&dump_path(), &text, 0o600) {
         eprintln!("warden: {e}");
         return 1;

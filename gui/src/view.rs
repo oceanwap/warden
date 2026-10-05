@@ -59,6 +59,11 @@ const SETTINGS_FRAME_H: f32 = 190.0;
 const SETTINGS_MIN_H: f32 = 140.0;
 /// The "older supervisor" banner: a sentence and the command under it.
 const OUTDATED_H: f32 = 74.0;
+/// The top bar's readings at 13 px, wide enough for `100.0%`, `999.99 GB / 999.99 GB` and
+/// `99.99 99.99 99.99`.
+const CPU_VALUE_W: f32 = 50.0;
+const MEM_VALUE_W: f32 = 150.0;
+const LOAD_VALUE_W: f32 = 118.0;
 const IDLE_H: f32 = 92.0;
 const PORTS_H: f32 = 24.0;
 const ACTIONS_H: f32 = 32.0;
@@ -268,24 +273,40 @@ fn topbar(g: &Gui) -> Element<'_, Message> {
             let spark = |s, hue, top: Option<f32>, floor| {
                 canvas(Sparkline { series: s, hue, top, floor }).width(SPARK_W).height(SPARK_H)
             };
-            let metric =
-                |i: Icon, t: String| row![icon(i).size(13).style(muted), text(t).size(13)].spacing(5).align_y(Center);
+            // Each value has a fixed width, as wide as its longest reading, so the bar does not
+            // shift as the numbers change (`9.9%` to `10.4%`).
+            let metric = |i: Icon, label: &'static str, value: String, w: f32| {
+                row![
+                    icon(i).size(13).style(muted),
+                    text(label).size(13),
+                    text(value).size(13).width(w).align_x(iced::alignment::Horizontal::Right)
+                ]
+                .spacing(5)
+                .align_y(Center)
+            };
             let mut r = Row::new().spacing(8).align_y(Center);
-            r = r.push(metric(Icon::Cpu, format!("CPU {}", format::percent(h.cpu_percent))));
+            r = r.push(metric(Icon::Cpu, "CPU", format::percent(h.cpu_percent), CPU_VALUE_W));
             if sparks {
                 r = r.push(spark(&series[history::HOST_CPU], Hue::Blue, None, 10.0));
             }
             if mem {
                 r = r.push(metric(
                     Icon::Memory,
-                    format!("Mem {} / {}", format::bytes(h.mem_used_bytes), format::bytes(h.mem_total_bytes)),
+                    "Mem",
+                    format!("{} / {}", format::bytes(h.mem_used_bytes), format::bytes(h.mem_total_bytes)),
+                    MEM_VALUE_W,
                 ));
                 if sparks {
                     r = r.push(spark(&series[history::HOST_MEM], Hue::Aqua, Some(h.mem_total_bytes as f32), 0.0));
                 }
             }
             if load {
-                r = r.push(metric(Icon::Activity, format!("Load {:.2} {:.2} {:.2}", h.load[0], h.load[1], h.load[2])));
+                r = r.push(metric(
+                    Icon::Activity,
+                    "Load",
+                    format!("{:.2} {:.2} {:.2}", h.load[0], h.load[1], h.load[2]),
+                    LOAD_VALUE_W,
+                ));
             }
             r.into()
         }

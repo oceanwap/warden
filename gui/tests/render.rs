@@ -250,9 +250,10 @@ fn main_screen_with_fake_data() {
     let mut ui = sim(&g);
     for t in [
         "wardend 0.1.0 · pid 4211",
-        "CPU 23.4%",
-        "Mem 3.10 GB / 7.66 GB",
-        "Load 0.52 0.40 0.31",
+        "CPU",
+        "23.4%",
+        "3.10 GB / 7.66 GB",
+        "0.52 0.40 0.31",
         "api",
         "jobs",
         "gave up",
@@ -840,10 +841,10 @@ fn narrow_window_still_draws_the_table() {
     let mut g = connected();
     let _ = g.update(Message::Resized(iced::Size::new(900.0, 700.0)));
     let mut ui = Simulator::with_size(warden_gui::settings(), (900.0, 700.0), warden_gui::view::view(&g));
-    for t in ["Worker", "State", "RSS", "RUNNING", "Connected", "Add app", "CPU 23.4%"] {
+    for t in ["Worker", "State", "RSS", "RUNNING", "Connected", "Add app", "23.4%"] {
         assert!(ui.find(t).is_ok(), "{t:?} is not on the narrow screen");
     }
-    for t in ["Load 0.52 0.40 0.31", "wardend 0.1.0 · pid 4211"] {
+    for t in ["0.52 0.40 0.31", "wardend 0.1.0 · pid 4211"] {
         assert!(ui.find(t).is_err(), "{t:?} is dropped from the top bar when there is no room");
     }
     save(&mut ui, "main-screen-narrow");
