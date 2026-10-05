@@ -1317,18 +1317,101 @@ pub fn child_new_session() -> io::Result<()> {
 /// being async-signal-safe: this one calls nothing but the two helpers
 /// above, so it allocates and locks nothing after fork. `ipc_fd` must stay
 /// open until the command is spawned.
-pub fn pre_exec_worker(cmd: &mut std::process::Command, ipc_fd: RawFd, target: RawFd) {
+pub fn pre_exec_worker(cmd: &mut std::process::Command, ipc_fd: RawFd, target: RawFd, handoff: Option<RawFd>) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: the closure only calls `child_dup_ipc` (dup2, fcntl) and
-    // `child_parent_death_signal` (prctl or nothing; an atomic load in debug
-    // builds): all async-signal-safe, no allocation, no locks. It captures two
-    // integers.
+    // SAFETY: the closure only calls `child_dup_ipc` (dup2, fcntl),
+    // `child_dup_above` (fcntl) and `child_parent_death_signal` (prctl or
+    // nothing; an atomic load in debug builds): all async-signal-safe, no
+    // allocation, no locks. It captures three integers.
     unsafe {
         cmd.pre_exec(move || {
+            // The handoff channel goes to `target + 1`: first out of the way
+            // (it may be `target` itself), then into place after fd 3.
+            let handoff = match handoff {
+                Some(fd) => Some(child_dup_above(fd, target + 2)?),
+                None => None,
+            };
             child_dup_ipc(ipc_fd, target)?;
+            if let Some(fd) = handoff {
+                child_dup_ipc(fd, target + 1)?;
+            }
             child_parent_death_signal(libc::SIGTERM)
         });
     }
+}
+
+/// Receive one message and the descriptor riding on it, if any (the other
+/// end of [`send_with_fd`]). Blocks like the socket does.
+#[cfg(test)]
+pub fn recv_with_fd(sock: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
+    let mut buf = vec![0u8; max];
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    // SAFETY: an all-zero msghdr is valid; its pointers are set to live buffers.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    // SAFETY: `msg` points at buffers that outlive the call.
+    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    // SAFETY: recvmsg filled `control` and set msg_controllen; CMSG_FIRSTHDR
+    // checks the length, and an SCM_RIGHTS header carries one descriptor here.
+    let fd = unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (!cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS)
+            .then(|| OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const RawFd)))
+    };
+    Ok((buf, fd))
+}
+
+/// In a forked child: a copy of `fd` numbered `min` or above (close-on-exec;
+/// `child_dup_ipc` then moves it into place without the flag).
+pub fn child_dup_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
+    // SAFETY: fcntl(F_DUPFD_CLOEXEC) on a descriptor that exists in the
+    // child; async-signal-safe.
+    check(unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min) })
+}
+
+/// Send `buf` with `fd` attached (SCM_RIGHTS) on a Unix socket: the
+/// receiver gets its own copy of the descriptor. Never raises SIGPIPE
+/// (MSG_NOSIGNAL on Linux, SO_NOSIGPIPE on the socket elsewhere). The
+/// descriptor rides on the first byte, so a short write still delivered it.
+pub fn send_with_fd(sock: BorrowedFd<'_>, buf: &[u8], fd: BorrowedFd<'_>) -> io::Result<usize> {
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let raw = fd.as_raw_fd();
+    // SAFETY: CMSG_SPACE/CMSG_LEN are pure size computations.
+    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let mut control = vec![0u8; space];
+    let mut iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    // SAFETY: an all-zero msghdr is valid; the fields set below point at
+    // `iov` and `control`, which outlive the sendmsg call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    // SAFETY: `control` is CMSG_SPACE bytes for one descriptor, so the first
+    // header and its data fit; the header is written before its data is.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut RawFd, raw);
+    }
+    // SAFETY: `msg` is fully initialized and its buffers are alive.
+    let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, flags) };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
 
 /// Run `cmd`'s child in a new session (`child_new_session`): detached from
@@ -2241,7 +2324,7 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "read -r line <&3; echo \"got $line\" >&3; echo $$; ps -o pgid= -p $$ >&3"])
             .stdout(std::process::Stdio::piped());
-        pre_exec_worker(&mut cmd, cfd, 3);
+        pre_exec_worker(&mut cmd, cfd, 3, None);
         pre_exec_new_session(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         drop(theirs); // only the child's copy remains: its exit is EOF here

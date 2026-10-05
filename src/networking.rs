@@ -1,7 +1,8 @@
-//! Port handling. Warden never accepts or proxies application traffic; workers
-//! bind the port themselves with SO_REUSEPORT and the kernel balances
-//! connections. Warden only decides which port each worker uses and checks,
-//! from outside, whether a worker is listening.
+//! Port handling. Warden never proxies application traffic; workers bind the
+//! port themselves with SO_REUSEPORT and the kernel balances connections.
+//! Warden only decides which port each worker uses and checks, from outside,
+//! whether a worker is listening. (On macOS, whose kernel does not balance,
+//! Warden accepts and hands each connection to a worker: `crate::handoff`.)
 
 use crate::config::PortStrategy;
 

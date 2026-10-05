@@ -31,6 +31,9 @@ pub struct Spec {
     pub output: Output,
     /// Output lines kept per second per stream (0 = no limit; capture only).
     pub max_lines_per_sec: u32,
+    /// A second socket at fd 4 that Warden hands accepted connections over
+    /// (macOS handoff, `crate::handoff`): Node's IPC channel, `NODE_CHANNEL_FD`.
+    pub handoff: bool,
 }
 
 /// `[logging] worker_output`.
@@ -96,6 +99,12 @@ pub struct IpcMsg {
     /// [`IpcMsg::requests`].
     #[serde(default)]
     pub req: Option<serde_json::Value>,
+    /// `listening`: the shim takes connections from Warden (`crate::handoff`)
+    /// instead of listening on the port; `host` is what the app asked for.
+    #[serde(default)]
+    pub handoff: Option<bool>,
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 impl IpcMsg {
@@ -177,9 +186,17 @@ pub struct Handle {
     /// Set by the waiter once it reaped the process (the signal that ended
     /// it, if any), before its `Exited` event is sent.
     reaped: Rc<std::cell::Cell<Option<Option<i32>>>>,
+    /// Warden's end of the fd-4 handoff socket, until `take_handoff` gives
+    /// it to the dispatcher (when the worker is ready).
+    handoff: Option<OwnedFd>,
 }
 
 impl Handle {
+    /// The handoff socket (once): connections for this worker go over it.
+    pub fn take_handoff(&mut self) -> Option<OwnedFd> {
+        self.handoff.take()
+    }
+
     /// Is this process dying of SIGKILL, from anyone: reaped by its waiter
     /// with that death not handled yet, or (not reaped, so its pid is still
     /// its own) a zombie of it, exiting from it, or with it pending. What a
@@ -248,6 +265,13 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     // not the runtime's ignoring SIGPIPE for the whole process.
     let _ = crate::sys::set_nosigpipe(std::os::fd::AsFd::as_fd(&ipc_ours));
 
+    // fd 4 (handoff only): Warden passes accepted connections over it.
+    let handoff = if spec.handoff { Some(crate::sys::socketpair_cloexec()?) } else { None };
+    if let Some((ours, _)) = &handoff {
+        let _ = crate::sys::set_nosigpipe(std::os::fd::AsFd::as_fd(ours));
+    }
+    let handoff_child = handoff.as_ref().map(|(_, child)| std::os::fd::AsRawFd::as_raw_fd(child));
+
     let mut cmd = Command::new(&spec.program);
     // Direct mode: our own pipes (read end, file, stream), spliced into
     // the files on the output thread.
@@ -292,12 +316,13 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     cmd.env_remove(crate::events::LAUNCH_ENV);
     // The IPC socket at fd 3; and, if Warden dies without cleaning up
     // (SIGKILL), the workers go with it (where the OS can).
-    crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD);
+    crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD, handoff_child);
     let mut child = cmd.spawn()?;
     // Our copies of the pipes' write ends (in `cmd`) and of the worker's end
     // of the IPC socket: only the worker's remain, so its exit is EOF.
     drop(cmd);
     drop(ipc_child);
+    let handoff = handoff.map(|(ours, _child)| ours);
     let pid = child.id().unwrap_or(0);
     let label = spec.label.clone();
     let shared_label = Label::new(&label);
@@ -424,7 +449,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
-    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped })
+    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff })
 }
 
 /// Warden's end of the IPC socket, non-blocking: a tokio stream for the
@@ -1043,6 +1068,7 @@ mod tests {
                     label: "t".into(),
                     output: Output::Capture,
                     max_lines_per_sec: 0,
+                    handoff: false,
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -1101,6 +1127,7 @@ mod tests {
             label: label.into(),
             output: Output::Capture,
             max_lines_per_sec: 1,
+            handoff: false,
         }
     }
 
@@ -1128,6 +1155,7 @@ mod tests {
                     label: "quiet".into(),
                     output: Output::Capture,
                     max_lines_per_sec: 0,
+                    handoff: false,
                 };
                 let quiet = spawn(quiet, 2, tx).unwrap();
                 // Written 50 ms apart: all ten in the log well within 3 s, each read
@@ -1178,6 +1206,7 @@ mod tests {
                     label: "t".into(),
                     output: Output::Capture,
                     max_lines_per_sec: 0,
+                    handoff: false,
                 };
                 let h = spawn(spec, 9, tx).unwrap();
                 h.relabel("2");
@@ -1228,6 +1257,7 @@ mod tests {
                     label: "t".into(),
                     output: Output::Capture,
                     max_lines_per_sec: 0,
+                    handoff: false,
                 };
                 let h = spawn(spec, 3, tx).unwrap();
                 async fn next(rx: &mut mpsc::UnboundedReceiver<ProcEvent>) -> ProcEvent {
@@ -1273,6 +1303,7 @@ mod tests {
                     label: "t".into(),
                     output: Output::Capture,
                     max_lines_per_sec: 0,
+                    handoff: false,
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);

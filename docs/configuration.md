@@ -281,6 +281,7 @@ JSON, defaults included.
 | `WARDEN_WORKERS`, `WARDEN_ENTRY`, `WARDEN_SHIM` | how many Workers, the module each imports, the shim | worker-mode host process |
 | `WARDEN_STATIC` | the `[static]` section as JSON | `warden serve` workers |
 | `WARDEN_IPC_FD` | `3`: the shim's channel to Warden (readiness, heartbeat) | every worker |
+| `WARDEN_HANDOFF`, `NODE_CHANNEL_FD`, `NODE_CHANNEL_SERIALIZATION_MODE` | the connection handoff (macOS, more than one worker: [platforms](platforms.md)): `1`, fd `4` (Node's IPC channel, Warden's dispatcher on the other end) and `json` | workers of a handoff app |
 | `WARDEN_REQUESTS` | `0` with `[metrics] requests = false`: the static server and the shim count no responses | every worker |
 | `WARDEN_HEARTBEAT_MS`, `WARDEN_DRAIN_MS`, `WARDEN_LONG_LIVED_MS`, `WARDEN_STOP_SIGNAL`, `WARDEN_WAIT_READY`, `WARDEN_REUSE_PORT`, `WARDEN_HEALTH_DIR`, `WARDEN_INSTANCE_VAR`, `WARDEN_INSTANCE` | settings for the shim: heartbeat period (1000), `shutdown.drain_ms`, `long_lived_timeout` in ms, `shutdown.signal`, `1` with `wait_ready`, `1` with a shared port, where private health sockets go, the instance variable's name, an internal process number (unique per supervisor run) | every worker |
 
