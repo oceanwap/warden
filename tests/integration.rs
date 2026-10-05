@@ -87,11 +87,16 @@ impl Warden {
     }
 
     fn status(&self) -> Option<Value> {
+        self.status_or_why().ok()
+    }
+
+    /// The status, or what `warden status` said instead (for a wait that times out).
+    fn status_or_why(&self) -> Result<Value, String> {
         let (code, out) = self.cli(&["status", "--json"]);
         if code != 0 {
-            return None;
+            return Err(format!("exit {code}: {out}"));
         }
-        serde_json::from_str(&out).ok()
+        serde_json::from_str(&out).map_err(|e| format!("{e}: {out}"))
     }
 
     /// How long Warden says it was frozen (SIGSTOP, an overloaded or paused CI
@@ -112,18 +117,21 @@ impl Warden {
     fn wait_for(&self, what: &str, timeout: Duration, f: impl Fn(&Value) -> bool) -> Value {
         let start = Instant::now();
         let mut last = None;
+        let mut why = None;
         let mut deadline = timeout;
         while start.elapsed() < deadline {
-            if let Some(s) = self.status() {
-                if f(&s) {
-                    return s;
-                }
-                last = Some(s);
+            match self.status_or_why() {
+                Ok(s) if f(&s) => return s,
+                Ok(s) => last = Some(s),
+                Err(e) => why = Some(e),
             }
             std::thread::sleep(Duration::from_millis(100));
             deadline = timeout + self.frozen().min(Duration::from_secs(60));
         }
-        panic!("timed out waiting for {what}; last status: {last:#?}\nlog:\n{}", self.log());
+        panic!(
+            "timed out waiting for {what}; last status: {last:#?}\nlast failed status: {why:?}\nlog:\n{}",
+            self.log()
+        );
     }
 
     fn log(&self) -> String {
@@ -1627,8 +1635,9 @@ fn static_responses_are_counted_and_can_be_turned_off() {
     assert_eq!((&s["requests"]["total"]["2xx"], &s["workers"][0]["requests"]["total"]["2xx"]), (&json!(7), &json!(7)));
     // The static server's sockets defer accepting (TCP_DEFER_ACCEPT), which the kernel counts as drops: none shown.
     assert!(s["ports"][0]["max_backlog"].as_u64().unwrap() > 0 && s["ports"][0].get("drops").is_none(), "{s:#?}");
+    // A beat for any count to arrive, then a status that answers (a busy runner can miss one).
     std::thread::sleep(Duration::from_millis(1500));
-    let s = w_off.status().unwrap();
+    let s = wait_status(&w_off, "a status", |s| s["workers"][0]["pid"].is_u64());
     assert!(s.get("requests").is_none() && s["workers"][0].get("requests").is_none(), "{s:#?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
