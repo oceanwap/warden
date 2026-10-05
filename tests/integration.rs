@@ -1680,6 +1680,63 @@ fn node_workers_share_a_port_through_the_shim() {
     assert!(fail.load(Ordering::Relaxed) <= allowed_resets(), "requests failed during the rolling restart");
 }
 
+/// Connection handoff (src/handoff.rs): Warden owns the port and passes each
+/// connection to a worker over Node's IPC channel, under Node and under Bun.
+/// On by default on macOS with several workers; forced on here, so it runs
+/// where CI does. Connections reach both workers, `Connection: close` ends
+/// them (Bun keeps a handed-over socket open otherwise: `get` reads to EOF),
+/// readiness comes through, and a rolling restart loses nothing.
+#[test]
+fn handed_over_connections_reach_every_worker_and_survive_a_rolling_restart() {
+    if !have_bun() {
+        return;
+    }
+    for runtime in ["node", "bun"] {
+        if runtime == "node" && !have_node() {
+            continue;
+        }
+        let port = free_port();
+        let name = format!("handoff-{runtime}");
+        let cfg = format!(
+            "[app]\nname = \"{name}\"\ncommand = \"{runtime}\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+             [health]\npath = \"/whoami\"\n[reload]\nhealth_passes = 1\nhealth_interval_ms = 100\n[shutdown]\ndrain_ms = 200\n",
+            fixture("node_app.mjs")
+        );
+        let w = Warden::start_env(&name, port, &cfg, &[("WARDEN_HANDOFF", "1")]);
+        w.wait_for("2 ready", T, ready(2));
+        assert!(w.log().contains("workers take connections from Warden"), "{runtime}: {}", w.log());
+        let mut seen = HashSet::new();
+        for _ in 0..40 {
+            seen.insert(get(port, "/whoami").unwrap_or_else(|| panic!("{runtime}: request failed\n{}", w.log())));
+        }
+        let instances: HashSet<String> = seen.iter().map(|s| s.split(':').nth(1).unwrap().to_string()).collect();
+        assert_eq!(instances, HashSet::from(["0".to_string(), "1".to_string()]), "{runtime}: {seen:?}");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let client = {
+            let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let n = if get(port, "/whoami").is_some() { &ok } else { &fail };
+                    n.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let before = pid_set(&w.status().unwrap());
+        let (code, out) = w.cli(&["restart"]);
+        stop.store(true, Ordering::Relaxed);
+        client.join().unwrap();
+        assert_eq!(code, 0, "{runtime}: {out}\n{}", w.log());
+        assert!(before.is_disjoint(&pid_set(&w.status().unwrap())), "{runtime}: every worker replaced");
+        let (ok, fail) = (ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
+        eprintln!("{runtime} handoff rolling restart: {ok} ok, {fail} failed");
+        assert!(ok > 50, "{runtime}: {ok} ok");
+        assert!(fail <= allowed_resets(), "{runtime}: requests failed during the rolling restart: {fail}");
+        assert!(get(port, "/whoami").is_some(), "{runtime}: served after the restart");
+    }
+}
+
 /// Apps written for PM2: readiness from process.send('ready'), graceful stop
 /// on SIGINT.
 #[test]

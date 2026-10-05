@@ -58,6 +58,11 @@ const forceReusePort = env.WARDEN_REUSE_PORT === "1";
 // a Node app could not listen at all; there it listens as it asked (one
 // worker per port: docs/platforms.md). Bun sets SO_REUSEPORT on macOS too.
 const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos", "aix"].includes(process.platform);
+// Warden accepts on the app's port and hands each connection to a worker
+// over Node's IPC channel (src/handoff.rs): where the kernel does not spread
+// a shared port (macOS) and the app has several workers. A node:http server
+// on the app's port then takes those connections instead of listening.
+const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function";
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);
@@ -437,8 +442,67 @@ if (!isBun) {
     if (this !== privateServer) {
       trackNodeServer(this);
       if (standby && !promoted && deferNodeListen(this, args)) return this;
+      if (handoff && isHttpServer(this) && takeHandoff(this, args, origListen)) return this;
       if (nodeReusePort) args = withReusePort(args);
     }
+    return origListen.apply(this, args);
+  };
+}
+
+// ---------------------------------------------------------------- handoff
+//
+// The app's server does not listen on its port: it listens on an ephemeral
+// 127.0.0.1 port (so `listening`, address() and the app's callback behave)
+// and serves the connections Warden hands over ("warden:connection" with the
+// socket attached, Node's own handle passing; Bun speaks it too).
+
+const handoffServers = new Set();
+const handedOver = new WeakSet();
+
+function takeHandoff(server, args, origListen) {
+  if (appPort == null || nodeListenPort(args) !== appPort) return false;
+  const a0 = args[0];
+  const host = a0 && typeof a0 === "object" ? a0.host : typeof args[1] === "string" ? args[1] : undefined;
+  const cb = args.find((x) => typeof x === "function");
+  if (!handoffServers.size) {
+    process.on("message", (msg, socket) => {
+      if (msg !== "warden:connection" || !socket) return;
+      const target = [...handoffServers].find((s) => s.listening !== false) ?? [...handoffServers][0];
+      if (!target) return socket.destroy();
+      handedOver.add(socket);
+      target.emit("connection", socket);
+      socket.resume?.();
+    });
+  }
+  handoffServers.add(server);
+  // Bun answers "Connection: close" on a handed-over socket (to an HTTP/1.0
+  // request always, keep-alive or not) but keeps it open: end it once the
+  // response is out. Node closes it itself.
+  if (isBun) {
+    server.on("request", (req, res) => {
+      if (!handedOver.has(req.socket)) return;
+      const close = req.httpVersion === "1.0" || String(req.headers.connection || "").toLowerCase() === "close";
+      if (close) res.once("finish", () => req.socket.end());
+    });
+  }
+  server.once("listening", () => {
+    appHttpServers.add(server);
+    // Its private health socket, as for a server on the port.
+    const done = (socket) =>
+      report({ ev: "listening", port: appPort, handoff: true, host: host ?? null, ...(socket ? { socket } : {}) });
+    if (!privateServer) openPrivateNode(server, done);
+    else done(privatePath);
+  });
+  origListen.call(server, { port: 0, host: "127.0.0.1" }, cb);
+  return true;
+}
+
+if (isBun && handoff) {
+  // Bun's node:http Server has its own listen (it ends in Bun.serve).
+  const Server = http().Server;
+  const origListen = Server.prototype.listen;
+  Server.prototype.listen = function (...args) {
+    if (this !== privateServer && takeHandoff(this, args, origListen)) return this;
     return origListen.apply(this, args);
   };
 }
@@ -1341,7 +1405,9 @@ function loopDelay() {
 // PM2 apps call process.send('ready') (wait_ready) and some call process.send
 // unguarded. Without an IPC channel it would be undefined and throw; here it
 // reports readiness to Warden instead.
-if (!inWorker && typeof process.send !== "function") {
+// With the handoff, process.send is Node's IPC channel to Warden's
+// dispatcher, which reads no app messages: readiness still goes to fd 3.
+if (!inWorker && (typeof process.send !== "function" || handoff)) {
   process.send = function (msg, ...rest) {
     if (msg === "ready" || (msg && typeof msg === "object" && msg.type === "ready")) report({ ev: "ready" });
     const cb = rest.find((x) => typeof x === "function");
