@@ -9,6 +9,7 @@ use crate::history::{AppChart, HostSpark, Load, Range};
 use crate::hosts::{self, Machine, Saved};
 use crate::logs::{self, LogPane, Scroll};
 use crate::model::Model;
+use crate::release::{self, Release};
 use crate::ssh;
 use crate::system;
 use iced::widget::{Id, operation, text_editor};
@@ -300,6 +301,10 @@ pub struct Gui {
     pub restart_who: Option<Result<commands::Who, String>>,
     /// Seconds since "Restart now" (it ticks while the restart runs).
     pub restart_secs: u64,
+    /// A newer release, and updating to it.
+    pub release: Release,
+    /// "Not now" on the release banner (until the window starts again).
+    pub release_hidden: bool,
     /// A restart that did not finish: the apps may be stopped. Shown, with the way back, until the next try.
     pub restart_note: Option<String>,
     /// What runs is "start the saved apps again", not a restart.
@@ -362,6 +367,14 @@ pub enum Message {
     LogsStderr(bool),
     LogsEvents(bool),
     LogsClear,
+    CheckRelease,
+    ReleaseChecked(Result<release::Check, String>),
+    /// The banner's Update: `warden upgrade --yes`.
+    UpgradeNow,
+    UpgradeTick,
+    Upgraded(Result<Output, String>),
+    HideRelease,
+    SetAutoUpdate(bool),
     /// The Delete button: the dialog that asks for the app's name.
     AskDelete(String),
     DeleteTyped(String),
@@ -550,6 +563,8 @@ impl Gui {
             restart_all: RestartAll::Idle,
             restart_who: None,
             restart_secs: 0,
+            release: Release::Unknown,
+            release_hidden: false,
             restart_note: None,
             resurrecting: false,
             epoch: 0,
@@ -844,6 +859,97 @@ impl Gui {
             Message::LogsStderr(b) => self.with_logs(|l| l.stderr = b),
             Message::LogsEvents(b) => self.with_logs(|l| l.events = b),
             Message::LogsClear => self.with_logs(LogPane::clear),
+            Message::CheckRelease => self.check_release(),
+            Message::ReleaseChecked(r) => {
+                if self.release != Release::Checking {
+                    return Task::none();
+                }
+                match r {
+                    Ok(c) if c.update => {
+                        self.release = Release::Available(c.clone());
+                        let mut tasks = Vec::new();
+                        if self.saved.notified_release.as_deref() != Some(c.latest.as_str()) {
+                            release::notify(
+                                &format!("Warden {} is out", c.latest),
+                                &format!(
+                                    "{} runs {}. Open Warden and click Update.",
+                                    self.target.machine_name(),
+                                    c.current
+                                ),
+                            );
+                            self.saved.notified_release = Some(c.latest.clone());
+                            tasks.push(self.persist());
+                        }
+                        if self.saved.auto_update {
+                            tasks.push(self.update(Message::UpgradeNow));
+                        }
+                        Task::batch(tasks)
+                    }
+                    Ok(c) => {
+                        self.release = Release::UpToDate(c.current);
+                        Task::none()
+                    }
+                    // A warden from before `upgrade`, no network: nothing to say on the main screen.
+                    Err(e) => {
+                        self.release = Release::Failed(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::UpgradeNow => {
+                let Some(c) = self.release.available() else { return Task::none() };
+                if self.restart_all != RestartAll::Idle {
+                    return Task::none();
+                }
+                self.release = Release::Updating { to: c.latest.clone(), secs: 0 };
+                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::upgrade(&host, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::Upgraded(r))
+                })
+            }
+            Message::UpgradeTick => {
+                if let Release::Updating { secs, .. } = &mut self.release {
+                    *secs += 1;
+                }
+                Task::none()
+            }
+            Message::Upgraded(r) => {
+                let Release::Updating { to, .. } = self.release.clone() else { return Task::none() };
+                match r {
+                    Ok(out) if out.ok => {
+                        self.release = Release::UpToDate(to.clone());
+                        // This window is the old version too, on this machine: it starts again.
+                        if self.target.host.is_local() && version_lt(env!("CARGO_PKG_VERSION"), &to) {
+                            if let Err(e) = release::relaunch() {
+                                return self.toast(false, format!("Updated to {to}; {e}"));
+                            }
+                            return iced::exit();
+                        }
+                        self.toast(true, format!("Updated to Warden {to}: everything runs on it"))
+                    }
+                    Ok(out) => {
+                        let e = format!("{} (`{}`)", out.text(), out.command);
+                        self.release = Release::Failed(e.clone());
+                        self.toast(false, format!("Update to {to} failed: {e}"))
+                    }
+                    Err(e) => {
+                        self.release = Release::Failed(e.clone());
+                        self.toast(false, format!("Update to {to} failed: {e}"))
+                    }
+                }
+            }
+            Message::HideRelease => {
+                self.release_hidden = true;
+                Task::none()
+            }
+            Message::SetAutoUpdate(on) => {
+                self.saved.auto_update = on;
+                let save = self.persist();
+                if on && self.release.available().is_some() {
+                    return Task::batch([save, self.update(Message::UpgradeNow)]);
+                }
+                save
+            }
             Message::AskDelete(app) => {
                 self.menu = None;
                 self.modal = Modal::Delete(DeleteForm { app, typed: String::new(), running: false, error: None });
@@ -1325,6 +1431,15 @@ impl Gui {
     }
 
     /// Write the list of machines; a failure is told, the list stays in memory.
+    fn check_release(&mut self) -> Task<Message> {
+        if matches!(self.release, Release::Checking | Release::Updating { .. }) {
+            return Task::none();
+        }
+        self.release = Release::Checking;
+        let (host, tag) = (self.target.host.clone(), self.tag());
+        Task::perform(async move { release::check(&host).await }, move |r| tag.wrap(Message::ReleaseChecked(r)))
+    }
+
     fn persist(&mut self) -> Task<Message> {
         let Some(path) = self.saved_path.clone() else { return Task::none() };
         match hosts::save(&path, &self.saved) {
@@ -1409,8 +1524,10 @@ impl Gui {
             FeedMsg::Connected { socket } => {
                 self.conn = Conn::Connected;
                 self.socket = Some(socket);
-                // What happened while away (or before this window opened).
-                Task::batch([self.fetch_host(), self.fetch_chart()])
+                // What happened while away (or before this window opened); a newer release,
+                // once per host.
+                let release = if self.release == Release::Unknown { self.check_release() } else { Task::none() };
+                Task::batch([self.fetch_host(), self.fetch_chart(), release])
             }
             FeedMsg::Batch(b) => {
                 let now = now_ms();
@@ -1545,6 +1662,10 @@ impl Gui {
         if self.restart_all == RestartAll::Running {
             all.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::RestartTick));
         }
+        if matches!(self.release, Release::Updating { .. }) {
+            all.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::UpgradeTick));
+        }
+        all.push(iced::time::every(release::EVERY).map(|_| Message::CheckRelease));
         if self.source.follows_system() {
             // The desktop's look: GNOME says when it changes; elsewhere it is read
             // again when the window is focused or the mode changes.
@@ -1557,6 +1678,17 @@ impl Gui {
         }
         Subscription::batch(all)
     }
+}
+
+/// `a` is an older version than `b` (`0.1.1` < `0.2.0`; a pre-release before its release).
+fn version_lt(a: &str, b: &str) -> bool {
+    let key = |v: &str| {
+        let v = v.trim_start_matches('v');
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+        let nums: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (nums, pre.is_none(), pre)
+    };
+    key(a) < key(b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1832,6 +1964,40 @@ mod tests {
         let mut g = connected();
         g.target.endpoint = Endpoint::Socket("/tmp/wg-test-run/wardend.sock".into());
         g
+    }
+
+    #[test]
+    fn a_newer_release_is_offered_once_and_update_runs_it() {
+        let mut g = connected_to_a_runtime_dir();
+        assert_eq!(g.release, Release::Checking, "asked when it connected");
+        g.release = Release::Unknown;
+        let c = release::Check { current: "0.1.1".into(), latest: "0.2.0".into(), update: true };
+        let _ = g.update(Message::ReleaseChecked(Ok(c.clone())));
+        assert_eq!(g.release, Release::Unknown, "an answer nobody asked for is dropped");
+        let _ = g.update(Message::CheckRelease);
+        assert_eq!(g.release, Release::Checking);
+        let _ = g.update(Message::ReleaseChecked(Ok(c.clone())));
+        assert_eq!(g.release.available(), Some(&c));
+        assert_eq!(g.saved.notified_release.as_deref(), Some("0.2.0"), "notified once for 0.2.0");
+        let _ = g.update(Message::HideRelease);
+        assert!(g.release_hidden && g.release.available().is_some(), "still in Settings");
+        let _ = g.update(Message::UpgradeNow);
+        assert_eq!(g.release, Release::Updating { to: "0.2.0".into(), secs: 0 });
+        let _ = g.update(Message::UpgradeTick);
+        assert!(matches!(g.release, Release::Updating { secs: 1, .. }));
+        let _ = g.update(Message::Upgraded(Err("no network".into())));
+        assert_eq!(g.release, Release::Failed("no network".into()));
+        assert!(g.toasts.iter().any(|t| !t.ok && t.text.contains("Update to 0.2.0 failed")));
+        // Up to date: nothing to offer.
+        let _ = g.update(Message::CheckRelease);
+        let _ = g.update(Message::ReleaseChecked(Ok(release::Check { update: false, latest: "0.1.1".into(), ..c })));
+        assert_eq!(g.release, Release::UpToDate("0.1.1".into()));
+    }
+
+    #[test]
+    fn versions_compare_in_release_order() {
+        assert!(version_lt("0.1.1", "0.2.0") && version_lt("0.1.9", "0.1.10") && version_lt("1.0.0-rc.1", "1.0.0"));
+        assert!(!version_lt("0.2.0", "0.2.0") && !version_lt("0.3.0", "0.2.9"));
     }
 
     #[test]

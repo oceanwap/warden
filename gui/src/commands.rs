@@ -343,6 +343,11 @@ pub async fn restart_everything(host: &Host, dir: Option<&Path>) -> Restart {
     restart_report(r, "Restarted every supervisor and wardend from the installed warden.", &resurrect_by_hand(host))
 }
 
+/// `warden upgrade --yes`: the newest release installed on `host`, everything restarted onto it.
+pub async fn upgrade(host: &Host, dir: Option<&Path>) -> Result<Output, String> {
+    run_aimed(host, &["upgrade".into(), "--yes".into()], dir).await.map_err(|n| n.text)
+}
+
 /// `warden resurrect`: start what the last `warden save` (the first step of a restart) remembered.
 pub async fn resurrect_all(host: &Host, dir: Option<&Path>) -> Restart {
     let r = run_aimed(host, &["resurrect".into()], dir).await;

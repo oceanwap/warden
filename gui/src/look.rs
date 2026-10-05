@@ -238,7 +238,7 @@ pub fn warden_palette(light: bool) -> Palette {
         }
     } else {
         Palette {
-            background: color!(0x121510),
+            background: color!(0x141514),
             text: color!(0xf1f0ea),
             primary: color!(0x4eae78),
             success: color!(0x4eae78),

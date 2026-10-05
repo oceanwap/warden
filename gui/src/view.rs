@@ -19,6 +19,7 @@ use crate::look::{
     state_pill, tile, tip,
 };
 use crate::model::App;
+use crate::release::Release;
 use iced::widget::text::{LineHeight, Wrapping};
 use iced::widget::{
     Column, Id, Row, button, canvas, center, checkbox, column, container, mouse_area, opaque, progress_bar, responsive,
@@ -79,6 +80,9 @@ pub fn view(g: &Gui) -> Element<'_, Message> {
     let mut main = column![topbar(g), rule::horizontal(1)].height(Fill);
     if g.cli.banner(g.saved.cli_banner_dismissed) {
         main = main.push(cli_banner(g));
+    }
+    if release_banner_shown(g) {
+        main = main.push(release_banner(g));
     }
     let main = main.push(body(g));
     let mut layers: Vec<Element<'_, Message>> = vec![main.into()];
@@ -792,6 +796,9 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
     // whether the pane keeps a usable height).
     let mut top = TOPBAR_H + PAGE_PAD + HEAD_H + 8.0 + FACTS_H + GAP;
     if g.cli.banner(g.saved.cli_banner_dismissed) {
+        top += CLI_BANNER_H;
+    }
+    if release_banner_shown(g) {
         top += CLI_BANNER_H;
     }
     if cwd.is_some() {
@@ -1875,6 +1882,7 @@ fn settings_dialog(g: &Gui) -> Element<'_, Message> {
         ]
         .spacing(8),
         cli_section(g),
+        updates_section(g),
         restart_all_section(g),
         small(format!("This desktop: {}.", g.system.describe())),
     ]
@@ -2019,6 +2027,109 @@ fn cli_section(g: &Gui) -> Element<'_, Message> {
 }
 
 /// The first-run offer, under the top bar: from an app bundle, with no `warden` in Terminal's reach.
+/// A newer release (until "Not now"), or the update to it running.
+fn release_banner_shown(g: &Gui) -> bool {
+    match &g.release {
+        Release::Available(_) => !g.release_hidden,
+        Release::Updating { .. } => true,
+        _ => false,
+    }
+}
+
+/// "Warden 0.2.0 is out": Update installs it and restarts everything onto it.
+fn release_banner(g: &Gui) -> Element<'_, Message> {
+    let line: Element<'_, Message> = match &g.release {
+        Release::Updating { to, secs } => row![
+            icon(Icon::Loader).size(16).style(Tone::Accent.style()),
+            text(format!(
+                "Updating to Warden {to}\u{2026} {secs} s: installing it, then restarting every app on it (they stop \
+                 for a few seconds). The window reconnects, and starts again on {to} at the end."
+            ))
+            .size(13)
+            .width(Fill),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .into(),
+        Release::Available(c) => row![
+            icon(Icon::Info).size(16).style(Tone::Accent.style()),
+            text(format!(
+                "Warden {} is out ({} runs {}). Update installs it and restarts everything on it: nothing else to do.",
+                c.latest,
+                g.target.machine_name(),
+                c.current
+            ))
+            .size(13)
+            .width(Fill),
+            button(text("Update").size(13).font(SEMIBOLD))
+                .padding([5, 14])
+                .style(look::solid(Tone::Accent))
+                .on_press_maybe((g.restart_all == crate::app::RestartAll::Idle).then_some(Message::UpgradeNow)),
+            button(text("Not now").size(13).font(MEDIUM))
+                .padding([5, 14])
+                .style(look::quiet)
+                .on_press(Message::HideRelease),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .into(),
+        _ => space().into(),
+    };
+    container(container(line).padding([7, 14]).width(Fill).style(look::banner(Tone::Accent)))
+        .padding(iced::Padding { top: 10.0, right: 18.0, bottom: 0.0, left: 18.0 })
+        .into()
+}
+
+/// Settings' updates: what the check said, Check now, and the automatic switch.
+fn updates_section(g: &Gui) -> Element<'_, Message> {
+    let state = match &g.release {
+        Release::Unknown => said(Icon::Info, Tone::Muted, "Not checked yet."),
+        Release::Checking => said(Icon::Loader, Tone::Muted, "Checking for a newer release\u{2026}"),
+        Release::UpToDate(v) => said(Icon::CheckCircle, Tone::Good, format!("Warden {v} is the newest release.")),
+        Release::Available(c) => said(
+            Icon::Info,
+            Tone::Accent,
+            format!("Warden {} is out; {} runs {}.", c.latest, g.target.machine_name(), c.current),
+        ),
+        Release::Updating { to, secs } => said(Icon::Loader, Tone::Muted, format!("Updating to {to}\u{2026} {secs} s")),
+        Release::Failed(e) => said(Icon::Alert, Tone::Warn, format!("Could not check or update: {e}")),
+    };
+    let busy = matches!(g.release, Release::Checking | Release::Updating { .. });
+    let mut r = row![
+        button(labeled(Icon::Reload, "Check now"))
+            .padding([6, 14])
+            .style(look::quiet)
+            .on_press_maybe((!busy).then_some(Message::CheckRelease))
+    ]
+    .spacing(10);
+    if g.release.available().is_some() {
+        r = r.push(
+            button(labeled(Icon::Restart, "Update"))
+                .padding([6, 14])
+                .style(look::solid(Tone::Accent))
+                .on_press(Message::UpgradeNow),
+        );
+    }
+    column![
+        look::section_icon(Icon::Reload, "Updates"),
+        small(
+            "Warden looks for a new release when it connects and every 6 hours, and says so here, in a banner and \
+             once in a desktop notification. Update installs it (checked against the release's checksums) and \
+             restarts every app's supervisor and wardend on it; the apps stop for a few seconds."
+        ),
+        state,
+        r,
+        checkbox(g.saved.auto_update)
+            .label("Install updates automatically")
+            .on_toggle(Message::SetAutoUpdate)
+            .size(14)
+            .text_size(13)
+            .style(look::check),
+    ]
+    .spacing(8)
+    .into()
+}
+
 fn cli_banner(g: &Gui) -> Element<'_, Message> {
     let installing = g.cli.work == Work::Installing;
     container(
