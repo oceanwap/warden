@@ -16,8 +16,9 @@ one config file and one port. It is inspired by [Platformatic Watt](https://gith
 worker model, but it is a single binary of about 5 MB that embeds no JavaScript runtime.
 
 - **Process mode** (default, production): N Bun processes. One crash affects one worker.
-- **Worker mode** (experimental): one Bun process running N `Worker` threads, about half the memory.
-  If that process crashes, all workers go down together.
+- **Worker mode** (opt-in, Linux, Bun 1.4+): one Bun process running N `Worker` threads, 14-22 % less memory
+  and as fast as processes for NestJS on Bun 1.4. If that process crashes, all workers go down together;
+  on macOS the threads don't share the load, and before Bun 1.4 they ran 20-50 % slower (Warden warns).
 
 This page is the short version. The long one, with the experiments behind
 every decision, is [`architecture.md`](architecture.md).

@@ -128,6 +128,8 @@ pub struct Supervisor {
     runtime_dir: PathBuf,
     shim_path: Option<PathBuf>,
     host_path: Option<PathBuf>,
+    /// Worker mode on macOS or an old Bun (`config::worker_mode_hint`): asked once at start.
+    worker_mode_hint: Option<String>,
     force_kill: bool,
     /// `[watchdog] port_lost`: a look at the workers' sockets is running.
     port_look_inflight: bool,
@@ -336,6 +338,17 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         pid = std::process::id(),
         control = socket.display(),
     );
+    if sup.cfg.workers.mode == Mode::Worker {
+        let bun = crate::config::runtime_version(&sup.cfg.app.command);
+        sup.worker_mode_hint = crate::config::worker_mode_hint(&sup.cfg, cfg!(target_os = "macos"), bun);
+        if let Some(h) = &sup.worker_mode_hint {
+            warn!(
+                "worker mode costs this app speed here",
+                reason = h,
+                hint = "process mode is the default; worker mode only saves memory"
+            );
+        }
+    }
     if sup.cfg.workers.standby > 0 {
         info!(
             "hot standbys enabled: started once the workers are ready",
@@ -567,6 +580,7 @@ impl Supervisor {
             runtime_dir,
             shim_path,
             host_path,
+            worker_mode_hint: None,
             force_kill: false,
             port_look_inflight: false,
             requests: None,
@@ -2949,12 +2963,14 @@ impl Supervisor {
             watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
             requests: self.app_requests(),
             ports,
-            hint: crate::config::more_workers_hint(
-                &self.cfg,
-                self.count,
-                cfg!(target_os = "linux"),
-                crate::config::cpu_count(),
-            ),
+            hint: self.worker_mode_hint.clone().or_else(|| {
+                crate::config::more_workers_hint(
+                    &self.cfg,
+                    self.count,
+                    cfg!(target_os = "linux"),
+                    crate::config::cpu_count(),
+                )
+            }),
         }
     }
 }

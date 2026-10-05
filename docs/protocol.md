@@ -164,10 +164,12 @@ under `config.watch`.
 
 `status.hint` (a string, absent when there is none and from an older Warden):
 a way to make the app faster that the supervisor sees, for `warden doctor` and
-the GUI. Today one: the app runs 1 worker (counting `warden scale`) on a Linux
-host with more cores, with a port the workers share, where `count = "max"`
-lets the kernel spread connections over one worker per core. Not a problem:
-an app that keeps state in memory needs its one worker.
+the GUI. Worker mode where its threads cost speed (on macOS, where one thread
+gets most connections, and on Bun before 1.4), else 1 worker (counting
+`warden scale`) on a Linux host with more cores, with a port the workers
+share, where `count = "max"` lets the kernel spread connections over one
+worker per core. Not a problem: an app that keeps state in memory needs its
+one worker, and worker mode saves memory.
 
 `status.workers[].listening` (an array, absent when empty; an addition older
 clients ignore): the sockets the worker's process listens on, and the

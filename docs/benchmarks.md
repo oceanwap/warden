@@ -87,10 +87,20 @@ under every manager, and Warden's rolling restarts still lost none).
   drain in the background while the next ones are replaced (`[reload]
   max_draining`, default 4), so the 4-worker restart took 2.3–2.5 s instead
   of ~8.5 s when the drains ran one after another.
-- **Worker (thread) mode** (Bun only): by PSS it saves ~19 % idle (NestJS
-  167 vs 206 MB) and ~10 % after load (257 vs 286 MB), with a worse p99 for
-  NestJS (17.0 vs 9.6 ms), and one crash takes all workers down (crash
-  recovery 1,094 ms vs 467 ms). **Use process mode in production.** For
+- **Worker (thread) mode** (Bun only, Linux): it depends on the Bun version.
+  On Bun 1.4.2 (2026-10-05, 14-CPU Linux VM, `cargo xtask bench`) NestJS
+  serves the same in both modes (327.7k vs 329.0k req/s plaintext, 267.5k vs
+  266.5k json, 5,089 vs 5,059 cpu; CPU per request 12.3 vs 11.6 µs, p99 0.75
+  vs 0.79 ms) with 22 % less PSS idle (192 vs 151 MB) and 14 % after load
+  (314 vs 270 MB); a bare `Bun.serve` app is 6-9 % slower (757.9k vs 714.7k
+  req/s) with 28 % less. On Bun 1.3.13-1.3.14 its threads were 20-50 % slower
+  for NestJS (3 app CPUs, 4 workers: 29.7k vs 15.9k req/s cold, 34.6k vs
+  27.0k warmed, p99 16 vs 21 ms; 95 vs 147 µs of CPU per request): the JIT
+  and allocator shared by the threads; more JIT threads did not help. Its
+  costs either way: one crash takes all workers down (crash recovery 128 vs
+  101 ms on 1.4.2), and on macOS the threads do not share the load (Warden
+  warns, and `warden doctor` says so, on macOS and on Bun before 1.4).
+  **Process mode stays the default.** For
   Node, threads don't save memory at all (4 `node:http` processes 96 MB PSS,
   one process with 4 threads 104 MB), so Warden has no Node thread mode.
 - **Static files.** With the response cache, `warden serve` is **ahead of
