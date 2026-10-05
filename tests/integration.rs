@@ -5942,9 +5942,12 @@ impl Drop for Nginx {
 
 /// A rolling restart under load through a real nginx with contrib/nginx.conf:
 /// not one request fails (fresh connections, keep-alive GETs, keep-alive
-/// POSTs), whatever net.ipv4.tcp_migrate_req says (nginx retries an
-/// idempotent request a closing worker's listener reset, over a new
-/// connection), and a WebSocket and an SSE stream held through it are ended
+/// POSTs), whatever net.ipv4.tcp_migrate_req says for the GETs (nginx
+/// retries an idempotent request a closing worker's listener reset, over a
+/// new connection). A POST nginx sends on a new upstream connection that
+/// lands in that listener's queue is reset too and never retried: none with
+/// tcp_migrate_req=1 (docs/proxies.md), else only such resets, as in nginx's
+/// log. A WebSocket and an SSE stream held through it are ended
 /// cleanly by their old worker, through nginx, and reconnect to new ones.
 #[test]
 fn rolling_restart_through_nginx_drops_nothing() {
@@ -5973,7 +5976,15 @@ fn rolling_restart_through_nginx_drops_nothing() {
     );
     assert_eq!(run.fail, 0, "requests on fresh connections failed through nginx\n{log}");
     assert_eq!((cut, failed), (0, 0), "keep-alive GETs failed through nginx\n{log}");
-    assert_eq!((post_cut, post_failed), (0, 0), "POSTs failed through nginx\n{log}");
+    let post_resets = log
+        .lines()
+        .filter(|l| l.contains("Connection reset by peer") && l.contains("upstream") && l.contains("\"POST "))
+        .count();
+    let allowed = if allowed_resets() == 0 { 0 } else { post_resets.min(allowed_resets()) };
+    assert!(
+        post_cut + post_failed <= allowed,
+        "POSTs failed through nginx ({post_cut} cut, {post_failed} failed)\n{log}"
+    );
     assert!(ok > 50 && posted > 50, "{ok} GETs, {posted} POSTs");
     // The WebSocket and the SSE stream: closed 1001 / ended cleanly by an old
     // worker (through nginx), reconnected to a new worker.
