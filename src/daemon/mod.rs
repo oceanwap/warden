@@ -932,16 +932,18 @@ impl Daemon {
 }
 
 /// Until the app's supervisor says its workers are ready (or that they are stopped on purpose),
-/// at most a minute.
+/// at most a minute. Looks every 50 ms for the first 10 s (the next saved app starts as soon as
+/// this one is up), then every 250 ms.
 async fn wait_until_up(socket: PathBuf) {
-    let until = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < until {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(60) {
         if let Ok(st) = watcher::poll_status(socket.clone()).await {
             if st.stopped || st.workers_ready >= st.workers_configured {
                 return;
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        let every = if t0.elapsed() < Duration::from_secs(10) { 50 } else { 250 };
+        tokio::time::sleep(Duration::from_millis(every)).await;
     }
 }
 

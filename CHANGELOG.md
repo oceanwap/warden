@@ -29,6 +29,17 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   with one. Only a hint: an app that keeps state in memory needs its one
   worker. Supervisors send it as `status.hint`.
 
+### Changed
+
+- `warden reload`, `restart` and `safe-reload` return as soon as the rollout
+  ends: they follow the supervisor's event stream instead of asking for its
+  status every 250 ms, so they no longer wait up to a quarter second more
+  (4 `node:http` workers on a busy host: reload median 648 → 500 ms, restart
+  519 → 470 ms). They fall back to polling when the stream is not available
+  (an older supervisor, too many live streams). `warden start` notices the
+  supervisor and its ready workers sooner, and wardend starts the next saved
+  app at boot sooner. Output and exit codes are unchanged.
+
 ### Fixed
 
 - macOS: apps that wardend starts (at login, after `warden update`, or when
