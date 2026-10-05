@@ -105,6 +105,9 @@ pub struct Supervisor {
     handoff_on: bool,
     /// The dispatcher, once a worker said it takes handed-over connections.
     handoff: Option<crate::handoff::Handoff>,
+    /// A worker's Bun is too old for the handoff (its version): logged once,
+    /// then shown as the status hint (`warden doctor`, the GUI).
+    handoff_old_bun: Option<String>,
     cfg: Config,
     cfg_path: Option<PathBuf>,
     policy: Policy,
@@ -562,6 +565,7 @@ impl Supervisor {
                 cfg!(target_os = "macos"),
             ),
             handoff: None,
+            handoff_old_bun: None,
             policy: Policy::from(&cfg.restart),
             count: cfg.workers.count,
             slots: BTreeMap::new(),
@@ -1324,6 +1328,17 @@ impl Supervisor {
                 }
             }
             "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
+            "handoff_unsupported" if self.handoff_old_bun.is_none() => {
+                let bun = msg.message.clone().unwrap_or_else(|| "?".into());
+                warn!(
+                    "this Bun cannot take connections from Warden, so the workers do not share the load",
+                    bun = bun,
+                    hint = "Bun 1.4 or newer takes the connections Warden hands to each worker; this one listens on \
+                            the port itself, and on macOS one worker then gets every connection. Upgrade Bun \
+                            (`bun upgrade`) and restart the app (`warden restart`) to spread them over every worker",
+                );
+                self.handoff_old_bun = Some(bun);
+            }
             "ready" => {
                 if self.cfg.workers.wait_ready {
                     debug!("app reported ready", worker = worker, pid = inst.handle.pid);
@@ -2989,14 +3004,24 @@ impl Supervisor {
             watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
             requests: self.app_requests(),
             ports,
-            hint: self.worker_mode_hint.clone().or_else(|| {
-                crate::config::more_workers_hint(
-                    &self.cfg,
-                    self.count,
-                    cfg!(target_os = "linux"),
-                    crate::config::cpu_count(),
-                )
-            }),
+            hint: self
+                .handoff_old_bun
+                .as_ref()
+                .map(|v| {
+                    format!(
+                        "Bun {v} cannot take the connections Warden hands to workers, so they do not share the \
+                         load here: upgrade Bun to 1.4 or newer (`bun upgrade`), then `warden restart`"
+                    )
+                })
+                .or_else(|| self.worker_mode_hint.clone())
+                .or_else(|| {
+                    crate::config::more_workers_hint(
+                        &self.cfg,
+                        self.count,
+                        cfg!(target_os = "linux"),
+                        crate::config::cpu_count(),
+                    )
+                }),
         }
     }
 }

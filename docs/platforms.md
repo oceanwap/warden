@@ -14,7 +14,8 @@
     talk directly: Warden never touches the traffic, and the app sees the
     client's address. It works for `node:http` servers (Express, Fastify,
     NestJS, …) under Node and under Bun 1.4 or newer (older Bun cannot take a
-    handed-over socket: its workers listen as before); measured on an M-series Mac, 4
+    handed-over socket: its workers listen as before, and Warden warns once
+    and suggests `bun upgrade`); measured on an M-series Mac, 4
     workers of a 1 ms-per-request app served 3.2–3.4× what 1 worker did
     (p99 3 ms instead of 7–10), and a trivial app the same within noise.
     Apps on `Bun.serve` itself (Elysia, Hono on Bun) cannot take a handed-over

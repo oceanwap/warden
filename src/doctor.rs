@@ -507,10 +507,13 @@ async fn apps(args: &Args) -> Vec<Finding> {
 }
 
 /// Info, not a warning: the app works as it is (one worker may be what it needs; worker mode
-/// saves memory).
+/// saves memory; an older Bun still serves). Each hint carries its own fix.
 fn workers_hint(name: &str, hint: String, config: Option<&Path>) -> Finding {
     let file = config.map_or_else(|| "its config".to_string(), |p| p.display().to_string());
-    let fix = if hint.starts_with("worker mode") {
+    // ponytail: told apart by their text; a hint kind in the protocol when there are more.
+    let fix = if hint.contains("bun upgrade") {
+        format!("`bun upgrade`, then `warden restart {name}`")
+    } else if hint.starts_with("worker mode") {
         format!(
             "set `mode = \"process\"` and `args = [<entry>]` in place of `entry` in {file}, then `warden reload {name}`"
         )
