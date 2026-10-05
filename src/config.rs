@@ -761,6 +761,22 @@ pub fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
+/// A hint for an app that runs one worker on a Linux host with more cores: there the workers
+/// share the port and the kernel spreads the connections over them, so throughput grows with
+/// them, and one worker leaves the other cores idle under load. Only a
+/// hint (`warden doctor`, the GUI): an app that keeps state in memory needs its one worker.
+/// `count`: the workers it runs now (after `warden scale`); `linux` and `cpus`: the host's.
+pub fn more_workers_hint(cfg: &Config, count: usize, linux: bool, cpus: usize) -> Option<String> {
+    // Without a shared port (none, or one per worker) more workers are not one faster app.
+    if !linux || cpus < 2 || count != 1 || cfg.app.port.is_none() || cfg.workers.port_strategy != PortStrategy::Shared {
+        return None;
+    }
+    Some(format!(
+        "1 worker on a host with {cpus} cores: under load the other cores stay idle; \
+         `count = \"max\"` under [workers] runs one per core (keep 1 if the app holds state in memory)"
+    ))
+}
+
 /// `count = 4`, `count = "max"`, `count = "max-1"`.
 fn count_or_max<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
     use serde::de::Error;
@@ -2162,5 +2178,19 @@ level = "info"
         let c = Config::parse(&format!("{node}[workers]\nport_strategy = \"offset\"\n")).unwrap();
         assert!(c.no_overlap_reason().is_some() && !c.overlap());
         assert!(Config::parse("[app]\nname = \"a\"\ncommand = \"python3\"\n").unwrap().overlap(), "no port");
+    }
+
+    #[test]
+    fn one_worker_on_a_many_core_linux_host_gets_the_max_hint() {
+        let one = Config::parse(&format!("{MIN}port = 3000\n")).unwrap();
+        let hint = more_workers_hint(&one, 1, true, 8).expect("1 worker of 8 cores");
+        assert!(hint.contains("8 cores") && hint.contains("count = \"max\""), "{hint}");
+        assert_eq!(more_workers_hint(&one, 1, false, 8), None, "macOS spreads no connections over the workers");
+        assert_eq!(more_workers_hint(&one, 1, true, 1), None, "one core: nothing idle");
+        assert_eq!(more_workers_hint(&one, 2, true, 8), None, "scaled up already");
+        let no_port = Config::parse(MIN).unwrap();
+        assert_eq!(more_workers_hint(&no_port, 1, true, 8), None, "no port to share");
+        let offset = Config::parse(&format!("{MIN}port = 3000\n[workers]\nport_strategy = \"offset\"\n")).unwrap();
+        assert_eq!(more_workers_hint(&offset, 1, true, 8), None, "a port per worker");
     }
 }

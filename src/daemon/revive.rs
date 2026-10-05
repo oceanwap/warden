@@ -177,22 +177,27 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
-    fn dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("warden-revive-{}-{}", std::process::id(), crate::events::now_ms()));
+    /// Its own per test: they run at once, and the same millisecond is likely.
+    fn dir(test: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "warden-revive-{test}-{}-{}",
+            std::process::id(),
+            crate::events::now_ms()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
     #[tokio::test]
     async fn no_socket_means_stopped_on_purpose_or_never_started() {
-        let d = dir();
+        let d = dir("stopped");
         assert_eq!(probe(&d.join("wardend.sock")).await, Probe::Stopped);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[tokio::test]
     async fn a_socket_nobody_listens_on_means_wardend_died() {
-        let d = dir();
+        let d = dir("died");
         let sock = d.join("wardend.sock");
         let l = UnixListener::bind(&sock).unwrap();
         assert_eq!(probe(&sock).await, Probe::Alive, "listening");
@@ -200,7 +205,17 @@ mod tests {
         // unlinking is the same thing.
         drop(l);
         assert!(sock.exists());
-        assert_eq!(probe(&sock).await, Probe::Died);
+        // macOS can still take a connection for a moment after the close (seen on CI);
+        // the supervisors look again every few seconds, so a moment later is as good.
+        let mut seen = probe(&sock).await;
+        for _ in 0..40 {
+            if seen == Probe::Died {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen = probe(&sock).await;
+        }
+        assert_eq!(seen, Probe::Died);
         // A clean exit removes it.
         std::fs::remove_file(&sock).unwrap();
         assert_eq!(probe(&sock).await, Probe::Stopped);
@@ -209,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn something_that_is_not_a_socket_is_left_alone() {
-        let d = dir();
+        let d = dir("not-a-socket");
         let f = d.join("wardend.sock");
         std::fs::write(&f, "x").unwrap();
         assert_eq!(probe(&f).await, Probe::Stopped);

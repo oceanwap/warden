@@ -754,6 +754,18 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         ));
     }
     c = c.push(small(facts.join(" · ")));
+    // A way to make the app faster (one worker on a Linux host with more cores): one quiet
+    // line, as one worker works and may be what the app needs. The whole text is its tooltip.
+    let hint = a.status.as_ref().and_then(|s| s.hint.as_deref());
+    if let Some(h) = hint {
+        let (shown, _) = fit(h, SMALL, false, room - 40.0);
+        c = c.push(tip(
+            row![icon(Icon::Info).size(13).style(muted), small(shown.into_owned()).wrapping(Wrapping::None)]
+                .spacing(6)
+                .align_y(Center),
+            h.to_string(),
+        ));
+    }
     if let (AppState::GaveUp | AppState::Unreachable, Some(p)) = (e.state, &e.problem) {
         c = c.push(
             container(
@@ -802,6 +814,9 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         top += CLI_BANNER_H;
     }
     if cwd.is_some() {
+        top += CWD_H + 8.0;
+    }
+    if hint.is_some() {
         top += CWD_H + 8.0;
     }
     if matches!(e.state, AppState::GaveUp | AppState::Unreachable) && e.problem.is_some() {

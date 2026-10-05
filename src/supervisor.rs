@@ -2842,6 +2842,12 @@ impl Supervisor {
             watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
             requests: self.app_requests(),
             ports,
+            hint: crate::config::more_workers_hint(
+                &self.cfg,
+                self.count,
+                cfg!(target_os = "linux"),
+                crate::config::cpu_count(),
+            ),
         }
     }
 }

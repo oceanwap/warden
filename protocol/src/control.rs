@@ -229,6 +229,11 @@ pub struct Status {
     /// dropped connections, open ones. Absent (empty) where the OS cannot say.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortStats>,
+    /// A way to make the app faster the supervisor sees (one worker on a Linux host with
+    /// more cores: `count = "max"`), for `warden doctor` and the GUI. Not a problem: absent
+    /// when there is none, and from a supervisor that does not send it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// An executable as the supervisor saw it at start: where it was and what
