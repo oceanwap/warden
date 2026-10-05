@@ -2986,8 +2986,9 @@ fn wardend_runs_reports_and_stops() {
     assert!(bg.0.is_some(), "{out}");
     let out = f.ok(&["wardend", "status"]);
     assert!(out.contains("wardend: pid") && out.contains("protocol 1"), "{out}");
+    // A second one is not needed and exits 0 (launchd would start a failed one again).
     let (code, out) = f.cli(&["wardend"]);
-    assert_eq!(code, 1, "{out}");
+    assert_eq!(code, 0, "{out}");
     assert!(out.contains("already running"), "{out}");
     let out = f.ok(&["wardend", "--background"]);
     assert!(out.contains("already running"), "{out}");
@@ -3184,6 +3185,21 @@ fn update_restarts_every_supervisor_and_wardend() {
     assert_ne!(idle["status"]["pid"].as_u64(), Some(before.2), "though its supervisor is new too");
     let after = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs again");
     assert_ne!(after, wardend, "a new wardend");
+
+    // An update while nothing runs (one before it was cut short) keeps the saved list, with the
+    // one it replaces as dump.json.bak, and starts the apps again.
+    let (code, out) = f.cli_env(&["kill", "--yes"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = f.cli_env(&["update", "--yes"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    for name in ["one", "two", "idle"] {
+        assert!(out.contains(&format!("{name}: not running; kept in the saved list")), "{name}:\n{out}");
+    }
+    assert!(out.contains("saved 3 app(s)") && out.contains("dump.json.bak"), "{out}");
+    f.wait("the apps are back again", |f| {
+        f.app("one")["status"]["pid"].is_u64() && f.app("two")["status"]["pid"].is_u64()
+    });
+    assert_eq!(f.app("idle")["status"]["stopped"], true, "still stopped");
 }
 
 #[test]
