@@ -247,6 +247,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
 }
 
 async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
+    worker_mode_supported(&cfg, cfg!(target_os = "macos"))?;
     // While our launcher is still our parent (see `own_unit`).
     let _ = systemd::own_unit();
     let socket = cfg.socket_path();
@@ -521,6 +522,21 @@ fn warn_if_node_cannot_share_the_port(cfg: &Config) {
                 next to the old one, which fails with EADDRINUSE); or set workers.port_strategy = \"offset\" \
                 (one port per worker)",
     );
+}
+
+/// Worker mode is for Linux: there each Worker thread listens on the port and the
+/// kernel spreads connections over them. macOS gives every connection to one of
+/// them, so its threads would not share the load; process mode does, through the
+/// handoff.
+fn worker_mode_supported(cfg: &Config, macos: bool) -> Result<(), String> {
+    if macos && cfg.workers.mode == Mode::Worker {
+        return Err("worker mode (`[workers] mode = \"worker\"`) runs on Linux only: macOS does not spread a shared \
+                    port over the Worker threads, so one of them would get every connection. Use process mode (remove \
+                    `mode`, or set `mode = \"process\"`): there Warden hands each connection to a worker, so they \
+                    share the load"
+            .into());
+    }
+    Ok(())
 }
 
 /// Whether connections are handed to the workers (`crate::handoff`): by
@@ -3120,6 +3136,16 @@ fn skip_entries(path: PathBuf, log: bool) -> Vec<watch::Skip> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_mode_is_refused_on_macos_only() {
+        let w = Config::parse("[app]\nname = \"a\"\nentry = \"main.js\"\n[workers]\nmode = \"worker\"\n").unwrap();
+        let e = worker_mode_supported(&w, true).unwrap_err();
+        assert!(e.contains("Linux only") && e.contains("process"), "{e}");
+        assert!(worker_mode_supported(&w, false).is_ok());
+        let p = Config::parse("[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\n").unwrap();
+        assert!(worker_mode_supported(&p, true).is_ok(), "process mode runs everywhere");
+    }
 
     #[test]
     fn handoff_is_on_by_default_only_on_macos_with_several_workers() {

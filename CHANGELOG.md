@@ -22,6 +22,10 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   on macOS at all, and reload without `EADDRINUSE`. `Bun.serve` apps are
   unchanged. On by default with more than one worker; `WARDEN_HANDOFF=0`
   turns it off.
+- Worker mode (`[workers] mode = "worker"`) is refused on macOS instead of
+  warned about: the kernel there would give every connection to one Worker
+  thread. The error points to process mode, which shares the load on macOS
+  through the handoff. On Linux it stays as it is.
 - With Bun older than 1.4 (which cannot take a handed-over connection),
   Warden warns once that the workers do not share the load and suggests
   `bun upgrade`.
