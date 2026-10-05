@@ -50,7 +50,7 @@ ICONS = [
     ("Pause", "pause"), ("Info", "info"), ("Loader", "loader"), ("Wifi", "wifi"), ("WifiOff", "wifi-off"),
     ("Boxes", "boxes"), ("Workers", "layers"), ("Folder", "folder"), ("Timer", "timer"),
     ("Sun", "sun"), ("Moon", "moon"), ("SunMoon", "sun-moon"), ("Palette", "palette"), ("Monitor", "monitor"),
-    ("Save", "save"), ("Trash", "trash-2"),
+    ("Save", "save"), ("Trash", "trash-2"), ("Maximize", "maximize-2"), ("Minimize", "minimize-2"),
 ]
 
 TEXT_UNICODES = (

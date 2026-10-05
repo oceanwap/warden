@@ -512,12 +512,9 @@ fn body(g: &Gui) -> Element<'_, Message> {
             .into(),
         };
     }
-    let list = app_list(g);
-    let detail: Element<'_, Message> = match g.selected_app() {
-        Some(a) => detail(g, a),
-        None => center(text("Select an app")).into(),
-    };
-    let main = row![list, rule::vertical(1), detail].height(Fill);
+    let expanded = g.logs_expanded && g.tab == Tab::Logs && g.logs.is_some() && g.selected_app().is_some();
+    let main: Element<'_, Message> =
+        if expanded { container(logs_pane(g)).padding([18, 22]).width(Fill).height(Fill).into() } else { split(g) };
     match &g.conn {
         Conn::Down { error, .. } => column![
             container(
@@ -534,8 +531,17 @@ fn body(g: &Gui) -> Element<'_, Message> {
             main
         ]
         .into(),
-        _ => main.into(),
+        _ => main,
     }
+}
+
+/// The app list beside the selected app.
+fn split(g: &Gui) -> Element<'_, Message> {
+    let detail: Element<'_, Message> = match g.selected_app() {
+        Some(a) => detail(g, a),
+        None => center(text("Select an app")).into(),
+    };
+    row![app_list(g), rule::vertical(1), detail].height(Fill).into()
 }
 
 fn not_running<'a>(g: &'a Gui, error: &'a str, attempt: u32) -> Element<'a, Message> {
@@ -1346,42 +1352,49 @@ impl Line<'_> {
 
 /// A list drawn only where it is visible: every row is `LINE_H` tall, the
 /// rest is spacers. Anchored at the bottom, like a terminal. A line wider
-/// than the list is cut with `…` and shows in full in a tooltip.
+/// than the list wraps onto more rows.
 fn lines<'a>(
     items: Vec<Line<'a>>,
     scroll: Scroll,
     id: &'static str,
     on_scroll: fn(f32) -> Message,
 ) -> Element<'a, Message> {
-    let total = items.len();
     let list = responsive(move |size| {
+        let rows = wrap_rows(&items, size.width);
+        let total = rows.len();
         let (start, end) = scroll.window(total, LINE_H, size.height);
         let mut col = Column::new().width(Fill);
         if start > 0 {
             col = col.push(space().height(start as f32 * LINE_H));
         }
-        for item in &items[start..end] {
+        for &(i, piece, first) in &rows[start..end] {
+            let item = &items[i];
             let (tone, dot_tone) = item.look();
-            let used =
-                16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if dot_tone.is_some() { 16.0 } else { 0.0 };
-            let font = if item.mono { 12.0 } else { 13.0 };
-            let (shown, cut) = fit(item.text, font, item.mono, (size.width - used - 14.0).max(90.0));
             let mut r = Row::new().spacing(8).align_y(Center).height(LINE_H);
             if let Some(t) = item.time {
-                r = r.push(
-                    text(t).font(MONO).size(11).style(muted).width(60).line_height(LineHeight::Absolute(LINE_H.into())),
-                );
+                r = r.push(if first {
+                    Element::from(
+                        text(t)
+                            .font(MONO)
+                            .size(11)
+                            .style(muted)
+                            .width(60)
+                            .line_height(LineHeight::Absolute(LINE_H.into())),
+                    )
+                } else {
+                    space().width(60).into()
+                });
             }
             if let Some(d) = dot_tone {
-                r = r.push(dot(d, 6.0));
+                r = r.push(if first { dot(d, 6.0) } else { space().width(6).into() });
             }
-            let body = text(shown.into_owned())
+            let body = text(piece)
                 .size(if item.mono { 12 } else { 13 })
                 .line_height(LineHeight::Absolute(LINE_H.into()))
                 .wrapping(Wrapping::None)
                 .style(tone.style());
             r = r.push(if item.mono { body.font(MONO) } else { body });
-            col = col.push(if cut { tip(r, item.text.to_string()) } else { r.into() });
+            col = col.push(r);
         }
         if end < total {
             col = col.push(space().height((total - end) as f32 * LINE_H));
@@ -1397,6 +1410,48 @@ fn lines<'a>(
             .into()
     });
     container(list).style(look::card).width(Fill).height(Fill).into()
+}
+
+/// Each line as the rows it takes in a list `width` wide: (line, the row's text, whether it is
+/// the line's first row). A row breaks after a space when there is one in its second half, else
+/// where it is full. (Widths are estimated, the mono font's closely; a proportional row keeps
+/// a little room spare.)
+fn wrap_rows<'a>(items: &[Line<'a>], width: f32) -> Vec<(usize, &'a str, bool)> {
+    let mut rows = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let dot = item.by_words || item.dot.is_some();
+        let used = 16.0 + if item.time.is_some() { 68.0 } else { 0.0 } + if dot { 16.0 } else { 0.0 };
+        let size = if item.mono { 12.0 } else { 13.0 };
+        let room = (width - used - 14.0).max(90.0) * if item.mono { 1.0 } else { 0.96 };
+        let mut rest: &'a str = item.text;
+        let mut first = true;
+        loop {
+            let (mut used, mut cut, mut space_at) = (0.0, rest.len(), None);
+            for (at, c) in rest.char_indices() {
+                used += em_of(c, item.mono) * size;
+                if used > room && at > 0 {
+                    cut = at;
+                    break;
+                }
+                if c == ' ' {
+                    space_at = Some(at + 1);
+                }
+            }
+            if cut < rest.len()
+                && let Some(sp) = space_at.filter(|&sp| sp > cut / 2)
+            {
+                cut = sp;
+            }
+            let (row, next) = rest.split_at(cut);
+            rows.push((i, row.trim_end(), first));
+            first = false;
+            if next.is_empty() {
+                break;
+            }
+            rest = next;
+        }
+    }
+    rows
 }
 
 fn events(a: &App, scroll: Scroll) -> Element<'_, Message> {
@@ -1456,9 +1511,26 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
         pause,
         button(labeled(Icon::Close, "Clear")).padding([4, 10]).style(look::quiet).on_press(Message::LogsClear),
         small(notes.join(" · ")),
+        space::horizontal(),
+        button(labeled(Icon::Terminal, "Open in Terminal"))
+            .padding([4, 10])
+            .style(look::quiet)
+            .on_press(Message::LogsTerminal),
+        if g.logs_expanded {
+            button(labeled(Icon::Minimize, "Exit full screen"))
+                .padding([4, 10])
+                .style(look::quiet)
+                .on_press(Message::LogsExpand(false))
+        } else {
+            button(labeled(Icon::Maximize, "Full screen"))
+                .padding([4, 10])
+                .style(look::quiet)
+                .on_press(Message::LogsExpand(true))
+        },
     ]
     .spacing(12)
-    .align_y(Center);
+    .align_y(Center)
+    .wrap();
     let visible = p.visible();
     let body = if visible.is_empty() {
         container(small(if p.is_empty() { "No log lines yet." } else { "No line matches." }))
@@ -1484,7 +1556,11 @@ fn logs_pane(g: &Gui) -> Element<'_, Message> {
             .collect();
         lines(items, p.scroll, LOGS_ID, Message::LogsScrolled)
     };
-    column![bar, body].spacing(8).height(Fill).into()
+    let mut c = Column::new().spacing(8).height(Fill);
+    if g.logs_expanded {
+        c = c.push(heading(p.app.as_str()).size(18));
+    }
+    c.push(bar).push(body).into()
 }
 
 // ----------------------------------------------------------------- history
@@ -2315,6 +2391,32 @@ mod tests {
         let (upper, _) = fit(&w60, 13.0, false, 300.0);
         assert!(upper.chars().count() < lower.chars().count(), "{upper} / {lower}");
         assert!(width_of(&upper, 13.0, false) <= 300.0 && width_of(&lower, 13.0, false) <= 300.0);
+    }
+
+    #[test]
+    fn long_log_lines_wrap_onto_rows_and_short_ones_keep_one() {
+        let long =
+            "worker=1 stdout: [MetaLeadSyncService] syncSince: form 1776923023350598 returned 2 leads since 1789654236";
+        let items = vec![
+            Line { time: None, text: "short", tone: Tone::Plain, dot: None, mono: true, by_words: false },
+            Line { time: None, text: long, tone: Tone::Plain, dot: None, mono: true, by_words: false },
+        ];
+        let rows = wrap_rows(&items, 400.0);
+        assert_eq!(rows[0], (0, "short", true));
+        let pieces: Vec<&str> = rows.iter().filter(|r| r.0 == 1).map(|r| r.1).collect();
+        assert!(pieces.len() >= 2, "{pieces:?}");
+        assert_eq!(rows.iter().filter(|r| r.0 == 1 && r.2).count(), 1, "one first row");
+        assert_eq!(
+            pieces.join(" ").split_whitespace().collect::<Vec<_>>(),
+            long.split_whitespace().collect::<Vec<_>>()
+        );
+        for p in &pieces {
+            assert!(width_of(p, 12.0, true) <= 400.0 - 16.0 - 14.0, "{p:?} fits");
+        }
+        let unbroken = "x".repeat(300);
+        let items =
+            vec![Line { time: None, text: &unbroken, tone: Tone::Plain, dot: None, mono: true, by_words: false }];
+        assert_eq!(wrap_rows(&items, 400.0).iter().map(|r| r.1.len()).sum::<usize>(), 300, "cut where full");
     }
 
     #[test]

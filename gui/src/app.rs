@@ -268,6 +268,8 @@ pub struct Gui {
     pub logs: Option<LogPane>,
     /// The logs stream is connected (a gap is noted when it drops).
     pub logs_live: bool,
+    /// The Logs tab fills the window.
+    pub logs_expanded: bool,
     pub toasts: Vec<Toast>,
     next_toast: u64,
     pub confirm: Option<Pending>,
@@ -341,6 +343,11 @@ pub enum Message {
     LogsStderr(bool),
     LogsEvents(bool),
     LogsClear,
+    /// The logs fill the window (true), or go back under the app (false).
+    LogsExpand(bool),
+    /// Follow this app's log in a terminal window (`warden logs <app>`).
+    LogsTerminal,
+    LogsTerminalOpened(Result<(), String>),
     LogHistory {
         app: String,
         result: Result<Vec<String>, String>,
@@ -510,6 +517,7 @@ impl Gui {
             feed_scroll: Scroll::default(),
             logs: None,
             logs_live: false,
+            logs_expanded: false,
             toasts: Vec::new(),
             next_toast: 0,
             confirm: None,
@@ -812,6 +820,19 @@ impl Gui {
             Message::LogsStderr(b) => self.with_logs(|l| l.stderr = b),
             Message::LogsEvents(b) => self.with_logs(|l| l.events = b),
             Message::LogsClear => self.with_logs(LogPane::clear),
+            Message::LogsExpand(on) => {
+                self.logs_expanded = on;
+                Task::none()
+            }
+            Message::LogsTerminal => {
+                let Some(app) = self.logs.as_ref().map(|p| p.app.clone()) else { return Task::none() };
+                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
+                Task::perform(async move { commands::open_log_terminal(&host, &app, dir.as_deref()).await }, move |r| {
+                    tag.wrap(Message::LogsTerminalOpened(r))
+                })
+            }
+            Message::LogsTerminalOpened(Ok(())) => Task::none(),
+            Message::LogsTerminalOpened(Err(e)) => self.toast(false, format!("cannot open a terminal: {e}")),
             Message::LogHistory { app, result } => {
                 let Some(pane) = self.logs.as_mut().filter(|p| p.app == app) else { return Task::none() };
                 match result {
