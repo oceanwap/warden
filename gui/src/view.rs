@@ -754,8 +754,8 @@ fn detail<'a>(g: &'a Gui, a: &'a App) -> Element<'a, Message> {
         ));
     }
     c = c.push(small(facts.join(" · ")));
-    // A way to make the app faster (one worker on a Linux host with more cores): one quiet
-    // line, as one worker works and may be what the app needs. The whole text is its tooltip.
+    // A way to make the app faster (one worker on a Linux host with more cores, a Bun too
+    // old to share the load on macOS): one quiet line. The whole text is its tooltip.
     let hint = a.status.as_ref().and_then(|s| s.hint.as_deref());
     if let Some(h) = hint {
         let (shown, _) = fit(h, SMALL, false, room - 40.0);

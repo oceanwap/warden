@@ -98,8 +98,10 @@ under every manager, and Warden's rolling restarts still lost none).
   27.0k warmed, p99 16 vs 21 ms; 95 vs 147 µs of CPU per request): the JIT
   and allocator shared by the threads; more JIT threads did not help. Its
   costs either way: one crash takes all workers down (crash recovery 128 vs
-  101 ms on 1.4.2), and on macOS the threads do not share the load (Warden
-  warns, and `warden doctor` says so, on macOS and on Bun before 1.4).
+  101 ms on 1.4.2), and on macOS the threads do not share the load, so
+  Warden refuses worker mode there (process mode shares the load on macOS
+  through the handoff); on Bun before 1.4 it warns, and `warden doctor` says
+  so.
   **Process mode stays the default.** For
   Node, threads don't save memory at all (4 `node:http` processes 96 MB PSS,
   one process with 4 threads 104 MB), so Warden has no Node thread mode.

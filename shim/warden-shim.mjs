@@ -66,6 +66,11 @@ const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos
 // net.Socket", and the connection is lost): older ones listen as before.
 const bunTakesSockets = !isBun || (([maj, min]) => maj > 1 || (maj === 1 && min >= 4))(Bun.version.split(".").map(Number));
 const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function" && bunTakesSockets;
+// Say so, so Warden can suggest a newer Bun (after the module has loaded:
+// `report` needs state declared below).
+if (env.WARDEN_HANDOFF === "1" && !inWorker && !bunTakesSockets) {
+  queueMicrotask(() => report({ ev: "handoff_unsupported", message: Bun.version }));
+}
 const healthDir = env.WARDEN_HEALTH_DIR || "";
 const instance = env.WARDEN_INSTANCE || String(process.pid);
 const heartbeatMs = Number(env.WARDEN_HEARTBEAT_MS || 0);

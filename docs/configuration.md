@@ -60,7 +60,7 @@ path = "/health"          # checked on each worker's private socket
 | Key | Default | Meaning |
 |---|---|---|
 | `count` | `1` | Number of workers; also `"max"` (one per CPU) or `"max-1"` |
-| `mode` | `"process"` | `"process"` (production, one crash affects one worker) or `"worker"` (opt-in, Bun only: `Worker` threads in one process, 14-22 % less memory; level with processes on Linux from Bun 1.4, slower before; on macOS the threads don't share the load, and Warden warns) |
+| `mode` | `"process"` | `"process"` (production, one crash affects one worker) or `"worker"` (opt-in, Bun only: `Worker` threads in one process, 14-22 % less memory; level with processes on Linux from Bun 1.4, slower before; refused on macOS, where the threads would not share the load: process mode shares it there through the handoff) |
 | `port_strategy` | `"shared"` | `"shared"` (`SO_REUSEPORT`) or `"offset"` (`PORT = port + i - 1`) |
 | `ready_timeout` | `30` | Seconds to start listening, else killed and counted as a crash |
 | `wait_ready` | `false` | Ready on `process.send('ready')` instead of listening (PM2's `wait_ready`) |

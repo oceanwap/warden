@@ -1776,6 +1776,19 @@ fn handed_over_connections_reach_every_worker_and_survive_a_rolling_restart() {
         // on the port as without the handoff (the rest of the test holds).
         let takes = runtime == "node" || bun_version() >= (1, 4);
         assert_eq!(w.log().contains("workers take connections from Warden"), takes, "{runtime}: {}", w.log());
+        // And says why, suggesting a newer Bun.
+        const OLD_BUN: &str = "this Bun cannot take connections from Warden";
+        let t0 = Instant::now();
+        while !takes && !w.log().contains(OLD_BUN) && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(w.log().contains(OLD_BUN), !takes, "{runtime}: {}", w.log());
+        let hint = w.status().and_then(|s| s["hint"].as_str().map(String::from)).unwrap_or_default();
+        assert_eq!(
+            hint.contains("bun upgrade"),
+            !takes,
+            "{runtime}: the status hint, for doctor and the GUI: {hint:?}"
+        );
         let mut seen = HashSet::new();
         for _ in 0..40 {
             seen.insert(get(port, "/whoami").unwrap_or_else(|| panic!("{runtime}: request failed\n{}", w.log())));

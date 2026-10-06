@@ -230,7 +230,8 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortStats>,
     /// A way to make the app faster the supervisor sees (one worker on a Linux host with
-    /// more cores: `count = "max"`), for `warden doctor` and the GUI. Not a problem: absent
+    /// more cores: `count = "max"`; a Bun older than 1.4, whose workers cannot take the
+    /// connections Warden hands them: `bun upgrade`), for `warden doctor` and the GUI. Not a problem: absent
     /// when there is none, and from a supervisor that does not send it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,

@@ -105,6 +105,9 @@ pub struct Supervisor {
     handoff_on: bool,
     /// The dispatcher, once a worker said it takes handed-over connections.
     handoff: Option<crate::handoff::Handoff>,
+    /// A worker's Bun is too old for the handoff (its version): logged once,
+    /// then shown as the status hint (`warden doctor`, the GUI).
+    handoff_old_bun: Option<String>,
     cfg: Config,
     cfg_path: Option<PathBuf>,
     policy: Policy,
@@ -244,6 +247,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
 }
 
 async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String> {
+    worker_mode_supported(&cfg, cfg!(target_os = "macos"))?;
     // While our launcher is still our parent (see `own_unit`).
     let _ = systemd::own_unit();
     let socket = cfg.socket_path();
@@ -520,6 +524,21 @@ fn warn_if_node_cannot_share_the_port(cfg: &Config) {
     );
 }
 
+/// Worker mode is for Linux: there each Worker thread listens on the port and the
+/// kernel spreads connections over them. macOS gives every connection to one of
+/// them, so its threads would not share the load; process mode does, through the
+/// handoff.
+fn worker_mode_supported(cfg: &Config, macos: bool) -> Result<(), String> {
+    if macos && cfg.workers.mode == Mode::Worker {
+        return Err("worker mode (`[workers] mode = \"worker\"`) runs on Linux only: macOS does not spread a shared \
+                    port over the Worker threads, so one of them would get every connection. Use process mode (remove \
+                    `mode`, or set `mode = \"process\"`): there Warden hands each connection to a worker, so they \
+                    share the load"
+            .into());
+    }
+    Ok(())
+}
+
 /// Whether connections are handed to the workers (`crate::handoff`): by
 /// default where the kernel does not spread a shared port (`macos`), for a
 /// process-mode app with the shim, a port and more than one worker.
@@ -562,6 +581,7 @@ impl Supervisor {
                 cfg!(target_os = "macos"),
             ),
             handoff: None,
+            handoff_old_bun: None,
             policy: Policy::from(&cfg.restart),
             count: cfg.workers.count,
             slots: BTreeMap::new(),
@@ -1324,6 +1344,17 @@ impl Supervisor {
                 }
             }
             "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
+            "handoff_unsupported" if self.handoff_old_bun.is_none() => {
+                let bun = msg.message.clone().unwrap_or_else(|| "?".into());
+                warn!(
+                    "this Bun cannot take connections from Warden, so the workers do not share the load",
+                    bun = bun,
+                    hint = "Bun 1.4 or newer takes the connections Warden hands to each worker; this one listens on \
+                            the port itself, and on macOS one worker then gets every connection. Upgrade Bun \
+                            (`bun upgrade`) and restart the app (`warden restart`) to spread them over every worker",
+                );
+                self.handoff_old_bun = Some(bun);
+            }
             "ready" => {
                 if self.cfg.workers.wait_ready {
                     debug!("app reported ready", worker = worker, pid = inst.handle.pid);
@@ -2989,14 +3020,24 @@ impl Supervisor {
             watching: self.watch.as_ref().is_some_and(|(_, h)| !h.is_finished()),
             requests: self.app_requests(),
             ports,
-            hint: self.worker_mode_hint.clone().or_else(|| {
-                crate::config::more_workers_hint(
-                    &self.cfg,
-                    self.count,
-                    cfg!(target_os = "linux"),
-                    crate::config::cpu_count(),
-                )
-            }),
+            hint: self
+                .handoff_old_bun
+                .as_ref()
+                .map(|v| {
+                    format!(
+                        "Bun {v} cannot take the connections Warden hands to workers, so they do not share the \
+                         load here: upgrade Bun to 1.4 or newer (`bun upgrade`), then `warden restart`"
+                    )
+                })
+                .or_else(|| self.worker_mode_hint.clone())
+                .or_else(|| {
+                    crate::config::more_workers_hint(
+                        &self.cfg,
+                        self.count,
+                        cfg!(target_os = "linux"),
+                        crate::config::cpu_count(),
+                    )
+                }),
         }
     }
 }
@@ -3095,6 +3136,16 @@ fn skip_entries(path: PathBuf, log: bool) -> Vec<watch::Skip> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_mode_is_refused_on_macos_only() {
+        let w = Config::parse("[app]\nname = \"a\"\nentry = \"main.js\"\n[workers]\nmode = \"worker\"\n").unwrap();
+        let e = worker_mode_supported(&w, true).unwrap_err();
+        assert!(e.contains("Linux only") && e.contains("process"), "{e}");
+        assert!(worker_mode_supported(&w, false).is_ok());
+        let p = Config::parse("[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\n").unwrap();
+        assert!(worker_mode_supported(&p, true).is_ok(), "process mode runs everywhere");
+    }
 
     #[test]
     fn handoff_is_on_by_default_only_on_macos_with_several_workers() {
