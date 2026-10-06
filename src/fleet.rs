@@ -1651,7 +1651,8 @@ async fn start_app(ctx: &Ctx, app: &App, on_fail: OnFailedStart) -> i32 {
                 if reachable(app) {
                     return ready_or_not(ctx, app, on_fail, &format!("see {}", log.display())).await;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // A failed connect costs microseconds: look often.
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             eprintln!(
                 "warden: {prefix}the supervisor did not open its control socket within 15 s; see {}",
@@ -1695,6 +1696,14 @@ fn sweep_wait(app: &App) -> Duration {
     crate::platform::orphans::longest(Duration::from_secs(grace)) + Duration::from_secs(10)
 }
 
+/// How long `wait_ready` sleeps between two looks at the status, `elapsed`
+/// into the wait: often while a quick start may be about to finish, then
+/// every 100 ms, so a slow boot does not pay for a status (a `/proc` read
+/// per worker) 40 times a second.
+fn ready_poll(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_secs(3) { Duration::from_millis(25) } else { Duration::from_millis(100) }
+}
+
 /// Wait until every worker is ready (or the app is stopped), then print one
 /// line. Fails fast when the supervisor says every worker crashed before
 /// one was ready (`Status.start_failed`): reports why, with the app's last
@@ -1707,6 +1716,7 @@ async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
     let mut first_ready = false;
     let mut sweeping_since: Option<Instant> = None;
     let mut last = None;
+    let t0 = Instant::now();
     while Instant::now() < deadline {
         if let Ok(st) = status_of(app).await {
             if let Some(reason) = st.start_failed.clone() {
@@ -1757,7 +1767,7 @@ async fn wait_ready(app: &App, on_fail: OnFailedStart, log: &str) -> i32 {
             );
             return 1;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(ready_poll(t0.elapsed())).await;
     }
     match last {
         Some(st) if st.workers_ready == 0 => {

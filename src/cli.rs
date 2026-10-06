@@ -785,11 +785,80 @@ pub(crate) fn empty_args() -> Args {
 }
 
 /// Follow a rollout until it finishes; exit code 0 = succeeded.
+///
+/// Follows the supervisor's event stream (`subscribe`) and returns on the
+/// rollout's `rollout_done`; progress is printed from the stream's status
+/// every 250 ms, as polling did. When the stream is refused, ends early or
+/// the supervisor is too old for it, polls `status` every 250 ms instead.
 pub async fn wait_for_rollout(socket: &std::path::Path, seq: u64) -> i32 {
     let mut last = String::new();
+    if let Some(code) = follow_rollout(socket, seq, &mut last).await {
+        return code;
+    }
+    poll_rollout(socket, seq, &mut last).await
+}
+
+/// How often progress is sampled while waiting for a rollout.
+const ROLLOUT_TICK_MS: u64 = 250;
+
+/// `wait_for_rollout` over `subscribe`. None: the stream is unavailable or
+/// ended before the rollout did (the caller polls).
+async fn follow_rollout(socket: &std::path::Path, seq: u64, last: &mut String) -> Option<i32> {
+    use crate::events::Event;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+    // Dropping the write half would tell the supervisor we hung up: keep it.
+    let (r, mut w) = stream.into_split();
+    let req = Request::Subscribe { interval_ms: Some(ROLLOUT_TICK_MS), logs: false };
+    let mut line = serde_json::to_string(&req).ok()?;
+    line.push('\n');
+    w.write_all(line.as_bytes()).await.ok()?;
+    let mut lines = tokio::io::BufReader::new(r).lines();
+    // A refusal (`{"ok":false,...}`) or an old supervisor's `bad request` is no `hello`.
+    let hello = next_event_line(&mut lines).await?;
+    if !matches!(serde_json::from_str::<Event>(&hello), Ok(Event::Hello { .. })) {
+        return None;
+    }
+    // The first status is the snapshot taken after the subscription began:
+    // a rollout that finished before then shows there. Polling printed no
+    // progress this early, so neither does this.
+    let mut snapshot = true;
+    loop {
+        let line = next_event_line(&mut lines).await?;
+        // Event types this CLI does not know are skipped.
+        let Ok(ev) = serde_json::from_str::<Event>(&line) else { continue };
+        match ev {
+            Event::RolloutDone { outcome, .. } if outcome.seq >= seq => return Some(rollout_result(&outcome)),
+            // Each phase change, so a fast rollout shows every batch (a 250 ms sample can miss one).
+            Event::Rollout { rollout, .. } => {
+                rollout_progress(&rollout, seq, last);
+                snapshot = false;
+            }
+            Event::Status { status, .. } => {
+                if let Some(code) = rollout_check(&status, seq, last, !snapshot) {
+                    return Some(code);
+                }
+                snapshot = false;
+            }
+            Event::Bye { .. } => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The next line of a subscription; None at its end, on an error, or when
+/// it is silent for `REQUEST_TIMEOUT` (a status is due every 250 ms).
+async fn next_event_line(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+) -> Option<String> {
+    tokio::time::timeout(control::REQUEST_TIMEOUT, lines.next_line()).await.ok()?.ok()?
+}
+
+/// `wait_for_rollout` by polling `status` every 250 ms.
+async fn poll_rollout(socket: &std::path::Path, seq: u64, last: &mut String) -> i32 {
     let mut sink = std::io::sink();
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(ROLLOUT_TICK_MS)).await;
         let st = match control::call(socket, &Request::Status, &mut sink).await {
             Ok(Some(r)) => r.status,
             Ok(None) => None,
@@ -799,21 +868,43 @@ pub async fn wait_for_rollout(socket: &std::path::Path, seq: u64) -> i32 {
             }
         };
         let Some(st) = st else { continue };
-        if let Some(o) = st.last_rollout.as_ref().filter(|o| o.seq >= seq) {
-            if o.ok {
-                println!("{}", o.message);
-                return 0;
-            }
-            eprintln!("warden: {}", o.message);
-            return 1;
-        }
-        if let Some(r) = st.rollout.as_ref().filter(|r| r.seq == seq) {
-            if r.phase != last {
-                println!("  [{}/{}] {}", r.done, r.total, r.phase);
-                last = r.phase.clone();
-            }
+        if let Some(code) = rollout_check(&st, seq, last, true) {
+            return code;
         }
     }
+}
+
+/// One status seen while waiting for rollout `seq`: its exit code when it
+/// is over, else (with `progress`) a line when its phase changed.
+fn rollout_check(st: &Status, seq: u64, last: &mut String, progress: bool) -> Option<i32> {
+    if let Some(o) = st.last_rollout.as_ref().filter(|o| o.seq >= seq) {
+        return Some(rollout_result(o));
+    }
+    if !progress {
+        return None;
+    }
+    if let Some(r) = st.rollout.as_ref() {
+        rollout_progress(r, seq, last);
+    }
+    None
+}
+
+/// A progress line for rollout `seq` when its phase changed.
+fn rollout_progress(r: &control::RolloutStatus, seq: u64, last: &mut String) {
+    if r.seq == seq && r.phase != *last {
+        println!("  [{}/{}] {}", r.done, r.total, r.phase);
+        *last = r.phase.clone();
+    }
+}
+
+/// Print how a rollout ended; its exit code.
+fn rollout_result(o: &control::RolloutOutcome) -> i32 {
+    if o.ok {
+        println!("{}", o.message);
+        return 0;
+    }
+    eprintln!("warden: {}", o.message);
+    1
 }
 
 /// The app's state as one word, and how to paint it: what `warden list` shows

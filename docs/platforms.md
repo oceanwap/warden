@@ -27,8 +27,9 @@
     SIGKILL (or one that crashed, or that launchd killed in the middle of a
     shutdown). Warden stops them the next time the app starts, before it
     starts new ones: [below](#workers-a-killed-supervisor-leaves-behind-macos).
-  - `warden serve` checks static paths with realpath instead of `openat2`
-    (same confinement, slower).
+  - `warden serve` opens static files with `openat` confined by the kernel
+    (`O_RESOLVE_BENEATH` on macOS 15+, `O_NOFOLLOW_ANY` before) on a thread,
+    instead of `openat2` inline (same confinement, slower).
   - No out-of-memory attribution: a worker the kernel killed for memory
     shows as `killed by SIGKILL`, not as an OOM kill (macOS has no cgroup
     events to read).

@@ -18,12 +18,56 @@ if (!shim || !env.WARDEN_ENTRY) {
   process.exit(78);
 }
 
+// Reports never wait for Warden (as in the shim: fd 3 is non-blocking, so a
+// stopped Warden can't freeze this process on a full socket). When it is
+// full, only the latest heartbeat of each Worker waits; every other line
+// waits whole and in order, retried by a timer that keeps nothing alive.
+let pending = null; // bytes that go first (a line cut short, lines kept)
+const beats = new Map(); // Worker id -> its latest heartbeat not sent yet
+let retry = null;
+let retryMs = 10;
+
 function report(msg) {
   if (ipcFd == null) return;
-  try {
-    fs.writeSync(ipcFd, JSON.stringify(msg) + "\n");
-  } catch {}
+  const line = JSON.stringify(msg) + "\n";
+  if (msg.ev === "heartbeat") beats.set(msg.worker, line);
+  else if (!pending) pending = Buffer.from(line);
+  else if (pending.length < 1 << 20) pending = Buffer.concat([pending, Buffer.from(line)]); // else dropped
+  flush();
 }
+
+function flush() {
+  while (pending || beats.size) {
+    const beat = pending ? null : beats.keys().next().value;
+    const buf = pending || Buffer.from(beats.get(beat));
+    let n;
+    try {
+      n = fs.writeSync(ipcFd, buf);
+    } catch (e) {
+      if (e && e.code === "EINTR") continue;
+      if (e && (e.code === "EAGAIN" || e.code === "EWOULDBLOCK")) return retryLater();
+      pending = null; // Warden is gone: no one to wait for
+      beats.clear();
+      return;
+    }
+    if (!(n > 0)) return retryLater();
+    if (!pending) beats.delete(beat);
+    pending = n < buf.length ? buf.subarray(n) : null;
+  }
+  retryMs = 10;
+}
+
+function retryLater() {
+  if (retry) return;
+  retry = setTimeout(() => {
+    retry = null;
+    flush();
+  }, retryMs);
+  if (typeof retry.unref === "function") retry.unref();
+  retryMs = Math.min(retryMs * 2, 1000);
+}
+
+process.on("exit", () => flush());
 
 const workers = new Map();
 let shuttingDown = false;

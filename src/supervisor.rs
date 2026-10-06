@@ -33,6 +33,8 @@ use listening::ListenerCache;
 use rollout::{Kind, Roll};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -898,18 +900,23 @@ impl Supervisor {
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
         let env = self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        // Warden's own code reports on fd 3 (`process::Spec::ipc_nonblocking`).
+        let ipc_nonblocking;
         let (program, args) = match self.cfg.workers.mode {
             // A standby (slot 0) runs the workers' command; the shim defers
             // its listen until promoted. In the pinned release, as workers
             // (`release.rs`).
             Mode::Process if self.cfg.static_files.is_some() && slot_id != STANDBY_SLOT => {
+                ipc_nonblocking = true;
                 (self.exe.display().to_string(), vec!["serve-static".to_string()])
             }
             Mode::Process => {
+                ipc_nonblocking = self.shim_path.is_some();
                 let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
                 (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
             }
             Mode::Worker => {
+                ipc_nonblocking = self.host_path.is_some();
                 let host = self.host_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
                 (self.pinned_arg(&a.command), vec![host])
             }
@@ -923,6 +930,7 @@ impl Supervisor {
             output: process::Output::from_config(&self.cfg.logging),
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
             handoff: self.handoff_on && slot_id != STANDBY_SLOT,
+            ipc_nonblocking,
         }
     }
 
@@ -1077,18 +1085,25 @@ impl Supervisor {
             }
             None => {} // worker mode: wait for every Worker's shim report
             Some(port) => {
+                let Some(flag) = self.insts.get(&inst).map(|i| Arc::downgrade(&i.ready_flag)) else { return };
                 tokio::task::spawn_local(async move {
                     let start = Instant::now();
                     let mut delay = Duration::from_millis(20);
                     while start.elapsed() < deadline {
                         tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_millis(250));
-                        match networking::count_listeners(pid, port) {
-                            Some(n) if n >= expected => break,
-                            Some(_) => continue,
+                        // Ready by the shim's report, or gone: nothing to wait for.
+                        if flag.upgrade().is_none_or(|f| f.load(Ordering::Relaxed)) {
+                            return;
+                        }
+                        let found = tokio::task::spawn_blocking(move || networking::count_listeners_cheap(pid, port));
+                        match found.await.ok().flatten() {
+                            Some((n, _)) if n >= expected => break,
+                            // The kernel's list of listeners: cheap, asked every 20 ms. A
+                            // read of /proc/net/tcp (a row per connection) backs off.
+                            Some((_, true)) => delay = Duration::from_millis(20),
                             // No /proc: a connect probe is only meaningful for the first worker.
                             None if first_worker && networking::port_accepts(port) => break,
-                            None => continue,
+                            _ => delay = (delay * 2).min(Duration::from_millis(250)),
                         }
                     }
                     if start.elapsed() < deadline {
@@ -1302,6 +1317,11 @@ impl Supervisor {
                 if ready && (!self.cfg.workers.wait_ready || promoted) {
                     self.mark_ready(inst_id);
                 }
+                // Found listening on its port before the shim reported its
+                // private socket: its first gate check waited for this.
+                if msg.socket.is_some() {
+                    self.rollout_socket_reported(inst_id);
+                }
             }
             "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
             "ready" => {
@@ -1372,6 +1392,7 @@ impl Supervisor {
         }
         let now = Instant::now();
         inst.ready_at = Some(now);
+        inst.ready_flag.store(true, Ordering::Relaxed);
         // Handed-over connections: it never listens on the port, so there is
         // nothing for `port_lost` to watch; it joins the rotation instead.
         if inst.handoff {
@@ -2906,7 +2927,8 @@ impl Supervisor {
         // What the workers listen on (the standbys do not yet, the draining ones have closed theirs).
         let own = listening::Own { runtime_dir: self.runtime_dir.clone(), app: self.cfg.app.name.clone() };
         let mut live = std::collections::HashSet::new();
-        for w in workers.iter_mut() {
+        let mut asks = Vec::new();
+        for (i, w) in workers.iter().enumerate() {
             let Some(pid) = w.pid else { continue };
             live.insert(pid);
             // Worker mode: the threads share their host's process; only one that is up holds the port.
@@ -2914,7 +2936,11 @@ impl Supervisor {
                 continue;
             }
             let young = w.uptime_secs.is_none_or(|u| u < listening::YOUNG.as_secs());
-            w.listening = self.listeners.of(pid, now, young, &own);
+            asks.push((i, (pid, young)));
+        }
+        let pids: Vec<(u32, bool)> = asks.iter().map(|a| a.1).collect();
+        for ((i, _), found) in asks.iter().zip(self.listeners.of_each(&pids, now, &own)) {
+            workers[*i].listening = found;
         }
         self.listeners.retain(&live);
         let ports = self.port_stats(&workers);

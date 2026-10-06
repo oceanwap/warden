@@ -641,6 +641,78 @@ pub fn openat2(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: i32, resolve: 
     Err(io::Error::new(io::ErrorKind::Unsupported, "openat2 is Linux-only"))
 }
 
+/// macOS 15 (Darwin 24) and later: open(2) refuses, with ENOTCAPABLE, a
+/// lookup that would leave the directory it starts from (`..` above it, an
+/// absolute path or an absolute symlink), in the kernel, so nothing can be
+/// swapped in between a check and the open. The `libc` crate lacks it; the
+/// value is xnu's `bsd/sys/fcntl.h`: `#define O_RESOLVE_BENEATH 0x00001000`.
+/// Older kernels ignore the bit (it is FMARK there, kernel-internal, masked
+/// off at open), so it is only used once [`resolve_beneath_works`] said so.
+#[cfg(target_os = "macos")]
+pub const O_RESOLVE_BENEATH: libc::c_int = 0x1000;
+
+/// openat(2) of `path` relative to `dir`, close-on-exec. No O_CREAT: no
+/// mode argument.
+#[cfg(target_os = "macos")]
+pub fn openat(dir: BorrowedFd<'_>, path: &std::ffi::CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: `path` is NUL-terminated and outlives the call; `dir` is
+    // borrowed, so it stays open for it. Without O_CREAT the variadic mode
+    // argument is not read.
+    let fd = check(unsafe { libc::openat(dir.as_raw_fd(), path.as_ptr(), flags | libc::O_CLOEXEC) })?;
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether open(2) honours O_RESOLVE_BENEATH (macOS 15+), asked once: an
+/// absolute path is always refused under it (ENOTCAPABLE), so a kernel that
+/// opens "/" ignored the flag. Any other answer counts as no.
+#[cfg(target_os = "macos")]
+pub fn resolve_beneath_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| refuses(c"/", O_RESOLVE_BENEATH, libc::ENOTCAPABLE))
+}
+
+/// Whether open(2) honours O_NOFOLLOW_ANY (macOS 11+: ELOOP at any symlink
+/// in the path), asked once on `/tmp`, a symlink on every macOS. If it ever
+/// were not one, the answer is no, and callers take their slower way.
+#[cfg(target_os = "macos")]
+pub fn nofollow_any_works() -> bool {
+    static WORKS: OnceLock<bool> = OnceLock::new();
+    *WORKS.get_or_init(|| refuses(c"/tmp", libc::O_NOFOLLOW_ANY, libc::ELOOP))
+}
+
+/// open(2) of `path` with `flag` fails with `errno` (a descriptor it opened
+/// is closed at once).
+#[cfg(target_os = "macos")]
+fn refuses(path: &std::ffi::CStr, flag: libc::c_int, errno: libc::c_int) -> bool {
+    // SAFETY: `path` is NUL-terminated and outlives the call; no O_CREAT.
+    match check(unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | flag) }) {
+        Ok(fd) => {
+            // SAFETY: open returned a new descriptor that nothing else owns.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+            false
+        }
+        Err(e) => e.raw_os_error() == Some(errno),
+    }
+}
+
+/// The path the kernel has for an open descriptor (fcntl F_GETPATH). Asked
+/// of the descriptor, not of a path, it names the file that will be read
+/// even if a symlink was swapped since. A file with several hard links may
+/// be named by any of them.
+#[cfg(target_os = "macos")]
+pub fn fd_path(fd: BorrowedFd<'_>) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // MAXPATHLEN (sys/param.h), which is what F_GETPATH writes at most.
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most MAXPATHLEN
+    // (= PATH_MAX, 1024) bytes into `buf`, which is that long and lives for
+    // the call; `fd` is borrowed, so it stays open for it.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) })?;
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(std::ffi::OsStr::from_bytes(&buf[..len]).into())
+}
+
 /// pidfd_open(2): a descriptor that becomes readable when process `pid`
 /// exits, for watching a process that is not our child (`wardend` watching
 /// supervisors) without polling and without pid-reuse races. ENOSYS before
@@ -875,6 +947,57 @@ pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// A worker's IPC socket (fd 3), set up so that the worker does not wait
+/// for Warden, whatever Warden does (stopped, a frozen VM, a bug): room for
+/// `IPC_BUFFER` bytes (send buffer on the worker's end, receive buffer on
+/// Warden's), as much as the system allows (macOS starts AF_UNIX sockets
+/// with 8 KB, about a minute of heartbeats; never made smaller), and with
+/// `nonblocking`, O_NONBLOCK on the worker's end: a full socket answers
+/// EAGAIN, and the shim keeps what it must not lose until there is room.
+pub fn prepare_ipc_socket(ours: BorrowedFd<'_>, theirs: BorrowedFd<'_>, nonblocking: bool) -> io::Result<()> {
+    let _ = grow_socket_buffer(theirs, libc::SO_SNDBUF, IPC_BUFFER);
+    let _ = grow_socket_buffer(ours, libc::SO_RCVBUF, IPC_BUFFER);
+    if !nonblocking {
+        return Ok(());
+    }
+    // SAFETY: fcntl on a borrowed descriptor, which stays open for the call,
+    // with integer arguments only.
+    unsafe {
+        let fl = check(libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL))?;
+        check(libc::fcntl(theirs.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK))?;
+    }
+    Ok(())
+}
+
+/// What a worker's IPC socket asks for (`prepare_ipc_socket`): with a
+/// heartbeat a second, hours of them while Warden reads nothing.
+pub const IPC_BUFFER: libc::c_int = 4 << 20;
+
+/// `opt` (SO_SNDBUF or SO_RCVBUF) of `sock` raised towards `want`: halved
+/// while the system refuses it (macOS: above kern.ipc.maxsockbuf; Linux caps
+/// it silently at net.core.wmem_max / rmem_max). Returns the size it has.
+pub fn grow_socket_buffer(sock: BorrowedFd<'_>, opt: libc::c_int, want: libc::c_int) -> io::Result<libc::c_int> {
+    let had = getsockopt_int(sock, libc::SOL_SOCKET, opt)?;
+    let mut want = want;
+    while want > had {
+        if setsockopt_int(sock, libc::SOL_SOCKET, opt, want).is_ok() {
+            break;
+        }
+        want /= 2;
+    }
+    getsockopt_int(sock, libc::SOL_SOCKET, opt)
+}
+
+fn getsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int) -> io::Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `len` are live and sized for a c_int, as passed.
+    check(unsafe {
+        libc::getsockopt(fd.as_raw_fd(), level, name, &mut value as *mut libc::c_int as *mut libc::c_void, &mut len)
+    })?;
+    Ok(value)
+}
+
 fn setsockopt_int(fd: BorrowedFd<'_>, level: libc::c_int, name: libc::c_int, value: libc::c_int) -> io::Result<()> {
     // SAFETY: `value` is a live c_int and the length passed is its size.
     check(unsafe {
@@ -1038,6 +1161,22 @@ mod diag {
     /// struct nlmsghdr, and struct inet_diag_msg before its attributes.
     pub(super) const NLMSG_HDR: usize = 16;
     pub(super) const MSG: usize = 72;
+    /// struct unix_diag_msg before its attributes; the name it is bound to
+    /// (`UDIAG_SHOW_NAME`, answered as `UNIX_DIAG_NAME`).
+    pub(super) const UNIX_MSG: usize = 16;
+    pub(super) const UDIAG_SHOW_NAME: u32 = 1;
+    pub(super) const UNIX_DIAG_NAME: u16 = 0;
+}
+
+/// A Unix socket in LISTEN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnixListen {
+    /// Its inode, as for [`TcpListen`].
+    pub inode: u64,
+    /// The address it is bound to, as the kernel keeps it (`sun_path`, its
+    /// length included: a path ends with its NUL, an abstract name starts
+    /// with one); `None`: unnamed.
+    pub name: Option<Vec<u8>>,
 }
 
 /// The TCP sockets in LISTEN of this network namespace, IPv4 and IPv6. Not
@@ -1062,6 +1201,67 @@ pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
 #[cfg(not(target_os = "linux"))]
 pub fn tcp_listeners() -> io::Result<Vec<TcpListen>> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// The Unix sockets in LISTEN of this network namespace, with their names:
+/// the kernel walks its table and answers only those (`/proc/net/unix` has a
+/// row per socket). Not Linux: `Unsupported`.
+#[cfg(target_os = "linux")]
+pub fn unix_listeners() -> io::Result<Vec<UnixListen>> {
+    // SAFETY: as in `tcp_listeners`.
+    let fd = check(unsafe {
+        libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_SOCK_DIAG)
+    })?;
+    // SAFETY: `fd` was just returned by socket(2) and nothing else owns it.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut found = Vec::new();
+    let req = unix_diag_request(1 << diag::TCP_LISTEN, diag::UDIAG_SHOW_NAME);
+    diag_dump(std::os::fd::AsFd::as_fd(&sock), &req, |msg| found.extend(parse_unix_listen(msg)))?;
+    Ok(found)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unix_listeners() -> io::Result<Vec<UnixListen>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "socket diagnostics are Linux-only"))
+}
+
+/// A dump request: struct nlmsghdr, then struct unix_diag_req for Unix
+/// sockets in `states` (a bit per state, TCP's numbers) with what `show`
+/// asks for (`UDIAG_SHOW_*`), every inode.
+#[cfg(target_os = "linux")]
+fn unix_diag_request(states: u32, show: u32) -> [u8; 40] {
+    let mut r = [0u8; 40];
+    r[0..4].copy_from_slice(&40u32.to_ne_bytes());
+    r[4..6].copy_from_slice(&diag::SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    r[6..8].copy_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+    r[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    r[16] = libc::AF_UNIX as u8;
+    r[20..24].copy_from_slice(&states.to_ne_bytes());
+    r[28..32].copy_from_slice(&show.to_ne_bytes());
+    r
+}
+
+/// One struct unix_diag_msg (and its attributes): its inode and its name.
+#[cfg(target_os = "linux")]
+fn parse_unix_listen(msg: &[u8]) -> Option<UnixListen> {
+    if msg.len() < diag::UNIX_MSG || i32::from(msg[0]) != libc::AF_UNIX {
+        return None;
+    }
+    let inode = u64::from(u32::from_ne_bytes(msg[4..8].try_into().ok()?));
+    let mut name = None;
+    let mut at = diag::UNIX_MSG;
+    while at + 4 <= msg.len() {
+        let len = usize::from(u16::from_ne_bytes([msg[at], msg[at + 1]]));
+        let kind = u16::from_ne_bytes([msg[at + 2], msg[at + 3]]);
+        if len < 4 || at + len > msg.len() {
+            break;
+        }
+        if kind == diag::UNIX_DIAG_NAME {
+            name = Some(msg[at + 4..at + len].to_vec());
+        }
+        at += (len + 3) & !3;
+    }
+    Some(UnixListen { inode, name })
 }
 
 /// How many TCP connections are established on local port `port` (IPv4 and
@@ -2237,6 +2437,52 @@ mod tests {
         assert_eq!(set_tcp_cork(tx.as_fd(), true).unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 
+    /// A worker's end of its IPC socket: a write never blocks (EAGAIN when
+    /// full, so a stopped Warden can't freeze the worker), and it holds at
+    /// least what a plain socket holds (macOS: far more than its 8 KB).
+    #[test]
+    fn a_workers_ipc_end_never_blocks_and_holds_more_than_a_plain_socket() {
+        use std::os::fd::AsFd;
+        let line = [b'x'; 120];
+        // Bytes written before the socket is full (EAGAIN), Warden reading nothing.
+        let fill = |fd: BorrowedFd<'_>| {
+            let mut total = 0usize;
+            loop {
+                match send(fd, &line, false) {
+                    Ok(n) => total += n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return total,
+                    Err(e) => panic!("{e}"),
+                }
+                assert!(total < 256 << 20, "never full");
+            }
+        };
+        let (_plain_ours, plain) = socketpair_cloexec().unwrap();
+        // SAFETY (test): fcntl with integer arguments on a live descriptor.
+        unsafe {
+            let fl = libc::fcntl(plain.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(plain.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let plain_room = fill(plain.as_fd());
+
+        let (ours, theirs) = socketpair_cloexec().unwrap();
+        prepare_ipc_socket(ours.as_fd(), theirs.as_fd(), true).unwrap();
+        // SAFETY (test): fcntl with integer arguments on a live descriptor.
+        let fl = unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL) };
+        assert!(fl & libc::O_NONBLOCK != 0, "the worker's end must not block");
+        let room = fill(theirs.as_fd());
+        eprintln!("IPC room: {room} bytes (a plain socket: {plain_room})");
+        assert!(room >= plain_room, "{room} < {plain_room}");
+        #[cfg(target_os = "macos")]
+        assert!(room >= 512 << 10, "macOS: {room} bytes, about a minute of heartbeats");
+        // Warden reads again: there is room again.
+        let mut buf = Vec::with_capacity(64 << 10);
+        recv_into(ours.as_fd(), &mut buf).unwrap();
+        assert!(send(theirs.as_fd(), &line, false).is_ok());
+        // A second call never shrinks what the first set.
+        let had = getsockopt_int(theirs.as_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF).unwrap();
+        assert!(grow_socket_buffer(theirs.as_fd(), libc::SO_SNDBUF, 4096).unwrap() >= had);
+    }
+
     #[test]
     fn set_nosigpipe_accepts_sockets_and_refuses_other_files() {
         use std::os::fd::AsFd;
@@ -2422,7 +2668,7 @@ mod tests {
         openat2(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags, resolve)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn read_all(fd: OwnedFd) -> String {
         let mut s = String::new();
         std::fs::File::from(fd).read_to_string(&mut s).unwrap();
@@ -2450,6 +2696,54 @@ mod tests {
         file.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"abc");
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// macOS: O_RESOLVE_BENEATH is detected exactly where the kernel has
+    /// it (Darwin 24, macOS 15, and later), O_NOFOLLOW_ANY on every
+    /// supported macOS (11+).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_open_flags_are_detected_by_kernel_version() {
+        let out = std::process::Command::new("uname").arg("-r").output().unwrap();
+        let release = String::from_utf8_lossy(&out.stdout).to_string();
+        let major: u32 = release.split('.').next().unwrap().trim().parse().unwrap();
+        assert_eq!(resolve_beneath_works(), major >= 24, "Darwin {release}");
+        assert!(nofollow_any_works(), "Darwin {release}");
+    }
+
+    /// macOS: openat with O_RESOLVE_BENEATH stays under the directory (where
+    /// the kernel has it), O_NOFOLLOW_ANY refuses every symlink, and
+    /// F_GETPATH names the file a descriptor has open.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_openat_flags_and_fd_path() {
+        use std::os::fd::AsFd;
+        let (base, dir) = tree();
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY;
+        let at = |p: &str, extra: libc::c_int| openat(dir.as_fd(), &std::ffi::CString::new(p).unwrap(), flags | extra);
+        assert_eq!(read_all(at("in", 0).unwrap()), "A");
+        assert_eq!(read_all(at("up", 0).unwrap()), "secret", "plain openat follows anything");
+        if resolve_beneath_works() {
+            assert_eq!(read_all(at("in", O_RESOLVE_BENEATH).unwrap()), "A");
+            assert_eq!(read_all(at("sub/b.txt", O_RESOLVE_BENEATH).unwrap()), "B");
+            for out in ["up", "abs", "outdir/outside.txt", "..", "sub/../../outside.txt"] {
+                let e = at(out, O_RESOLVE_BENEATH).unwrap_err();
+                assert_eq!(e.raw_os_error(), Some(libc::ENOTCAPABLE), "{out}: {e}");
+            }
+        }
+        assert_eq!(read_all(at("sub/b.txt", libc::O_NOFOLLOW_ANY).unwrap()), "B");
+        for link in ["in", "abs", "up", "outdir/outside.txt"] {
+            assert_eq!(at(link, libc::O_NOFOLLOW_ANY).unwrap_err().raw_os_error(), Some(libc::ELOOP), "{link}");
+        }
+        let root = std::fs::canonicalize(base.join("root")).unwrap();
+        assert_eq!(fd_path(dir.as_fd()).unwrap(), root);
+        assert_eq!(fd_path(at("in", 0).unwrap().as_fd()).unwrap(), root.join("a.txt"), "the target, not the link");
+        assert_eq!(
+            fd_path(at("up", 0).unwrap().as_fd()).unwrap(),
+            std::fs::canonicalize(base.join("outside.txt")).unwrap()
+        );
+        assert_eq!(at("missing", 0).unwrap_err().kind(), io::ErrorKind::NotFound);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -3076,5 +3370,76 @@ mod tests {
         // Without the attribute, no drops; a cut attribute is ignored.
         assert_eq!(parse_tcp_listen(&listen[..diag::MSG]).unwrap().drops, 0);
         assert_eq!(parse_tcp_listen(&listen[..diag::MSG + 10]).unwrap().drops, 0);
+    }
+
+    /// The kernel's Unix listeners: a named one (path and abstract) with its
+    /// inode and its name as the kernel keeps it; a bound socket that does
+    /// not listen, and a connection, are not listed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_see_a_unix_listener_and_its_name() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram, UnixListener, UnixStream};
+        let inode_of = |fd: RawFd| -> u64 {
+            let link = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+            let link = link.to_string_lossy();
+            link.trim_start_matches("socket:[").trim_end_matches(']').parse().unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("wsd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("l.sock");
+        let l = UnixListener::bind(&path).unwrap();
+        let name = format!("warden-test-{}", std::process::id());
+        let abs = UnixListener::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes()).unwrap()).unwrap();
+        let dgram = UnixDatagram::bind(dir.join("d.sock")).unwrap();
+        let client = UnixStream::connect(&path).unwrap();
+        let found = unix_listeners();
+        let _ = std::fs::remove_dir_all(&dir);
+        // A kernel without unix_diag (a minimal VM's) has no such table: ENOENT.
+        let found = match found {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return,
+            found => found.unwrap(),
+        };
+        let by_inode = |fd: RawFd| found.iter().find(|s| s.inode == inode_of(fd)).cloned();
+        let mut want = path.as_os_str().as_encoded_bytes().to_vec();
+        want.push(0);
+        assert_eq!(by_inode(l.as_raw_fd()).unwrap().name, Some(want), "a path ends with its NUL");
+        let mut want = vec![0];
+        want.extend_from_slice(name.as_bytes());
+        assert_eq!(by_inode(abs.as_raw_fd()).unwrap().name, Some(want), "an abstract name starts with one");
+        assert_eq!(by_inode(dgram.as_raw_fd()), None, "bound, not listening");
+        assert_eq!(by_inode(client.as_raw_fd()), None, "a connection");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_diagnostics_unix_messages_are_read_with_care() {
+        assert_eq!(&unix_diag_request(1 << 10, 1)[16..32], &[1, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        // A unix_diag_msg of inode 4242 with its name, then another attribute.
+        let mut m = vec![0u8; diag::UNIX_MSG];
+        m[0] = libc::AF_UNIX as u8;
+        m[4..8].copy_from_slice(&4242u32.to_ne_bytes());
+        let attr = |kind: u16, data: &[u8]| {
+            let mut a = Vec::new();
+            a.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
+            a.extend_from_slice(&kind.to_ne_bytes());
+            a.extend_from_slice(data);
+            while a.len() % 4 != 0 {
+                a.push(0);
+            }
+            a
+        };
+        let bare = m.clone();
+        m.extend_from_slice(&attr(diag::UNIX_DIAG_NAME, b"/run/a.sock\0"));
+        m.extend_from_slice(&attr(5, &[1, 2, 3, 4]));
+        assert_eq!(parse_unix_listen(&m), Some(UnixListen { inode: 4242, name: Some(b"/run/a.sock\0".to_vec()) }));
+        assert_eq!(parse_unix_listen(&bare), Some(UnixListen { inode: 4242, name: None }), "unnamed");
+        let mut cut = bare.clone();
+        cut.extend_from_slice(&attr(diag::UNIX_DIAG_NAME, b"/run/a.sock\0")[..8]);
+        assert_eq!(parse_unix_listen(&cut).unwrap().name, None, "a cut attribute is ignored");
+        assert_eq!(parse_unix_listen(&bare[..8]), None, "too short");
+        let mut inet = bare;
+        inet[0] = libc::AF_INET as u8;
+        assert_eq!(parse_unix_listen(&inet), None);
     }
 }

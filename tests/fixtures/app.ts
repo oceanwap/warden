@@ -22,6 +22,8 @@
 //               start with "v2 "
 //   /unlisten   close the app's server and stay alive (port_lost)
 //   /relisten?ms=N  close it, and listen again after N ms (a server restarting itself)
+//   /fill-ipc   fill fd 3 with heartbeats until it is full (hours of them, Warden
+//               stopped); answers the bytes written
 import { threadId } from "node:worker_threads";
 
 if (process.env.FIXTURE_EXIT) process.exit(Number(process.env.FIXTURE_EXIT));
@@ -63,6 +65,17 @@ if (process.env.FIXTURE_IPC_FLOOD) {
   };
   setTimeout(flood, 200);
 }
+// What hours of heartbeats do to fd 3 while Warden reads nothing, at once.
+// Stops at the first write that does not go through (a full socket).
+function fillIpc() {
+  const fs = require("node:fs");
+  const line = JSON.stringify({ ev: "heartbeat", worker: Number(process.env.WARDEN_WORKER_ID || 0) }) + "\n";
+  let n = 0;
+  try {
+    while (n < 256 << 20) n += fs.writeSync(3, line);
+  } catch {}
+  return n;
+}
 let sick = process.env.FIXTURE_HEALTH_FAIL === "1";
 const hoard: Uint8Array[] = [];
 
@@ -77,6 +90,8 @@ function handler(tag: string) {
         break;
       case "/health":
         return new Response(sick ? "sick" : "ok", { status: sick ? 503 : 200 });
+      case "/fill-ipc":
+        return new Response(String(fillIpc()));
       case "/throw":
         setTimeout(() => { throw new Error(`fixture crash ${who}`); });
         break;

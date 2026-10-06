@@ -31,11 +31,20 @@ pub(super) const MAX_DEPTH: usize = 4;
 /// workers, report it once). `None` when `root` itself cannot be read: it is
 /// gone, belongs to another user, or the OS has no adapter. A child that
 /// cannot be read is skipped.
-pub(super) fn of_tree(p: &dyn Platform, root: u32) -> Option<Vec<Listener>> {
-    let mut found = p.listeners_of(&tree(p, root))?;
-    found.sort();
-    found.dedup();
-    Some(found)
+#[cfg(test)]
+fn of_tree(p: &dyn Platform, root: u32) -> Option<Vec<Listener>> {
+    of_trees(p, &[root]).pop().flatten()
+}
+
+/// [`of_tree`] for each of `roots`, in order, in one call to the adapter.
+pub(super) fn of_trees(p: &dyn Platform, roots: &[u32]) -> Vec<Option<Vec<Listener>>> {
+    let trees: Vec<Vec<u32>> = roots.iter().map(|root| tree(p, *root)).collect();
+    let mut all = p.listeners_of_each(&trees);
+    for found in all.iter_mut().flatten() {
+        found.sort();
+        found.dedup();
+    }
+    all
 }
 
 /// `root` and its descendants, parents before children, within the limits.
@@ -188,6 +197,16 @@ mod tests {
         f.tree.insert(3, (vec![], vec![tcp(81)])); // 2 is another user's: no answer
         assert_eq!(of_tree(&f, 1).unwrap(), [tcp(80), tcp(81)]);
         assert_eq!(of_tree(&f, 99), None);
+    }
+
+    #[test]
+    fn several_trees_get_an_answer_each_in_order() {
+        let mut f = Fake::default();
+        f.tree.insert(1, (vec![2], vec![tcp(81)]));
+        f.tree.insert(2, (vec![], vec![tcp(80), tcp(81)]));
+        f.tree.insert(5, (vec![], vec![tcp(90)]));
+        assert_eq!(of_trees(&f, &[5, 99, 1]), [Some(vec![tcp(90)]), None, Some(vec![tcp(80), tcp(81)])]);
+        assert!(of_trees(&f, &[]).is_empty());
     }
 
     #[test]

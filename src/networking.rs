@@ -21,6 +21,14 @@ pub fn count_listeners(pid: u32, port: u16) -> Option<usize> {
     crate::platform::listening_ports(pid).map(|ports| ports.iter().filter(|p| **p == port).count())
 }
 
+/// [`count_listeners`], and whether the OS answered cheaply (Linux: the
+/// kernel's list of listening sockets, not a table with a row per
+/// connection), so that it may be asked again soon.
+pub fn count_listeners_cheap(pid: u32, port: u16) -> Option<(usize, bool)> {
+    crate::platform::listening_ports_cheap(pid)
+        .map(|(ports, cheap)| (ports.iter().filter(|p| **p == port).count(), cheap))
+}
+
 /// Fallback readiness probe for platforms whose adapter cannot list listeners: can we connect?
 /// Imprecise with a shared port (any worker may answer).
 pub fn port_accepts(port: u16) -> bool {

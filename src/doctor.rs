@@ -137,7 +137,7 @@ fn kernel() -> Vec<Finding> {
             Err(e) => f(
                 Level::Info,
                 "openat2",
-                format!("unavailable ({e}): `warden serve` checks paths with realpath instead (slower, same safety)"),
+                format!("unavailable ({e}): `warden serve` checks paths with realpath instead (slower)"),
                 Some("a 5.6+ kernel, or allow openat2 in the container's seccomp profile"),
             ),
         },
@@ -345,7 +345,14 @@ fn platform_findings(os: &str, c: crate::platform::Capabilities) -> Vec<Finding>
         f(
             Level::Info,
             "openat2",
-            format!("{name}: unavailable; `warden serve` checks paths with realpath instead (slower, same safety)"),
+            if os == "macos" {
+                format!(
+                    "{name}: unavailable; `warden serve` opens files with openat, kept inside the root by the kernel \
+                     (O_RESOLVE_BENEATH on macOS 15+, O_NOFOLLOW_ANY before), on a thread (slower, same safety)"
+                )
+            } else {
+                format!("{name}: unavailable; `warden serve` checks paths with realpath instead (slower)")
+            },
             None,
         ),
     ]

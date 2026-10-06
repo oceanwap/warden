@@ -52,6 +52,24 @@ const TS_LEN: usize = 25;
 
 pub type Line = Arc<str>;
 
+/// Slots in the channel to `warden logs -f` and `subscribe` followers.
+const FOLLOW_SLOTS: usize = 256;
+/// Bytes of lines one slot holds (a longer line has a slot of its own). One
+/// read of worker output (64 KB, however short its lines) fits in the
+/// channel, so a follower that keeps up never misses lines to a burst; a
+/// stalled one holds at most FOLLOW_SLOTS × 16 KB, as when a slot was one
+/// line of up to 16 KB.
+const SLOT_BYTES: usize = 16 * 1024;
+
+/// One slot of the follow channel: consecutive lines, and the number of the
+/// first among every line sent to followers, so one that fell behind knows
+/// how many lines (not slots) it missed.
+#[derive(Clone)]
+struct Slot {
+    first: u64,
+    lines: Arc<[Line]>,
+}
+
 /// One FIFO to the writer thread keeps lines in order and wakes it at once;
 /// the bounds are enforced with counters before a line is queued.
 enum Queued {
@@ -383,7 +401,10 @@ fn split_output(line: &str) -> Option<(&str, &str, &str)> {
 struct Logger {
     level: AtomicU8,
     rings: Mutex<Rings>,
-    tx: broadcast::Sender<Line>,
+    tx: broadcast::Sender<Slot>,
+    /// Lines sent to followers so far; held while sending, so the numbers
+    /// rise in the order the slots are queued.
+    follow_seq: Mutex<u64>,
     writer: Option<Writer>,
     /// Lines queued but not yet written (for `flush`).
     pending: AtomicUsize,
@@ -453,22 +474,14 @@ pub fn init(level: Level, timestamps: Option<bool>, mut files: Files) {
         stream_timestamps: files.timestamps,
     };
     let file = files.file;
-    let (tx, _) = broadcast::channel(256);
     let (wtx, wrx) = channel::<Queued>();
     let ok = LOGGER
         .set(Logger {
             level: AtomicU8::new(level as u8),
-            rings: Mutex::new(Rings::default()),
-            tx,
             writer: Some(Writer { tx: wtx }),
-            pending: AtomicUsize::new(0),
-            events_queued: AtomicUsize::new(0),
-            output_queued: AtomicUsize::new(0),
-            output_bytes: AtomicUsize::new(0),
-            dropped_output: AtomicU64::new(0),
-            dropped_events: AtomicU64::new(0),
             file_path: file,
             direct: files.direct,
+            ..Logger::bare(FOLLOW_SLOTS)
         })
         .is_ok();
     if ok {
@@ -480,12 +493,18 @@ pub fn init(level: Level, timestamps: Option<bool>, mut files: Files) {
 }
 
 fn logger() -> &'static Logger {
-    LOGGER.get_or_init(|| {
-        let (tx, _) = broadcast::channel(16);
+    LOGGER.get_or_init(|| Logger::bare(16))
+}
+
+impl Logger {
+    /// Before `init` (CLI commands, tests): INFO, kept in memory and printed.
+    fn bare(follow_slots: usize) -> Logger {
+        let (tx, _) = broadcast::channel(follow_slots);
         Logger {
             level: AtomicU8::new(Level::Info as u8),
             rings: Mutex::new(Rings::default()),
             tx,
+            follow_seq: Mutex::new(0),
             writer: None,
             pending: AtomicUsize::new(0),
             events_queued: AtomicUsize::new(0),
@@ -496,7 +515,14 @@ fn logger() -> &'static Logger {
             file_path: None,
             direct: None,
         }
-    })
+    }
+
+    /// A new follower (see `subscribe`).
+    fn follower(&self) -> Follower {
+        // Under the lock: the first slot this follower gets is numbered `next`.
+        let seq = self.follow_seq.lock().unwrap_or_else(|e| e.into_inner());
+        Follower { rx: self.tx.subscribe(), slot: None, next: *seq }
+    }
 }
 
 fn current_level(l: &Logger) -> Level {
@@ -570,11 +596,7 @@ pub fn worker_output_batch(b: OutputBatch) {
             rings.output.push(seq, line.clone());
         }
     }
-    if l.tx.receiver_count() > 0 {
-        for line in &batch.lines {
-            let _ = l.tx.send(line.clone());
-        }
-    }
+    to_followers(l, &batch.lines);
     let Some(w) = &l.writer else {
         // Before `init` (CLI commands, tests): plain stdout.
         let mut out = std::io::stdout().lock();
@@ -653,8 +675,107 @@ fn emit(l: &Logger, line: Line, level: Option<Level>) {
         let ring = if level.is_some() { &mut rings.events } else { &mut rings.output };
         ring.push(seq, line.clone());
     }
-    // No subscriber (`warden logs -f`) is the normal case, not an error.
-    let _ = l.tx.send(line);
+    to_followers(l, std::slice::from_ref(&line));
+}
+
+/// Send `lines` to followers (`warden logs -f`, `subscribe` with logs), a
+/// slot per up to SLOT_BYTES of them: a burst takes a few slots, not one
+/// per line. No follower is the normal case, not an error.
+fn to_followers(l: &Logger, lines: &[Line]) {
+    if lines.is_empty() || l.tx.receiver_count() == 0 {
+        return;
+    }
+    let mut seq = l.follow_seq.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rest = lines;
+    while !rest.is_empty() {
+        let n = slot_len(rest);
+        let (now, later) = rest.split_at(n);
+        let _ = l.tx.send(Slot { first: *seq, lines: now.into() });
+        *seq += n as u64;
+        rest = later;
+    }
+}
+
+/// How many of `lines` (at least one) go in the next slot.
+fn slot_len(lines: &[Line]) -> usize {
+    let mut bytes = 0;
+    for (i, line) in lines.iter().enumerate() {
+        bytes += line.len();
+        if bytes > SLOT_BYTES && i > 0 {
+            return i;
+        }
+    }
+    lines.len()
+}
+
+/// A follower of the log: every line from when it subscribed, in order. A
+/// follower that falls behind by more than the channel holds gets
+/// `Lagged(lines missed)` once, then the oldest lines still there.
+pub struct Follower {
+    rx: broadcast::Receiver<Slot>,
+    /// The slot being handed out and the index of its next line.
+    slot: Option<(Slot, usize)>,
+    /// Number of the next line expected.
+    next: u64,
+}
+
+impl Follower {
+    /// The next line. Cancel safe (a line is taken only when returned).
+    pub async fn recv(&mut self) -> Result<Line, broadcast::error::RecvError> {
+        use broadcast::error::RecvError;
+        loop {
+            if let Some(line) = self.take() {
+                return Ok(line);
+            }
+            match self.rx.recv().await {
+                Ok(slot) => {
+                    if let Some(missed) = self.start(slot) {
+                        return Err(RecvError::Lagged(missed));
+                    }
+                }
+                // The slot after the gap says how many lines it held.
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return Err(RecvError::Closed),
+            }
+        }
+    }
+
+    /// The next line if one is already here.
+    pub fn try_recv(&mut self) -> Result<Line, broadcast::error::TryRecvError> {
+        use broadcast::error::TryRecvError;
+        loop {
+            if let Some(line) = self.take() {
+                return Ok(line);
+            }
+            match self.rx.try_recv() {
+                Ok(slot) => {
+                    if let Some(missed) = self.start(slot) {
+                        return Err(TryRecvError::Lagged(missed));
+                    }
+                }
+                Err(TryRecvError::Lagged(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn take(&mut self) -> Option<Line> {
+        let (slot, at) = self.slot.as_mut()?;
+        let line = slot.lines.get(*at).cloned();
+        *at += 1;
+        if *at >= slot.lines.len() {
+            self.slot = None;
+        }
+        line
+    }
+
+    /// Start handing out `slot`; the lines missed before it, if any.
+    fn start(&mut self, slot: Slot) -> Option<u64> {
+        let missed = slot.first.saturating_sub(self.next);
+        self.next = slot.first + slot.lines.len() as u64;
+        self.slot = Some((slot, 0));
+        (missed > 0).then_some(missed)
+    }
 }
 
 /// How long `warden flush` waits for the threads that write the files.
@@ -1731,10 +1852,7 @@ pub fn following() -> bool {
 /// Direct-mode output for `warden logs -f` only: not kept, not written
 /// (it is in the file already).
 pub fn follow_only(b: OutputBatch) {
-    let l = logger();
-    for line in b.batch.lines {
-        let _ = l.tx.send(line);
-    }
+    to_followers(logger(), &b.batch.lines);
 }
 
 /// Bytes read from the end of each direct file for `warden logs`.
@@ -2016,8 +2134,9 @@ fn merge_newest(a: &Ring, b: &Ring, n: usize, keep: &dyn Fn(&str) -> bool) -> Ve
     out
 }
 
-pub fn subscribe() -> broadcast::Receiver<Line> {
-    logger().tx.subscribe()
+/// Follow the log from now on: `warden logs -f`, `subscribe` with logs.
+pub fn subscribe() -> Follower {
+    logger().follower()
 }
 
 fn level_name(l: Level) -> &'static str {
@@ -2690,5 +2809,115 @@ mod tests {
         assert_eq!(format_rfc3339(0, 0), "1970-01-01T00:00:00.000Z");
         assert_eq!(format_rfc3339(1_790_769_601, 5), "2026-09-30T12:00:01.005Z");
         assert_eq!(format_rfc3339(951_782_400, 999), "2000-02-29T00:00:00.999Z");
+    }
+
+    /// One worker write of `n` lines, as the output reader batches it.
+    fn one_write(n: usize, text: impl Fn(usize) -> String) -> OutputBatch {
+        let mut b = OutputBatch::new("1", "stdout");
+        for i in 0..n {
+            b.push(&text(i));
+        }
+        b
+    }
+
+    /// Everything a follower has now: lines, and the skip notices' counts.
+    fn drain(f: &mut Follower) -> (Vec<Line>, Vec<u64>) {
+        use broadcast::error::TryRecvError;
+        let (mut lines, mut skipped) = (Vec::new(), Vec::new());
+        loop {
+            match f.try_recv() {
+                Ok(l) => lines.push(l),
+                Err(TryRecvError::Lagged(n)) => skipped.push(n),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return (lines, skipped),
+            }
+        }
+    }
+
+    #[test]
+    fn a_burst_in_one_write_reaches_a_follower_whole() {
+        // 2,000 lines in one write used to fill the 256 one-line slots at
+        // once: "lines skipped" for a client that was reading promptly.
+        let l = Logger::bare(FOLLOW_SLOTS);
+        let mut f = l.follower();
+        let b = one_write(2000, |i| format!("line {i}"));
+        to_followers(&l, &b.batch.lines);
+        let (got, skipped) = drain(&mut f);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(got.len(), 2000);
+        assert!(got.iter().zip(&b.batch.lines).all(|(a, b)| a == b), "every line, in order");
+
+        // The worst one read can bring (64 KB of empty lines) fits too.
+        let mut f = l.follower();
+        let b = one_write(64 * 1024, |_| String::new());
+        to_followers(&l, &b.batch.lines);
+        let (got, skipped) = drain(&mut f);
+        assert!(skipped.is_empty() && got.len() == 64 * 1024, "{skipped:?} {}", got.len());
+    }
+
+    #[test]
+    fn a_stalled_follower_is_told_how_many_lines_it_missed() {
+        let l = Logger::bare(4);
+        let mut f = l.follower();
+        let mut fast = l.follower();
+        let mut sent: Vec<Line> = Vec::new();
+        let mut fast_got = Vec::new();
+        // Events (a slot each) and bursts (several slots of up to 16 KB),
+        // far more than 4 slots, while `f` reads nothing.
+        for round in 0..10 {
+            let line: Line = format!("event {round}").into();
+            to_followers(&l, std::slice::from_ref(&line));
+            sent.push(line);
+            let b = one_write(100, |i| format!("{round}-{i} {}", "x".repeat(100)));
+            to_followers(&l, &b.batch.lines);
+            sent.extend(b.batch.lines.iter().cloned());
+            let (got, skipped) = drain(&mut fast);
+            assert!(skipped.is_empty(), "the reader that keeps up misses nothing: {skipped:?}");
+            fast_got.extend(got);
+        }
+        assert_eq!(fast_got, sent);
+        let (got, skipped) = drain(&mut f);
+        assert_eq!(skipped.len(), 1, "one notice: {skipped:?}");
+        assert_eq!(skipped[0] as usize + got.len(), sent.len(), "the count is in lines");
+        assert_eq!(got[..], sent[sent.len() - got.len()..], "then the newest lines, in order");
+        assert!(!got.is_empty() && got.len() < sent.len());
+        // Caught up: what follows comes with no notice.
+        to_followers(&l, &["after".into()]);
+        let (got, skipped) = drain(&mut f);
+        assert!(skipped.is_empty());
+        assert_eq!(got, vec![Line::from("after")]);
+    }
+
+    #[test]
+    fn follower_recv_hands_out_lines_then_the_skip_count() {
+        use broadcast::error::RecvError;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let l = Logger::bare(2);
+            let mut f = l.follower();
+            for i in 0..5 {
+                to_followers(&l, &[format!("{i}").into()]);
+            }
+            assert!(matches!(f.recv().await, Err(RecvError::Lagged(3))));
+            assert_eq!(&*f.recv().await.unwrap(), "3");
+            assert_eq!(&*f.recv().await.unwrap(), "4");
+            // A slot of several lines comes out one line at a time.
+            let b = one_write(3, |i| format!("b{i}"));
+            to_followers(&l, &b.batch.lines);
+            for i in 0..3 {
+                assert!(f.recv().await.unwrap().ends_with(&format!("b{i}")));
+            }
+            drop(l);
+            assert!(matches!(f.recv().await, Err(RecvError::Closed)));
+        });
+    }
+
+    #[test]
+    fn slots_hold_up_to_slot_bytes_and_at_least_one_line() {
+        let big: Line = "y".repeat(SLOT_BYTES * 2).into();
+        assert_eq!(slot_len(&[big.clone(), "a".into()]), 1);
+        assert_eq!(slot_len(&["a".into(), big]), 1);
+        let small: Vec<Line> = (0..100).map(|_| Line::from("z".repeat(1000))).collect();
+        assert_eq!(slot_len(&small), SLOT_BYTES / 1000);
+        assert_eq!(slot_len(&small[..3]), 3);
     }
 }

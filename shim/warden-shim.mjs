@@ -124,9 +124,53 @@ function report(msg) {
     return;
   }
   if (ipcFd == null || !ipcOpen) return;
-  try {
-    fs.writeSync(ipcFd, JSON.stringify(msg) + "\n");
-  } catch {}
+  ipcSend(JSON.stringify(msg) + "\n", msg.ev === "heartbeat");
+}
+
+// Reports never wait for Warden: fd 3 is non-blocking (Warden sets it up so,
+// with room for hours of heartbeats), so a stopped Warden (SIGSTOP, a frozen
+// VM, a bug) can't freeze the event loop on a full socket. When it is full,
+// a heartbeat waits as the latest one only (the next replaces it), and every
+// other line waits whole and in order, sent once there is room (a timer
+// retries, without keeping the process alive).
+let ipcPending = null; // bytes that go first (a line cut short, lines kept)
+let ipcBeat = null; // the latest heartbeat not sent yet
+let ipcRetry = null;
+let ipcRetryMs = 10;
+const IPC_BACKLOG_MAX = 1 << 20; // lines kept beyond this are dropped (an app spamming `ready`)
+function ipcSend(line, droppable) {
+  if (droppable) ipcBeat = line;
+  else if (!ipcPending) ipcPending = Buffer.from(line);
+  else if (ipcPending.length < IPC_BACKLOG_MAX) ipcPending = Buffer.concat([ipcPending, Buffer.from(line)]);
+  ipcFlush();
+}
+function ipcFlush() {
+  while (ipcOpen && (ipcPending || ipcBeat)) {
+    const beat = !ipcPending;
+    const buf = ipcPending || Buffer.from(ipcBeat);
+    let n;
+    try {
+      n = fs.writeSync(ipcFd, buf);
+    } catch (e) {
+      if (e && e.code === "EINTR") continue;
+      if (e && (e.code === "EAGAIN" || e.code === "EWOULDBLOCK")) return ipcRetryLater();
+      ipcPending = ipcBeat = null; // Warden is gone: no one to wait for
+      return;
+    }
+    if (!(n > 0)) return ipcRetryLater();
+    if (beat) ipcBeat = null;
+    ipcPending = n < buf.length ? buf.subarray(n) : null;
+  }
+  ipcRetryMs = 10;
+}
+function ipcRetryLater() {
+  if (ipcRetry) return;
+  ipcRetry = setTimeout(() => {
+    ipcRetry = null;
+    ipcFlush();
+  }, ipcRetryMs);
+  if (typeof ipcRetry.unref === "function") ipcRetry.unref();
+  ipcRetryMs = Math.min(ipcRetryMs * 2, 1000);
 }
 
 function privateSocketPath() {
@@ -777,8 +821,11 @@ function promote(msg) {
 //   until Warden's SIGKILL. The socket owns fd 3 from then on and closes it
 //   when it ends (Warden shut down or closed its end): `ipcOpen` turns false
 //   first, so reports never go to a reused fd 3.
-// - Bun: fs.read (its net.Socket can't take an fd), which doesn't hold up
-//   its exit.
+// - Bun: a stream of Bun.file(fd) (its net.Socket can't take an fd), which
+//   waits for data in Bun's event loop (fd 3 is non-blocking: fs.read would
+//   only get EAGAIN) and leaves fd 3 open when it ends or is cancelled.
+//   Cancelled once promoted or draining, so it doesn't hold up the exit.
+//   Without Bun.file: fs.read, retried on EAGAIN.
 // Warden also shuts down its end when it stops a standby: a pending read
 // gets EOF whatever it runs on.
 function readWardenCommands() {
@@ -813,6 +860,23 @@ function readWardenCommands() {
       ipcReader = sock;
       return;
     } catch {} // not a socket Node can watch: read it the Bun way
+  }
+  if (isBun && typeof Bun !== "undefined" && typeof Bun.file === "function") {
+    try {
+      const reader = Bun.file(ipcFd).stream().getReader();
+      const decoder = new TextDecoder();
+      const stop = () => reader.cancel().catch(() => {});
+      ipcReader = { unref: stop };
+      (async () => {
+        for (;;) {
+          const r = await reader.read();
+          if (r.done) return; // Warden shut down its end (stopping this standby, or exiting)
+          take(decoder.decode(r.value, { stream: true }));
+          if (promoted) return stop();
+        }
+      })().catch(() => {}); // fd 3 is gone: nothing can promote this worker
+      return;
+    } catch {}
   }
   const buf = Buffer.alloc(4096);
   const next = () =>
@@ -1605,6 +1669,8 @@ if (inWorker) {
 
 if (!inWorker) {
   process.on("exit", closePrivateSocket);
+  // A last try for lines still waiting for room in fd 3 (Warden stopped).
+  process.on("exit", () => ipcFlush());
 }
 
 if (inWorker && env.WARDEN_ENTRY) {

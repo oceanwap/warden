@@ -372,7 +372,17 @@ struct Watcher {
     subscribed_logs: bool,
     /// The receiver is gone: stop.
     closed: bool,
+    /// Log lines forwarded, for [`LOG_TURN`].
+    logs_forwarded: u32,
 }
+
+/// Log lines forwarded before the clients get a turn. wardend runs on one
+/// thread and a burst (thousands of lines in one write) is already in the
+/// socket buffer, so without turns the watcher could fill the log bus
+/// before a client that reads promptly ran at all, and that client got
+/// `lagged`. A client relays about 64 lines a turn before tokio makes it
+/// yield (its budget: 128 operations, a receive and a write per line).
+const LOG_TURN: u32 = 32;
 
 /// Watch one supervisor until its process exits (`Gone`) or, when no pid
 /// is known, until it cannot be reached (`Lost`).
@@ -391,6 +401,7 @@ pub(crate) async fn run(spec: Spec, tx: mpsc::Sender<WatchMsg>, bus: Bus, logs_b
         unresponsive: false,
         subscribed_logs: false,
         closed: false,
+        logs_forwarded: 0,
     };
     w.main().await;
 }
@@ -467,7 +478,13 @@ impl Watcher {
                     self.status(status).await;
                 }
             }
-            LineKind::Log => self.forward(Kind::Log),
+            LineKind::Log => {
+                self.forward(Kind::Log);
+                self.logs_forwarded = self.logs_forwarded.wrapping_add(1);
+                if self.logs_forwarded % LOG_TURN == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
             LineKind::Lagged => match serde_json::from_slice::<Event>(&self.buf) {
                 // Say whose stream lagged.
                 Ok(Event::Lagged { app: None, dropped }) => {
@@ -720,6 +737,7 @@ mod tests {
         child: std::process::Child,
         rx: mpsc::Receiver<WatchMsg>,
         frames: tokio::sync::broadcast::Receiver<Frame>,
+        log_frames: tokio::sync::broadcast::Receiver<Frame>,
         task: tokio::task::JoinHandle<()>,
         _logs: watch::Sender<bool>,
     }
@@ -736,7 +754,7 @@ mod tests {
         tokio::task::spawn_local(serve(listener, pid));
         let (tx, rx) = mpsc::channel(64);
         let (bus, frames) = tokio::sync::broadcast::channel(64);
-        let (logs_bus, _) = tokio::sync::broadcast::channel(64);
+        let (logs_bus, log_frames) = tokio::sync::broadcast::channel(64);
         let (logs_tx, logs) = watch::channel(false);
         let spec = Spec {
             app: "api".into(),
@@ -746,7 +764,7 @@ mod tests {
             interval: Duration::from_millis(250),
         };
         let task = tokio::task::spawn_local(run(spec, tx, bus, logs_bus, logs));
-        Setup { dir, socket, child, rx, frames, task, _logs: logs_tx }
+        Setup { dir, socket, child, rx, frames, log_frames, task, _logs: logs_tx }
     }
 
     impl Setup {
@@ -844,6 +862,47 @@ mod tests {
             let (on_purpose, detail) = s.kill_and_wait_gone().await;
             assert!(on_purpose, "bye seen: {detail}");
             assert!(detail.contains("shutdown"), "{detail}");
+        });
+    }
+
+    /// A burst of log lines in one write reaches a client that reads
+    /// promptly whole, though it is far more than the log bus holds (64
+    /// here): the watcher gives clients turns.
+    #[test]
+    fn a_log_burst_reaches_a_prompt_client_without_lagged() {
+        const BURST: usize = 3000;
+        let burst = |l: UnixListener, pid: u32| -> Pin<Box<dyn Future<Output = ()>>> {
+            Box::pin(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let (r, mut w) = s.into_split();
+                let mut req = String::new();
+                BufReader::new(r).read_line(&mut req).await.unwrap();
+                let mut out = line(&Event::Hello { protocol: 1, app: Some("api".into()), pid, version: "0".into() });
+                out += &line(&Event::Status { app: "api".into(), status: Box::new(status(pid, false)) });
+                for i in 0..BURST {
+                    out += &line(&Event::Log { app: "api".into(), line: format!("line {i}") });
+                }
+                w.write_all(out.as_bytes()).await.unwrap();
+                std::future::pending::<()>().await;
+            })
+        };
+        local(async {
+            let mut s = setup("burst", burst);
+            let mut log_frames = s.log_frames.resubscribe();
+            let client = tokio::task::spawn_local(async move {
+                let mut got = 0;
+                while got < BURST {
+                    match log_frames.recv().await {
+                        Ok(f) => {
+                            assert!(f.line.contains(&format!(r#""line":"line {got}""#)), "in order: {}", f.line);
+                            got += 1;
+                        }
+                        Err(e) => panic!("after {got} lines: {e:?}"),
+                    }
+                }
+            });
+            attached(&mut s).await;
+            tokio::time::timeout(Duration::from_secs(10), client).await.expect("every line in time").unwrap();
         });
     }
 

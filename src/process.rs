@@ -34,6 +34,12 @@ pub struct Spec {
     /// A second socket at fd 4 that Warden hands accepted connections over
     /// (macOS handoff, `crate::handoff`): Node's IPC channel, `NODE_CHANNEL_FD`.
     pub handoff: bool,
+    /// The program reports through code of Warden's that never waits on fd 3
+    /// (the shim, the worker-mode host, the static server): the worker's end
+    /// of fd 3 is then non-blocking, so a stopped Warden can't freeze it
+    /// (`sys::prepare_ipc_socket`). Other programs get a blocking socket, as
+    /// a plain read or write of fd 3 expects.
+    pub ipc_nonblocking: bool,
 }
 
 /// `[logging] worker_output`.
@@ -264,6 +270,14 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     // macOS that is this option (Linux sends with MSG_NOSIGNAL), once, here,
     // not the runtime's ignoring SIGPIPE for the whole process.
     let _ = crate::sys::set_nosigpipe(std::os::fd::AsFd::as_fd(&ipc_ours));
+    // The worker never waits for Warden: room for hours of heartbeats while
+    // Warden reads nothing (stopped, a frozen VM, a bug), and, under the shim
+    // (which keeps what it can't drop for later), writes that never block.
+    let _ = crate::sys::prepare_ipc_socket(
+        std::os::fd::AsFd::as_fd(&ipc_ours),
+        std::os::fd::AsFd::as_fd(&ipc_child),
+        spec.ipc_nonblocking,
+    );
 
     // fd 4 (handoff only): Warden passes accepted connections over it.
     let handoff = if spec.handoff { Some(crate::sys::socketpair_cloexec()?) } else { None };
@@ -1069,6 +1083,7 @@ mod tests {
                     output: Output::Capture,
                     max_lines_per_sec: 0,
                     handoff: false,
+                    ipc_nonblocking: false,
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -1128,6 +1143,7 @@ mod tests {
             output: Output::Capture,
             max_lines_per_sec: 1,
             handoff: false,
+            ipc_nonblocking: false,
         }
     }
 
@@ -1156,6 +1172,7 @@ mod tests {
                     output: Output::Capture,
                     max_lines_per_sec: 0,
                     handoff: false,
+                    ipc_nonblocking: false,
                 };
                 let quiet = spawn(quiet, 2, tx).unwrap();
                 // Written 50 ms apart: all ten in the log well within 3 s, each read
@@ -1207,6 +1224,7 @@ mod tests {
                     output: Output::Capture,
                     max_lines_per_sec: 0,
                     handoff: false,
+                    ipc_nonblocking: false,
                 };
                 let h = spawn(spec, 9, tx).unwrap();
                 h.relabel("2");
@@ -1258,6 +1276,7 @@ mod tests {
                     output: Output::Capture,
                     max_lines_per_sec: 0,
                     handoff: false,
+                    ipc_nonblocking: false,
                 };
                 let h = spawn(spec, 3, tx).unwrap();
                 async fn next(rx: &mut mpsc::UnboundedReceiver<ProcEvent>) -> ProcEvent {
@@ -1304,6 +1323,7 @@ mod tests {
                     output: Output::Capture,
                     max_lines_per_sec: 0,
                     handoff: false,
+                    ipc_nonblocking: false,
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);

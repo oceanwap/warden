@@ -2,9 +2,10 @@
 //!
 //! The OS adapter walks a worker's process tree (a wrapper such as `npm run
 //! start` is the process Warden started; the server is below it), which
-//! reads `/proc` or asks libproc for each process. A status request arrives
-//! every second while wardend or a GUI watches, and a busy host's socket
-//! tables are large, so:
+//! reads `/proc` (each process's sockets, and on Linux the listeners of the
+//! namespace from one netlink request for all the workers) or asks libproc
+//! for each process. A status request arrives every second while wardend or
+//! a GUI watches, and a process with many connections has many sockets, so:
 //!
 //! - the first reading of a worker is taken on the spot (so `warden start`
 //!   can print the port it waited for), and a worker that has listened on
@@ -70,21 +71,44 @@ enum Plan {
 impl ListenerCache {
     /// The listeners of the process tree of `pid`, without Warden's own
     /// sockets. `young`: the worker started recently.
+    #[cfg(test)]
     pub(super) fn of(&self, pid: u32, now: Instant, young: bool, own: &Own) -> Vec<Listener> {
-        match self.plan(pid, now, young) {
-            Plan::Fresh(found) => found,
-            Plan::Stale(found) => {
-                if self.claim(pid) {
-                    let (cache, own) = (self.clone(), own.clone());
-                    // Off the supervisor's loop: it reads /proc for every process of the tree.
-                    tokio::task::spawn_blocking(move || {
-                        cache.refresh(pid, platform::listeners, &own);
-                    });
-                }
-                found
+        self.of_each(&[(pid, young)], now, own).remove(0)
+    }
+
+    /// [`Self::of`] for each worker (`(pid, young)`), in order: those to read
+    /// are read together, the OS's socket tables once for all of them.
+    pub(super) fn of_each(&self, workers: &[(u32, bool)], now: Instant, own: &Own) -> Vec<Vec<Listener>> {
+        let plans: Vec<Plan> = workers.iter().map(|(pid, young)| self.plan(*pid, now, *young)).collect();
+        let (mut unknown, mut stale) = (Vec::new(), Vec::new());
+        for ((pid, _), plan) in workers.iter().zip(&plans) {
+            match plan {
+                // A pid twice (worker mode's threads share one process) is read once.
+                Plan::Unknown if !unknown.contains(pid) => unknown.push(*pid),
+                Plan::Stale(_) if self.claim(*pid) => stale.push(*pid),
+                _ => {}
             }
-            Plan::Unknown => self.refresh(pid, platform::listeners, own),
         }
+        if !stale.is_empty() {
+            let (cache, own) = (self.clone(), own.clone());
+            // Off the supervisor's loop: it reads /proc for every process of the trees.
+            tokio::task::spawn_blocking(move || {
+                cache.refresh_each(&stale, platform::listeners_each, &own);
+            });
+        }
+        let read: HashMap<u32, Vec<Listener>> = if unknown.is_empty() {
+            HashMap::new()
+        } else {
+            unknown.iter().copied().zip(self.refresh_each(&unknown, platform::listeners_each, own)).collect()
+        };
+        workers
+            .iter()
+            .zip(plans)
+            .map(|((pid, _), plan)| match plan {
+                Plan::Fresh(found) | Plan::Stale(found) => found,
+                Plan::Unknown => read.get(pid).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 
     fn plan(&self, pid: u32, now: Instant, young: bool) -> Plan {
@@ -108,16 +132,32 @@ impl ListenerCache {
     }
 
     /// Read `pid` now and keep the answer.
+    #[cfg(test)]
     fn refresh(
         &self,
         pid: u32,
         lookup: impl FnOnce(u32) -> Option<Vec<platform::Listener>>,
         own: &Own,
     ) -> Vec<Listener> {
-        let found = visible(lookup(pid).unwrap_or_default(), own);
+        self.refresh_each(&[pid], |pids| vec![lookup(pids[0])], own).remove(0)
+    }
+
+    /// Read `pids` now (`lookup` answers for each, in order) and keep the answers.
+    fn refresh_each(
+        &self,
+        pids: &[u32],
+        lookup: impl FnOnce(&[u32]) -> Vec<Option<Vec<platform::Listener>>>,
+        own: &Own,
+    ) -> Vec<Vec<Listener>> {
+        let mut answers = lookup(pids).into_iter();
+        let found: Vec<Vec<Listener>> =
+            pids.iter().map(|_| visible(answers.next().flatten().unwrap_or_default(), own)).collect();
+        let now = Instant::now();
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        g.by_pid.insert(pid, (Instant::now(), found.clone()));
-        g.refreshing.remove(&pid);
+        for (pid, found) in pids.iter().zip(&found) {
+            g.by_pid.insert(*pid, (now, found.clone()));
+            g.refreshing.remove(pid);
+        }
         found
     }
 

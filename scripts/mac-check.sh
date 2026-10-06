@@ -286,8 +286,8 @@ WARDEN_HOME=$work/home WARDEN_RUNTIME_DIR=$work/run WARDEN_NO_DAEMON=1 "$bin" de
 # ------------------------------------------------------ smoke: static serve
 # `warden serve`: the bodies are right and the answers are fast. Keep-alive
 # requests from python, so the time is the server's and the kernel's (no
-# browser). A Mac opens files through the realpath fallback; this shows what
-# that costs.
+# browser). A Mac opens files on a thread (openat with O_RESOLVE_BENEATH or
+# O_NOFOLLOW_ANY, no openat2); this shows what that costs.
 #
 # The bytes are compared with the file, not just counted: files above 16 KB
 # go out through the macOS-only path (one sendfile(2) with an `sf_hdtr` header,

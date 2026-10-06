@@ -113,7 +113,7 @@ Gates for every replacement: `reload`, `safe-reload`, `restart N` and recycling.
 | Key | Default | Meaning |
 |---|---|---|
 | `health_passes` | `3` | Consecutive passes on the new worker's private socket |
-| `health_interval_ms` | `500` | Milliseconds between those checks |
+| `health_interval_ms` | `500` | Milliseconds from the end of one check to the next. The first runs as soon as the worker listens, and it takes over as soon as its last gate passes |
 | `verify_command` | none | A smoke test, e.g. `curl -sf --unix-socket "$WARDEN_WORKER_SOCKET" http://w/ready` |
 | `min_ready` | `0` | Seconds each new worker must stay healthy before taking over |
 | `canary_soak` | `30` | Seconds the safe-reload canary runs next to the old worker |

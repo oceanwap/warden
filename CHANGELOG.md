@@ -29,8 +29,53 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   with one. Only a hint: an app that keeps state in memory needs its one
   worker. Supervisors send it as `status.hint`.
 
+### Changed
+
+- `warden reload`, `restart` and `safe-reload` return as soon as the rollout
+  ends: they follow the supervisor's event stream instead of asking for its
+  status every 250 ms, so they no longer wait up to a quarter second more
+  (4 `node:http` workers on a busy host: reload median 648 → 500 ms, restart
+  519 → 470 ms). They fall back to polling when the stream is not available
+  (an older supervisor, too many live streams). `warden start` notices the
+  supervisor and its ready workers sooner, and wardend starts the next saved
+  app at boot sooner. Progress lines now show every phase of a rollout (a
+  250 ms sample could skip a short batch); exit codes are unchanged.
+- Reloads with a `[health] path` are faster: a new worker's first health check
+  runs as soon as it listens, each next one `health_interval_ms` after the
+  previous one ended, and the worker takes over the moment its last check,
+  `verify_command` or soak passes. They used to wait for a shared 500 ms tick
+  at each step: listening to taking over went from about 1.9 s to 1.0 s with
+  the defaults, and `warden reload` of 4 node:http workers from 8.5 s to 5 s.
+  The gates are the same: `health_passes` checks in a row, never closer than
+  `health_interval_ms`. A first check that fails resets the passes but
+  doesn't count toward failing the worker, so a slow starter gets no less
+  time than before.
+- Linux: a supervisor no longer reads the host's whole socket table to find
+  what its workers listen on (`status`, `warden ports`) or whether a new
+  worker listens yet. It asks the kernel for the listening sockets only (one
+  netlink request for all the workers, as `port_lost` already did), where
+  `/proc/net/tcp` has a row per connection: with 20,000 idle keep-alive
+  connections on a 4-worker app, the supervisor went from 14 % to 3.7 %
+  of a core (what is left is reading which sockets each worker holds). A
+  worker without the shim is now seen listening within 20 ms (it was up to
+  250 ms). Workers in another network namespace are read from `/proc` as
+  before; the answers are the same.
+
 ### Fixed
 
+- A stopped supervisor (SIGSTOP, a frozen VM, a bug) no longer freezes its
+  workers. They report to it over a socket, and once its buffer was full
+  (macOS: 8 KB, about a minute of heartbeats; Linux: a few minutes) the next
+  report blocked the worker's event loop until the supervisor read again. Now
+  the socket holds far more (hours of heartbeats where the system allows it),
+  and under the shim and the static server it never blocks: when full, only
+  the latest heartbeat waits, and every other message (`listening`, `ready`,
+  `draining`) waits whole and in order until the supervisor reads.
+- macOS: a connection a worker refused (`NODE_HANDLE_NACK`, e.g. at its
+  file-descriptor limit) was handed out again forever, a busy loop. Like
+  Node's cluster module, it now goes round at most 3 more times, to the least
+  busy worker, and is then closed, with a warning (at most once a minute)
+  saying how many were closed and what to raise.
 - macOS: apps that wardend starts (at login, after `warden update`, or when
   it restarts a supervisor) ran at background priority (20 instead of 31):
   launchd ran wardend as a background job and every app inherited it, so on a
@@ -38,6 +83,21 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   startup` now writes `ProcessType = Interactive`, and a job an older warden
   wrote gets it the next time warden starts wardend through launchd (`warden
   update`, the GUI's Update), with nothing to run by hand.
+- Security: `warden serve` could serve a file outside its root when a
+  symlink under the root was swapped between the check of a path and its
+  open. On macOS every request had that window (the path was checked with
+  realpath, then opened); on Linux only paths through an absolute symlink
+  did. Now the kernel keeps the open inside the root: `O_RESOLVE_BENEATH` on
+  macOS 15+, `O_NOFOLLOW_ANY` (no symlinks) on macOS 11-14, `openat2` on
+  Linux; a path through a symlink is resolved, and its real path opened the
+  same way. Symlinks that stay inside the root work as before, and a Mac
+  now opens most files in one system call instead of a realpath walk.
+- `warden logs -f` and the GUI's log no longer say "lines skipped" to a
+  client that reads promptly when a worker writes many lines at once (more
+  than 256 in one write did it): followers get a write's lines together, and
+  only one that really falls behind is told how many lines it missed.
+  wardend, relaying logs to the GUI, also gives its clients a turn during a
+  burst.
 
 ## [0.1.2] — 2026-10-05
 

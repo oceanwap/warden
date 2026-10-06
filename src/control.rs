@@ -379,9 +379,7 @@ impl Subscriber {
     }
 }
 
-async fn next_line(
-    lines: &mut Option<tokio::sync::broadcast::Receiver<crate::logging::Line>>,
-) -> Result<crate::logging::Line, RecvError> {
+async fn next_line(lines: &mut Option<crate::logging::Follower>) -> Result<crate::logging::Line, RecvError> {
     match lines {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,

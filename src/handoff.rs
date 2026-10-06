@@ -16,6 +16,12 @@
 //! others. With no worker in the rotation Warden stops accepting, so new
 //! connections wait in the kernel's backlog until one is back.
 //!
+//! A worker that cannot take a connection (at its file-descriptor limit)
+//! answers `NODE_HANDLE_NACK`, and the connection goes round again, to the
+//! least busy worker. Like Node (`MAX_HANDLE_RETRANSMISSIONS`), it is sent
+//! again at most 3 times: refused a 4th time, it is closed, so a fleet out of
+//! descriptors sheds connections instead of passing them around forever.
+//!
 //! The dispatcher runs on its own thread (with its own small runtime), so the
 //! supervisor's loop (logs, IPC, timers) never delays a connection.
 
@@ -26,7 +32,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -37,6 +43,13 @@ pub const MESSAGE: &str = "warden:connection";
 /// How long a worker may take to acknowledge a connection before it is
 /// taken out of the rotation (the connection is closed: it may have it).
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many times a refused (NACKed) connection is sent again before it is
+/// closed: Node's `MAX_HANDLE_RETRANSMISSIONS`.
+const MAX_RETRANSMISSIONS: u8 = 3;
+
+/// At most one warning about closed refused connections this often.
+const REFUSED_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// The dispatcher of one app. Dropping it stops the thread and closes the port.
 pub struct Handoff {
@@ -49,10 +62,19 @@ enum Ctl {
     Remove(u64),
 }
 
+/// An accepted connection on its way to a worker.
+struct Conn {
+    fd: OwnedFd,
+    /// Times a worker refused it (`NODE_HANDLE_NACK`).
+    refused: u8,
+}
+
 /// From a worker's task back to the dispatcher.
 enum Back {
     /// Not delivered: give it to another worker.
-    Again(OwnedFd),
+    Again(Conn),
+    /// The worker refused it (NACK): again, up to `MAX_RETRANSMISSIONS` times.
+    Refused(Conn),
     /// The worker's channel failed: out of the rotation. `true`: it did not
     /// answer (a hung worker); otherwise it is gone, and its exit says so.
     Gone(u64, bool),
@@ -69,7 +91,12 @@ impl Handoff {
             let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    crate::error!("connection handoff could not start", app = app, error = e);
+                    crate::error!(
+                        "connection handoff could not start",
+                        app = app,
+                        error = e,
+                        hint = "Warden could not create the dispatcher's runtime (out of memory or threads?)",
+                    );
                     return;
                 }
             };
@@ -91,7 +118,7 @@ impl Handoff {
 
 struct Worker {
     inst: u64,
-    tx: mpsc::UnboundedSender<OwnedFd>,
+    tx: mpsc::UnboundedSender<Conn>,
     /// Connections sent or queued, not yet acknowledged.
     pending: Arc<AtomicUsize>,
     /// Out of the rotation: whatever is still queued goes back.
@@ -102,15 +129,21 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
     let listener = match AsyncFd::with_interest(listener, Interest::READABLE) {
         Ok(l) => l,
         Err(e) => {
-            crate::error!("connection handoff could not start", app = app, error = e);
+            crate::error!(
+                "connection handoff could not start",
+                app = app,
+                error = e,
+                hint = "the port's socket could not be watched; the app gets no connections",
+            );
             return;
         }
     };
     let (back_tx, mut back_rx) = mpsc::unbounded_channel::<Back>();
     let mut workers: Vec<Worker> = Vec::new();
-    let mut waiting: VecDeque<OwnedFd> = VecDeque::new();
+    let mut waiting: VecDeque<Conn> = VecDeque::new();
     let mut next = 0usize;
     let mut errors = 0u32;
+    let mut refused = RefusedLog::default();
     loop {
         tokio::select! {
             c = ctl.recv() => match c {
@@ -129,6 +162,22 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
             },
             b = back_rx.recv() => match b {
                 Some(Back::Again(conn)) => dispatch(&workers, &mut next, conn, &mut waiting),
+                Some(Back::Refused(conn)) => match again_after_refusal(conn) {
+                    Some(conn) => dispatch(&workers, &mut next, conn, &mut waiting),
+                    None => {
+                        if let Some(closed) = refused.closed(Instant::now()) {
+                            crate::warn!(
+                                "connections refused by every worker they were sent to were closed",
+                                app = app,
+                                closed = closed,
+                                tries = MAX_RETRANSMISSIONS + 1,
+                                hint = "workers answer NACK when they cannot take a connection, usually at their \
+                                        file-descriptor limit: raise it (`ulimit -n`, LimitNOFILE) or add workers; \
+                                        this is said at most once a minute",
+                            );
+                        }
+                    }
+                },
                 Some(Back::Gone(inst, hung)) => {
                     if hung && workers.iter().any(|w| w.inst == inst) {
                         crate::warn!(
@@ -149,7 +198,7 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                     match crate::sys::accept_nonblocking(listener.get_ref().as_fd()) {
                         Ok(conn) => {
                             errors = 0;
-                            dispatch(&workers, &mut next, conn, &mut waiting);
+                            dispatch(&workers, &mut next, Conn { fd: conn, refused: 0 }, &mut waiting);
                         }
                         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                             guard.clear_ready();
@@ -160,7 +209,13 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                             // EMFILE and the like: say so once, back off a little.
                             errors += 1;
                             if errors == 1 {
-                                crate::warn!("accepting a connection failed", app = app, error = e);
+                                crate::warn!(
+                                    "accepting a connection failed",
+                                    app = app,
+                                    error = e,
+                                    hint = "Warden is out of file descriptors (raise LimitNOFILE / ulimit -n) or memory; \
+                                            it retries",
+                                );
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             break;
@@ -169,6 +224,32 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                 }
             }
         }
+    }
+}
+
+/// A refused connection: back for another try, or `None` once it has been
+/// refused `MAX_RETRANSMISSIONS + 1` times (dropped, which closes it).
+fn again_after_refusal(mut conn: Conn) -> Option<Conn> {
+    conn.refused = conn.refused.saturating_add(1);
+    (conn.refused <= MAX_RETRANSMISSIONS).then_some(conn)
+}
+
+/// Counts connections closed after refusals, and says when to warn: at the
+/// first, then at most once per `REFUSED_WARN_EVERY` (with the count since).
+#[derive(Default)]
+struct RefusedLog {
+    last: Option<Instant>,
+    unreported: u64,
+}
+
+impl RefusedLog {
+    fn closed(&mut self, now: Instant) -> Option<u64> {
+        self.unreported += 1;
+        if self.last.is_some_and(|t| now.duration_since(t) < REFUSED_WARN_EVERY) {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.unreported))
     }
 }
 
@@ -183,7 +264,7 @@ fn drop_worker(workers: &mut Vec<Worker>, inst: u64) {
 
 /// The worker with the fewest connections in flight, starting the search at
 /// `next` so equals take turns. None in the rotation: it waits.
-fn dispatch(workers: &[Worker], next: &mut usize, conn: OwnedFd, waiting: &mut VecDeque<OwnedFd>) {
+fn dispatch(workers: &[Worker], next: &mut usize, conn: Conn, waiting: &mut VecDeque<Conn>) {
     let Some(i) = pick(workers.iter().map(|w| w.pending.load(Ordering::Acquire)), *next) else {
         waiting.push_back(conn);
         return;
@@ -209,7 +290,7 @@ fn pick(loads: impl Iterator<Item = usize>, start: usize) -> Option<usize> {
 async fn deliver(
     inst: u64,
     channel: OwnedFd,
-    mut rx: mpsc::UnboundedReceiver<OwnedFd>,
+    mut rx: mpsc::UnboundedReceiver<Conn>,
     pending: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     back: mpsc::UnboundedSender<Back>,
@@ -230,7 +311,7 @@ async fn deliver(
             let _ = back.send(Back::Again(conn));
             continue;
         }
-        if send(&channel, line.as_bytes(), &conn).await.is_err() {
+        if send(&channel, line.as_bytes(), &conn.fd).await.is_err() {
             // Not delivered (the worker is gone): someone else takes it.
             pending.fetch_sub(1, Ordering::AcqRel);
             let _ = back.send(Back::Again(conn));
@@ -243,7 +324,7 @@ async fn deliver(
             Ok(Ok(true)) => drop(conn),
             // NACK: the worker could not take it; it is still ours to give.
             Ok(Ok(false)) => {
-                let _ = back.send(Back::Again(conn));
+                let _ = back.send(Back::Refused(conn));
             }
             // No answer: the worker may hold it, so it is closed, not resent.
             Ok(Err(_)) | Err(_) => {
@@ -256,11 +337,7 @@ async fn deliver(
 }
 
 /// Everything still queued for a worker that left goes to the others.
-async fn give_back(
-    rx: &mut mpsc::UnboundedReceiver<OwnedFd>,
-    back: &mpsc::UnboundedSender<Back>,
-    pending: &AtomicUsize,
-) {
+async fn give_back(rx: &mut mpsc::UnboundedReceiver<Conn>, back: &mpsc::UnboundedSender<Back>, pending: &AtomicUsize) {
     rx.close();
     while let Some(conn) = rx.recv().await {
         pending.fetch_sub(1, Ordering::AcqRel);
@@ -343,6 +420,62 @@ mod tests {
         assert_eq!(acknowledgement(b"{\"cmd\":\"NODE_HANDLE_NACK\"}\n"), Some(false));
         assert_eq!(acknowledgement(br#"{"cmd":"NODE_CLUSTER"}"#), None);
         assert_eq!(acknowledgement(b"not json"), None);
+    }
+
+    #[test]
+    fn a_refused_connection_is_sent_again_three_times_like_node_then_closed() {
+        let (fd, _peer) = crate::sys::socketpair_cloexec().unwrap();
+        let mut conn = Conn { fd, refused: 0 };
+        for tries in 1..=MAX_RETRANSMISSIONS {
+            conn = again_after_refusal(conn).unwrap_or_else(|| panic!("closed after {tries} refusals"));
+            assert_eq!(conn.refused, tries);
+        }
+        assert!(again_after_refusal(conn).is_none(), "the 4th refusal closes it");
+    }
+
+    #[test]
+    fn closed_refused_connections_are_reported_at_most_once_a_minute() {
+        let mut log = RefusedLog::default();
+        let t0 = Instant::now();
+        assert_eq!(log.closed(t0), Some(1), "the first one is said at once");
+        assert_eq!(log.closed(t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.closed(t0 + Duration::from_secs(59)), None);
+        assert_eq!(log.closed(t0 + REFUSED_WARN_EVERY), Some(3), "then with the count since");
+        assert_eq!(log.closed(t0 + REFUSED_WARN_EVERY + Duration::from_secs(1)), None);
+    }
+
+    /// A worker that refuses every connection (NACK) gets it 4 times, as
+    /// Node's cluster would send it, then Warden closes it: the client sees
+    /// the end of the connection instead of Warden resending it forever.
+    #[test]
+    fn a_connection_refused_four_times_is_closed_not_resent_forever() {
+        use std::io::{Read, Write};
+        let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
+        let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
+        h.add(1, ours);
+        let mut client = std::net::TcpStream::connect(h.addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let theirs = std::os::unix::net::UnixStream::from(theirs);
+        theirs.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut sends = 0;
+        while let Ok((line, fd)) = crate::sys::recv_with_fd(theirs.as_fd(), 4096) {
+            if line.is_empty() {
+                break;
+            }
+            assert!(String::from_utf8_lossy(&line).contains("NODE_HANDLE"));
+            drop(fd.expect("a descriptor came with it"));
+            sends += 1;
+            assert!(sends <= 10, "resent forever");
+            (&theirs).write_all(b"{\"cmd\":\"NODE_HANDLE_NACK\"}\n").unwrap();
+        }
+        assert_eq!(sends, 1 + MAX_RETRANSMISSIONS as usize, "sent once, then again 3 times");
+        let mut got = [0u8; 1];
+        assert_eq!(client.read(&mut got).unwrap(), 0, "closed by Warden");
+        // The worker is still in the rotation: the next connection reaches it.
+        let _c2 = std::net::TcpStream::connect(h.addr).unwrap();
+        theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (line, fd) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
+        assert!(String::from_utf8_lossy(&line).contains("NODE_HANDLE") && fd.is_some());
     }
 
     /// A connection accepted here arrives at the other end of the channel

@@ -70,8 +70,12 @@ impl Kind {
     }
 }
 
+/// `Tick`: deadlines, drains, and a fallback for the gates' own timers.
+/// `Due`: a lane's next gate may be due (its next health check, the end of
+/// its soak, or of its wait for its private socket).
 pub(super) enum GateEvent {
     Tick { seq: u64 },
+    Due { seq: u64, inst: u64 },
     Check { seq: u64, inst: u64, result: Result<(), String> },
     Command { seq: u64, inst: u64, result: Result<(), String> },
     Preflight { seq: u64, result: Result<(), String> },
@@ -203,6 +207,13 @@ struct Verify {
     passes: u32,
     fails: u32,
     checking: bool,
+    /// No health check before this: `health_interval_ms` after the previous
+    /// one finished. `None` until the first, which runs once it listens.
+    next_check: Option<Instant>,
+    /// Found listening (its port open) before the shim reported its
+    /// private socket: the first check waits for the report until this,
+    /// one interval, then runs anyway.
+    socket_wait: Option<Instant>,
     cmd: Cmd,
     soak: Duration,
     soak_until: Option<Instant>,
@@ -697,11 +708,20 @@ impl Supervisor {
             passes: 0,
             fails: 0,
             checking: false,
+            next_check: None,
+            socket_wait: None,
             cmd,
             soak,
             soak_until: None,
             canary,
         });
+        // Its first health check (or verify_command, or soak) starts now.
+        self.gate_steps(Some(new));
+    }
+
+    /// The shim reported a private health socket of `inst`.
+    pub(super) fn rollout_socket_reported(&mut self, inst: u64) {
+        self.gate_steps(Some(inst));
     }
 
     /// With a health path configured, health gates are mandatory: a worker
@@ -714,6 +734,7 @@ impl Supervisor {
         let seq_now = self.roll.as_ref().map(|r| r.seq);
         match ev {
             GateEvent::Tick { seq } if Some(seq) == seq_now => self.gate_tick(),
+            GateEvent::Due { seq, inst } if Some(seq) == seq_now => self.gate_steps(Some(inst)),
             GateEvent::Check { seq, inst, result } if Some(seq) == seq_now => self.gate_check(inst, result),
             GateEvent::Command { seq, inst, result } if Some(seq) == seq_now => {
                 let Some((slot, v)) = self.verifying(inst) else { return };
@@ -721,6 +742,7 @@ impl Supervisor {
                     Ok(()) => {
                         v.cmd = Cmd::Passed;
                         info!("verify_command passed", worker = slot);
+                        self.gate_steps(Some(inst));
                     }
                     Err(e) => self.fail_at(Some(slot), format!("verify_command failed: {e}")),
                 }
@@ -756,6 +778,8 @@ impl Supervisor {
         })
     }
 
+    /// Deadlines, and room freed by drains. The gates run on their own
+    /// timers (`gate_steps`); the tick only runs any that is overdue.
     fn gate_tick(&mut self) {
         // Drains end with their process's exit (`rollout_on_exit`); this
         // catches room freed by an exit seen elsewhere, so a rollout waiting
@@ -764,67 +788,100 @@ impl Supervisor {
         let now = Instant::now();
         let timeout = self.cfg.reload.timeout;
         let required = self.cfg.reload.health_passes;
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &self.roll else { return };
+        let fail = lanes.iter().find_map(|lane| match &lane.at {
+            At::Starting { deadline, .. } if now > *deadline => {
+                Some((lane.slot, format!("new worker not listening within {timeout}s")))
+            }
+            At::Verifying(v) if now > v.deadline => {
+                Some((lane.slot, format!("gates not passed within {timeout}s (health {}/{required})", v.passes)))
+            }
+            _ => None,
+        });
+        if let Some((slot, msg)) = fail {
+            self.fail_at(Some(slot), msg);
+            return;
+        }
+        self.gate_steps(None);
+    }
+
+    /// Run the next gate of each verifying lane (`only`: of that worker's)
+    /// that is due: a health check `health_interval_ms` after the previous
+    /// one finished (the first once it listens), then `verify_command`,
+    /// then the soak; a lane past them all passes, and the batch is promoted
+    /// as soon as every lane has. Called when a worker listens, when a
+    /// check or command ends, by the lane's timers (`GateEvent::Due`), and
+    /// by the tick.
+    fn gate_steps(&mut self, only: Option<u64>) {
+        let now = Instant::now();
+        let required = self.cfg.reload.health_passes;
         let checks = required > 0 && self.can_check(0);
+        let every = Duration::from_millis(self.cfg.reload.health_interval_ms);
+        // Its private socket(s) not reported yet: a check now would fail.
+        let expected = if self.cfg.private_sockets() { self.expected_listeners() } else { 0 };
+        let insts = &self.insts;
+        let unreported = |inst: u64| insts.get(&inst).is_some_and(|i| i.sockets.len() < expected);
         let Some(roll) = &mut self.roll else { return };
         let seq = roll.seq;
         let Step::Batch(lanes) = &mut roll.step else { return };
         let several = lanes.len() > 1;
         // Decide for every lane first, then act (acting needs `self`).
-        let mut fail = None;
         let mut checks_due = Vec::new();
         let mut commands_due = Vec::new();
+        let mut wakes = Vec::new();
         for lane in lanes.iter_mut() {
-            let mut passed = None;
-            match &mut lane.at {
-                At::Starting { deadline, .. } if now > *deadline => {
-                    fail = Some((lane.slot, format!("new worker not listening within {timeout}s")));
-                    break;
+            let At::Verifying(v) = &mut lane.at else { continue };
+            if only.is_some_and(|inst| inst != v.new) || v.checking || v.cmd == Cmd::Running {
+                continue;
+            }
+            // Not yet: the timer `gate_check` set calls again when it is.
+            let mut check_due = checks && v.next_check.is_none_or(|t| now >= t);
+            if check_due && v.next_check.is_none() && unreported(v.new) {
+                // The report, or this timer, calls again.
+                let until = *v.socket_wait.get_or_insert_with(|| {
+                    wakes.push((v.new, every));
+                    crate::restart::later(now, every)
+                });
+                check_due = now >= until;
+            }
+            if checks && v.passes < required {
+                if check_due {
+                    v.checking = true;
+                    checks_due.push(v.new);
                 }
-                At::Verifying(v) => {
-                    if now > v.deadline {
-                        fail = Some((
-                            lane.slot,
-                            format!("gates not passed within {timeout}s (health {}/{required})", v.passes),
-                        ));
-                        break;
+                continue;
+            }
+            if v.cmd == Cmd::Pending {
+                v.cmd = Cmd::Running;
+                commands_due.push((v.new, lane.slot));
+                continue;
+            }
+            if !v.soak.is_zero() {
+                let until = match v.soak_until {
+                    Some(until) => until,
+                    None => {
+                        let until = crate::restart::later(now, v.soak);
+                        v.soak_until = Some(until);
+                        wakes.push((v.new, v.soak));
+                        until
                     }
-                    if v.checking || v.cmd == Cmd::Running {
-                        continue;
-                    }
-                    if checks && v.passes < required {
+                };
+                if now < until {
+                    if check_due {
                         v.checking = true;
                         checks_due.push(v.new);
-                        continue;
                     }
-                    if v.cmd == Cmd::Pending {
-                        v.cmd = Cmd::Running;
-                        commands_due.push((v.new, lane.slot));
-                        continue;
-                    }
-                    if !v.soak.is_zero() {
-                        let until = *v.soak_until.get_or_insert(crate::restart::later(now, v.soak));
-                        if now < until {
-                            if checks {
-                                v.checking = true;
-                                checks_due.push(v.new);
-                            }
-                            continue;
-                        }
-                    }
-                    passed = Some((v.new, v.old));
+                    continue;
                 }
-                _ => {}
             }
-            if let Some((new, old)) = passed {
-                lane.at = At::Passed { new, old };
-                if several {
-                    debug!("new worker passed its gates; waiting for the rest of its batch", worker = lane.slot);
-                }
+            let (new, old) = (v.new, v.old);
+            lane.at = At::Passed { new, old };
+            if several {
+                debug!("new worker passed its gates; waiting for the rest of its batch", worker = lane.slot);
             }
         }
-        if let Some((slot, msg)) = fail {
-            self.fail_at(Some(slot), msg);
-            return;
+        for (inst, after) in wakes {
+            self.send_later(after, Event::Gate(GateEvent::Due { seq, inst }));
         }
         for inst in checks_due {
             self.launch_check(seq, inst);
@@ -838,9 +895,17 @@ impl Supervisor {
     fn gate_check(&mut self, inst: u64, result: Result<(), String>) {
         let required = self.cfg.reload.health_passes;
         let threshold = self.cfg.health.failure_threshold;
+        let every = Duration::from_millis(self.cfg.reload.health_interval_ms);
+        let seq = self.roll.as_ref().map_or(0, |r| r.seq);
         let Some((slot, v)) = self.verifying(inst) else { return };
         v.checking = false;
         let soaking = v.soak_until.is_some();
+        // The check run the moment it listened: when checks waited for a
+        // tick, a worker had up to one interval more to warm up. Its failure
+        // resets the passes but doesn't count toward failing the worker, so
+        // a slow starter fails no sooner than it did then.
+        let first = v.next_check.is_none();
+        v.next_check = Some(crate::restart::later(Instant::now(), every));
         match result {
             Ok(()) => {
                 v.fails = 0;
@@ -853,7 +918,9 @@ impl Supervisor {
                 }
             }
             Err(e) => {
-                v.fails += 1;
+                if !first {
+                    v.fails += 1;
+                }
                 if !soaking {
                     v.passes = 0;
                 }
@@ -861,11 +928,18 @@ impl Supervisor {
                 if soaking && v.fails >= threshold {
                     let what = if v.canary { "canary" } else { "new worker" };
                     self.fail_at(Some(slot), format!("{what} failed {threshold} health checks during soak: {e}"));
-                } else if !soaking && v.fails >= threshold * 3 {
+                    return;
+                }
+                if !soaking && v.fails >= threshold * 3 {
                     self.fail_at(Some(slot), format!("new worker keeps failing health checks: {e}"));
+                    return;
                 }
             }
         }
+        // The next check is due one interval after this one finished; the
+        // last pass, or the soak's end, moves the lane on now.
+        self.send_later(every, Event::Gate(GateEvent::Due { seq, inst }));
+        self.gate_steps(Some(inst));
     }
 
     fn launch_check(&self, seq: u64, inst: u64) {
@@ -1653,6 +1727,7 @@ mod tests {
 
     use super::super::rig::{Rig, local};
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     /// A worker that listens at once (shim protocol on fd 3) and, asked to
     /// stop, drains for FAKE_DRAIN seconds (a WebSocket's long_lived_timeout)
@@ -1865,6 +1940,157 @@ wait $!
             r.sup.stop_all();
             assert!(r.sup.roll.is_none());
             assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true), "{:?}", r.sup.last_rollout);
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A worker that listens at once, reporting FAKE_SOCK as its private
+    /// health socket, and exits when stopped.
+    const CHECKED: &str = r#"
+trap 'exit 0' TERM
+echo "{\"ev\":\"listening\",\"port\":1,\"socket\":\"$FAKE_SOCK\"}" >&3
+sleep 60 &
+wait $!
+"#;
+
+    /// The private health socket of `checked` workers: answers 503 while
+    /// `failing` is above zero (counting it down), 200 after; `seen` is
+    /// when each readiness check arrived.
+    struct Probe {
+        seen: Rc<RefCell<Vec<Instant>>>,
+        failing: Rc<Cell<u32>>,
+    }
+
+    /// One worker gated on `/ready` checks on its private socket.
+    async fn checked(name: &str, reload: &str, health: &str) -> (Rig, Probe) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut r = Rig::new(
+            name,
+            &format!(
+                "[workers]\ncount = 1\noverlap = true\n[health]\nready_path = \"/ready\"\n{health}[reload]\n{reload}"
+            ),
+            CHECKED,
+        );
+        r.sup.cfg.app.shim = Some(true);
+        let sock = std::env::temp_dir().join(format!("wp-probe-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        r.sup.cfg.app.env.insert("FAKE_SOCK".into(), sock.display().to_string());
+        let probe = Probe { seen: Rc::default(), failing: Rc::default() };
+        let (seen, failing) = (probe.seen.clone(), probe.failing.clone());
+        tokio::task::spawn_local(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 512];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /ready ") {
+                    seen.borrow_mut().push(Instant::now());
+                }
+                let code = if failing.get() > 0 { "503 Service Unavailable" } else { "200 OK" };
+                failing.set(failing.get().saturating_sub(1));
+                let _ = s.write_all(format!("HTTP/1.1 {code}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await;
+            }
+        });
+        r.sup.start_all();
+        r.until("the worker running", |s| s.slots.values().all(|x| x.state == State::Running)).await;
+        (r, probe)
+    }
+
+    /// Restarts the one worker; returns when it took over (`None`: the
+    /// rollout failed). After each event it checks that no gate waited for
+    /// a tick: a lane verifying has its first check running from the event
+    /// that saw it listen on, and never sits on its last pass.
+    async fn replace_checked(r: &mut Rig) -> Option<Instant> {
+        let old = currents(&r.sup)[0];
+        let required = r.sup.cfg.reload.health_passes;
+        r.sup.begin_rollout(Kind::Restart, vec![1], String::new(), false).unwrap();
+        let promoted = Cell::new(None);
+        let waited = RefCell::new(Vec::new());
+        r.until("the rollout's end", |s| {
+            if let Some(Roll { step: Step::Batch(lanes), .. }) = &s.roll {
+                for l in lanes {
+                    let At::Verifying(v) = &l.at else { continue };
+                    let reported = !s.insts[&v.new].sockets.is_empty();
+                    if v.next_check.is_none() && !v.checking && reported {
+                        waited.borrow_mut().push("listening, its first check not started");
+                    }
+                    if v.passes == required && v.cmd == Cmd::Skip && v.soak.is_zero() {
+                        waited.borrow_mut().push("passed every check, not promoted");
+                    }
+                }
+            }
+            if promoted.get().is_none() && s.slots[&1].current != Some(old) {
+                promoted.set(Some(Instant::now()));
+            }
+            s.roll.is_none()
+        })
+        .await;
+        assert_eq!(waited.borrow().as_slice(), &[] as &[&str], "a gate waited");
+        promoted.get()
+    }
+
+    fn gaps(seen: &[Instant]) -> Vec<Duration> {
+        seen.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// The gates run on their own timers, not the shared tick: the first
+    /// check as soon as it listens, each next one health_interval_ms after
+    /// the previous, and the takeover right at the last pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_gates_run_when_due_and_promote_at_the_last_pass() {
+        local(async {
+            let every = Duration::from_millis(300);
+            let (mut r, p) = checked("gates-due", "health_passes = 3\nhealth_interval_ms = 300\n", "").await;
+            replace_checked(&mut r).await.expect("replaced");
+            let seen = p.seen.borrow().clone();
+            assert_eq!(seen.len(), 3, "health_passes checks, no more");
+            for g in gaps(&seen) {
+                assert!(g >= every, "checks {g:?} apart: never closer than health_interval_ms");
+            }
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true));
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A failure resets the passes and the next check comes an interval
+    /// later; min_ready then soaks, still checking, for its full length.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_check_resets_the_passes_and_min_ready_soaks_in_full() {
+        local(async {
+            let every = Duration::from_millis(200);
+            let (mut r, p) =
+                checked("gates-soak", "health_passes = 2\nhealth_interval_ms = 200\nmin_ready = 1\n", "").await;
+            p.failing.set(2);
+            let promoted = replace_checked(&mut r).await.expect("replaced");
+            let seen = p.seen.borrow().clone();
+            // 2 failures, 2 passes (the 4th check), then checks through the 1 s soak.
+            assert!(seen.len() >= 5, "{} checks", seen.len());
+            for g in gaps(&seen) {
+                assert!(g >= every, "checks {g:?} apart");
+            }
+            let soak = promoted - seen[3];
+            assert!(soak >= Duration::from_secs(1), "took over {soak:?} after its last pass (min_ready = 1)");
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true));
+            r.shutdown().await;
+        })
+        .await;
+    }
+
+    /// A worker that never passes still fails its gates: after its first
+    /// check (run the moment it listened, not counted) and 3 ×
+    /// failure_threshold more.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_worker_failing_every_check_still_rolls_back() {
+        local(async {
+            let (mut r, p) =
+                checked("gates-fail", "health_passes = 2\nhealth_interval_ms = 100\n", "failure_threshold = 1\n").await;
+            let old = currents(&r.sup)[0];
+            p.failing.set(u32::MAX);
+            assert!(replace_checked(&mut r).await.is_none(), "never took over");
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(false), "{:?}", r.sup.last_rollout);
+            assert_eq!(p.seen.borrow().len(), 4, "the first check, then 3 counted failures");
+            assert_eq!(currents(&r.sup), vec![old], "the old worker still serves");
             r.shutdown().await;
         })
         .await;

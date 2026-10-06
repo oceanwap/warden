@@ -1218,6 +1218,57 @@ fn stalled_stdout_does_not_block_supervision() {
     assert!(out.lines().all(|l| l.contains("worker=2")), "{out}");
 }
 
+/// A stopped Warden (SIGSTOP, a frozen VM, a bug) never freezes its workers.
+/// With fd 3 full (what hours of heartbeats do while Warden reads nothing,
+/// done at once by the fixture's `/fill-ipc`), the worker keeps serving: its
+/// writes to fd 3 don't block its event loop, the shim's heartbeats wait.
+/// Once Warden runs again they flow again: the watchdog (4 s) keeps it.
+#[test]
+fn a_stopped_supervisor_never_freezes_its_workers() {
+    if have_bun() {
+        let port = free_port();
+        stopped_supervisor_case("ipcstall", port, &simple("ipcstall", port, 1, "[watchdog]\ntimeout = 4\n"));
+    }
+    if have_node() {
+        let port = free_port();
+        let cfg = format!(
+            "[app]\nname = \"ipcstalln\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 1\n\
+             [watchdog]\ntimeout = 4\n",
+            fixture("node_app.mjs")
+        );
+        stopped_supervisor_case("ipcstalln", port, &cfg);
+    }
+}
+
+fn stopped_supervisor_case(name: &str, port: u16, cfg: &str) {
+    let w = Warden::start(name, port, cfg);
+    let s = w.wait_for("1 ready worker", T, ready(1));
+    let pid = s["workers"][0]["pid"].clone();
+    {
+        let _frozen = w.freeze();
+        let filled = get(port, "/fill-ipc").unwrap_or_else(|| panic!("{name}: no answer: a write to fd 3 blocked"));
+        let filled: u64 = filled.parse().unwrap();
+        assert!(filled > 0, "{name}: nothing written");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(3) {
+            assert!(
+                get(port, "/whoami").is_some(),
+                "{name}: the worker stopped answering while Warden was stopped (its heartbeats blocked it?)"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    // Warden reads the backlog, the heartbeats flow again: nobody is hung.
+    std::thread::sleep(Duration::from_secs(9));
+    let s = w.status().unwrap();
+    let log = w.log();
+    assert_eq!(s["workers"][0]["pid"], pid, "{name}: the worker was replaced\n{log}");
+    assert_eq!(s["workers"][0]["state"], "RUNNING", "{name}\n{log}");
+    assert!(!log.contains("worker hung"), "{name}\n{log}");
+    assert!(get(port, "/whoami").is_some());
+    every_warning_has_a_hint(&log);
+}
+
 /// CP6: a worker that floods fd 3 with messages and junk is rate-limited,
 /// summarised in a bounded number of lines, and Warden's memory stays flat.
 #[test]
@@ -4464,6 +4515,49 @@ fn direct_output_flush_and_logs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `warden logs -f` keeps up with a burst: 2,000 lines in one write used to
+/// overflow the follow channel (256 one-line slots) at once, and a client
+/// reading promptly saw "... lines skipped".
+#[test]
+fn logs_follow_takes_a_burst_whole() {
+    let dir = direct_dir("follow-burst");
+    let (input, go) = (dir.join("burst.txt"), dir.join("go"));
+    let text: String = (1..=2000).map(|i| format!("burst {i}\n")).collect();
+    std::fs::write(&input, text).unwrap();
+    let script =
+        format!("while [ ! -e {} ]; do sleep 0.05; done; cat {}; exec sleep 300", go.display(), input.display());
+    let cfg = format!(
+        "[app]\nname = \"follow-burst\"\ncommand = \"sh\"\nargs = [\"-c\", \"{script}\"]\n\
+         [workers]\nmin_uptime = 100\n[logging]\nmax_lines_per_sec = 0\n"
+    );
+    let w = Warden::start("follow-burst", 0, &cfg);
+    w.wait_log("worker ready", T);
+    let mut follow =
+        Command::new(BIN).args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
+    let mut reader = std::io::BufReader::new(follow.stdout.take().unwrap());
+    let mut line = String::new();
+    // The snapshot line: the follower is subscribed from here on.
+    assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0);
+    std::fs::write(&go, "").unwrap();
+    let (mut got, mut other) = (Vec::new(), Vec::new());
+    let t0 = Instant::now();
+    while got.last() != Some(&2000) && t0.elapsed() < T {
+        line.clear();
+        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        match line.trim_end().rsplit_once("stdout: burst ").and_then(|(_, n)| n.parse::<u32>().ok()) {
+            Some(n) => got.push(n),
+            None => other.push(line.clone()),
+        }
+    }
+    let _ = follow.kill();
+    let _ = follow.wait();
+    assert!(other.iter().all(|l| !l.contains("skipped")), "{other:?}");
+    assert_eq!(got, (1..=2000).collect::<Vec<u32>>(), "every line, in order; also seen: {other:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `warden flush` empties every current log file in both output modes,
 /// like `pm2 flush`: Warden's log, each worker's out and err file (also one
 /// no running worker writes), keeps the rotated ones, and writing goes on
@@ -5848,9 +5942,12 @@ impl Drop for Nginx {
 
 /// A rolling restart under load through a real nginx with contrib/nginx.conf:
 /// not one request fails (fresh connections, keep-alive GETs, keep-alive
-/// POSTs), whatever net.ipv4.tcp_migrate_req says (nginx retries an
-/// idempotent request a closing worker's listener reset, over a new
-/// connection), and a WebSocket and an SSE stream held through it are ended
+/// POSTs), whatever net.ipv4.tcp_migrate_req says for the GETs (nginx
+/// retries an idempotent request a closing worker's listener reset, over a
+/// new connection). A POST nginx sends on a new upstream connection that
+/// lands in that listener's queue is reset too and never retried: none with
+/// tcp_migrate_req=1 (docs/proxies.md), else only such resets, as in nginx's
+/// log. A WebSocket and an SSE stream held through it are ended
 /// cleanly by their old worker, through nginx, and reconnect to new ones.
 #[test]
 fn rolling_restart_through_nginx_drops_nothing() {
@@ -5879,7 +5976,15 @@ fn rolling_restart_through_nginx_drops_nothing() {
     );
     assert_eq!(run.fail, 0, "requests on fresh connections failed through nginx\n{log}");
     assert_eq!((cut, failed), (0, 0), "keep-alive GETs failed through nginx\n{log}");
-    assert_eq!((post_cut, post_failed), (0, 0), "POSTs failed through nginx\n{log}");
+    let post_resets = log
+        .lines()
+        .filter(|l| l.contains("Connection reset by peer") && l.contains("upstream") && l.contains("\"POST "))
+        .count();
+    let allowed = if allowed_resets() == 0 { 0 } else { post_resets.min(allowed_resets()) };
+    assert!(
+        post_cut + post_failed <= allowed,
+        "POSTs failed through nginx ({post_cut} cut, {post_failed} failed)\n{log}"
+    );
     assert!(ok > 50 && posted > 50, "{ok} GETs, {posted} POSTs");
     // The WebSocket and the SSE stream: closed 1001 / ended cleanly by an old
     // worker (through nginx), reconnected to a new worker.
