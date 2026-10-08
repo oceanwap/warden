@@ -39,6 +39,77 @@ pub struct Config {
     /// not used.
     #[serde(default, rename = "static")]
     pub static_files: Option<Static>,
+    /// Hostnames nginx sends to this app (`warden expose`, which writes this
+    /// section and the nginx site file). Warden itself never reads requests.
+    #[serde(default)]
+    pub expose: Option<Expose>,
+}
+
+/// `[expose]`: what `warden expose` wrote the nginx site file from, so running
+/// it again (another hostname, a new certificate, `--remove`) rewrites the
+/// same file.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Expose {
+    /// `server_name`s: api.example.com, or *.example.com.
+    pub hosts: Vec<String>,
+    /// TLS certificate chain and key for nginx; unset: plain HTTP on port 80
+    /// (TLS ends at Cloudflare or a load balancer in front).
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    #[serde(default)]
+    pub key: Option<PathBuf>,
+    /// The nginx site file (default: warden-<app>.conf in nginx's conf.d).
+    #[serde(default)]
+    pub site: Option<PathBuf>,
+    /// Paths that carry WebSockets / Server-Sent Events: long read timeouts,
+    /// no buffering for SSE.
+    #[serde(default)]
+    pub websocket_paths: Vec<String>,
+    #[serde(default)]
+    pub sse_paths: Vec<String>,
+}
+
+impl Expose {
+    pub fn check(&self) -> Result<(), String> {
+        if self.hosts.is_empty() {
+            return Err("expose.hosts must name at least one hostname".into());
+        }
+        for h in &self.hosts {
+            valid_hostname(h).map_err(|e| format!("expose.hosts: {e}"))?;
+        }
+        if self.cert.is_some() != self.key.is_some() {
+            return Err("expose.cert and expose.key go together (the certificate chain and its key)".into());
+        }
+        for p in self.websocket_paths.iter().chain(&self.sse_paths) {
+            if !p.starts_with('/') || p.chars().any(|c| c.is_whitespace() || c == ';' || c == '{' || c == '}') {
+                return Err(format!("expose: {p:?} is not a URL path (starts with /, no spaces, ; or braces)"));
+            }
+        }
+        for p in [&self.cert, &self.key, &self.site].into_iter().flatten() {
+            let s = p.to_string_lossy();
+            if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == ';' || c == '{' || c == '}' || c == '"') {
+                return Err(format!("expose: path {s:?} cannot go in an nginx file (no spaces, quotes, ; or braces)"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A name nginx's `server_name` takes as an exact or leading-wildcard name:
+/// labels of [A-Za-z0-9-], optionally `*.` first.
+pub fn valid_hostname(h: &str) -> Result<(), String> {
+    let rest = h.strip_prefix("*.").unwrap_or(h);
+    let ok = !rest.is_empty()
+        && h.len() <= 253
+        && rest.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if ok { Ok(()) } else { Err(format!("{h:?} is not a hostname (like api.example.com or *.example.com)")) }
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
@@ -1000,6 +1071,12 @@ impl Config {
         }
         if a.name == "all" {
             return Err("app.name cannot be \"all\" (that targets every app)".into());
+        }
+        if let Some(x) = &self.expose {
+            x.check()?;
+            if self.app.port.is_none() {
+                return Err("[expose] needs app.port (the port nginx sends requests to)".into());
+            }
         }
         if let Some(st) = &self.static_files {
             if self.app.port.is_none() {

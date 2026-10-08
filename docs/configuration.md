@@ -217,6 +217,22 @@ Applies to every log file above; built in, no logrotate needed.
 |---|---|---|
 | `socket` | `<runtime dir>/<name>/control.sock` | The control socket, e.g. `"/run/warden/api/control.sock"` (`RuntimeDirectory=warden/%i` in the unit). The runtime dir is `/run/warden` for root, else `$XDG_RUNTIME_DIR/warden` or `/tmp/warden-<uid>`; `$WARDEN_RUNTIME_DIR` overrides it |
 
+## `[expose]`
+
+The hostnames nginx sends to this app, written by
+[`warden expose`](proxies.md#warden-expose), which writes the nginx site file
+from them. Warden itself never reads requests: nginx connects to `[app] port`.
+Edit it by running `warden expose` again (it rewrites the site file and checks
+it with `nginx -t`); an edit by hand applies at the next `warden expose`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hosts` | required | nginx `server_name`s, e.g. `["api.example.com"]`; `*.example.com` works |
+| `cert`, `key` | unset | Certificate chain and key: nginx serves HTTPS with HTTP/2 on 443 and redirects port 80. Unset: plain HTTP on port 80 (TLS ends at Cloudflare or a load balancer) |
+| `site` | `<nginx conf.d>/warden-<name>.conf` | The site file (`/etc/nginx/conf.d`, or Homebrew's `servers/`) |
+| `websocket_paths` | `[]` | Paths that carry WebSockets: 1 h read timeout, `lingering_close always` |
+| `sse_paths` | `[]` | Paths that stream Server-Sent Events: no buffering, 1 h read timeout |
+
 ## `[static]`
 
 A static site instead of an app (what `warden serve <dir> <port>` writes).

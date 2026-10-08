@@ -171,6 +171,16 @@ requests = true                              # count responses by status (static
 [control]
 socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory=warden/%i in the unit
 
+# Hostnames nginx sends to this app: written by `warden expose api.example.com --app <name>`,
+# which also writes the nginx site file from it, checks it (nginx -t) and reloads nginx.
+# [expose]
+# hosts = ["api.example.com"]                # example; nginx server_name(s)
+# cert = "/etc/ssl/cf/api.example.com.pem"   # example; with key: HTTPS + HTTP/2 on 443, port 80 redirects
+# key = "/etc/ssl/cf/api.example.com.key"    # example; unset: plain HTTP on 80 (TLS ends at Cloudflare/LB)
+# site = "/etc/nginx/conf.d/warden-api.conf" # default: warden-<name>.conf in nginx's conf.d
+# websocket_paths = ["/ws"]                  # example; 1 h read timeout
+# sse_paths = ["/events"]                    # example; no buffering, 1 h read timeout
+
 # A static site instead of an app (what `warden serve <dir> <port>` writes).
 # Workers are Warden's own file server: no command needed, process mode.
 # [static]
