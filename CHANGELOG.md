@@ -11,6 +11,13 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   front) failed every health check, so with `[health]` set each reload rolled
   back ("not an HTTP response"). The shim's private health socket copied the
   app's `tls` options; it now stays plain HTTP. The public port keeps its TLS.
+- The same for a Bun app with HTTP/3 on (`http3: true`): Bun refuses HTTP/3
+  without TLS, so the private health socket never opened and every reload
+  rolled back. The private socket now drops `http3` too.
+- A `node:http2` app (`http2.createSecureServer` or `createServer`) got no
+  private health socket, so with `[health]` set every reload rolled back
+  ("only 0 of 1 private health socket(s) reported"). It now gets one, as a
+  `node:http` app does.
 
 ## [0.1.3] — 2026-10-08
 
