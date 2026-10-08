@@ -385,6 +385,12 @@ pub struct App {
     pub working_directory: Option<PathBuf>,
     /// Port the app listens on. Enables readiness detection and sets `PORT`.
     pub port: Option<u16>,
+    /// This app's own IP address (an IPv6 from the server's /64, or a spare
+    /// IPv4): its workers listen on `address:port` only, so several apps can
+    /// each have port 443 on one server with nothing in front
+    /// (`docs/routing.md`). On Linux the supervisor adds the address to the
+    /// network interface when it is missing. Needs the shim (Bun) or Node.
+    pub address: Option<std::net::IpAddr>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// A file of `KEY=VALUE` lines (secrets kept out of the config, mode
@@ -1170,6 +1176,20 @@ impl Config {
         if a.name == "all" {
             return Err("app.name cannot be \"all\" (that targets every app)".into());
         }
+        if let Some(ip) = a.address {
+            if a.port.is_none() {
+                return Err("app.address needs app.port (the port to listen on at that address)".into());
+            }
+            if ip.is_unspecified() || ip.is_multicast() {
+                return Err(format!("app.address {ip} must be one address of this server (not {ip})"));
+            }
+            if self.route.is_some() {
+                return Err("app.address does not apply to [route]: set route.host".into());
+            }
+            if self.static_files.is_some() {
+                return Err("app.address does not apply to [static]: set static.host".into());
+            }
+        }
         if let Some(r) = &self.route {
             r.check()?;
             if self.app.port.is_none() {
@@ -1818,6 +1838,20 @@ mod tests {
         assert_eq!(c.watchdog.timeout, 60);
         assert_eq!(c.restart.failed_cooldown, 300);
         assert_eq!(c.health_path(), None);
+    }
+
+    #[test]
+    fn an_app_address_is_checked() {
+        let c = Config::parse("[app]\nname = \"api\"\nport = 443\naddress = \"2001:db8::10\"\n").unwrap();
+        assert_eq!(c.app.address, Some("2001:db8::10".parse().unwrap()));
+        let err = |text: &str| Config::parse(text).unwrap_err();
+        assert!(err("[app]\nname = \"api\"\naddress = \"2001:db8::10\"\n").contains("needs app.port"));
+        assert!(err("[app]\nname = \"api\"\nport = 443\naddress = \"::\"\n").contains("one address of this server"));
+        assert!(err("[app]\nname = \"api\"\nport = 443\naddress = \"api.example.com\"\n").contains("address"));
+        assert!(
+            err("[app]\nname = \"e\"\nport = 443\naddress = \"2001:db8::1\"\n[route]\nhosts = { \"a.test\" = 1 }\n")
+                .contains("route.host")
+        );
     }
 
     #[test]

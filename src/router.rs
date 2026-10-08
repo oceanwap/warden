@@ -44,18 +44,45 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Made by the supervisor at each worker start (`WARDEN_ROUTE`).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Table {
-    /// Hostname (`a.example.com`, `*.example.com`, `*`) → port.
-    pub routes: BTreeMap<String, u16>,
+    /// Hostname (`a.example.com`, `*.example.com`, `*`) → where it goes.
+    pub routes: BTreeMap<String, Dest>,
     /// Apps named in `route.hosts` with no config (or no `app.port`) here.
     #[serde(default)]
     pub missing: Vec<String>,
     pub client_ip: bool,
     pub host: String,
-    /// Port → the `route.sock` of the app on it: connections for that port
-    /// are handed to the app's workers when its supervisor takes them
-    /// (`crate::handoff`), and passed byte by byte otherwise.
-    #[serde(default)]
-    pub handoff: BTreeMap<u16, PathBuf>,
+}
+
+/// Where a hostname's connections go.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Dest {
+    pub port: u16,
+    /// The app's own address (`[app] address`): bytes passed go there, and
+    /// never from the visitor's address (routing rules for its port would
+    /// also catch the answers to the visitors who reach the app directly).
+    /// Several apps can share a port this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<IpAddr>,
+    /// The `route.sock` of the app: its connections are handed to the app's
+    /// workers when its supervisor takes them (`crate::handoff`), and passed
+    /// byte by byte otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<PathBuf>,
+}
+
+impl Dest {
+    fn port(port: u16) -> Dest {
+        Dest { port, ..Dest::default() }
+    }
+}
+
+impl std::fmt::Display for Dest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.address {
+            Some(ip) => write!(f, "{}", SocketAddr::new(ip, self.port)),
+            None => write!(f, "{}", self.port),
+        }
+    }
 }
 
 /// The table for `[route]`: app names are looked up in this host's app
@@ -66,24 +93,25 @@ pub fn table(r: &Route) -> Table {
 
 fn table_with(r: &Route, apps: &[Config]) -> Table {
     let mut t = Table { client_ip: r.client_ip(), host: r.host.clone(), ..Table::default() };
+    let app = |c: &Config, port: u16| Dest { port, address: c.app.address, handoff: Some(handoff_socket(c)) };
     for (host, target) in &r.hosts {
-        match target {
-            RouteTarget::Port(p) => {
-                t.routes.insert(host.clone(), *p);
-            }
-            RouteTarget::App(name) => match apps.iter().find(|c| &c.app.name == name).and_then(|c| c.app.port) {
-                Some(p) => {
-                    t.routes.insert(host.clone(), p);
+        let dest = match target {
+            // A port: the app on it, if one here has it (and no address of its own).
+            RouteTarget::Port(p) => apps
+                .iter()
+                .find(|c| c.app.port == Some(*p) && c.route.is_none() && c.app.address.is_none())
+                .map_or_else(|| Dest::port(*p), |c| app(c, *p)),
+            RouteTarget::App(name) => match apps.iter().find(|c| &c.app.name == name && c.route.is_none()) {
+                Some(c) if c.app.port.is_some() => app(c, c.app.port.unwrap_or(0)),
+                _ => {
+                    if !t.missing.contains(name) {
+                        t.missing.push(name.clone());
+                    }
+                    continue;
                 }
-                None if !t.missing.contains(name) => t.missing.push(name.clone()),
-                None => {}
             },
-        }
-    }
-    for p in t.ports() {
-        if let Some(c) = apps.iter().find(|c| c.app.port == Some(p) && c.route.is_none()) {
-            t.handoff.insert(p, handoff_socket(c));
-        }
+        };
+        t.routes.insert(host.clone(), dest);
     }
     t
 }
@@ -114,26 +142,27 @@ pub fn routed(cfg: &Config) -> bool {
 }
 
 impl Table {
-    /// The port for a hostname: the exact name, then `*.` and the name
+    /// Where a hostname goes: the exact name, then `*.` and the name
     /// without its first label, then `*` (which also takes connections that
     /// name no host).
-    fn lookup(&self, host: Option<&str>) -> Option<u16> {
+    fn lookup(&self, host: Option<&str>) -> Option<&Dest> {
         if let Some(h) = host {
-            if let Some(p) = self.routes.get(h) {
-                return Some(*p);
+            if let Some(d) = self.routes.get(h) {
+                return Some(d);
             }
             if let Some((_, rest)) = h.split_once('.') {
-                if let Some(p) = self.routes.get(&format!("*.{rest}")) {
-                    return Some(*p);
+                if let Some(d) = self.routes.get(&format!("*.{rest}")) {
+                    return Some(d);
                 }
             }
         }
-        self.routes.get("*").copied()
+        self.routes.get("*")
     }
 
-    /// The ports connections go to.
-    pub fn ports(&self) -> Vec<u16> {
-        let mut p: Vec<u16> = self.routes.values().copied().collect();
+    /// The ports `client_ip`'s routing rules are for: those connections go
+    /// to on loopback (not the apps with their own address).
+    pub fn rule_ports(&self) -> Vec<u16> {
+        let mut p: Vec<u16> = self.routes.values().filter(|d| d.address.is_none()).map(|d| d.port).collect();
         p.sort_unstable();
         p.dedup();
         p
@@ -314,14 +343,18 @@ async fn connection(
     let host = tokio::time::timeout(HELLO_TIMEOUT, peek_hello(&c))
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-    let Some(port) = table.lookup(host.as_deref()) else { return Ok(()) };
-    if handovers.give(port, &c).await {
+    let Some(dest) = table.lookup(host.as_deref()) else { return Ok(()) };
+    let port = dest.port;
+    if handovers.give(dest, &c).await {
         // The app's worker has it; our copy closes, the connection stays.
         return Ok(());
     }
 
     let peer_ip = peer.ip().to_canonical();
-    let (target, from) = if transparent && !peer_ip.is_loopback() {
+    let (target, from) = if let Some(ip) = dest.address {
+        // An app on its own address: the router's own address as the source.
+        (SocketAddr::new(ip, port), None)
+    } else if transparent && !peer_ip.is_loopback() {
         // The app's port on the address the visitor reached: from the
         // visitor's address, a loopback target would be a martian.
         (SocketAddr::new(c.local_addr()?.ip().to_canonical(), port), Some(peer_ip))
@@ -369,7 +402,8 @@ async fn peek_hello(c: &TcpStream) -> io::Result<Option<String>> {
 /// The router worker's connections to app supervisors' `route.sock`, one
 /// per app port, opened at first use.
 struct Handovers {
-    apps: BTreeMap<u16, (PathBuf, tokio::sync::Mutex<Link>)>,
+    /// Each app's `route.sock` → the link to its supervisor.
+    apps: BTreeMap<PathBuf, tokio::sync::Mutex<Link>>,
 }
 
 #[derive(Default)]
@@ -384,16 +418,17 @@ const HANDOFF_RETRY: Duration = Duration::from_secs(1);
 
 impl Handovers {
     fn new(t: &Table) -> Handovers {
-        let apps = t.handoff.iter().map(|(p, path)| (*p, (path.clone(), tokio::sync::Mutex::default()))).collect();
+        let apps = t.routes.values().filter_map(|d| d.handoff.clone()).map(|p| (p, Default::default())).collect();
         Handovers { apps }
     }
 
-    /// Hand `c` to the supervisor of the app on `port`: true once it has
+    /// Hand `c` to the supervisor of the app `dest` is: true once it has
     /// queued it for a worker. False (the caller passes bytes instead)
     /// when the app takes no connections this way (its workers listen on
     /// the port themselves) or its supervisor is not there.
-    async fn give(&self, port: u16, c: &TcpStream) -> bool {
-        let Some((path, link)) = self.apps.get(&port) else { return false };
+    async fn give(&self, dest: &Dest, c: &TcpStream) -> bool {
+        let Some(path) = &dest.handoff else { return false };
+        let Some(link) = self.apps.get(path) else { return false };
         let mut link = link.lock().await;
         if link.retry_at.is_some_and(|t| Instant::now() < t) {
             return false;
@@ -468,24 +503,28 @@ mod tests {
     use super::*;
 
     fn t(routes: &[(&str, u16)]) -> Table {
-        Table { routes: routes.iter().map(|(h, p)| (h.to_string(), *p)).collect(), ..Table::default() }
+        Table { routes: routes.iter().map(|(h, p)| (h.to_string(), Dest::port(*p))).collect(), ..Table::default() }
+    }
+
+    fn port(t: &Table, host: Option<&str>) -> Option<u16> {
+        t.lookup(host).map(|d| d.port)
     }
 
     #[test]
     fn exact_names_win_then_one_label_wildcards_then_the_catch_all() {
         let t = t(&[("api.example.com", 1), ("*.example.com", 2), ("*", 3)]);
-        assert_eq!(t.lookup(Some("api.example.com")), Some(1));
-        assert_eq!(t.lookup(Some("www.example.com")), Some(2));
-        assert_eq!(t.lookup(Some("a.b.example.com")), Some(3), "a wildcard matches one label");
-        assert_eq!(t.lookup(Some("example.com")), Some(3));
-        assert_eq!(t.lookup(None), Some(3), "no server_name: the catch-all");
+        assert_eq!(port(&t, Some("api.example.com")), Some(1));
+        assert_eq!(port(&t, Some("www.example.com")), Some(2));
+        assert_eq!(port(&t, Some("a.b.example.com")), Some(3), "a wildcard matches one label");
+        assert_eq!(port(&t, Some("example.com")), Some(3));
+        assert_eq!(port(&t, None), Some(3), "no server_name: the catch-all");
     }
 
     #[test]
     fn without_a_catch_all_unknown_names_go_nowhere() {
         let t = t(&[("a.test", 1)]);
-        assert_eq!(t.lookup(Some("b.test")), None);
-        assert_eq!(t.lookup(None), None);
+        assert_eq!(port(&t, Some("b.test")), None);
+        assert_eq!(port(&t, None), None);
     }
 
     #[test]
@@ -495,24 +534,44 @@ mod tests {
             app("[app]\nname = \"api\"\nport = 8443\n"),
             app("[app]\nname = \"edge\"\nport = 443\n[route]\nhosts = { \"a.test\" = 9 }\n"),
         ];
-        let r: Route = toml::from_str("hosts = { \"a.test\" = \"api\", \"b.test\" = 9000 }").unwrap();
+        let r: Route =
+            toml::from_str("hosts = { \"a.test\" = \"api\", \"b.test\" = 9000, \"c.test\" = 8443 }").unwrap();
         let t = table_with(&r, &apps);
-        assert_eq!(t.routes["a.test"], 8443);
-        assert_eq!(t.handoff.get(&8443), Some(&handoff_socket(&apps[0])));
-        assert!(!t.handoff.contains_key(&9000), "a port no app config has: bytes are passed");
+        assert_eq!(t.routes["a.test"].port, 8443);
+        assert_eq!(t.routes["a.test"].handoff, Some(handoff_socket(&apps[0])));
+        assert_eq!(t.routes["c.test"].handoff, Some(handoff_socket(&apps[0])), "the app on that port");
+        assert_eq!(t.routes["b.test"].handoff, None, "a port no app config has: bytes are passed");
         assert!(handoff_socket(&apps[0]).ends_with("api/route.sock"));
     }
 
     #[test]
-    fn ports_are_listed_once() {
-        assert_eq!(t(&[("a.test", 9), ("b.test", 4), ("*", 9)]).ports(), vec![4, 9]);
+    fn apps_on_their_own_address_can_share_a_port() {
+        let app = |text: &str| Config::parse(text).unwrap();
+        let apps = [
+            app("[app]\nname = \"api\"\nport = 443\naddress = \"2001:db8::10\"\n"),
+            app("[app]\nname = \"www\"\nport = 443\naddress = \"2001:db8::11\"\n"),
+            app("[app]\nname = \"web\"\nport = 8443\n"),
+        ];
+        let r: Route =
+            toml::from_str("hosts = { \"a.test\" = \"api\", \"b.test\" = \"www\", \"c.test\" = \"web\" }").unwrap();
+        let t = table_with(&r, &apps);
+        assert_eq!(t.routes["a.test"].to_string(), "[2001:db8::10]:443");
+        assert_eq!(t.routes["b.test"].to_string(), "[2001:db8::11]:443");
+        assert_eq!(t.routes["b.test"].handoff, Some(handoff_socket(&apps[1])), "each app its own supervisor");
+        assert_eq!(t.routes["c.test"].to_string(), "8443");
+        assert_eq!(t.rule_ports(), vec![8443], "rules on 443 would catch the answers to its direct visitors");
+    }
+
+    #[test]
+    fn rule_ports_are_listed_once() {
+        assert_eq!(t(&[("a.test", 9), ("b.test", 4), ("*", 9)]).rule_ports(), vec![4, 9]);
     }
 
     #[test]
     fn ports_in_the_config_need_no_lookup_and_unknown_apps_are_reported() {
         let r: Route = toml::from_str("hosts = { \"a.test\" = 8443 }").unwrap();
         let tb = table(&r);
-        assert_eq!(tb.routes.get("a.test"), Some(&8443));
+        assert_eq!(tb.routes.get("a.test").map(|d| d.port), Some(8443));
         assert!(tb.missing.is_empty());
     }
 }

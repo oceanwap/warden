@@ -6,6 +6,9 @@
 
 use crate::config::PortStrategy;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod address;
+
 /// The port worker `id` (1-based) should listen on.
 pub fn worker_port(base: u16, strategy: PortStrategy, id: usize) -> u16 {
     match strategy {
@@ -31,8 +34,9 @@ pub fn count_listeners_cheap(pid: u32, port: u16) -> Option<(usize, bool)> {
 
 /// Fallback readiness probe for platforms whose adapter cannot list listeners: can we connect?
 /// Imprecise with a shared port (any worker may answer).
-pub fn port_accepts(port: u16) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+/// `ip`: the app's own address (`[app] address`), else loopback.
+pub fn port_accepts(ip: Option<std::net::IpAddr>, port: u16) -> bool {
+    let addr = std::net::SocketAddr::new(ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()), port);
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok()
 }
 

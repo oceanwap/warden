@@ -66,6 +66,10 @@ const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos
 // net.Socket", and the connection is lost): older ones listen as before.
 const bunTakesSockets = !isBun || (([maj, min]) => maj > 1 || (maj === 1 && min >= 4))(Bun.version.split(".").map(Number));
 const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function" && bunTakesSockets;
+// `[app] address` on Linux: the workers still listen on the app's port
+// themselves (the kernel spreads it), and only the hostname router's
+// connections come over the IPC channel.
+const handoffListens = handoff && env.WARDEN_HANDOFF_LISTEN === "1";
 // Say so, so Warden can suggest a newer Bun (after the module has loaded:
 // `report` needs state declared below).
 if (env.WARDEN_HANDOFF === "1" && !inWorker && !bunTakesSockets) {
@@ -85,6 +89,10 @@ const longLived = longLivedMs > 0 && drains;
 // The app's own port. Other servers the app starts (metrics, admin) are
 // neither readiness signals nor health-check targets.
 const appPort = env.PORT ? Number(env.PORT) : null;
+// `[app] address`: the app's own IP on this server. Its listen on the app's
+// port uses that address, whatever host the app asked for, so several apps
+// can each have the same port (443) on their own address.
+const appAddress = env.WARDEN_ADDRESS || null;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Worker mode: each Worker gets its instance index (PM2's NODE_APP_INSTANCE).
@@ -196,6 +204,10 @@ let originalServe = null;
 const bunApps = new Map(); // server -> { opts, reload: the native reload }
 
 function wardenServe(options, ...rest) {
+  if (appAddress && deferrableBun(options)) {
+    options = Object.create(options);
+    options.hostname = appAddress;
+  }
   if (standby && !promoted && deferrableBun(options)) return deferBunServe(options, rest);
   const nodeHttp = !!options && typeof options === "object" && typeof options.onNodeHTTPRequest === "function";
   let opts = options;
@@ -212,7 +224,7 @@ function wardenServe(options, ...rest) {
   const own = drains && opts !== options && !nodeHttp && runsAppHandler(options);
   // The handoff: on a private port if this Bun can adopt descriptors (below).
   const adopting = handoff && bunAdopts !== false && !nodeHttp && deferrableBun(options);
-  if (adopting) opts = onPrivatePort(opts);
+  if (adopting && !handoffListens) opts = onPrivatePort(opts);
   // A server started while draining (rare) drains from its first request.
   let server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
   if (adopting) {
@@ -225,18 +237,22 @@ function wardenServe(options, ...rest) {
     }
     // This Bun has no adopt(): the app listens on its port, as before.
     bunAdopts = false;
-    try {
-      server.stop(true);
-    } catch {}
-    opts = Object.getPrototypeOf(opts);
-    server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
+    if (!handoffListens) {
+      try {
+        server.stop(true);
+      } catch {}
+      opts = Object.getPrototypeOf(opts);
+      server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
+    }
   }
   servers.add(server);
   if (own) trackBunApp(server, opts);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
   if (isApp) {
     const socket = privateServer ? null : openPrivateBun(options);
-    report(socket ? { ev: "listening", port: server.port, socket } : { ev: "listening", port: server.port });
+    // Bun's node:http server on the port, taking the router's connections too (takeHandoff).
+    const handed = handoffListens && nodeHttp && handoffServers.size > 0 ? { handoff: true } : {};
+    report({ ev: "listening", port: server.port, ...handed, ...(socket ? { socket } : {}) });
   }
   return server;
 }
@@ -473,6 +489,17 @@ function withReusePort(args) {
   return args;
 }
 
+// A listen on the app's port, on the app's own address (`appAddress`):
+// listen({ port, host }), listen(port[, host][, backlog][, cb]).
+function withAddress(args) {
+  if (nodeListenPort(args) !== appPort) return args;
+  const a0 = args[0];
+  if (a0 && typeof a0 === "object") return [{ ...a0, host: appAddress }, ...args.slice(1)];
+  const rest = args.slice(1);
+  if (typeof rest[0] === "string") rest.shift();
+  return [Number(a0), appAddress, ...rest];
+}
+
 // An http(s).Server, told apart without loading node:http for a plain TCP
 // server: every http.Server has `maxHeadersCount` (null by default).
 const isHttpServer = (server) => "maxHeadersCount" in server && typeof server.setTimeout === "function";
@@ -527,9 +554,9 @@ function trackNodeServer(server) {
     if (!isApp) return;
     if (isHttpServer(server)) appHttpServers.add(server);
     if (!privateServer && (isHttpServer(server) || isHttp2Server(server))) {
-      openPrivateNode(server, (socket) =>
-        report(socket ? { ev: "listening", port: addr.port, socket } : { ev: "listening", port: addr.port }),
-      );
+      // Taking the hostname router's connections too (takeHandoff).
+      const handed = handoffServers.has(server) ? { handoff: true } : {};
+      openPrivateNode(server, (socket) => report({ ev: "listening", port: addr.port, ...handed, ...(socket ? { socket } : {}) }));
     } else {
       report({ ev: "listening", port: addr.port });
     }
@@ -563,6 +590,7 @@ if (!isBun) {
   nodeOrigListen = origListen;
   net.Server.prototype.listen = function (...args) {
     if (this !== privateServer) {
+      if (appAddress) args = withAddress(args);
       trackNodeServer(this);
       if (standby && !promoted && deferNodeListen(this, args)) return this;
       if (handoff && isHttpServer(this) && takeHandoff(this, args, origListen)) return this;
@@ -609,6 +637,8 @@ function takeHandoff(server, args, origListen) {
       if (close) res.once("finish", () => req.socket.end());
     });
   }
+  // Listening on the port as well: the usual `listening` report says so.
+  if (handoffListens) return false;
   server.once("listening", () => {
     appHttpServers.add(server);
     // Its private health socket, as for a server on the port.
@@ -628,6 +658,15 @@ if (isBun && handoff) {
   Server.prototype.listen = function (...args) {
     if (this !== privateServer && takeHandoff(this, args, origListen)) return this;
     return origListen.apply(this, args);
+  };
+}
+
+if (isBun && appAddress) {
+  // Bun's node:http Server has its own listen (it ends in Bun.serve).
+  const Server = http().Server;
+  const origListen = Server.prototype.listen;
+  Server.prototype.listen = function (...args) {
+    return origListen.apply(this, this === privateServer ? args : withAddress(args));
   };
 }
 

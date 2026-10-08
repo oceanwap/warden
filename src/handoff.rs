@@ -67,7 +67,8 @@ const REFUSED_WARN_EVERY: Duration = Duration::from_secs(60);
 /// The dispatcher of one app. Dropping it stops the thread and closes the port.
 pub struct Handoff {
     ctl: mpsc::UnboundedSender<Ctl>,
-    pub addr: SocketAddr,
+    /// The app's port it accepts on; `None` for [`Handoff::router_only`].
+    pub addr: Option<SocketAddr>,
     /// `route.sock`, removed when the dispatcher stops.
     router: Option<std::path::PathBuf>,
 }
@@ -118,6 +119,17 @@ impl Handoff {
     pub fn start(app: &str, addr: SocketAddr) -> io::Result<Handoff> {
         let listener = crate::sys::listen_tcp(addr, false, 1024)?;
         let addr = listener.local_addr()?;
+        Self::spawn(app, Some(OwnedFd::from(listener)), Some(addr))
+    }
+
+    /// Without a port of its own: the workers listen on the app's port
+    /// themselves (the kernel spreads it) and the dispatcher only passes them
+    /// the connections the hostname router hands over (`serve_router`).
+    pub fn router_only(app: &str) -> io::Result<Handoff> {
+        Self::spawn(app, None, None)
+    }
+
+    fn spawn(app: &str, listener: Option<OwnedFd>, addr: Option<SocketAddr>) -> io::Result<Handoff> {
         let (tx, rx) = mpsc::unbounded_channel();
         let app = app.to_string();
         std::thread::Builder::new().name("handoff".into()).spawn(move || {
@@ -133,7 +145,7 @@ impl Handoff {
                     return;
                 }
             };
-            rt.block_on(run(app, OwnedFd::from(listener), rx));
+            rt.block_on(run(app, listener, rx));
         })?;
         Ok(Handoff { ctl: tx, addr, router: None })
     }
@@ -172,8 +184,8 @@ struct Worker {
     closed: Arc<AtomicBool>,
 }
 
-async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ctl>) {
-    let listener = match AsyncFd::with_interest(listener, Interest::READABLE) {
+async fn run(app: String, listener: Option<OwnedFd>, mut ctl: mpsc::UnboundedReceiver<Ctl>) {
+    let listener = match listener.map(|l| AsyncFd::with_interest(l, Interest::READABLE)).transpose() {
         Ok(l) => l,
         Err(e) => {
             crate::error!(
@@ -242,8 +254,9 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                 None => {}
             },
             // Only while a worker can take them: otherwise they wait in the backlog.
-            g = listener.readable(), if !workers.is_empty() => {
+            g = async { listener.as_ref().expect("guarded").readable().await }, if listener.is_some() && !workers.is_empty() => {
                 let Ok(mut guard) = g else { break };
+                let listener = listener.as_ref().expect("guarded");
                 loop {
                     match crate::sys::accept_nonblocking(listener.get_ref().as_fd()) {
                         Ok(conn) => {
@@ -556,7 +569,7 @@ mod tests {
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
         let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
         h.add(1, ours, Kind::Socket);
-        let mut client = std::net::TcpStream::connect(h.addr).unwrap();
+        let mut client = std::net::TcpStream::connect(h.addr.unwrap()).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let theirs = std::os::unix::net::UnixStream::from(theirs);
         theirs.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
@@ -575,7 +588,7 @@ mod tests {
         let mut got = [0u8; 1];
         assert_eq!(client.read(&mut got).unwrap(), 0, "closed by Warden");
         // The worker is still in the rotation: the next connection reaches it.
-        let _c2 = std::net::TcpStream::connect(h.addr).unwrap();
+        let _c2 = std::net::TcpStream::connect(h.addr.unwrap()).unwrap();
         theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (line, fd) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
         assert!(String::from_utf8_lossy(&line).contains("NODE_HANDLE") && fd.is_some());
@@ -589,7 +602,7 @@ mod tests {
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
         let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
         h.add(1, ours, Kind::Fd);
-        let _client = std::net::TcpStream::connect(h.addr).unwrap();
+        let _client = std::net::TcpStream::connect(h.addr.unwrap()).unwrap();
         let theirs = std::os::unix::net::UnixStream::from(theirs);
         theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let (line, fd) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
@@ -603,13 +616,25 @@ mod tests {
     /// confirmed with "y" and reaches a worker like an accepted one.
     #[test]
     fn a_connection_from_the_router_goes_to_a_worker() {
+        router_hands_over(Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap(), "port");
+    }
+
+    /// Without a port of its own (the workers listen themselves): the
+    /// router's connections still arrive.
+    #[test]
+    fn a_dispatcher_for_the_router_only_has_no_port() {
+        let h = Handoff::router_only("t").unwrap();
+        assert!(h.addr.is_none());
+        router_hands_over(h, "only");
+    }
+
+    fn router_hands_over(mut h: Handoff, tag: &str) {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("warden-handoff-router-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("warden-handoff-router-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("route.sock");
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
-        let mut h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
         h.serve_router(&path).unwrap();
         h.add(1, ours, Kind::Fd);
         // A visitor's connection, as the router holds it.
@@ -645,7 +670,7 @@ mod tests {
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
         let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
         h.add(1, ours, Kind::Socket);
-        let mut client = std::net::TcpStream::connect(h.addr).unwrap();
+        let mut client = std::net::TcpStream::connect(h.addr.unwrap()).unwrap();
         // The worker's side: read the message and the descriptor.
         let theirs = std::os::unix::net::UnixStream::from(theirs);
         theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -665,7 +690,7 @@ mod tests {
         client.read_exact(&mut got).unwrap();
         assert_eq!(&got, b"pong", "client and worker talk directly");
         // A second connection is delivered too.
-        let _c2 = std::net::TcpStream::connect(h.addr).unwrap();
+        let _c2 = std::net::TcpStream::connect(h.addr.unwrap()).unwrap();
         let (line2, fd2) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
         assert!(String::from_utf8(line2).unwrap().contains("NODE_HANDLE") && fd2.is_some());
     }

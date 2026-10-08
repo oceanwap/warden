@@ -34,6 +34,73 @@ picks up an app that moved) or a port number. `*.example.com` matches one
 label (`www.example.com`, not `a.b.example.com`); `"*"` takes every other
 hostname, and connections that name none.
 
+## One address per app: nothing in between
+
+The fastest way: give each app an IP address of its own, and the kernel
+sends each visitor straight to the app by the address it connected to. A
+server usually comes with a whole IPv6 /64, so IPv6 addresses cost nothing;
+point each hostname's AAAA record at its app's address.
+
+```toml
+# /etc/warden/api.toml
+[app]
+name = "api"
+command = "bun"
+args = ["run", "server.ts"]   # Bun.serve({ port, tls: {...}, http2: true })
+port = 443
+address = "2001:db8::10"
+```
+
+```toml
+# /etc/warden/www.toml
+[app]
+name = "www"
+command = "bun"
+args = ["run", "server.ts"]
+port = 443
+address = "2001:db8::11"
+```
+
+Each app's listen on its port is on its address (the shim sets it, whatever
+host the app asks for, under Bun.serve, node:http and Node), so both have port
+443. The visitor's IP is the app's peer, with no rules and no privileges
+beyond binding port 443. Measured with two Bun apps on 2 cores: 313k
+requests/s together, the same as Bun on its own.
+
+On Linux the supervisor adds a missing address to the interface of the
+default route when the app starts, and removes it when the app stops (an
+address that was already there is left alone):
+
+```text
+ip -6 addr add 2001:db8::10/128 dev eth0 nodad preferred_lft 0
+```
+
+`preferred_lft 0` keeps the server's own outgoing connections on its main
+address. Adding an address needs root; otherwise add it yourself (netplan,
+`ip addr`) and Warden only binds it. On macOS add it yourself.
+
+IPv4 visitors: a spare IPv4 address per app works the same way. With one
+IPv4 for the server, run the router on it and name the apps in its `hosts`:
+
+```toml
+# /etc/warden/edge.toml
+[app]
+name = "edge"
+port = 443
+
+[route]
+hosts = { "api.example.com" = "api", "www.example.com" = "www" }
+```
+
+The router listens on `0.0.0.0:443` (IPv4) next to the apps on their IPv6
+addresses. On Linux the apps' workers still listen on their own addresses,
+so IPv6 visitors reach them with nothing in between, and the router hands
+its IPv4 connections over (below); the app sees the visitor's IPv4 address.
+When an app cannot take a handed-over connection (stock Bun), the router
+passes the bytes to the app's address, without `client_ip`: the routing rules
+that keep the visitor's IP would also catch the answers to the app's direct
+visitors. Those apps see the router's address for IPv4 visitors.
+
 ## Handing connections over
 
 The router only peeks at the ClientHello and leaves it in the socket. When

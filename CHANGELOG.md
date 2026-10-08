@@ -7,6 +7,16 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `[app] address = "2001:db8::10"`: an app's own IP address, so several apps
+  can each listen on port 443 of one server with nothing in front of them.
+  The kernel sends each visitor to the app by the address it connected to,
+  at the app's own speed and with the visitor's IP. The shim makes the app's
+  listen use that address whatever host it asks for. On Linux the supervisor
+  adds a missing address to the default route's interface (`nodad
+  preferred_lft 0` for IPv6) and removes it when the app stops. With the
+  `[route]` router on the server's IPv4 address the same apps take IPv4
+  visitors too: their workers keep listening on their own address and only
+  the router's connections are handed over.
 - `warden expose api.example.com --app api`: nginx in front of an app in one
   command. It writes the app's nginx site file with the settings of
   `contrib/nginx.conf` (the app's port, the hostnames, a map and upstream

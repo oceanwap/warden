@@ -103,6 +103,10 @@ pub struct Supervisor {
     /// macOS, more than one worker: Warden owns the port and hands each
     /// connection to a worker (`crate::handoff`). Decided at start.
     handoff_on: bool,
+    /// With `handoff_on`: the workers listen on the app's port themselves
+    /// and only the hostname router's connections are handed over
+    /// (`handoff_listens`).
+    handoff_listen: bool,
     /// The dispatcher, once a worker said it takes handed-over connections.
     handoff: Option<crate::handoff::Handoff>,
     /// A worker's Bun is too old for the handoff (its version): logged once,
@@ -430,6 +434,11 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         if sup.insts.is_empty() && sup.cfg.route.is_some() && crate::router::rules::in_place() {
             crate::router::rules::clear();
         }
+        // No worker left: the address Warden added for the app goes too.
+        #[cfg(target_os = "linux")]
+        if sup.insts.is_empty() && networking::address::added() {
+            networking::address::release();
+        }
         if sup.shutting_down && sup.insts.is_empty() {
             break;
         }
@@ -567,6 +576,32 @@ fn handoff_wanted(cfg: &Config, var: Option<&str>, macos: bool, routed: bool) ->
         && !cfg.builtin_server()
 }
 
+/// With the handoff on, whether the workers still listen on the app's port
+/// themselves: an app on its own address (`[app] address`) where the kernel
+/// spreads a shared port, so the visitors who reach that address go
+/// straight to a worker and only the hostname router's connections (IPv4
+/// visitors, say) are handed over. `WARDEN_HANDOFF=1` makes Warden take
+/// them all.
+fn handoff_listens(cfg: &Config, var: Option<&str>, macos: bool) -> bool {
+    cfg.app.address.is_some() && !macos && var != Some("1")
+}
+
+/// Before a worker of an app with its own address starts: the address on
+/// this server (`networking::address`).
+#[cfg(target_os = "linux")]
+fn ensure_address(ip: std::net::IpAddr) {
+    match networking::address::ensure(ip) {
+        Ok(true) => info!("added the app's address to this server", address = ip),
+        Ok(false) => {}
+        Err(e) => warn!(
+            "cannot add the app's address to this server: its workers cannot listen on it",
+            address = ip,
+            error = e,
+            hint = "run Warden as root, or add the address to an interface yourself",
+        ),
+    }
+}
+
 /// Before a router worker starts: the routing rules `client_ip` needs, for
 /// the ports in its table (`router::rules`).
 #[cfg(target_os = "linux")]
@@ -580,7 +615,7 @@ fn sync_route_rules(env: &[(String, String)]) {
         }
         return;
     }
-    if let Err(e) = crate::router::rules::sync(&table.ports()) {
+    if let Err(e) = crate::router::rules::sync(&table.rule_ports()) {
         warn!(
             "cannot add the routing rules that bring apps' answers back to the router",
             error = e,
@@ -611,6 +646,11 @@ impl Supervisor {
                 std::env::var("WARDEN_HANDOFF").ok().as_deref(),
                 cfg!(target_os = "macos"),
                 crate::router::routed(&cfg),
+            ),
+            handoff_listen: handoff_listens(
+                &cfg,
+                std::env::var("WARDEN_HANDOFF").ok().as_deref(),
+                cfg!(target_os = "macos"),
             ),
             handoff: None,
             handoff_old_bun: None,
@@ -971,6 +1011,10 @@ impl Supervisor {
             }
             Mode::Process => {
                 ipc_nonblocking = self.shim_path.is_some();
+                #[cfg(target_os = "linux")]
+                if let Some(ip) = a.address {
+                    ensure_address(ip);
+                }
                 let args: Vec<String> = a.args.iter().map(|x| self.pinned_arg(x)).collect();
                 (self.pinned_arg(&a.command), with_preload(&a.command, &args, self.shim_path.as_deref()))
             }
@@ -1039,8 +1083,15 @@ impl Supervisor {
         if self.handoff_on && slot_id != STANDBY_SLOT {
             // Connections arrive on fd 4, Node's IPC channel (`crate::handoff`).
             add("WARDEN_HANDOFF", "1".into());
+            if self.handoff_listen {
+                add("WARDEN_HANDOFF_LISTEN", "1".into());
+            }
             add("NODE_CHANNEL_FD", "4".into());
             add("NODE_CHANNEL_SERIALIZATION_MODE", "json".into());
+        }
+        if let Some(ip) = a.address {
+            // The shim makes the app's listen on its port use this address.
+            add("WARDEN_ADDRESS", ip.to_string());
         }
         if let Some(p) = a.port {
             // Standbys (slot 0) need a shared port (config validation).
@@ -1151,6 +1202,7 @@ impl Supervisor {
             None => {} // worker mode: wait for every Worker's shim report
             Some(port) => {
                 let Some(flag) = self.insts.get(&inst).map(|i| Arc::downgrade(&i.ready_flag)) else { return };
+                let address = self.cfg.app.address;
                 tokio::task::spawn_local(async move {
                     let start = Instant::now();
                     let mut delay = Duration::from_millis(20);
@@ -1167,7 +1219,7 @@ impl Supervisor {
                             // read of /proc/net/tcp (a row per connection) backs off.
                             Some((_, true)) => delay = Duration::from_millis(20),
                             // No /proc: a connect probe is only meaningful for the first worker.
-                            None if first_worker && networking::port_accepts(port) => break,
+                            None if first_worker && networking::port_accepts(address, port) => break,
                             _ => delay = (delay * 2).min(Duration::from_millis(250)),
                         }
                     }
@@ -1946,7 +1998,22 @@ impl Supervisor {
         if self.handoff.is_some() {
             return Ok(());
         }
+        if self.handoff_listen {
+            let mut h = crate::handoff::Handoff::router_only(&self.cfg.app.name)?;
+            self.serve_router(&mut h);
+            info!(
+                "workers take the hostname router's connections from Warden",
+                hint = "they listen on the app's address themselves; the router hands over the connections for its \
+                        hostnames, which then go straight between client and worker",
+            );
+            self.handoff = Some(h);
+            return Ok(());
+        }
         let port = self.cfg.app.port.unwrap_or(0);
+        // The app's own address wins over what the app asked for (the shim
+        // binds it too).
+        let address = self.cfg.app.address.map(|a| a.to_string());
+        let host = address.as_deref().or(host);
         let ip: std::net::IpAddr = match host {
             None | Some("") | Some("::") => std::net::Ipv6Addr::UNSPECIFIED.into(),
             Some("localhost") => std::net::Ipv4Addr::LOCALHOST.into(),
@@ -1962,6 +2029,20 @@ impl Supervisor {
                 _ => Err(e),
             })?;
         let mut h = h;
+        self.serve_router(&mut h);
+        info!(
+            "workers take connections from Warden",
+            address = h.addr.map(|a| a.to_string()).unwrap_or_default(),
+            hint = "the kernel does not spread a shared port over workers here, so Warden accepts and hands each \
+                    connection to a worker; the traffic itself goes straight between client and worker",
+        );
+        self.handoff = Some(h);
+        Ok(())
+    }
+
+    /// The dispatcher takes the hostname router's connections too, on
+    /// `route.sock`.
+    fn serve_router(&self, h: &mut crate::handoff::Handoff) {
         let route_sock = crate::router::handoff_socket(&self.cfg);
         if let Err(e) = h.serve_router(&route_sock) {
             warn!(
@@ -1971,14 +2052,6 @@ impl Supervisor {
                 hint = "Warden could not create that Unix socket in the app's runtime directory",
             );
         }
-        info!(
-            "workers take connections from Warden",
-            address = h.addr,
-            hint = "the kernel does not spread a shared port over workers here, so Warden accepts and hands each \
-                    connection to a worker; the traffic itself goes straight between client and worker",
-        );
-        self.handoff = Some(h);
-        Ok(())
     }
 
     fn stop_instance(&mut self, inst_id: u64) {
@@ -3223,6 +3296,15 @@ mod tests {
         let one = cfg("[workers]\ncount = 1\n");
         assert!(handoff_wanted(&one, None, false, true), "an app the router sends to, one worker, Linux");
         assert!(!handoff_wanted(&one, Some("0"), false, true), "WARDEN_HANDOFF=0 still wins");
+        // An app on its own address keeps listening there; only the router's connections are handed over.
+        let own = Config::parse(
+            "[app]\nname = \"a\"\ncommand = \"node\"\nargs = [\"s.js\"]\nport = 443\naddress = \"2001:db8::10\"\n",
+        )
+        .unwrap();
+        assert!(handoff_listens(&own, None, false), "Linux");
+        assert!(!handoff_listens(&own, None, true), "macOS: the kernel does not spread the port");
+        assert!(!handoff_listens(&own, Some("1"), false), "WARDEN_HANDOFF=1: Warden takes them all");
+        assert!(!handoff_listens(&one, None, false), "no address: as before");
     }
 
     #[test]
