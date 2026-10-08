@@ -106,7 +106,8 @@ impl Table {
         self.routes.get("*").copied()
     }
 
-    /// The ports connections go to (for the routing rules).
+    /// The ports connections go to (for the routing rules, Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn ports(&self) -> Vec<u16> {
         let mut p: Vec<u16> = self.routes.values().copied().collect();
         p.sort_unstable();
