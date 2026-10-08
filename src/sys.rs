@@ -1612,7 +1612,7 @@ pub fn recv_with_fd(sock: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<u8>, Op
     };
     #[cfg(not(target_os = "linux"))]
     if let Some(f) = &fd {
-        set_cloexec(f.as_fd(), false)?;
+        set_cloexec(std::os::fd::AsFd::as_fd(f), false)?;
     }
     Ok((buf, fd))
 }
