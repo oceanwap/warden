@@ -101,7 +101,7 @@ for that config (what systemd runs; also `warden run`).
 | `reset <target>` | Zero restart counters and retry FAILED workers now |
 | `signal <SIG> <target>` | Send a signal to the workers (`SIGUSR2`, `USR2`, `12`) |
 | `top` | Live view of every app (also `monit`) |
-| `expose <host>... --app <app>` | Send hostnames to the app through nginx: writes the app's nginx site file, checks it with `nginx -t` (a failure puts the old file back), reloads nginx and records the hostnames in the app's `[expose]`. `--cert`/`--key` for HTTPS with HTTP/2 (a Let's Encrypt certificate in `/etc/letsencrypt/live/<host>/` is found by itself), `--websocket PATH`, `--sse PATH`, `--remove`, `--no-reload`, `--dry-run`. See [`proxies.md`](proxies.md#warden-expose) |
+| `expose <host>... --app <app>` | Send hostnames to the app through nginx: writes the app's nginx site file, checks it with `nginx -t` (a failure puts the old file back), reloads nginx and records the hostnames in the app's `[expose]`. HTTPS with HTTP/2 through `--acme <email>` (nginx's ACME module gets and renews a Let's Encrypt certificate) or `--cert`/`--key` (a certbot certificate in `/etc/letsencrypt/live/<host>/` is found by itself), `--websocket PATH`, `--sse PATH`, `--remove`, `--no-reload`, `--dry-run`. See [`proxies.md`](proxies.md#warden-expose) |
 | `serve [dir] [port]` | Serve static files (default: `.` on 8080) with Warden's built-in server, like `pm2 serve`: `--name`, `--spa`, `--listing`, `-i N`, `--html-max-age SECONDS`, `--basic-auth user:pass` (or `--basic-auth-username` / `--basic-auth-password`). See [`static-serving.md`](static-serving.md) |
 
 `reload`, `deploy` and `restart app:N` wait for the rollout, print its

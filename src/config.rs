@@ -59,6 +59,10 @@ pub struct Expose {
     pub cert: Option<PathBuf>,
     #[serde(default)]
     pub key: Option<PathBuf>,
+    /// Instead of cert/key: nginx's ACME module gets a Let's Encrypt
+    /// certificate and renews it; this is the contact e-mail.
+    #[serde(default)]
+    pub acme: Option<String>,
     /// The nginx site file (default: warden-<app>.conf in nginx's conf.d).
     #[serde(default)]
     pub site: Option<PathBuf>,
@@ -80,6 +84,19 @@ impl Expose {
         }
         if self.cert.is_some() != self.key.is_some() {
             return Err("expose.cert and expose.key go together (the certificate chain and its key)".into());
+        }
+        if let Some(a) = &self.acme {
+            if self.cert.is_some() {
+                return Err("expose.acme and expose.cert are two ways to get a certificate: set one".into());
+            }
+            if !a.contains('@') || a.chars().any(|c| c.is_whitespace() || ";{}\"'".contains(c)) {
+                return Err(format!("expose.acme = {a:?}: an e-mail address for Let's Encrypt"));
+            }
+            if let Some(h) = self.hosts.iter().find(|h| h.starts_with("*.")) {
+                return Err(format!(
+                    "expose: {h} is a wildcard, which Let's Encrypt's HTTP check cannot cover; use cert/key"
+                ));
+            }
         }
         for p in self.websocket_paths.iter().chain(&self.sse_paths) {
             if !p.starts_with('/') || p.chars().any(|c| c.is_whitespace() || c == ';' || c == '{' || c == '}') {

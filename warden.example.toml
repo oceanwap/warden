@@ -177,6 +177,8 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # hosts = ["api.example.com"]                # example; nginx server_name(s)
 # cert = "/etc/ssl/cf/api.example.com.pem"   # example; with key: HTTPS + HTTP/2 on 443, port 80 redirects
 # key = "/etc/ssl/cf/api.example.com.key"    # example; unset: plain HTTP on 80 (TLS ends at Cloudflare/LB)
+# acme = "you@example.com"                   # example; instead of cert/key: nginx's ACME module gets and
+                                             # renews a Let's Encrypt certificate (nginx-module-acme)
 # site = "/etc/nginx/conf.d/warden-api.conf" # default: warden-<name>.conf in nginx's conf.d
 # websocket_paths = ["/ws"]                  # example; 1 h read timeout
 # sse_paths = ["/events"]                    # example; no buffering, 1 h read timeout

@@ -27,13 +27,17 @@ nothing changes in nginx when you scale or deploy. Run it again to add a
 hostname or change a setting: the same file is rewritten. If `nginx -t` fails,
 the previous file is put back and nginx is not reloaded.
 
-With --cert and --key nginx serves HTTPS (HTTP/2) on 443 and redirects port 80
-to it. A Let's Encrypt certificate in /etc/letsencrypt/live/<hostname>/ is used
-without asking. Without a certificate nginx serves plain HTTP on port 80: for
-TLS that ends at Cloudflare or a load balancer in front.
+With --acme <email>, nginx gets a Let's Encrypt certificate itself and renews it
+(its ACME module, nginx.org's nginx-module-acme). With --cert and --key it uses
+those files (a Cloudflare Origin CA certificate, say); a certbot certificate in
+/etc/letsencrypt/live/<hostname>/ is used without asking. Either way nginx serves
+HTTPS (HTTP/2) on 443 and redirects port 80 to it. Without a certificate nginx
+serves plain HTTP on port 80: for TLS that ends at Cloudflare or a load balancer.
 
 OPTIONS:
     --app <app>       The app (name or id; -c <config> works too)
+    --acme <email>    HTTPS with a Let's Encrypt certificate that nginx gets and renews
+                      (nginx's ACME module; port 80 must reach this host)
     --cert <file>     Certificate chain (fullchain.pem; a Cloudflare Origin CA certificate)
     --key <file>      Its private key
     --no-tls          Plain HTTP on port 80, even with a certificate recorded or found
@@ -48,6 +52,7 @@ OPTIONS:
 EXAMPLES:
     warden expose api.example.com --app api
     warden expose api.example.com www.example.com --app web --websocket /ws
+    warden expose api.example.com --app api --acme you@example.com
     warden expose api.example.com --app api --cert /etc/ssl/cf/api.pem --key /etc/ssl/cf/api.key
     warden expose www.example.com --app web --remove
 ";
@@ -63,6 +68,8 @@ pub struct Opts {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
     pub no_tls: bool,
+    /// `--acme <email>`: nginx's ACME module gets the certificate.
+    pub acme: Option<String>,
     pub websocket: Vec<String>,
     pub sse: Vec<String>,
     pub site: Option<PathBuf>,
@@ -93,6 +100,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--cert" => o.cert = Some(value()?.into()),
             "--key" => o.key = Some(value()?.into()),
             "--no-tls" => o.no_tls = true,
+            "--acme" => o.acme = Some(value()?),
             "--websocket" | "--ws" => o.websocket.push(value()?),
             "--sse" => o.sse.push(value()?),
             "--site" => o.site = Some(value()?.into()),
@@ -117,10 +125,15 @@ pub fn parse_args(argv: &[String]) -> Result<Args, String> {
         if o.cert.is_some() != o.key.is_some() {
             return Err("expose: --cert and --key go together (the certificate chain and its key)".into());
         }
-        if o.no_tls && o.cert.is_some() {
-            return Err("expose: --no-tls and --cert contradict each other".into());
+        if o.no_tls && (o.cert.is_some() || o.acme.is_some()) {
+            return Err("expose: --no-tls and --cert / --acme contradict each other".into());
         }
-        if o.remove && (o.cert.is_some() || o.no_tls || !o.websocket.is_empty() || !o.sse.is_empty()) {
+        if o.acme.is_some() && o.cert.is_some() {
+            return Err("expose: --acme gets a certificate, --cert names one: give one of them".into());
+        }
+        if o.remove
+            && (o.cert.is_some() || o.no_tls || o.acme.is_some() || !o.websocket.is_empty() || !o.sse.is_empty())
+        {
             return Err("expose: --remove takes only hostnames (and --app, --no-reload, --dry-run)".into());
         }
     }
@@ -135,8 +148,8 @@ pub struct Site {
     pub app: String,
     pub port: u16,
     pub hosts: Vec<String>,
-    /// Certificate chain and key: HTTPS on 443, port 80 redirects.
-    pub tls: Option<(PathBuf, PathBuf)>,
+    /// HTTPS on 443 (port 80 redirects), with these files or nginx's ACME module.
+    pub tls: Option<Tls>,
     pub websocket_paths: Vec<String>,
     pub sse_paths: Vec<String>,
     /// nginx 1.25.1+ takes `http2 on;`; older ones `listen 443 ssl http2`.
@@ -145,6 +158,18 @@ pub struct Site {
     /// would refuse the file.
     pub ipv6: bool,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Tls {
+    /// Certificate chain and key files.
+    Files(PathBuf, PathBuf),
+    /// A Let's Encrypt certificate that nginx gets and renews itself
+    /// (ngx_http_acme_module), with this contact address.
+    Acme(String),
+}
+
+/// Let's Encrypt's production directory.
+pub const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// `api.v2` → `api_v2`: nginx variable and upstream names take [A-Za-z0-9_].
 fn ident(app: &str) -> String {
@@ -180,6 +205,18 @@ pub fn render(s: &Site) -> String {
          }}\n\n",
         app = s.app,
     ));
+    if let Some(Tls::Acme(contact)) = &s.tls {
+        // HTTP-01: Let's Encrypt asks for a file on port 80, which nginx
+        // answers itself (before the redirect below runs).
+        o.push_str(&format!(
+            "# The certificate: nginx's ACME module gets it from Let's Encrypt and renews it.\n\
+             acme_issuer warden_{id} {{\n\
+             \x20   uri         {LETS_ENCRYPT};\n\
+             \x20   contact     {contact};\n\
+             \x20   accept_terms_of_service;\n\
+             }}\n\n"
+        ));
+    }
     let v6_80 = if s.ipv6 { "    listen [::]:80;\n" } else { "" };
     if s.tls.is_some() {
         o.push_str(&format!(
@@ -195,7 +232,7 @@ pub fn render(s: &Site) -> String {
     }
     o.push_str("server {\n");
     match &s.tls {
-        Some((cert, key)) => {
+        Some(tls) => {
             let h2 = if s.http2_directive { "" } else { " http2" };
             o.push_str(&format!("    listen 443 ssl{h2};\n"));
             if s.ipv6 {
@@ -205,11 +242,19 @@ pub fn render(s: &Site) -> String {
                 o.push_str("    http2 on;\n");
             }
             o.push_str(&format!("    server_name {names};\n"));
-            o.push_str(&format!(
-                "    ssl_certificate     {};\n    ssl_certificate_key {};\n",
-                cert.display(),
-                key.display()
-            ));
+            match tls {
+                Tls::Files(cert, key) => o.push_str(&format!(
+                    "    ssl_certificate     {};\n    ssl_certificate_key {};\n",
+                    cert.display(),
+                    key.display()
+                )),
+                Tls::Acme(_) => o.push_str(&format!(
+                    "    acme_certificate warden_{id};\n\
+                     \x20   ssl_certificate       $acme_certificate;\n\
+                     \x20   ssl_certificate_key   $acme_certificate_key;\n\
+                     \x20   ssl_certificate_cache max=2;\n"
+                )),
+            }
         }
         None => o.push_str(&format!("    listen 80;\n{v6_80}    server_name {names};\n")),
     }
@@ -338,10 +383,16 @@ pub fn section_text(x: &Expose) -> String {
         "[expose]                                     # written by `warden expose`: nginx sends these hostnames here\n",
     );
     s.push_str(&format!("hosts = {}\n", toml_list(&x.hosts)));
-    for (k, v) in [("cert", &x.cert), ("key", &x.key), ("site", &x.site)] {
+    for (k, v) in [("cert", &x.cert), ("key", &x.key)] {
         if let Some(p) = v {
             s.push_str(&format!("{k} = {}\n", toml_str(&p.to_string_lossy())));
         }
+    }
+    if let Some(a) = &x.acme {
+        s.push_str(&format!("acme = {}\n", toml_str(a)));
+    }
+    if let Some(p) = &x.site {
+        s.push_str(&format!("site = {}\n", toml_str(&p.to_string_lossy())));
     }
     if !x.websocket_paths.is_empty() {
         s.push_str(&format!("websocket_paths = {}\n", toml_list(&x.websocket_paths)));
@@ -371,10 +422,16 @@ pub fn merge(old: Option<&Expose>, o: &Opts, found_cert: Option<(PathBuf, PathBu
     if o.no_tls {
         x.cert = None;
         x.key = None;
+        x.acme = None;
     } else if o.cert.is_some() {
         x.cert = o.cert.clone();
         x.key = o.key.clone();
-    } else if x.cert.is_none() {
+        x.acme = None;
+    } else if o.acme.is_some() {
+        x.acme = o.acme.clone();
+        x.cert = None;
+        x.key = None;
+    } else if x.cert.is_none() && x.acme.is_none() {
         if let Some((c, k)) = found_cert {
             x.cert = Some(c);
             x.key = Some(k);
@@ -504,7 +561,11 @@ fn run_inner(o: &Opts) -> Result<(), String> {
             return Err(format!("expose: {app} is not exposed as {h} (it has: {})", list_or_none(&known)));
         }
     }
-    let found = if o.cert.is_none() && !o.no_tls { o.hosts.first().and_then(|h| letsencrypt(h)) } else { None };
+    let found = if o.cert.is_none() && o.acme.is_none() && !o.no_tls {
+        o.hosts.first().and_then(|h| letsencrypt(h))
+    } else {
+        None
+    };
     let found_note = found.clone().filter(|_| old.as_ref().is_none_or(|x| x.cert.is_none()));
     let new = merge(old.as_ref(), o, found);
     if let Some(x) = &new {
@@ -525,7 +586,11 @@ fn run_inner(o: &Opts) -> Result<(), String> {
             app: app.clone(),
             port,
             hosts: x.hosts.clone(),
-            tls: x.cert.clone().zip(x.key.clone()),
+            tls: match (&x.acme, &x.cert, &x.key) {
+                (Some(a), _, _) => Some(Tls::Acme(a.clone())),
+                (None, Some(c), Some(k)) => Some(Tls::Files(c.clone(), k.clone())),
+                _ => None,
+            },
             websocket_paths: x.websocket_paths.clone(),
             sse_paths: x.sse_paths.clone(),
             http2_directive: version.is_none_or(|v| v >= (1, 25, 1)),
@@ -565,6 +630,10 @@ fn run_inner(o: &Opts) -> Result<(), String> {
         std::fs::copy(&site, &bak).map_err(|e| format!("keeping {} as {}: {e}", site.display(), bak.display()))?;
     }
     let bak_ref = existing.is_some().then_some(bak.as_path());
+    // Read before the new file is in place: nginx -T fails on an issuer without a resolver.
+    let need_resolver = new.as_ref().is_some_and(|x| x.acme.is_some())
+        && !site.with_file_name("warden-resolver.conf").exists()
+        && !has_resolver(&run_cmd(&nginx, &["-T"]).unwrap_or_default());
     match &text {
         Some(t) => crate::fleet::write_private(&site, t, 0o644)?,
         None => {
@@ -573,10 +642,31 @@ fn run_inner(o: &Opts) -> Result<(), String> {
             }
         }
     }
+    // The ACME module looks up Let's Encrypt with nginx's resolver: one for
+    // every app, written once when nginx has none.
+    let mut resolver_file = None;
+    if need_resolver {
+        match add_resolver(&site) {
+            Ok(f) => resolver_file = f,
+            Err(e) => {
+                restore(&site, bak_ref);
+                return Err(e);
+            }
+        }
+    }
     if let Err(out) = run_cmd(&nginx, &["-t"]) {
         restore(&site, bak_ref);
+        if let Some(f) = &resolver_file {
+            let _ = std::fs::remove_file(f);
+        }
+        let hint = if out.contains("unknown directive \"acme_") {
+            "\nnginx has no ACME module: install it (nginx.org's package nginx-module-acme, then \
+             `load_module modules/ngx_http_acme_module.so;` at the top of nginx.conf), or use --cert/--key"
+        } else {
+            ""
+        };
         return Err(format!(
-            "`nginx -t` failed, so {} is back as it was and nginx was not reloaded:\n{out}",
+            "`nginx -t` failed, so {} is back as it was and nginx was not reloaded:\n{out}{hint}",
             site.display()
         ));
     }
@@ -603,7 +693,7 @@ fn run_inner(o: &Opts) -> Result<(), String> {
 
     match &new {
         Some(x) => {
-            let scheme = if x.cert.is_some() { "https" } else { "http" };
+            let scheme = if x.cert.is_some() || x.acme.is_some() { "https" } else { "http" };
             for h in &x.hosts {
                 println!("{scheme}://{h} -> nginx -> 127.0.0.1:{port} ({app})");
             }
@@ -611,10 +701,19 @@ fn run_inner(o: &Opts) -> Result<(), String> {
             if let Some((c, _)) = &found_note {
                 println!("certificate: {} (found in /etc/letsencrypt; --no-tls for plain HTTP)", c.display());
             }
-            if x.cert.is_none() {
+            if let Some(f) = &resolver_file {
+                println!("resolver for the ACME module: {} (nginx had none)", f.display());
+            }
+            if x.acme.is_some() {
+                println!(
+                    "certificate: nginx gets it from Let's Encrypt and renews it (ACME module); port 80 must be \
+                     reachable for its check. Until it arrives, HTTPS handshakes fail: see nginx's error log"
+                );
+            }
+            if x.cert.is_none() && x.acme.is_none() {
                 println!(
                     "plain HTTP on port 80: for TLS that ends at Cloudflare or a load balancer. For HTTPS here, \
-                     run again with --cert <fullchain.pem> --key <privkey.pem>"
+                     run again with --acme <email> (Let's Encrypt via nginx) or --cert <fullchain.pem> --key <privkey.pem>"
                 );
             }
         }
@@ -626,6 +725,39 @@ fn run_inner(o: &Opts) -> Result<(), String> {
         None => println!("nginx not reloaded (--no-reload): run `nginx -s reload` or `systemctl reload nginx`"),
     }
     Ok(())
+}
+
+/// `resolver` for nginx's http context, which has none, from the first
+/// nameserver in /etc/resolv.conf, as `warden-resolver.conf` next to the site
+/// file.
+fn add_resolver(site: &Path) -> Result<Option<PathBuf>, String> {
+    let file = site.with_file_name("warden-resolver.conf");
+    let conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let ns = nameserver(&conf).ok_or(
+        "expose: --acme needs a DNS resolver in nginx's http block (`resolver 1.1.1.1;`), and /etc/resolv.conf \
+         names no nameserver to write one from",
+    )?;
+    let text = format!(
+        "{MARKER}: nginx's ACME module resolves Let's Encrypt with it.\n\
+         # From /etc/resolv.conf; change it freely (expose writes it only when nginx has no resolver).\n\
+         resolver {ns} valid=300s;\n"
+    );
+    crate::fleet::write_private(&file, &text, 0o644)?;
+    Ok(Some(file))
+}
+
+fn has_resolver(nginx_t: &str) -> bool {
+    nginx_t.lines().any(|l| l.split('#').next().unwrap_or("").trim_start().starts_with("resolver "))
+}
+
+/// The first nameserver of resolv.conf, bracketed when IPv6 (`[::1]`).
+fn nameserver(resolv: &str) -> Option<String> {
+    let ip = resolv.lines().find_map(|l| l.trim().strip_prefix("nameserver")?.split_whitespace().next())?;
+    let ip: std::net::IpAddr = ip.split('%').next()?.parse().ok()?;
+    Some(match ip {
+        std::net::IpAddr::V4(a) => a.to_string(),
+        std::net::IpAddr::V6(a) => format!("[{a}]"),
+    })
 }
 
 fn list_or_none(v: &[String]) -> String {
@@ -657,6 +789,8 @@ mod tests {
         assert!(args("bad_host --app api").unwrap_err().contains("not a hostname"));
         assert!(args("a.com --app api --cert x").unwrap_err().contains("go together"));
         assert!(args("a.com --app api --remove --no-tls").unwrap_err().contains("--remove takes only"));
+        assert_eq!(args("a.com --app api --acme me@a.com").unwrap().acme.as_deref(), Some("me@a.com"));
+        assert!(args("a.com --app api --acme me@a.com --cert c --key k").unwrap_err().contains("give one"));
         assert!(args("--help").unwrap().help);
         assert!(args("a.com --app api --frob").unwrap_err().contains("unknown option"));
     }
@@ -676,7 +810,7 @@ mod tests {
             app: "api.v2".into(),
             port: 3000,
             hosts: vec!["api.example.com".into(), "www.example.com".into()],
-            tls: tls.then(|| ("/c/full.pem".into(), "/c/key.pem".into())),
+            tls: tls.then(|| Tls::Files("/c/full.pem".into(), "/c/key.pem".into())),
             websocket_paths: vec!["/ws".into()],
             sse_paths: vec!["/events".into()],
             http2_directive: true,
@@ -739,6 +873,28 @@ mod tests {
     }
 
     #[test]
+    fn renders_acme() {
+        let t = render(&Site { tls: Some(Tls::Acme("me@example.com".into())), ..site(true) });
+        assert!(t.contains("\nacme_issuer warden_api_v2 {\n    uri         "));
+        assert!(t.contains(&format!("uri         {LETS_ENCRYPT};")));
+        assert!(t.contains("contact     me@example.com;") && t.contains("accept_terms_of_service;"));
+        assert!(t.contains("acme_certificate warden_api_v2;"));
+        assert!(t.contains("ssl_certificate       $acme_certificate;"));
+        assert!(t.contains("ssl_certificate_key   $acme_certificate_key;"));
+        assert!(t.contains("return 301 https://") && t.contains("listen 443 ssl;"));
+        assert_eq!(t.matches('{').count(), t.matches('}').count());
+    }
+
+    #[test]
+    fn resolvers() {
+        assert_eq!(nameserver("# x\nnameserver 127.0.0.53\nnameserver 8.8.8.8\n").as_deref(), Some("127.0.0.53"));
+        assert_eq!(nameserver("nameserver fe80::1%eth0\n").as_deref(), Some("[fe80::1]"));
+        assert_eq!(nameserver("search lan\n"), None);
+        assert!(has_resolver("http {\n    resolver 1.1.1.1;\n"));
+        assert!(!has_resolver("http {\n    # resolver 1.1.1.1;\n    resolver_timeout 5s;\n"));
+    }
+
+    #[test]
     fn nginx_version() {
         assert_eq!(parse_nginx_version("nginx version: nginx/1.24.0 (Ubuntu)\n"), Some((1, 24, 0)));
         assert_eq!(parse_nginx_version("nginx version: nginx/1.31.6\n"), Some((1, 31, 6)));
@@ -785,6 +941,13 @@ mod tests {
             Config::parse("[app]\nname = \"api\"\n[expose]\nhosts = [\"a.com\"]\n").unwrap_err().contains("app.port")
         );
         assert!(Config::parse(&format!("{base}[expose]\nhosts = [\"a.com\"]\nwebsocket_paths = [\"ws\"]\n")).is_err());
+        assert!(Config::parse(&format!("{base}[expose]\nhosts = [\"a.com\"]\nacme = \"me@a.com\"\n")).is_ok());
+        assert!(
+            Config::parse(&format!("{base}[expose]\nhosts = [\"*.a.com\"]\nacme = \"me@a.com\"\n"))
+                .unwrap_err()
+                .contains("wildcard")
+        );
+        assert!(Config::parse(&format!("{base}[expose]\nhosts = [\"a.com\"]\nacme = \"nope\"\n")).is_err());
     }
 
     #[test]
@@ -797,6 +960,13 @@ mod tests {
         assert_eq!(m.cert.as_deref(), Some(Path::new("/le/c")));
         assert_eq!(m.websocket_paths, ["/ws"]);
         // --no-tls drops a recorded certificate.
+        let a = merge(
+            Some(&m),
+            &Opts { hosts: vec!["a.com".into()], acme: Some("me@a.com".into()), ..Default::default() },
+            None,
+        )
+        .unwrap();
+        assert!(a.cert.is_none() && a.acme.as_deref() == Some("me@a.com"));
         let n =
             merge(Some(&m), &Opts { hosts: vec!["a.com".into()], no_tls: true, ..Default::default() }, None).unwrap();
         assert!(n.cert.is_none() && n.key.is_none());

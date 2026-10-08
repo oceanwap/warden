@@ -113,6 +113,7 @@ their connections end; WebSockets can keep them for hours. Set
 
 ```sh
 warden expose api.example.com --app api
+warden expose api.example.com --app api --acme you@example.com
 warden expose api.example.com --app api --cert /etc/ssl/cf/api.pem --key /etc/ssl/cf/api.key
 warden expose www.example.com example.com --app web --websocket /ws --sse /events
 warden expose www.example.com --app web --remove
@@ -132,13 +133,24 @@ takes hostnames away, and the file goes with the last one. The file it
 replaces is kept in Warden's state directory (`expose/<app>.conf.bak`). A
 file at that path that `expose` did not write is never overwritten.
 
-- **HTTPS**: `--cert` and `--key` (a Cloudflare Origin CA certificate, or any
+- **HTTPS from Let's Encrypt, renewed by nginx**: `--acme you@example.com`
+  writes an `acme_issuer` for Let's Encrypt and `acme_certificate` in the
+  server, so nginx's [ACME module](https://nginx.org/en/docs/http/ngx_http_acme_module.html)
+  gets the certificate on its first start and renews it; nothing else runs.
+  It needs the module (nginx.org's `nginx-module-acme` package and
+  `load_module modules/ngx_http_acme_module.so;` in `nginx.conf`; `expose`
+  says so when `nginx -t` doesn't know `acme_issuer`), port 80 reachable from
+  the internet for Let's Encrypt's check, and a `resolver` in nginx's http
+  block: when nginx has none, `expose` writes `warden-resolver.conf` next to
+  the site file from the first nameserver in `/etc/resolv.conf`. Until the
+  first certificate arrives, HTTPS handshakes fail (nginx's error log says
+  why). Wildcard hostnames need DNS validation: use `--cert`.
+- **HTTPS from files**: `--cert` and `--key` (a Cloudflare Origin CA certificate, or any
   chain and key). A Let's Encrypt certificate in
   `/etc/letsencrypt/live/<hostname>/` is used without asking (`--no-tls`
   keeps plain HTTP). nginx then serves HTTPS with HTTP/2 on 443 (`http2 on`
   from nginx 1.25.1, `listen 443 ssl http2` before) and redirects port 80.
-  Certificate renewal stays certbot's: its nginx reload picks the new files
-  up. Without a certificate nginx serves plain HTTP on port 80, for TLS that
+  Renewing those stays certbot's: its nginx reload picks the new files up. Without a certificate nginx serves plain HTTP on port 80, for TLS that
   ends at Cloudflare or a load balancer in front.
 - **WebSockets and SSE** on `/` get the 60 s read timeout; name their paths
   with `--websocket` and `--sse` for the 1 h settings above.

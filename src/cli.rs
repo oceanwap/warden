@@ -63,9 +63,9 @@ APPS (familiar from PM2):
                      revalidate on every page load)
     expose <host>... --app <app>   Send a hostname to the app through nginx: writes the
                      app's nginx site file, checks it (nginx -t), reloads nginx, and records
-                     the hostnames in the app's config. HTTPS with --cert/--key (or a Let's
-                     Encrypt certificate found), --websocket/--sse PATH, --remove,
-                     --dry-run (--help)
+                     the hostnames in the app's config. HTTPS: --acme <email> (nginx gets a
+                     Let's Encrypt certificate itself) or --cert/--key; --websocket/--sse
+                     PATH, --remove, --dry-run (--help)
     save             Remember the running apps, worker counts and stopped state
     resurrect        Start what `save` remembered (and wardend, if it is not running), the
                      apps at the same time but no more than one per CPU core at once:

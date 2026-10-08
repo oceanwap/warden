@@ -12,8 +12,9 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   `contrib/nginx.conf` (the app's port, the hostnames, a map and upstream
   named after the app), checks it with `nginx -t`, reloads nginx, and records
   the hostnames in the app's config (`[expose]`). A failed check puts the
-  previous file back. `--cert`/`--key` (or a Let's Encrypt certificate found
-  in /etc/letsencrypt/live) for HTTPS with HTTP/2 and a port 80 redirect;
+  previous file back. HTTPS with HTTP/2 and a port 80 redirect: `--acme
+  <email>` has nginx's ACME module get and renew a Let's Encrypt certificate,
+  or `--cert`/`--key` (a certbot certificate in /etc/letsencrypt/live is found);
   `--websocket` and `--sse` paths; `--remove`; `--dry-run`. Warden stays off
   the request path: nginx connects to the app's port as before.
 

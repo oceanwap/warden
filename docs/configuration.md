@@ -228,6 +228,7 @@ it with `nginx -t`); an edit by hand applies at the next `warden expose`.
 | Key | Default | Meaning |
 |---|---|---|
 | `hosts` | required | nginx `server_name`s, e.g. `["api.example.com"]`; `*.example.com` works |
+| `acme` | unset | An e-mail address: nginx's ACME module gets a Let's Encrypt certificate for `hosts` and renews it (HTTPS with HTTP/2 on 443, port 80 redirects). Not with `cert`, nor with wildcard hosts |
 | `cert`, `key` | unset | Certificate chain and key: nginx serves HTTPS with HTTP/2 on 443 and redirects port 80. Unset: plain HTTP on port 80 (TLS ends at Cloudflare or a load balancer) |
 | `site` | `<nginx conf.d>/warden-<name>.conf` | The site file (`/etc/nginx/conf.d`, or Homebrew's `servers/`) |
 | `websocket_paths` | `[]` | Paths that carry WebSockets: 1 h read timeout, `lingering_close always` |
