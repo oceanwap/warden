@@ -1396,8 +1396,17 @@ fn control_connections_are_bounded() {
     assert!(out.contains(r#""ok":true"#), "status with 32 streams open: {out}");
     w.wait_log("too many live streams; refusing a new one", Duration::from_secs(3));
     drop(streams);
-    let mut again = Events::open(&w, r#"{"cmd":"subscribe"}"#);
-    assert_eq!(again.next()["type"], "hello", "a stream slot is free again");
+    // The supervisor frees a slot when it sees the client gone, which can
+    // take a moment after the close: ask until one is free.
+    let t0 = Instant::now();
+    loop {
+        let first = Events::open(&w, r#"{"cmd":"subscribe"}"#).next();
+        if first["type"] == "hello" {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "a stream slot is free again: {first}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A6: the log level can be changed at runtime and filters apply to `logs`.
