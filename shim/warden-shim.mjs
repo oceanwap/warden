@@ -234,8 +234,10 @@ function openPrivateBun(options) {
     p.hostname = undefined;
     p.reusePort = false;
     // Warden checks this socket over plain HTTP: an app that serves TLS
-    // itself must not make the private socket TLS too.
+    // itself must not make the private socket TLS too, nor HTTP/3 (which
+    // Bun refuses without TLS).
     p.tls = undefined;
+    p.http3 = undefined;
     privateServer = originalServe.call(Bun, p);
     privatePath = path;
     return path;
@@ -413,6 +415,10 @@ function withReusePort(args) {
 // server: every http.Server has `maxHeadersCount` (null by default).
 const isHttpServer = (server) => "maxHeadersCount" in server && typeof server.setTimeout === "function";
 
+// A node:http2 server (createServer or createSecureServer): it gets a private
+// health socket too, answered by the same "request" handler.
+const isHttp2Server = (server) => typeof server.updateSettings === "function" && typeof server.setTimeout === "function";
+
 // The open connections of the app's node:http servers (and, separately, of
 // the private health socket's), per connection: nothing is added per
 // request. A drain reads what it needs off the sockets (nodeBusy, below).
@@ -458,7 +464,7 @@ function trackNodeServer(server) {
     const isApp = appPort == null || addr.port === appPort;
     if (!isApp) return;
     if (isHttpServer(server)) appHttpServers.add(server);
-    if (!privateServer && isHttpServer(server)) {
+    if (!privateServer && (isHttpServer(server) || isHttp2Server(server))) {
       openPrivateNode(server, (socket) =>
         report(socket ? { ev: "listening", port: addr.port, socket } : { ev: "listening", port: addr.port }),
       );
