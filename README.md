@@ -178,7 +178,7 @@ path = "/health"          # checked on each worker's private socket
 |---|---|
 | **Get started** | [Install](docs/install.md) · [Linux packages](docs/packages.md) · [Platforms](docs/platforms.md) · [Windows](docs/windows.md) · [Commands](docs/commands.md) · [Configuration](docs/configuration.md) |
 | **Run it in production** | [Deploying without downtime](docs/deploys.md) · [Staying up](docs/reliability.md) · [Production setup](docs/production.md) · [Behind a proxy](docs/proxies.md) · [File watching](docs/watch.md) · [Troubleshooting](docs/troubleshooting.md) |
-| **Parts** | [wardend](docs/wardend.md) · [Static serving](docs/static-serving.md) · [GUI](gui/README.md) |
+| **Parts** | [wardend](docs/wardend.md) · [Static serving](docs/static-serving.md) · [Hostname router](docs/routing.md) · [GUI](gui/README.md) |
 | **Coming from** | [Compared with PM2](docs/comparison.md) · [Coming from wattpm](docs/wattpm.md) |
 | **Design and numbers** | [How it works](docs/how-it-works.md) · [Architecture](docs/architecture.md) · [Protocol](docs/protocol.md) · [Benchmarks](docs/benchmarks.md) |
 | **The project** | [Development](docs/development.md) · [Releasing](docs/releasing.md) · [Review process](docs/review-process.md) · [Chaos soak](docs/chaos.md) · [Changelog](CHANGELOG.md) |

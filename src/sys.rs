@@ -887,6 +887,27 @@ pub fn shutdown_both(fd: std::os::fd::RawFd) -> io::Result<()> {
     if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// shutdown(2) the write side of a socket: the peer reads end-of-file once
+/// what was sent is through (the router passing an end of stream on).
+pub fn shutdown_write(sock: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: shutdown takes two integers and touches no memory; the
+    // descriptor is borrowed, so it is open for the call.
+    let r = unsafe { libc::shutdown(sock.as_raw_fd(), libc::SHUT_WR) };
+    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// IP_TRANSPARENT (or IPV6_TRANSPARENT) on a socket not yet bound: it may
+/// then bind to an address that is not this host's, a visitor's (needs
+/// CAP_NET_ADMIN; the router's `client_ip`).
+#[cfg(target_os = "linux")]
+pub fn set_ip_transparent(sock: BorrowedFd<'_>, v6: bool) -> io::Result<()> {
+    if v6 {
+        setsockopt_int(sock, libc::SOL_IPV6, libc::IPV6_TRANSPARENT, 1)
+    } else {
+        setsockopt_int(sock, libc::SOL_IP, libc::IP_TRANSPARENT, 1)
+    }
+}
+
 /// Is at least one byte waiting to be read on the socket `fd`? A peek that
 /// never blocks and takes nothing off the queue. False when the queue is
 /// empty, the peer has closed, or the call fails.

@@ -424,6 +424,12 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             }
         }
         sup.publish_rollout();
+        // No router left running (`warden stop`, or the end): the app ports
+        // answer directly again until a router worker starts.
+        #[cfg(target_os = "linux")]
+        if sup.insts.is_empty() && sup.cfg.route.is_some() && crate::router::rules::in_place() {
+            crate::router::rules::clear();
+        }
         if sup.shutting_down && sup.insts.is_empty() {
             break;
         }
@@ -555,7 +561,25 @@ fn handoff_wanted(cfg: &Config, var: Option<&str>, macos: bool) -> bool {
         && cfg.workers.mode == Mode::Process
         && cfg.workers.standby == 0
         && cfg.workers.port_strategy == PortStrategy::Shared
-        && cfg.static_files.is_none()
+        && !cfg.builtin_server()
+}
+
+/// Before a router worker starts: the routing rules `client_ip` needs, for
+/// the ports in its table (`router::rules`).
+#[cfg(target_os = "linux")]
+fn sync_route_rules(env: &[(String, String)]) {
+    let Some((_, text)) = env.iter().find(|(k, _)| k == "WARDEN_ROUTE") else { return };
+    let Ok(table) = serde_json::from_str::<crate::router::Table>(text) else { return };
+    if !table.client_ip {
+        return;
+    }
+    if let Err(e) = crate::router::rules::sync(&table.ports()) {
+        warn!(
+            "cannot add the routing rules that bring apps' answers back to the router",
+            error = e,
+            hint = "run Warden as root, or set client_ip = false under [route]",
+        );
+    }
 }
 
 fn mode_name(m: Mode) -> &'static str {
@@ -919,7 +943,8 @@ impl Supervisor {
     /// (`slot_id` is then 0).
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
-        let env = self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        let env: Vec<(String, String)> =
+            self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
         // Warden's own code reports on fd 3 (`process::Spec::ipc_nonblocking`).
         let ipc_nonblocking;
         let (program, args) = match self.cfg.workers.mode {
@@ -929,6 +954,12 @@ impl Supervisor {
             Mode::Process if self.cfg.static_files.is_some() && slot_id != STANDBY_SLOT => {
                 ipc_nonblocking = true;
                 (self.exe.display().to_string(), vec!["serve-static".to_string()])
+            }
+            Mode::Process if self.cfg.route.is_some() && slot_id != STANDBY_SLOT => {
+                ipc_nonblocking = true;
+                #[cfg(target_os = "linux")]
+                sync_route_rules(&env);
+                (self.exe.display().to_string(), vec!["route".to_string()])
             }
             Mode::Process => {
                 ipc_nonblocking = self.shim_path.is_some();
@@ -1032,6 +1063,12 @@ impl Supervisor {
                     st.compress_dir
                         .get_or_insert_with(|| crate::fleet::state_dir().join("compress").join(&self.cfg.app.name));
                     add("WARDEN_STATIC", serde_json::to_string(&st).unwrap_or_default());
+                }
+                if let Some(r) = &self.cfg.route {
+                    // App names become ports here, at each start: a reload
+                    // picks up an app that moved (`router::table`).
+                    let table = crate::router::table(r);
+                    add("WARDEN_ROUTE", serde_json::to_string(&table).unwrap_or_default());
                 }
             }
             Mode::Worker => {

@@ -234,6 +234,22 @@ it with `nginx -t`); an edit by hand applies at the next `warden expose`.
 | `websocket_paths` | `[]` | Paths that carry WebSockets: 1 h read timeout, `lingering_close always` |
 | `sse_paths` | `[]` | Paths that stream Server-Sent Events: no buffering, 1 h read timeout |
 
+## `[route]`
+
+Warden's hostname router instead of an app: it listens on `[app] port`
+(443) and passes each TLS connection, still encrypted, to the app serving the
+hostname it asks for, keeping the visitor's IP. Several apps share one IP with
+plain DNS, each doing its own TLS. How it works and what it costs:
+[`routing.md`](routing.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hosts` | required | Hostname → app name or port, e.g. `{ "api.example.com" = "api", "*.example.com" = 8480, "*" = "web" }`. `*.` matches one label; `"*"` takes everything else |
+| `host` | `"0.0.0.0"` | Address to listen on |
+| `client_ip` | `true` on Linux | Apps see the visitor's IP address (IP_TRANSPARENT, needs root; Warden adds two routing rules while the router runs, and the apps' ports then answer only through it). `false`: apps see `127.0.0.1` |
+
+`[workers] count` defaults to one per CPU core here.
+
 ## `[static]`
 
 A static site instead of an app (what `warden serve <dir> <port>` writes).

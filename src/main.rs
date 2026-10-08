@@ -27,6 +27,7 @@ mod networking;
 mod platform;
 mod process;
 mod restart;
+mod router;
 mod schedule;
 mod signals;
 mod stamp;
@@ -51,6 +52,10 @@ fn main() {
     // Internal: the worker process of an app with a [static] section.
     if argv.first().map(String::as_str) == Some("serve-static") {
         std::process::exit(static_server::main());
+    }
+    // Internal: the worker process of an app with a [route] section.
+    if argv.first().map(String::as_str) == Some("route") {
+        std::process::exit(router::main());
     }
     // Internal: a compression in the background, started by such a worker.
     if argv.first().map(String::as_str) == Some("static-compress") {
