@@ -52,7 +52,7 @@ mod names;
 mod open;
 mod path;
 mod response;
-mod serve;
+pub(crate) mod serve;
 mod store;
 mod text;
 

@@ -109,6 +109,10 @@ pub struct IpcMsg {
     /// instead of listening on the port; `host` is what the app asked for.
     #[serde(default)]
     pub handoff: Option<bool>,
+    /// `listening` with `handoff`: the worker takes a bare descriptor
+    /// (`"type":"fd"`, Bun.serve's `server.adopt(fd)`) instead of a socket.
+    #[serde(default)]
+    pub adopt: Option<bool>,
     #[serde(default)]
     pub host: Option<String>,
 }

@@ -34,6 +34,7 @@ replaces the tables between `<!-- bench:start -->` and `<!-- bench:end -->` in
   (or [wrk](https://github.com/wg/wrk) with `--loadgen wrk`)
 - npm (installs the pinned versions in `package.json`: pm2 6.0.14, wattpm 3.71.0, serve 14.2.6)
 - nginx, optional: without it the static-files table has no nginx column
+- For `routing.ts`: h2load (`apt install nghttp2-client`) and openssl; nginx with the `stream` and `ssl_preread` modules built in for its `nginx-stream` row (`--with-stream --with-stream_ssl_preread_module`)
 - Recommended: `sysctl -w net.ipv4.tcp_migrate_req=1` (what `warden startup`
   sets). Without it, a rolling restart can reset connections that were queued
   on a closing listener, under every manager.
@@ -79,6 +80,7 @@ the raw numbers to `bench/results/<date>-<suite>.json` (git-ignored).
 | `fleet.ts` | 10 apps on one host: manager memory, idle CPU, and how fast `list`, `describe` and `logs` answer |
 | `longlived.ts` | WebSocket and SSE clients held through a rolling restart: PM2 (cluster mode for Node, fork mode for Bun) vs Warden (processes; Bun also worker mode) |
 | `profile.ts` | One server at a time, a fixed number of requests: CPU time, context switches and syscalls per request, and where the time goes (perf). See [Profiling](#profiling) |
+| `routing.ts` | Several apps on one IP and port: one Bun.serve app (own TLS and HTTP/2) direct, behind Warden's `[route]` router (hand-off, and copying with `WARDEN_HANDOFF=0`), behind nginx `stream` + `ssl_preread`, and behind nginx terminating TLS (`proxy_pass`); h2load over a real hostname, HTTP/2 small and 64 KB, HTTP/1.1. `--bun PATH` for a Bun with `server.adopt`, `--nginx PATH` for an nginx with the stream modules, `--rounds N` interleaved |
 | `shim-cost.ts` | What Warden's shim adds to one request, in-process (ns), bare vs with the shim |
 
 Every `run.ts` app also runs `warden-standby`: Warden's processes plus one

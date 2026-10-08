@@ -43,6 +43,77 @@ pub struct Config {
     /// section and the nginx site file). Warden itself never reads requests.
     #[serde(default)]
     pub expose: Option<Expose>,
+    /// Warden's own hostname router (`docs/routing.md`): the workers listen
+    /// on `app.port` (443), read the hostname each TLS connection asks for
+    /// and pass the still-encrypted connection to that app's port. Several
+    /// apps share one IP; each app does its own TLS. `app.command` is then not
+    /// used.
+    #[serde(default)]
+    pub route: Option<Route>,
+}
+
+/// `[route]`: hostname → app.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    /// `"api.example.com" = "api"` (an app's name: its `app.port`) or
+    /// `= 8480` (a port). `*.example.com` matches one label; `"*"` takes
+    /// every hostname nothing else matches (and connections without one).
+    pub hosts: std::collections::BTreeMap<String, RouteTarget>,
+    /// Address to listen on (the port is `app.port`).
+    #[serde(default = "default_static_host")]
+    pub host: String,
+    /// Apps see the visitor's IP address, not the router's: the router
+    /// connects from the visitor's address (Linux, IP_TRANSPARENT, with two
+    /// routing rules Warden adds; needs root). Default: on, on Linux.
+    #[serde(default)]
+    pub client_ip: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum RouteTarget {
+    Port(u16),
+    App(String),
+}
+
+impl Route {
+    /// Whether apps get the visitor's address (the default on Linux).
+    pub fn client_ip(&self) -> bool {
+        self.client_ip.unwrap_or(cfg!(target_os = "linux"))
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if self.hosts.is_empty() {
+            return Err(
+                "route.hosts must send at least one hostname to an app, e.g. \"api.example.com\" = \"api\"".into()
+            );
+        }
+        for (h, t) in &self.hosts {
+            if h != "*" {
+                valid_hostname(h).map_err(|e| format!("route.hosts: {e}"))?;
+                if h.chars().any(|c| c.is_ascii_uppercase()) {
+                    return Err(format!("route.hosts: write {h:?} in lowercase"));
+                }
+            }
+            match t {
+                RouteTarget::Port(0) => return Err(format!("route.hosts.{h:?}: port 0 is not a port")),
+                RouteTarget::App(name)
+                    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) =>
+                {
+                    return Err(format!("route.hosts.{h:?} = {name:?}: an app's name, or a port number"));
+                }
+                _ => {}
+            }
+        }
+        if self.host.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!("route.host {:?} is not an IP address", self.host));
+        }
+        if self.client_ip == Some(true) && !cfg!(target_os = "linux") {
+            return Err("route.client_ip needs Linux (IP_TRANSPARENT); set client_ip = false here".into());
+        }
+        Ok(())
+    }
 }
 
 /// `[expose]`: what `warden expose` wrote the nginx site file from, so running
@@ -899,6 +970,11 @@ pub fn more_workers_hint(cfg: &Config, count: usize, linux: bool, cpus: usize) -
     ))
 }
 
+/// Whether the config sets `[workers] count`.
+fn workers_count_set(text: &str) -> bool {
+    toml::from_str::<toml::Table>(text).ok().is_some_and(|t| t.get("workers").and_then(|w| w.get("count")).is_some())
+}
+
 /// `count = 4`, `count = "max"`, `count = "max-1"`.
 fn count_or_max<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
     use serde::de::Error;
@@ -1059,7 +1135,12 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Config, String> {
-        let cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut cfg: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        // The router: one worker per core unless the config says otherwise
+        // (Linux, where the kernel spreads connections over them).
+        if cfg.route.is_some() && cfg!(target_os = "linux") && !workers_count_set(text) {
+            cfg.workers.count = cpu_count();
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1088,6 +1169,26 @@ impl Config {
         }
         if a.name == "all" {
             return Err("app.name cannot be \"all\" (that targets every app)".into());
+        }
+        if let Some(r) = &self.route {
+            r.check()?;
+            if self.app.port.is_none() {
+                return Err("[route] needs app.port (the port to listen on, usually 443)".into());
+            }
+            if self.static_files.is_some() {
+                return Err("[route] and [static] are two kinds of app: an app has one".into());
+            }
+            if self.workers.mode == Mode::Worker {
+                return Err("[route] runs Warden's own router: use workers.mode = \"process\"".into());
+            }
+            if self.watch.enabled {
+                return Err("[watch] does not apply to [route]: the router runs Warden's own code".into());
+            }
+            if let Some(RouteTarget::Port(p)) =
+                r.hosts.values().find(|t| **t == RouteTarget::Port(self.app.port.unwrap_or(0)))
+            {
+                return Err(format!("route.hosts: port {p} is the router's own port"));
+            }
         }
         if let Some(x) = &self.expose {
             x.check()?;
@@ -1372,10 +1473,12 @@ impl Config {
                  Fix: set standby = 0, or workers.mode = \"process\""
             ));
         }
-        if self.static_files.is_some() {
-            return Err("workers.standby: [static] runs Warden's own file server, which starts in milliseconds; \
+        if self.builtin_server() {
+            return Err(
+                "workers.standby: [static] and [route] run Warden's own server, which starts in milliseconds; \
                         remove standby"
-                .into());
+                    .into(),
+            );
         }
         if !self.shim_enabled() {
             return Err("workers.standby needs Warden's shim (bun and node commands, app.shim not false): it is \
@@ -1451,7 +1554,13 @@ impl Config {
 
     /// Workers report a private health socket (the shim, or the static server).
     pub fn health_sockets(&self) -> bool {
-        self.shim_enabled() || self.static_files.is_some()
+        self.shim_enabled() || self.builtin_server()
+    }
+
+    /// The workers run Warden's own server (`[static]` or `[route]`), not
+    /// `app.command`.
+    pub fn builtin_server(&self) -> bool {
+        self.static_files.is_some() || self.route.is_some()
     }
 
     /// Whether to inject the Bun shim.
@@ -1507,7 +1616,7 @@ impl Config {
             }
             None if self.app.port.is_none()
                 || self.shim_enabled()
-                || self.static_files.is_some()
+                || self.builtin_server()
                 || self.workers.mode == Mode::Worker =>
             {
                 None
@@ -1709,6 +1818,35 @@ mod tests {
         assert_eq!(c.watchdog.timeout, 60);
         assert_eq!(c.restart.failed_cooldown, 300);
         assert_eq!(c.health_path(), None);
+    }
+
+    #[test]
+    fn a_route_section_is_checked() {
+        let base = "[app]\nname = \"edge\"\nport = 443\n";
+        let ok = |extra: &str| Config::parse(&format!("{base}{extra}"));
+        let c = ok("[route]\nhosts = { \"api.example.com\" = \"api\", \"*.example.com\" = 8480, \"*\" = \"web\" }\n")
+            .unwrap();
+        let r = c.route.unwrap();
+        assert_eq!(r.hosts["*.example.com"], RouteTarget::Port(8480));
+        assert_eq!(r.hosts["api.example.com"], RouteTarget::App("api".into()));
+        assert_eq!(r.host, "0.0.0.0");
+        assert_eq!(r.client_ip(), cfg!(target_os = "linux"));
+        let err = |extra: &str| ok(extra).unwrap_err();
+        assert!(err("[route]\nhosts = {}\n").contains("at least one hostname"));
+        assert!(err("[route]\nhosts = { \"API.example.com\" = 1 }\n").contains("lowercase"));
+        assert!(err("[route]\nhosts = { \"a.test\" = 443 }\n").contains("router's own port"));
+        assert!(err("[route]\nhost = \"localhost\"\nhosts = { \"a.test\" = 1 }\n").contains("not an IP address"));
+        let no_port = Config::parse("[app]\nname = \"edge\"\n[route]\nhosts = { \"a.test\" = 1 }\n").unwrap_err();
+        assert!(no_port.contains("needs app.port"), "{no_port}");
+    }
+
+    #[test]
+    fn a_router_runs_one_worker_per_core_unless_told() {
+        let base = "[app]\nname = \"edge\"\nport = 443\n[route]\nhosts = { \"a.test\" = 1 }\n";
+        let n = if cfg!(target_os = "linux") { cpu_count() } else { 1 };
+        assert_eq!(Config::parse(base).unwrap().workers.count, n);
+        assert_eq!(Config::parse(&format!("{base}[workers]\ncount = 2\n")).unwrap().workers.count, 2);
+        assert_eq!(Config::parse(MIN).unwrap().workers.count, 1, "apps keep their default");
     }
 
     /// Every numeric field: huge, boundary and random values either parse

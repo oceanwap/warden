@@ -17,6 +17,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   or `--cert`/`--key` (a certbot certificate in /etc/letsencrypt/live is found);
   `--websocket` and `--sse` paths; `--remove`; `--dry-run`. Warden stays off
   the request path: nginx connects to the app's port as before.
+- `[route]`: Warden's own hostname router, for several apps on one IP and
+  port without nginx or Cloudflare. It reads the hostname from each TLS
+  ClientHello and passes the still-encrypted connection to that app's port
+  (`"api.example.com" = "api"`, `*.example.com`, `"*"`); each app does its own
+  TLS and HTTP/2. On Linux apps see the visitor's IP address (IP_TRANSPARENT,
+  with two routing rules Warden adds while the router runs). One worker per
+  core by default; small messages pass with one read and one write, bulk
+  transfers with splice(2). As fast as nginx's `stream` pass-through in our
+  measurements. Where the app can take a handed-over socket (node:http, or
+  Bun.serve with `server.adopt`), the router hands the connection itself to
+  the app's workers through the app's supervisor and leaves the path: no
+  bytes are copied and requests run at the app's direct speed. See
+  `docs/routing.md`.
 
 ### Fixed
 

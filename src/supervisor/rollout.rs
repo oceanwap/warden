@@ -430,6 +430,14 @@ impl Supervisor {
                     return Err(format!("preflight: entry {} not found", e.display()));
                 }
             }
+            Mode::Process if self.cfg.route.is_some() => {
+                let table = crate::router::table(self.cfg.route.as_ref().expect("checked"));
+                if let Some(name) = table.missing.first() {
+                    return Err(format!(
+                        "preflight: route.hosts names the app {name:?}, which has no config with an app.port on this host"
+                    ));
+                }
+            }
             Mode::Process if self.cfg.static_files.is_some() => {
                 let root = self.cfg.static_files.as_ref().map(|s| s.root.clone()).unwrap_or_default();
                 let root = self.pinned_path(root);

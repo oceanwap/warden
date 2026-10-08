@@ -21,7 +21,7 @@ const MAX_CONNECTIONS: usize = 10_000;
 /// socket never blocks (Warden may be stopped, `sys::prepare_ipc_socket`):
 /// a heartbeat that finds it full is dropped (the next one says the same),
 /// anything else waits in `IPC_BACKLOG`, in order, until there is room.
-fn report(msg: serde_json::Value) {
+pub(crate) fn report(msg: serde_json::Value) {
     let Some(fd) = std::env::var("WARDEN_IPC_FD").ok().and_then(|v| v.parse::<i32>().ok()) else { return };
     let droppable = msg["ev"] == "heartbeat";
     let mut line = msg.to_string();
@@ -89,7 +89,7 @@ fn ipc_write(fd: i32, buf: &[u8]) -> usize {
 }
 
 /// A number from the environment, when the variable is set and holds one.
-fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
+pub(crate) fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok()?.parse().ok()
 }
 
@@ -132,13 +132,13 @@ impl Tcp {
 
 /// The private socket for this worker's health checks, when Warden asked for
 /// one (WARDEN_HEALTH_DIR).
-struct Health {
-    listener: tokio::net::UnixListener,
-    path: PathBuf,
+pub(crate) struct Health {
+    pub(crate) listener: tokio::net::UnixListener,
+    pub(crate) path: PathBuf,
 }
 
 impl Health {
-    fn bind(worker: u64) -> Option<Health> {
+    pub(crate) fn bind(worker: u64) -> Option<Health> {
         let dir = std::env::var("WARDEN_HEALTH_DIR").ok()?;
         let app = std::env::var("WARDEN_APP").unwrap_or_else(|_| "app".into());
         let inst = std::env::var("WARDEN_INSTANCE").unwrap_or_else(|_| std::process::id().to_string());
@@ -152,7 +152,7 @@ impl Health {
         Some(Health { listener, path })
     }
 
-    async fn accept(this: Option<&Health>) -> std::io::Result<tokio::net::UnixStream> {
+    pub(crate) async fn accept(this: Option<&Health>) -> std::io::Result<tokio::net::UnixStream> {
         match this {
             Some(h) => h.listener.accept().await.map(|(stream, _)| stream),
             None => std::future::pending().await,

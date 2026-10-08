@@ -106,6 +106,26 @@ One small VM with 2 CPUs, shared with the load generator: compare the bars, not 
 
 Every number, the method and the caveats, including the one synthetic file per size on a noisy VM: [docs/benchmarks.md](docs/benchmarks.md#static-files-against-nginx-plain-and-compressed-2026-10-03) and [bench/README.md](bench/README.md). `cargo xtask bench` re-runs the suites in the repository.
 
+## Several apps on one server
+
+Each app serves its own TLS and HTTP/2, so nothing needs to sit in front of it. **Putting nginx in front slows the server down:** decrypting and re-sending every request cost 3–7× the CPU of the app answering alone, and cut throughput to 13–34 % of it (table below). Fastest first:
+
+1. **One address per app.** Point each hostname at its own IP (an IPv6 /64 gives you plenty) and have each app listen on its address at port 443. The kernel picks the app by address, so there is no layer at all, the same as `direct` below. IPv4 visitors need a spare IPv4 per app; otherwise send them through the router (2). Warden setting the addresses up for you is the next change.
+2. **One address, Warden's hostname router.** `[route]` on 443 reads the hostname from the TLS hello and hands the connection itself to the app's worker, which then talks to the visitor directly and sees their real IP. Needs a Bun with `server.adopt` (oven-sh/bun#44768) or Node's `node:http`/`node:https`: 93–96 % of direct.
+3. **The same router, copying bytes.** On stock Bun the router passes the bytes instead, with the visitor's IP kept: 45–70 % of direct, level with nginx's own pass-through (`stream` + `ssl_preread`).
+
+One Bun.serve app, 2 workers on 2 CPUs, h2load on 2 others, median of 3 rounds (2026-10-08). Requests/s, with the server CPU per request in brackets:
+
+| | HTTP/2, 12 B | HTTP/2, 64 KB | HTTP/1.1, 12 B |
+|---|---|---|---|
+| Direct (nothing in front) | 258,409 (7.7 µs) | 26,763 (74 µs) | 108,697 (17.5 µs) |
+| **Warden router, hand-off** | **245,265 (8.1 µs)** | **25,595 (78 µs)** | **100,700 (18.6 µs)** |
+| Warden router, copying | 140,719 (13.8 µs) | 18,634 (106 µs) | 48,945 (40.2 µs) |
+| nginx pass-through (`stream`) | 148,545 (13.2 µs) | 17,145 (114 µs) | 48,667 (40.2 µs) |
+| nginx in front (`proxy_pass`) | 34,881 (57.2 µs) | 9,041 (220 µs) | 27,457 (72.6 µs) |
+
+Bun 1.4.3 with `server.adopt`, nginx 1.31.6 with as many workers as the app. Run it yourself: `bun bench/routing.ts --bun <bun> --nginx <nginx>` ([bench/README.md](bench/README.md)). Setup: [docs/routing.md](docs/routing.md).
+
 ## Static files
 
 `warden serve dist 8080` runs Warden's own file server as the app's workers: supervised, health-checked and reloaded like any app.
@@ -178,7 +198,7 @@ path = "/health"          # checked on each worker's private socket
 |---|---|
 | **Get started** | [Install](docs/install.md) · [Linux packages](docs/packages.md) · [Platforms](docs/platforms.md) · [Windows](docs/windows.md) · [Commands](docs/commands.md) · [Configuration](docs/configuration.md) |
 | **Run it in production** | [Deploying without downtime](docs/deploys.md) · [Staying up](docs/reliability.md) · [Production setup](docs/production.md) · [Behind a proxy](docs/proxies.md) · [File watching](docs/watch.md) · [Troubleshooting](docs/troubleshooting.md) |
-| **Parts** | [wardend](docs/wardend.md) · [Static serving](docs/static-serving.md) · [GUI](gui/README.md) |
+| **Parts** | [wardend](docs/wardend.md) · [Static serving](docs/static-serving.md) · [Hostname router](docs/routing.md) · [GUI](gui/README.md) |
 | **Coming from** | [Compared with PM2](docs/comparison.md) · [Coming from wattpm](docs/wattpm.md) |
 | **Design and numbers** | [How it works](docs/how-it-works.md) · [Architecture](docs/architecture.md) · [Protocol](docs/protocol.md) · [Benchmarks](docs/benchmarks.md) |
 | **The project** | [Development](docs/development.md) · [Releasing](docs/releasing.md) · [Review process](docs/review-process.md) · [Chaos soak](docs/chaos.md) · [Changelog](CHANGELOG.md) |

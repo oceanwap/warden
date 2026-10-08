@@ -1396,8 +1396,17 @@ fn control_connections_are_bounded() {
     assert!(out.contains(r#""ok":true"#), "status with 32 streams open: {out}");
     w.wait_log("too many live streams; refusing a new one", Duration::from_secs(3));
     drop(streams);
-    let mut again = Events::open(&w, r#"{"cmd":"subscribe"}"#);
-    assert_eq!(again.next()["type"], "hello", "a stream slot is free again");
+    // The supervisor frees a slot when it sees the client gone, which can
+    // take a moment after the close: ask until one is free.
+    let t0 = Instant::now();
+    loop {
+        let first = Events::open(&w, r#"{"cmd":"subscribe"}"#).next();
+        if first["type"] == "hello" {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "a stream slot is free again: {first}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A6: the log level can be changed at runtime and filters apply to `logs`.
@@ -1879,6 +1888,54 @@ fn handed_over_connections_reach_every_worker_and_survive_a_rolling_restart() {
         assert!(fail <= allowed_resets(), "{runtime}: requests failed during the rolling restart: {fail}");
         assert!(get(port, "/whoami").is_some(), "{runtime}: served after the restart");
     }
+}
+
+/// A Bun with `server.adopt(fd)` (proposed upstream; releases up to 1.4.x
+/// have none).
+fn bun_adopts() -> bool {
+    let js = "const s = Bun.serve({ port: 0, fetch: () => new Response() }); \
+              console.log(typeof s.adopt); s.stop(true);";
+    let out = Command::new("bun").args(["-e", js]).env_remove("BUN_OPTIONS").output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "function")
+}
+
+/// The handoff for a Bun.serve app (TLS, served by the app itself): with
+/// `server.adopt(fd)` the shim serves it on a private port and reports
+/// `adopt`, Warden passes the bare descriptor (`"type":"fd"`), and Bun reads
+/// the ClientHello still waiting in the kernel; both workers answer, through
+/// a rolling restart too. A Bun without adopt() listens on the port as
+/// before the handoff (the rest of the test holds).
+#[test]
+fn a_bun_serve_tls_app_adopts_handed_over_connections() {
+    if !have_bun() || !Command::new("curl").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return;
+    }
+    let takes = bun_adopts();
+    let port = free_port();
+    let cfg = gated("adopt", port, 2, "").replace(&fixture("app.ts"), &fixture("tls_app.ts"));
+    let w = Warden::start_env("adopt", port, &cfg, &[("WARDEN_HANDOFF", "1")]);
+    w.wait_for("2 ready", T, ready(2));
+    assert_eq!(w.log().contains("workers take connections from Warden"), takes, "{}", w.log());
+    let url = format!("https://localhost:{port}/");
+    let get_tls = || {
+        let out = Command::new("curl")
+            .args(["-sk", "--max-time", "5", &url])
+            .env("NO_PROXY", "*")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(out.status.success() && !body.is_empty(), "curl: {out:?}\n{}", w.log());
+        body
+    };
+    let pids: HashSet<String> = (0..20).map(|_| get_tls()).collect();
+    if takes || cfg!(target_os = "linux") {
+        assert_eq!(pids, pid_set(&w.status().unwrap()).iter().map(|p| p.to_string()).collect(), "both answer");
+    }
+    let (code, out) = w.cli(&["restart"]);
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    get_tls();
 }
 
 /// Apps written for PM2: readiness from process.send('ready'), graceful stop
@@ -8430,4 +8487,96 @@ fn a_stale_launchd_job_is_not_waited_for() {
     assert!(t0.elapsed() < Duration::from_secs(10), "no 10 s wait for launchd: {:?}", t0.elapsed());
     assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 0, "wardend answers");
     let _ = run_with(&f, &["kill", "--yes"], &env);
+}
+
+/// A TLS ClientHello asking for `host`, as far as the router reads it.
+fn client_hello(host: &str) -> Vec<u8> {
+    let n = host.len() as u16;
+    let mut ext = vec![0x00, 0x00];
+    ext.extend_from_slice(&(n + 5).to_be_bytes());
+    ext.extend_from_slice(&(n + 3).to_be_bytes());
+    ext.push(0);
+    ext.extend_from_slice(&n.to_be_bytes());
+    ext.extend_from_slice(host.as_bytes());
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[7u8; 32]);
+    body.push(0); // no session id
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+    body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext);
+    let mut hs = vec![0x01, 0x00];
+    hs.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    hs.extend_from_slice(&body);
+    let mut rec = vec![0x16, 0x03, 0x01];
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+/// A backend that answers each connection with its tag, then echoes.
+fn tagged_echo(tag: &'static str) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut c = c;
+                let _ = c.write_all(tag.as_bytes());
+                let mut b = [0u8; 65536];
+                while let Ok(n) = c.read(&mut b) {
+                    if n == 0 || c.write_all(&b[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// `[route]`: each connection goes, by the hostname in its ClientHello, to
+/// that app's port, with the hello and every byte after it passed on as is
+/// (and a large transfer, through the splice path, intact).
+#[test]
+fn the_router_sends_each_hostname_to_its_app() {
+    let (a, b) = (tagged_echo("A:"), tagged_echo("B:"));
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"edge\"\nport = {port}\n[workers]\ncount = 2\n\
+         [route]\nhost = \"127.0.0.1\"\nclient_ip = false\nhosts = {{ \"a.test\" = {a}, \"*.b.test\" = {b} }}\n"
+    );
+    let w = Warden::start("route", port, &cfg);
+    w.wait_for("ready", T, ready(2));
+    let talk = |host: &str, extra: &[u8]| -> Vec<u8> {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut sent = client_hello(host);
+        sent.extend_from_slice(extra);
+        // Written from another thread: the echo comes back while we write.
+        let mut writer = c.try_clone().unwrap();
+        let out = sent.clone();
+        let t = std::thread::spawn(move || writer.write_all(&out).unwrap());
+        let mut got = Vec::new();
+        let mut b = [0u8; 65536];
+        while got.len() < 2 + sent.len() {
+            match c.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&b[..n]),
+            }
+        }
+        t.join().unwrap();
+        assert_eq!(&got[2.min(got.len())..], &sent[..], "every byte passed on as sent");
+        got
+    };
+    assert!(talk("a.test", b"ping").starts_with(b"A:"));
+    assert!(talk("www.b.test", b"ping").starts_with(b"B:"));
+    assert!(talk("A.TEST", b"").starts_with(b"A:"), "hostnames are matched in lowercase");
+    let big: Vec<u8> = (0..4u32 << 20).map(|i| (i % 251) as u8).collect();
+    talk("a.test", &big);
+    // No route for the name: the connection is closed, nothing is sent.
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(&client_hello("c.test")).unwrap();
+    let mut b = [0u8; 16];
+    assert_eq!(c.read(&mut b).unwrap_or(0), 0);
 }

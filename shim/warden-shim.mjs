@@ -210,8 +210,27 @@ function wardenServe(options, ...rest) {
     if (longLived) watchBunNodeServer();
   }
   const own = drains && opts !== options && !nodeHttp && runsAppHandler(options);
+  // The handoff: on a private port if this Bun can adopt descriptors (below).
+  const adopting = handoff && bunAdopts !== false && !nodeHttp && deferrableBun(options);
+  if (adopting) opts = onPrivatePort(opts);
   // A server started while draining (rare) drains from its first request.
-  const server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
+  let server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
+  if (adopting) {
+    if (server && typeof server.adopt === "function") {
+      bunAdopts = true;
+      servers.add(server);
+      if (own) trackBunApp(server, opts);
+      takeAdoptions(server, options);
+      return server;
+    }
+    // This Bun has no adopt(): the app listens on its port, as before.
+    bunAdopts = false;
+    try {
+      server.stop(true);
+    } catch {}
+    opts = Object.getPrototypeOf(opts);
+    server = originalServe.call(this, own && draining ? drainingOptions(opts) : opts, ...rest);
+  }
   servers.add(server);
   if (own) trackBunApp(server, opts);
   const isApp = server && server.port && (appPort == null || server.port === appPort);
@@ -220,6 +239,49 @@ function wardenServe(options, ...rest) {
     report(socket ? { ev: "listening", port: server.port, socket } : { ev: "listening", port: server.port });
   }
   return server;
+}
+
+// ------------------------------------------------- handoff (Bun.serve)
+//
+// Bun.serve has no "connection" event to hand a socket to, but a Bun with
+// `server.adopt(fd)` serves an already-connected descriptor as if its own
+// listener had accepted it (TLS included: the ClientHello is still in the
+// kernel buffer). So in handoff mode the app's Bun.serve on its port listens
+// on an ephemeral 127.0.0.1 port instead (everything else as the app asked:
+// fetch, routes, tls, websocket...), the worker reports `adopt: true`, and
+// Warden sends its connections as `"type":"fd"`: the bare descriptor, which
+// Bun's IPC hands over as a number without reading from it.
+//
+// Whether this Bun can adopt is only known from a server: the first one
+// tells (null: not asked yet). Without adopt() (Bun up to 1.4.x) that server
+// is stopped and the app listens on its port as it always did.
+
+let bunAdopts = null;
+// The app's latest Bun.serve on its port: one that stopped and served again
+// (server.stop(), then Bun.serve) takes the connections from then on.
+let adoptServer = null;
+
+function onPrivatePort(opts) {
+  const o = Object.create(opts);
+  o.port = 0;
+  o.hostname = "127.0.0.1";
+  o.reusePort = false;
+  return o;
+}
+
+function takeAdoptions(server, options) {
+  if (!adoptServer) {
+    process.on("message", (msg, fd) => {
+      if (msg !== "warden:connection" || typeof fd !== "number") return;
+      // adopt() closes the descriptor when it cannot take it (a stopped
+      // server).
+      adoptServer.adopt(fd);
+    });
+  }
+  adoptServer = server;
+  const socket = privateServer ? privatePath : openPrivateBun(options);
+  const host = options.hostname ?? null;
+  report({ ev: "listening", port: appPort, handoff: true, adopt: true, host, ...(socket ? { socket } : {}) });
 }
 
 // Same handler (Bun fetch or node:http), private Unix socket, this worker only.
@@ -527,7 +589,8 @@ function takeHandoff(server, args, origListen) {
   const cb = args.find((x) => typeof x === "function");
   if (!handoffServers.size) {
     process.on("message", (msg, socket) => {
-      if (msg !== "warden:connection" || !socket) return;
+      // A number is a bare descriptor, for Bun.serve (takeAdoptions).
+      if (msg !== "warden:connection" || !socket || typeof socket !== "object") return;
       const target = [...handoffServers].find((s) => s.listening !== false) ?? [...handoffServers][0];
       if (!target) return socket.destroy();
       handedOver.add(socket);
