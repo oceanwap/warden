@@ -596,6 +596,63 @@ fn pid_set(s: &Value) -> HashSet<u64> {
     Warden::pids(s).into_iter().collect()
 }
 
+/// An app that serves TLS itself (no proxy in front) passes the health gates:
+/// the shim's private health socket stays plain HTTP instead of copying the
+/// app's `tls`, which made every reload fail ("not an HTTP response").
+#[test]
+fn an_app_serving_tls_itself_passes_health_checks() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("tls", port, 2, "").replace(&fixture("app.ts"), &fixture("tls_app.ts"));
+    let w = Warden::start("tls", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new: {out}");
+    assert_eq!(s["last_rollout"]["ok"], true);
+}
+
+/// The same with HTTP/3 on: Bun refuses `http3` without `tls`, so the
+/// private health socket must drop it too or it never opens.
+#[test]
+fn an_app_serving_http3_itself_passes_health_checks() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg =
+        gated("h3", port, 2, "env = { FIXTURE_HTTP3 = \"1\" }").replace(&fixture("app.ts"), &fixture("tls_app.ts"));
+    let w = Warden::start("h3", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new: {out}");
+    assert_eq!(s["last_rollout"]["ok"], true);
+}
+
+/// A node:http2 TLS app (createSecureServer) gets a private health socket
+/// like a node:http one, so its reloads pass the health gates.
+#[test]
+fn a_node_http2_app_serving_tls_itself_passes_health_checks() {
+    if !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg =
+        gated("nodeh2", port, 2, "command = \"node\"").replace(&fixture("app.ts"), &fixture("node_http2_tls.mjs"));
+    let w = Warden::start("nodeh2", port, &cfg);
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.status().unwrap();
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new: {out}");
+    assert_eq!(s["last_rollout"]["ok"], true);
+}
+
 #[test]
 fn safe_reload_replaces_every_worker_through_the_gates() {
     if !have_bun() {
