@@ -25,7 +25,11 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   with two routing rules Warden adds while the router runs). One worker per
   core by default; small messages pass with one read and one write, bulk
   transfers with splice(2). As fast as nginx's `stream` pass-through in our
-  measurements. See `docs/routing.md`.
+  measurements. Where the app can take a handed-over socket (node:http, or
+  Bun.serve with `server.adopt`), the router hands the connection itself to
+  the app's workers through the app's supervisor and leaves the path: no
+  bytes are copied and requests run at the app's direct speed. See
+  `docs/routing.md`.
 
 ### Fixed
 

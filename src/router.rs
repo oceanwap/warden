@@ -25,10 +25,11 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::AsFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{TcpSocket, TcpStream};
 
 /// The largest first record a client may send (TLS caps a plaintext record
@@ -50,42 +51,66 @@ pub struct Table {
     pub missing: Vec<String>,
     pub client_ip: bool,
     pub host: String,
+    /// Port → the `route.sock` of the app on it: connections for that port
+    /// are handed to the app's workers when its supervisor takes them
+    /// (`crate::handoff`), and passed byte by byte otherwise.
+    #[serde(default)]
+    pub handoff: BTreeMap<u16, PathBuf>,
 }
 
 /// The table for `[route]`: app names are looked up in this host's app
 /// configs (their `app.port`).
 pub fn table(r: &Route) -> Table {
-    let mut apps: Option<Vec<(String, u16)>> = None;
+    table_with(r, &apps())
+}
+
+fn table_with(r: &Route, apps: &[Config]) -> Table {
     let mut t = Table { client_ip: r.client_ip(), host: r.host.clone(), ..Table::default() };
     for (host, target) in &r.hosts {
         match target {
             RouteTarget::Port(p) => {
                 t.routes.insert(host.clone(), *p);
             }
-            RouteTarget::App(name) => {
-                let apps = apps.get_or_insert_with(app_ports);
-                match apps.iter().find(|(n, _)| n == name) {
-                    Some((_, p)) => {
-                        t.routes.insert(host.clone(), *p);
-                    }
-                    None if !t.missing.contains(name) => t.missing.push(name.clone()),
-                    None => {}
+            RouteTarget::App(name) => match apps.iter().find(|c| &c.app.name == name).and_then(|c| c.app.port) {
+                Some(p) => {
+                    t.routes.insert(host.clone(), p);
                 }
-            }
+                None if !t.missing.contains(name) => t.missing.push(name.clone()),
+                None => {}
+            },
+        }
+    }
+    for p in t.ports() {
+        if let Some(c) = apps.iter().find(|c| c.app.port == Some(p) && c.route.is_none()) {
+            t.handoff.insert(p, handoff_socket(c));
         }
     }
     t
 }
 
-/// Every app config on this host that has a port: (name, port).
-fn app_ports() -> Vec<(String, u16)> {
-    crate::fleet::discover()
-        .into_iter()
-        .filter_map(|a| {
-            let c = Config::load(a.config.as_ref()?).ok()?;
-            Some((c.app.name, c.app.port?))
+/// Every app config on this host (that loads).
+fn apps() -> Vec<Config> {
+    crate::fleet::discover().into_iter().filter_map(|a| Config::load(a.config.as_ref()?).ok()).collect()
+}
+
+/// Where an app's supervisor takes connections from the router.
+pub fn handoff_socket(cfg: &Config) -> PathBuf {
+    cfg.socket_path().with_file_name("route.sock")
+}
+
+/// Whether a `[route]` app on this host sends connections to `cfg`'s app
+/// (by its name or its port): its workers then take them handed over.
+/// Read when the app's supervisor starts.
+pub fn routed(cfg: &Config) -> bool {
+    if cfg.route.is_some() || cfg.app.port.is_none() {
+        return false;
+    }
+    apps().iter().filter_map(|c| c.route.as_ref()).any(|r| {
+        r.hosts.values().any(|t| match t {
+            RouteTarget::App(n) => *n == cfg.app.name,
+            RouteTarget::Port(p) => Some(*p) == cfg.app.port,
         })
-        .collect()
+    })
 }
 
 impl Table {
@@ -106,8 +131,7 @@ impl Table {
         self.routes.get("*").copied()
     }
 
-    /// The ports connections go to (for the routing rules, Linux).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// The ports connections go to.
     pub fn ports(&self) -> Vec<u16> {
         let mut p: Vec<u16> = self.routes.values().copied().collect();
         p.sort_unstable();
@@ -145,6 +169,8 @@ async fn serve(table: Arc<Table>, port: u16) -> Result<(), String> {
         crate::sys::listen_tcp(addr, reuse_port, 4096).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     // Accepted connections inherit it on Linux; elsewhere each gets it below.
     let _ = crate::sys::set_tcp_nodelay(std_listener.as_fd(), true);
+    // Wake up for a connection once its ClientHello has arrived (Linux).
+    let _ = crate::sys::tcp_defer_accept(std_listener.as_fd(), HELLO_TIMEOUT.as_secs() as i32);
     std_listener.set_nonblocking(true).map_err(|e| format!("{addr}: {e}"))?;
     let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| format!("{addr}: {e}"))?;
     let transparent = table.client_ip && cfg!(target_os = "linux");
@@ -171,6 +197,7 @@ async fn serve(table: Arc<Table>, port: u16) -> Result<(), String> {
         if transparent { " (apps see the visitor's address)" } else { "" }
     );
 
+    let handovers = Arc::new(Handovers::new(&table));
     let active = Arc::new(AtomicUsize::new(0));
     let beat_ms: u64 = env_number("WARDEN_HEARTBEAT_MS").unwrap_or(0);
     if beat_ms > 0 {
@@ -196,11 +223,11 @@ async fn serve(table: Arc<Table>, port: u16) -> Result<(), String> {
             _ = stop.recv() => break,
             accepted = listener.accept() => match accepted {
                 Ok((c, peer)) => {
-                    let table = table.clone();
+                    let (table, handovers) = (table.clone(), handovers.clone());
                     let guard = Active::new(&active);
                     tokio::spawn(async move {
                         let _guard = guard;
-                        let _ = connection(c, peer, &table, transparent).await;
+                        let _ = connection(c, peer, &table, &handovers, transparent).await;
                     });
                 }
                 // Out of descriptors, or a connection reset before it was
@@ -270,36 +297,28 @@ async fn health_check(mut s: tokio::net::UnixStream) {
     }
 }
 
-/// One visitor's connection: read the ClientHello, connect to the app, send
-/// it the bytes read so far, then pass bytes both ways until both are done.
-async fn connection(mut c: TcpStream, peer: SocketAddr, table: &Table, transparent: bool) -> io::Result<()> {
+/// One visitor's connection: peek at the ClientHello (nothing is read off
+/// the socket), then hand the connection to the app's workers when the app
+/// takes it, else connect to the app and pass bytes both ways until both
+/// are done.
+async fn connection(
+    c: TcpStream,
+    peer: SocketAddr,
+    table: &Table,
+    handovers: &Handovers,
+    transparent: bool,
+) -> io::Result<()> {
     if !crate::sys::NODELAY_INHERITED {
         let _ = c.set_nodelay(true);
     }
-    let mut buf = vec![0u8; 2048];
-    let mut n = 0;
-    let host = tokio::time::timeout(HELLO_TIMEOUT, async {
-        loop {
-            match hello::parse(&buf[..n]) {
-                Hello::Done(host) => return Ok::<_, io::Error>(host),
-                Hello::NotTls => return Err(io::ErrorKind::InvalidData.into()),
-                Hello::Need(need) if need > MAX_HELLO => return Err(io::ErrorKind::InvalidData.into()),
-                Hello::Need(need) => {
-                    if buf.len() < need {
-                        buf.resize(need, 0);
-                    }
-                }
-            }
-            let r = c.read(&mut buf[n..]).await?;
-            if r == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            n += r;
-        }
-    })
-    .await
-    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    let host = tokio::time::timeout(HELLO_TIMEOUT, peek_hello(&c))
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     let Some(port) = table.lookup(host.as_deref()) else { return Ok(()) };
+    if handovers.give(port, &c).await {
+        // The app's worker has it; our copy closes, the connection stays.
+        return Ok(());
+    }
 
     let peer_ip = peer.ip().to_canonical();
     let (target, from) = if transparent && !peer_ip.is_loopback() {
@@ -313,14 +332,116 @@ async fn connection(mut c: TcpStream, peer: SocketAddr, table: &Table, transpare
     if let Some(ip) = from {
         bind_transparent(&sock, ip)?;
     }
-    let mut up = tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(target))
+    let up = tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(target))
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     up.set_nodelay(true)?;
-    up.write_all(&buf[..n]).await?;
-    drop(buf);
+    // The ClientHello is still in `c`: the pipe passes it on first.
     pipe::both(&c, &up).await;
     Ok(())
+}
+
+/// The hostname a connection's ClientHello asks for, read with MSG_PEEK so
+/// the hello stays in the socket for whoever serves it.
+async fn peek_hello(c: &TcpStream) -> io::Result<Option<String>> {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        c.readable().await?;
+        let n = match c.try_io(Interest::READABLE, || crate::sys::peek(c.as_fd(), &mut buf)) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        };
+        match hello::parse(&buf[..n]) {
+            Hello::Done(host) => return Ok(host),
+            Hello::NotTls => return Err(io::ErrorKind::InvalidData.into()),
+            Hello::Need(need) if need > MAX_HELLO => return Err(io::ErrorKind::InvalidData.into()),
+            // More of the hello is already there: look again, with room.
+            Hello::Need(need) if n == buf.len() => buf.resize(need, 0),
+            // The rest is on its way (a hello in two segments). A peek
+            // leaves the socket readable, so wait a moment, not for readiness.
+            Hello::Need(_) => tokio::time::sleep(Duration::from_millis(1)).await,
+        }
+    }
+}
+
+/// The router worker's connections to app supervisors' `route.sock`, one
+/// per app port, opened at first use.
+struct Handovers {
+    apps: BTreeMap<u16, (PathBuf, tokio::sync::Mutex<Link>)>,
+}
+
+#[derive(Default)]
+struct Link {
+    stream: Option<tokio::net::UnixStream>,
+    /// After a failed connect: bytes are passed until then, without trying.
+    retry_at: Option<Instant>,
+}
+
+/// How long the router passes bytes before trying an app's socket again.
+const HANDOFF_RETRY: Duration = Duration::from_secs(1);
+
+impl Handovers {
+    fn new(t: &Table) -> Handovers {
+        let apps = t.handoff.iter().map(|(p, path)| (*p, (path.clone(), tokio::sync::Mutex::default()))).collect();
+        Handovers { apps }
+    }
+
+    /// Hand `c` to the supervisor of the app on `port`: true once it has
+    /// queued it for a worker. False (the caller passes bytes instead)
+    /// when the app takes no connections this way (its workers listen on
+    /// the port themselves) or its supervisor is not there.
+    async fn give(&self, port: u16, c: &TcpStream) -> bool {
+        let Some((path, link)) = self.apps.get(&port) else { return false };
+        let mut link = link.lock().await;
+        if link.retry_at.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        if link.stream.is_none() {
+            match tokio::net::UnixStream::connect(path).await {
+                Ok(s) => link.stream = Some(s),
+                Err(_) => {
+                    link.retry_at = Some(Instant::now() + HANDOFF_RETRY);
+                    return false;
+                }
+            }
+        }
+        let s = link.stream.as_ref().expect("connected above");
+        match tokio::time::timeout(CONNECT_TIMEOUT, send_and_confirm(s, c)).await {
+            Ok(Ok(())) => true,
+            _ => {
+                // Unknown whether it took it: start over with a new link.
+                // The connection is passed byte by byte this time only if
+                // the supervisor never got it (a failed send).
+                link.stream = None;
+                false
+            }
+        }
+    }
+}
+
+/// One byte with the socket attached, then the supervisor's one byte back.
+async fn send_and_confirm(s: &tokio::net::UnixStream, c: &TcpStream) -> io::Result<()> {
+    loop {
+        s.writable().await?;
+        match s.try_io(Interest::WRITABLE, || crate::sys::send_with_fd(s.as_fd(), b"c", c.as_fd())) {
+            Ok(1) => break,
+            Ok(_) => return Err(io::ErrorKind::WriteZero.into()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let mut b = [0u8; 1];
+    loop {
+        s.readable().await?;
+        match s.try_read(&mut b) {
+            Ok(1) if b[0] == b'y' => return Ok(()),
+            Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Bind a socket to a visitor's (non-local) address (Linux, IP_TRANSPARENT).
@@ -365,6 +486,21 @@ mod tests {
         let t = t(&[("a.test", 1)]);
         assert_eq!(t.lookup(Some("b.test")), None);
         assert_eq!(t.lookup(None), None);
+    }
+
+    #[test]
+    fn apps_on_routed_ports_get_a_handoff_socket() {
+        let app = |text: &str| Config::parse(text).unwrap();
+        let apps = [
+            app("[app]\nname = \"api\"\nport = 8443\n"),
+            app("[app]\nname = \"edge\"\nport = 443\n[route]\nhosts = { \"a.test\" = 9 }\n"),
+        ];
+        let r: Route = toml::from_str("hosts = { \"a.test\" = \"api\", \"b.test\" = 9000 }").unwrap();
+        let t = table_with(&r, &apps);
+        assert_eq!(t.routes["a.test"], 8443);
+        assert_eq!(t.handoff.get(&8443), Some(&handoff_socket(&apps[0])));
+        assert!(!t.handoff.contains_key(&9000), "a port no app config has: bytes are passed");
+        assert!(handoff_socket(&apps[0]).ends_with("api/route.sock"));
     }
 
     #[test]

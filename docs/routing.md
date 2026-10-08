@@ -34,6 +34,31 @@ picks up an app that moved) or a port number. `*.example.com` matches one
 label (`www.example.com`, not `a.b.example.com`); `"*"` takes every other
 hostname, and connections that name none.
 
+## Handing connections over
+
+The router only peeks at the ClientHello and leaves it in the socket. When
+the app's supervisor takes connections from Warden, the
+router hands the socket itself to it over `route.sock` in the app's runtime
+directory, and the app's worker serves it as if it had accepted it. From then
+on the router is out of the path: no second connection, no bytes copied, and
+the app sees the visitor's own address without any routing rules.
+
+An app named in a `[route]` on the same host takes its connections this way
+when its supervisor starts (start the router's config first, or restart the
+app after adding it to `hosts`; `WARDEN_HANDOFF=0` turns it off). Which
+workers can take a handed-over socket:
+
+- **Bun.serve**: with a Bun that has `server.adopt(fd)` (proposed upstream,
+  oven-sh/bun#44768). Stock Bun cannot, so its workers listen on the port as
+  usual and the router passes the bytes instead.
+- **node:http / node:https** under Node: always.
+
+Measured with a Node HTTPS app (2 workers, HTTP/1.1, client in its own
+network namespace): 30-40k requests/s handed over, 32-35k direct, 14-23k
+when the router copies. With a patched Bun the hand-off measured level with
+Bun direct on HTTP/2 (235-315k against 274-304k requests/s), at about 40 µs
+more CPU per new connection.
+
 ## The visitor's IP address
 
 With `client_ip` (on by default on Linux) the router connects to the app from
@@ -62,7 +87,7 @@ The app has to listen on all addresses (`0.0.0.0` or `::`), not only
 macOS). The rules use priority and table 22356, so run one router app per
 host.
 
-## Workers and speed
+## Workers and speed (when bytes are passed)
 
 The router runs one worker per CPU core by default (`[workers] count` sets
 another number), and the kernel spreads connections over them

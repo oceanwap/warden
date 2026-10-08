@@ -28,6 +28,13 @@
 //! number without reading from it, so a TLS ClientHello is still there for
 //! Bun.serve) instead of `"type":"net.Socket"`. Everything else is the same.
 //!
+//! The hostname router (`[route]`, `crate::router`) hands connections over
+//! too: on `route.sock` in the app's runtime directory, it sends each one as
+//! a single byte with the socket attached, and gets a byte back once the
+//! connection is queued here; from then on it goes to a worker like one
+//! accepted on the port. The router only peeked at the ClientHello, so the
+//! app reads it as if it had accepted the connection itself.
+//!
 //! The dispatcher runs on its own thread (with its own small runtime), so the
 //! supervisor's loop (logs, IPC, timers) never delays a connection.
 
@@ -61,6 +68,16 @@ const REFUSED_WARN_EVERY: Duration = Duration::from_secs(60);
 pub struct Handoff {
     ctl: mpsc::UnboundedSender<Ctl>,
     pub addr: SocketAddr,
+    /// `route.sock`, removed when the dispatcher stops.
+    router: Option<std::path::PathBuf>,
+}
+
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        if let Some(p) = &self.router {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 /// How a worker takes its connections: the `type` of the `NODE_HANDLE` message.
@@ -75,6 +92,7 @@ pub enum Kind {
 enum Ctl {
     Add(u64, OwnedFd, Kind),
     Remove(u64),
+    Router(std::os::unix::net::UnixListener),
 }
 
 /// An accepted connection on its way to a worker.
@@ -117,7 +135,20 @@ impl Handoff {
             };
             rt.block_on(run(app, OwnedFd::from(listener), rx));
         })?;
-        Ok(Handoff { ctl: tx, addr })
+        Ok(Handoff { ctl: tx, addr, router: None })
+    }
+
+    /// Take connections from the hostname router on `path` too (owner-only
+    /// Unix socket; a stale one is replaced).
+    pub fn serve_router(&mut self, path: &std::path::Path) -> io::Result<()> {
+        let _ = std::fs::remove_file(path);
+        let l = std::os::unix::net::UnixListener::bind(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        l.set_nonblocking(true)?;
+        self.router = Some(path.to_path_buf());
+        let _ = self.ctl.send(Ctl::Router(l));
+        Ok(())
     }
 
     /// `inst` is ready: connections may go to it over `channel` (its fd 4),
@@ -175,6 +206,9 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                     }
                 }
                 Some(Ctl::Remove(inst)) => drop_worker(&mut workers, inst),
+                Some(Ctl::Router(l)) => {
+                    tokio::spawn(from_router(l, back_tx.clone()));
+                }
             },
             b = back_rx.recv() => match b {
                 Some(Back::Again(conn)) => dispatch(&workers, &mut next, conn, &mut waiting),
@@ -240,6 +274,36 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
                 }
             }
         }
+    }
+}
+
+/// Connections the hostname router hands over (`route.sock`): each router
+/// worker keeps one Unix connection open and sends a byte with each socket;
+/// the byte back says it is queued here (the router then closes its copy).
+async fn from_router(l: std::os::unix::net::UnixListener, back: mpsc::UnboundedSender<Back>) {
+    let Ok(l) = tokio::net::UnixListener::from_std(l) else { return };
+    while let Ok((s, _)) = l.accept().await {
+        let back = back.clone();
+        tokio::spawn(async move {
+            loop {
+                if s.readable().await.is_err() {
+                    return;
+                }
+                let got = s.try_io(Interest::READABLE, || crate::sys::recv_with_fd(s.as_fd(), 1));
+                match got {
+                    Ok((b, _)) if b.is_empty() => return,
+                    Ok((_, Some(fd))) => {
+                        let _ = back.send(Back::Again(Conn { fd, refused: 0 }));
+                        if s.writable().await.is_err() || s.try_write(b"y").is_err() {
+                            return;
+                        }
+                    }
+                    Ok((_, None)) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                }
+            }
+        });
     }
 }
 
@@ -533,6 +597,44 @@ mod tests {
         assert!(line.contains(r#""type":"fd""#) && line.contains(MESSAGE), "{line}");
         assert!(fd.is_some(), "a descriptor came with it");
         (&theirs).write_all(b"{\"cmd\":\"NODE_HANDLE_ACK\"}\n").unwrap();
+    }
+
+    /// The hostname router's hand-over: a socket sent on `route.sock` is
+    /// confirmed with "y" and reaches a worker like an accepted one.
+    #[test]
+    fn a_connection_from_the_router_goes_to_a_worker() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("warden-handoff-router-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("route.sock");
+        let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
+        let mut h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
+        h.serve_router(&path).unwrap();
+        h.add(1, ours, Kind::Fd);
+        // A visitor's connection, as the router holds it.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut visitor = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (held, _) = l.accept().unwrap();
+        visitor.write_all(b"hello").unwrap();
+        let router = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        router.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(crate::sys::send_with_fd(router.as_fd(), b"c", held.as_fd()).unwrap(), 1);
+        let mut b = [0u8; 1];
+        (&router).read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"y");
+        drop(held);
+        let theirs = std::os::unix::net::UnixStream::from(theirs);
+        theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (line, fd) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
+        assert!(String::from_utf8_lossy(&line).contains(r#""type":"fd""#));
+        let mut got = std::net::TcpStream::from(fd.expect("the socket came with it"));
+        let mut buf = [0u8; 5];
+        got.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hello", "the bytes the router left in the socket");
+        drop(h);
+        assert!(!path.exists(), "route.sock goes with the dispatcher");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A connection accepted here arrives at the other end of the channel

@@ -920,6 +920,24 @@ pub fn has_unread(fd: std::os::fd::RawFd) -> bool {
     n > 0
 }
 
+/// Copy what is waiting on a socket into `buf` without taking it off the
+/// queue (MSG_PEEK), never blocking: `WouldBlock` when nothing is there, 0
+/// when the peer has closed. The router reads a ClientHello this way, so the
+/// connection can be handed over with the hello still in it.
+pub fn peek(sock: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: `buf` is valid and exclusively borrowed for `buf.len()` bytes;
+    // the socket is borrowed, so it stays open for the call.
+    let n = unsafe {
+        libc::recv(
+            sock.as_raw_fd(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
 /// Make later `send`s and `sendfile`s on this connection fail with EPIPE
 /// instead of raising SIGPIPE. Linux: nothing to do (`send` passes
 /// MSG_NOSIGNAL per call). Not Linux: SO_NOSIGPIPE, once, when the
@@ -1562,8 +1580,7 @@ pub fn pre_exec_worker(cmd: &mut std::process::Command, ipc_fd: RawFd, target: R
 }
 
 /// Receive one message and the descriptor riding on it, if any (the other
-/// end of [`send_with_fd`]). Blocks like the socket does.
-#[cfg(test)]
+/// end of [`send_with_fd`]), close-on-exec. Blocks like the socket does.
 pub fn recv_with_fd(sock: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<u8>, Option<OwnedFd>)> {
     let mut buf = vec![0u8; max];
     // SAFETY: CMSG_SPACE is a pure size computation.
@@ -1576,8 +1593,12 @@ pub fn recv_with_fd(sock: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<u8>, Op
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
     // SAFETY: `msg` points at buffers that outlive the call.
-    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, flags) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1589,6 +1610,10 @@ pub fn recv_with_fd(sock: BorrowedFd<'_>, max: usize) -> io::Result<(Vec<u8>, Op
         (!cmsg.is_null() && (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS)
             .then(|| OwnedFd::from_raw_fd(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const RawFd)))
     };
+    #[cfg(not(target_os = "linux"))]
+    if let Some(f) = &fd {
+        set_cloexec(f.as_fd(), false)?;
+    }
     Ok((buf, fd))
 }
 

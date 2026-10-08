@@ -547,14 +547,17 @@ fn worker_mode_supported(cfg: &Config, macos: bool) -> Result<(), String> {
 
 /// Whether connections are handed to the workers (`crate::handoff`): by
 /// default where the kernel does not spread a shared port (`macos`), for a
-/// process-mode app with the shim, a port and more than one worker.
+/// process-mode app with the shim, a port and more than one worker; and for
+/// an app the hostname router sends connections to (`routed`,
+/// `router::routed`), with any number of workers, so the router hands them
+/// over instead of passing their bytes.
 /// `WARDEN_HANDOFF=1` / `0` (the supervisor's environment) turns it on or off
 /// anywhere. Standbys and `[static]` keep listening themselves.
-fn handoff_wanted(cfg: &Config, var: Option<&str>, macos: bool) -> bool {
+fn handoff_wanted(cfg: &Config, var: Option<&str>, macos: bool, routed: bool) -> bool {
     let on = match var {
         Some("1") => true,
         Some("0") => false,
-        _ => macos && cfg.workers.count > 1,
+        _ => (macos && cfg.workers.count > 1) || routed,
     };
     on && cfg.app.port.is_some()
         && cfg.shim_enabled()
@@ -571,6 +574,10 @@ fn sync_route_rules(env: &[(String, String)]) {
     let Some((_, text)) = env.iter().find(|(k, _)| k == "WARDEN_ROUTE") else { return };
     let Ok(table) = serde_json::from_str::<crate::router::Table>(text) else { return };
     if !table.client_ip {
+        // Turned off by a reload: the rules go.
+        if crate::router::rules::in_place() {
+            crate::router::rules::clear();
+        }
         return;
     }
     if let Err(e) = crate::router::rules::sync(&table.ports()) {
@@ -603,6 +610,7 @@ impl Supervisor {
                 &cfg,
                 std::env::var("WARDEN_HANDOFF").ok().as_deref(),
                 cfg!(target_os = "macos"),
+                crate::router::routed(&cfg),
             ),
             handoff: None,
             handoff_old_bun: None,
@@ -1953,6 +1961,16 @@ impl Supervisor {
                 ),
                 _ => Err(e),
             })?;
+        let mut h = h;
+        let route_sock = crate::router::handoff_socket(&self.cfg);
+        if let Err(e) = h.serve_router(&route_sock) {
+            warn!(
+                "the hostname router cannot hand connections to this app; it passes their bytes instead",
+                path = route_sock.display(),
+                error = e,
+                hint = "Warden could not create that Unix socket in the app's runtime directory",
+            );
+        }
         info!(
             "workers take connections from Warden",
             address = h.addr,
@@ -3193,12 +3211,18 @@ mod tests {
                 .unwrap()
         };
         let two = cfg("[workers]\ncount = 2\n");
-        assert!(handoff_wanted(&two, None, true), "macOS, 2 workers");
-        assert!(!handoff_wanted(&two, None, false), "the kernel spreads the port elsewhere");
-        assert!(!handoff_wanted(&cfg("[workers]\ncount = 1\n"), None, true), "one worker: nothing to spread");
-        assert!(handoff_wanted(&two, Some("1"), false) && !handoff_wanted(&two, Some("0"), true), "WARDEN_HANDOFF");
-        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nport_strategy = \"offset\"\n"), None, true));
-        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nstandby = 1\n"), None, true), "standbys listen");
+        assert!(handoff_wanted(&two, None, true, false), "macOS, 2 workers");
+        assert!(!handoff_wanted(&two, None, false, false), "the kernel spreads the port elsewhere");
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 1\n"), None, true, false), "one worker: nothing to spread");
+        assert!(
+            handoff_wanted(&two, Some("1"), false, false) && !handoff_wanted(&two, Some("0"), true, false),
+            "WARDEN_HANDOFF"
+        );
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nport_strategy = \"offset\"\n"), None, true, false));
+        assert!(!handoff_wanted(&cfg("[workers]\ncount = 2\nstandby = 1\n"), None, true, false), "standbys listen");
+        let one = cfg("[workers]\ncount = 1\n");
+        assert!(handoff_wanted(&one, None, false, true), "an app the router sends to, one worker, Linux");
+        assert!(!handoff_wanted(&one, Some("0"), false, true), "WARDEN_HANDOFF=0 still wins");
     }
 
     #[test]
