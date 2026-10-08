@@ -30,8 +30,8 @@
 //!
 //! The hostname router (`[route]`, `crate::router`) hands connections over
 //! too: on `route.sock` in the app's runtime directory, it sends each one as
-//! a single byte with the socket attached, and gets a byte back once the
-//! connection is queued here; from then on it goes to a worker like one
+//! a single byte with the socket attached (`C`; routers before 0.1.5 send `c`
+//! and wait for a `y` back); from then on it goes to a worker like one
 //! accepted on the port. The router only peeked at the ClientHello, so the
 //! app reads it as if it had accepted the connection itself.
 //!
@@ -291,8 +291,8 @@ async fn run(app: String, listener: Option<OwnedFd>, mut ctl: mpsc::UnboundedRec
 }
 
 /// Connections the hostname router hands over (`route.sock`): each router
-/// worker keeps one Unix connection open and sends a byte with each socket;
-/// the byte back says it is queued here (the router then closes its copy).
+/// worker keeps one Unix connection open and sends a byte with each socket,
+/// then closes its copy.
 async fn from_router(l: std::os::unix::net::UnixListener, back: mpsc::UnboundedSender<Back>) {
     let Ok(l) = tokio::net::UnixListener::from_std(l) else { return };
     while let Ok((s, _)) = l.accept().await {
@@ -305,9 +305,10 @@ async fn from_router(l: std::os::unix::net::UnixListener, back: mpsc::UnboundedS
                 let got = s.try_io(Interest::READABLE, || crate::sys::recv_with_fd(s.as_fd(), 1));
                 match got {
                     Ok((b, _)) if b.is_empty() => return,
-                    Ok((_, Some(fd))) => {
+                    Ok((b, Some(fd))) => {
                         let _ = back.send(Back::Again(Conn { fd, refused: 0 }));
-                        if s.writable().await.is_err() || s.try_write(b"y").is_err() {
+                        // `c` (routers before 0.1.5) waits for the `y`; `C` does not.
+                        if b[0] == b'c' && (s.writable().await.is_err() || s.try_write(b"y").is_err()) {
                             return;
                         }
                     }
@@ -612,11 +613,17 @@ mod tests {
         (&theirs).write_all(b"{\"cmd\":\"NODE_HANDLE_ACK\"}\n").unwrap();
     }
 
-    /// The hostname router's hand-over: a socket sent on `route.sock` is
-    /// confirmed with "y" and reaches a worker like an accepted one.
+    /// The hostname router's hand-over: a socket sent on `route.sock` with
+    /// `C` gets no answer and reaches a worker like an accepted one.
     #[test]
     fn a_connection_from_the_router_goes_to_a_worker() {
-        router_hands_over(Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap(), "port");
+        router_hands_over(Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap(), "port", b'C');
+    }
+
+    /// A router from before 0.1.5 sends `c` and waits for a `y`: it gets one.
+    #[test]
+    fn an_older_router_gets_its_confirmation() {
+        router_hands_over(Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap(), "old", b'c');
     }
 
     /// Without a port of its own (the workers listen themselves): the
@@ -625,10 +632,10 @@ mod tests {
     fn a_dispatcher_for_the_router_only_has_no_port() {
         let h = Handoff::router_only("t").unwrap();
         assert!(h.addr.is_none());
-        router_hands_over(h, "only");
+        router_hands_over(h, "only", b'C');
     }
 
-    fn router_hands_over(mut h: Handoff, tag: &str) {
+    fn router_hands_over(mut h: Handoff, tag: &str, byte: u8) {
         use std::io::{Read, Write};
         let dir = std::env::temp_dir().join(format!("warden-handoff-router-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -644,10 +651,7 @@ mod tests {
         visitor.write_all(b"hello").unwrap();
         let router = std::os::unix::net::UnixStream::connect(&path).unwrap();
         router.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(crate::sys::send_with_fd(router.as_fd(), b"c", held.as_fd()).unwrap(), 1);
-        let mut b = [0u8; 1];
-        (&router).read_exact(&mut b).unwrap();
-        assert_eq!(&b, b"y");
+        assert_eq!(crate::sys::send_with_fd(router.as_fd(), &[byte], held.as_fd()).unwrap(), 1);
         drop(held);
         let theirs = std::os::unix::net::UnixStream::from(theirs);
         theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -657,6 +661,14 @@ mod tests {
         let mut buf = [0u8; 5];
         got.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"hello", "the bytes the router left in the socket");
+        let mut b = [0u8; 1];
+        if byte == b'c' {
+            (&router).read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"y");
+        } else {
+            router.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            assert!((&router).read(&mut b).is_err(), "no answer to `C`");
+        }
         drop(h);
         assert!(!path.exists(), "route.sock goes with the dispatcher");
         let _ = std::fs::remove_dir_all(&dir);

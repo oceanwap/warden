@@ -168,8 +168,10 @@ in worker mode. Enabled by default when `command` is `bun`. It:
    on its port until Warden sends `promote` on fd 3 (F15).
 
 fd 3 is a Unix socketpair (`sys::socketpair_cloexec`): the worker writes its
-reports as JSON lines; Warden writes to it only to promote a standby, and
-only a standby's shim reads it. It has room for hours of heartbeats, and
+reports as JSON lines; Warden writes to it only to promote a standby and,
+before a shim worker starts, one fixed 132-byte line with the app's shared
+TLS ticket key (`warden-tls-ticket <since> <key>`, `WARDEN_TLS_TICKET=1`),
+which the shim reads first thing. Otherwise only a standby's shim reads it. It has room for hours of heartbeats, and
 under Warden's own code (the shim, the host, the static server) the
 worker's end is non-blocking (`sys::prepare_ipc_socket`,
 `Spec::ipc_nonblocking`): a stopped Warden (SIGSTOP, a frozen VM, a bug)

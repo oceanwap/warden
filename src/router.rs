@@ -444,12 +444,11 @@ impl Handovers {
             }
         }
         let s = link.stream.as_ref().expect("connected above");
-        match tokio::time::timeout(CONNECT_TIMEOUT, send_and_confirm(s, c)).await {
+        match tokio::time::timeout(CONNECT_TIMEOUT, send_connection(s, c)).await {
             Ok(Ok(())) => true,
             _ => {
-                // Unknown whether it took it: start over with a new link.
-                // The connection is passed byte by byte this time only if
-                // the supervisor never got it (a failed send).
+                // Not sent: the supervisor never got it, so it is passed
+                // byte by byte this time, and the next one tries a new link.
                 link.stream = None;
                 false
             }
@@ -457,23 +456,26 @@ impl Handovers {
     }
 }
 
-/// One byte with the socket attached, then the supervisor's one byte back.
-async fn send_and_confirm(s: &tokio::net::UnixStream, c: &TcpStream) -> io::Result<()> {
+/// One byte with the socket attached: `C`, "queued is enough". Once sendmsg
+/// succeeds the descriptor is in the supervisor's queue, so the router does
+/// not wait for an answer. (`c`, from routers before 0.1.5, asks for a `y`
+/// back; a supervisor that old answers `C` with `y` too, and those bytes are
+/// read off and dropped here.)
+async fn send_connection(s: &tokio::net::UnixStream, c: &TcpStream) -> io::Result<()> {
+    let mut stale = [0u8; 64];
     loop {
-        s.writable().await?;
-        match s.try_io(Interest::WRITABLE, || crate::sys::send_with_fd(s.as_fd(), b"c", c.as_fd())) {
-            Ok(1) => break,
-            Ok(_) => return Err(io::ErrorKind::WriteZero.into()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+        match s.try_read(&mut stale) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
     }
-    let mut b = [0u8; 1];
     loop {
-        s.readable().await?;
-        match s.try_read(&mut b) {
-            Ok(1) if b[0] == b'y' => return Ok(()),
-            Ok(_) => return Err(io::ErrorKind::InvalidData.into()),
+        s.writable().await?;
+        match s.try_io(Interest::WRITABLE, || crate::sys::send_with_fd(s.as_fd(), b"C", c.as_fd())) {
+            Ok(1) => return Ok(()),
+            Ok(_) => return Err(io::ErrorKind::WriteZero.into()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
         }

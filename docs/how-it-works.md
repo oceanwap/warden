@@ -40,6 +40,16 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   dying Worker, and Warden replaces the host.
 - **Health checks through a shared port hit a random worker.** The shim gives
   each worker a private Unix socket, so Warden can check *that* worker.
+- **Each worker makes its own TLS session-ticket key**, so a returning
+  visitor's ticket only resumes on the worker that issued it: 1 in N with N
+  workers, the rest paying for a full handshake (about a third more server
+  CPU under Node, a quarter under Bun). Warden gives all of an app's workers
+  one key, made when its supervisor starts and handed to each worker on fd 3
+  before it runs (never in its environment), and the shim sets it on the
+  app's Node `https`/`http2` servers. The key moves forward every 12 hours
+  by a one-way step, so no worker holds an earlier period's key. An app that
+  sets its own `ticketKeys` keeps them. Bun.serve ignores `ticketKeys` (Bun
+  1.4), so Bun apps keep one key per worker for now.
 
 ## Limitations
 
