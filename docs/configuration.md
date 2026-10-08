@@ -48,6 +48,7 @@ path = "/health"          # checked on each worker's private socket
 | `entry` | none | Worker mode: the module each Worker imports |
 | `working_directory` | | Where workers run; relative to the config file |
 | `port` | none | Sets `PORT` and enables readiness detection (a worker is ready when it listens) |
+| `address` | none | The app's own IP address (an IPv6 from the server's /64, or a spare IPv4): the app listens on `address:port` only, so several apps can each have port 443 ([routing.md](routing.md#one-address-per-app-nothing-in-between)). On Linux Warden adds a missing address to the default route's interface (needs root) and removes it when the app stops |
 | `env` | `{}` | Environment variables, e.g. `{ NODE_ENV = "production" }` |
 | `env_file` | none | `KEY=value` lines (dotenv / systemd `EnvironmentFile`), relative to the config file, read again by `warden reload`. Keep secrets there (mode 0600). See [Environment variables](#environment-variables) |
 | `shim` | `true` when `command` is `bun` or `node`, else `false` | The shim: `reusePort`, readiness, drain, private health socket |

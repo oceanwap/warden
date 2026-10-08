@@ -1767,6 +1767,46 @@ fn static_responses_are_counted_and_can_be_turned_off() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `[app] address`: the app's listen on its port is on that address, whatever
+/// host it asked for (the fixtures ask for 127.0.0.1 or none), under Bun.serve,
+/// Bun's node:http and Node. 127.0.0.2 stands in for an address of the
+/// server's own: Linux has every 127.x already, so nothing is added.
+#[test]
+#[cfg(target_os = "linux")]
+fn an_app_listens_on_its_own_address() {
+    if !have_bun() {
+        return;
+    }
+    let get2 = |port: u16| -> Option<String> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 2], port));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).ok()?;
+        buf.starts_with("HTTP/1.1 2").then_some(buf)
+    };
+    let mut cases = vec![("bun", fixture("app.ts")), ("bun", fixture("node_http.mjs"))];
+    if have_node() {
+        cases.push(("node", fixture("node_http.mjs")));
+    }
+    for (i, (command, script)) in cases.into_iter().enumerate() {
+        let port = free_port();
+        let name = format!("addr{i}");
+        let w = Warden::start(
+            &name,
+            port,
+            &format!(
+                "[app]\nname = \"{name}\"\ncommand = \"{command}\"\nargs = [\"{script}\"]\nport = {port}\n\
+                 address = \"127.0.0.2\"\n[workers]\ncount = 2\n"
+            ),
+        );
+        w.wait_for("2 ready", T, ready(2));
+        assert!(get2(port).is_some(), "{command} {script}: answers on 127.0.0.2:{port}\n{}", w.log());
+        assert!(get(port, "/").is_none(), "{command} {script}: not on 127.0.0.1, the host it asked for");
+    }
+}
+
 #[test]
 fn node_workers_share_a_port_through_the_shim() {
     if !have_bun() || !have_node() {

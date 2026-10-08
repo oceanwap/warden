@@ -110,7 +110,7 @@ Every number, the method and the caveats, including the one synthetic file per s
 
 Each app serves its own TLS and HTTP/2, so nothing needs to sit in front of it. **Putting nginx in front slows the server down:** decrypting and re-sending every request cost 3–7× the CPU of the app answering alone, and cut throughput to 13–34 % of it (table below). Fastest first:
 
-1. **One address per app.** Point each hostname at its own IP (an IPv6 /64 gives you plenty) and have each app listen on its address at port 443. The kernel picks the app by address, so there is no layer at all, the same as `direct` below. IPv4 visitors need a spare IPv4 per app; otherwise send them through the router (2). Warden setting the addresses up for you is the next change.
+1. **One address per app.** Point each hostname at its own IP (an IPv6 /64 gives you plenty) and have each app listen on its address at port 443. The kernel picks the app by address, so there is no layer at all, the same as `direct` below. Set `[app] address = "2001:db8::10"` and Warden adds the address and binds the app to it. IPv4 visitors need a spare IPv4 per app; otherwise send them through the router (2), which works alongside.
 2. **One address, Warden's hostname router.** `[route]` on 443 reads the hostname from the TLS hello and hands the connection itself to the app's worker, which then talks to the visitor directly and sees their real IP. Needs a Bun with `server.adopt` (oven-sh/bun#44768) or Node's `node:http`/`node:https`: 93–96 % of direct.
 3. **The same router, copying bytes.** On stock Bun the router passes the bytes instead, with the visitor's IP kept: 45–70 % of direct, level with nginx's own pass-through (`stream` + `ssl_preread`).
 

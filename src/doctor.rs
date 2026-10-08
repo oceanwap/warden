@@ -480,8 +480,7 @@ async fn apps(args: &Args) -> Vec<Finding> {
         if let Some(port) = cfg.as_ref().and_then(|c| c.app.port) {
             let host: std::net::IpAddr = cfg
                 .as_ref()
-                .and_then(|c| c.static_files.as_ref())
-                .and_then(|s| s.host.parse().ok())
+                .and_then(|c| c.app.address.or_else(|| c.static_files.as_ref().and_then(|s| s.host.parse().ok())))
                 .unwrap_or(std::net::IpAddr::from([0, 0, 0, 0]));
             if let Err(e) = crate::sys::listen_tcp(std::net::SocketAddr::new(host, port), false, 1) {
                 if e.raw_os_error() == Some(libc::EADDRINUSE) {
