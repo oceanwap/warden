@@ -1334,6 +1334,7 @@ impl Supervisor {
                 }
                 if msg.handoff == Some(true) && !inst.handoff {
                     inst.handoff = true;
+                    inst.adopt = msg.adopt == Some(true);
                     if let Err(e) = self.open_handoff(msg.host.as_deref()) {
                         let pid = self.insts.get(&inst_id).map(|i| i.handle.pid).unwrap_or(0);
                         error!(
@@ -1465,7 +1466,8 @@ impl Supervisor {
         // nothing for `port_lost` to watch; it joins the rotation instead.
         if inst.handoff {
             if let (Some(h), Some(ch)) = (self.handoff.as_ref(), inst.handle.take_handoff()) {
-                h.add(inst_id, ch);
+                let kind = if inst.adopt { crate::handoff::Kind::Fd } else { crate::handoff::Kind::Socket };
+                h.add(inst_id, ch, kind);
             }
         // It listened, so `[watchdog] port_lost` watches it from now on, even
         // if its server closes before the first look at its sockets.

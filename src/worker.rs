@@ -264,6 +264,8 @@ pub struct ThreadInfo {
 pub struct Instance {
     /// Takes its connections from Warden (`crate::handoff`), not the port.
     pub handoff: bool,
+    /// ...as a bare descriptor (`crate::handoff::Kind::Fd`).
+    pub adopt: bool,
     pub slot: usize,
     pub handle: Handle,
     pub started: Instant,
@@ -328,6 +330,7 @@ impl Instance {
     pub fn new(slot: usize, handle: Handle, role: Role) -> Self {
         Instance {
             handoff: false,
+            adopt: false,
             standby: (role == Role::Standby).then(StandbyGates::default),
             standby_number: None,
             promoted_at: None,

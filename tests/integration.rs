@@ -1890,6 +1890,54 @@ fn handed_over_connections_reach_every_worker_and_survive_a_rolling_restart() {
     }
 }
 
+/// A Bun with `server.adopt(fd)` (proposed upstream; releases up to 1.4.x
+/// have none).
+fn bun_adopts() -> bool {
+    let js = "const s = Bun.serve({ port: 0, fetch: () => new Response() }); \
+              console.log(typeof s.adopt); s.stop(true);";
+    let out = Command::new("bun").args(["-e", js]).env_remove("BUN_OPTIONS").output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "function")
+}
+
+/// The handoff for a Bun.serve app (TLS, served by the app itself): with
+/// `server.adopt(fd)` the shim serves it on a private port and reports
+/// `adopt`, Warden passes the bare descriptor (`"type":"fd"`), and Bun reads
+/// the ClientHello still waiting in the kernel; both workers answer, through
+/// a rolling restart too. A Bun without adopt() listens on the port as
+/// before the handoff (the rest of the test holds).
+#[test]
+fn a_bun_serve_tls_app_adopts_handed_over_connections() {
+    if !have_bun() || !Command::new("curl").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return;
+    }
+    let takes = bun_adopts();
+    let port = free_port();
+    let cfg = gated("adopt", port, 2, "").replace(&fixture("app.ts"), &fixture("tls_app.ts"));
+    let w = Warden::start_env("adopt", port, &cfg, &[("WARDEN_HANDOFF", "1")]);
+    w.wait_for("2 ready", T, ready(2));
+    assert_eq!(w.log().contains("workers take connections from Warden"), takes, "{}", w.log());
+    let url = format!("https://localhost:{port}/");
+    let get_tls = || {
+        let out = Command::new("curl")
+            .args(["-sk", "--max-time", "5", &url])
+            .env("NO_PROXY", "*")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(out.status.success() && !body.is_empty(), "curl: {out:?}\n{}", w.log());
+        body
+    };
+    let pids: HashSet<String> = (0..20).map(|_| get_tls()).collect();
+    if takes || cfg!(target_os = "linux") {
+        assert_eq!(pids, pid_set(&w.status().unwrap()).iter().map(|p| p.to_string()).collect(), "both answer");
+    }
+    let (code, out) = w.cli(&["restart"]);
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    get_tls();
+}
+
 /// Apps written for PM2: readiness from process.send('ready'), graceful stop
 /// on SIGINT.
 #[test]

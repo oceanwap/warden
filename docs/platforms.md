@@ -18,9 +18,12 @@
     and suggests `bun upgrade`); measured on an M-series Mac, 4
     workers of a 1 ms-per-request app served 3.2–3.4× what 1 worker did
     (p99 3 ms instead of 7–10), and a trivial app the same within noise.
-    Apps on `Bun.serve` itself (Elysia, Hono on Bun) cannot take a handed-over
-    connection: they share the port as before (one worker gets the
-    traffic), so keep `count = 1` for them locally. `WARDEN_HANDOFF=0` in
+    Apps on `Bun.serve` itself (Elysia, Hono on Bun) take part when their
+    Bun has `server.adopt(fd)` (proposed upstream): the shim serves them on
+    a private port and Warden passes the bare descriptor (TLS included).
+    Bun releases without it cannot take a handed-over connection: such apps
+    share the port as before (one worker gets the traffic), so keep
+    `count = 1` for them locally. `WARDEN_HANDOFF=0` in
     Warden's environment turns the handoff off (`=1` turns it on elsewhere,
     as the tests do on Linux). It is decided when the supervisor starts: an
     app scaled from 1 worker to more needs a `warden restart`.

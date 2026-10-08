@@ -22,6 +22,12 @@
 //! again at most 3 times: refused a 4th time, it is closed, so a fleet out of
 //! descriptors sheds connections instead of passing them around forever.
 //!
+//! A Bun.serve app takes part when its Bun has `server.adopt(fd)`: its shim
+//! reports `adopt: true` with `listening`, and its connections go out as
+//! `"type":"fd"` (the bare descriptor, which Bun hands to the shim as a
+//! number without reading from it, so a TLS ClientHello is still there for
+//! Bun.serve) instead of `"type":"net.Socket"`. Everything else is the same.
+//!
 //! The dispatcher runs on its own thread (with its own small runtime), so the
 //! supervisor's loop (logs, IPC, timers) never delays a connection.
 
@@ -57,8 +63,17 @@ pub struct Handoff {
     pub addr: SocketAddr,
 }
 
+/// How a worker takes its connections: the `type` of the `NODE_HANDLE` message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `"net.Socket"`: Node's own; the shim emits it on a node:http server.
+    Socket,
+    /// `"fd"`: the bare descriptor, for Bun.serve's `server.adopt(fd)`.
+    Fd,
+}
+
 enum Ctl {
-    Add(u64, OwnedFd),
+    Add(u64, OwnedFd, Kind),
     Remove(u64),
 }
 
@@ -105,9 +120,10 @@ impl Handoff {
         Ok(Handoff { ctl: tx, addr })
     }
 
-    /// `inst` is ready: connections may go to it over `channel` (its fd 4).
-    pub fn add(&self, inst: u64, channel: OwnedFd) {
-        let _ = self.ctl.send(Ctl::Add(inst, channel));
+    /// `inst` is ready: connections may go to it over `channel` (its fd 4),
+    /// as `kind` says.
+    pub fn add(&self, inst: u64, channel: OwnedFd, kind: Kind) {
+        let _ = self.ctl.send(Ctl::Add(inst, channel, kind));
     }
 
     /// `inst` stops getting connections (it drains, or is gone).
@@ -148,11 +164,11 @@ async fn run(app: String, listener: OwnedFd, mut ctl: mpsc::UnboundedReceiver<Ct
         tokio::select! {
             c = ctl.recv() => match c {
                 None => break,
-                Some(Ctl::Add(inst, channel)) => {
+                Some(Ctl::Add(inst, channel, kind)) => {
                     let (tx, rx) = mpsc::unbounded_channel();
                     let pending = Arc::new(AtomicUsize::new(0));
                     let closed = Arc::new(AtomicBool::new(false));
-                    tokio::spawn(deliver(inst, channel, rx, pending.clone(), closed.clone(), back_tx.clone()));
+                    tokio::spawn(deliver(inst, channel, kind, rx, pending.clone(), closed.clone(), back_tx.clone()));
                     workers.push(Worker { inst, tx, pending, closed });
                     while let Some(conn) = waiting.pop_front() {
                         dispatch(&workers, &mut next, conn, &mut waiting);
@@ -290,6 +306,7 @@ fn pick(loads: impl Iterator<Item = usize>, start: usize) -> Option<usize> {
 async fn deliver(
     inst: u64,
     channel: OwnedFd,
+    kind: Kind,
     mut rx: mpsc::UnboundedReceiver<Conn>,
     pending: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
@@ -303,7 +320,7 @@ async fn deliver(
             return give_back(&mut rx, &back, &pending).await;
         }
     };
-    let line = format!(r#"{{"cmd":"NODE_HANDLE","type":"net.Socket","msg":"{MESSAGE}","key":null}}"#) + "\n";
+    let line = handle_line(kind);
     let mut buf = Vec::with_capacity(256);
     while let Some(conn) = rx.recv().await {
         if closed.load(Ordering::Acquire) {
@@ -343,6 +360,15 @@ async fn give_back(rx: &mut mpsc::UnboundedReceiver<Conn>, back: &mpsc::Unbounde
         pending.fetch_sub(1, Ordering::AcqRel);
         let _ = back.send(Back::Again(conn));
     }
+}
+
+/// The `NODE_HANDLE` line a connection goes out with.
+fn handle_line(kind: Kind) -> String {
+    let ty = match kind {
+        Kind::Socket => "net.Socket",
+        Kind::Fd => "fd",
+    };
+    format!(r#"{{"cmd":"NODE_HANDLE","type":"{ty}","msg":"{MESSAGE}","key":null}}"#) + "\n"
 }
 
 /// Write `line` with `conn` attached to the first byte.
@@ -423,6 +449,19 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_that_adopts_descriptors_gets_type_fd() {
+        let parse = |k| serde_json::from_str::<serde_json::Value>(handle_line(k).trim_end()).unwrap();
+        let socket = parse(Kind::Socket);
+        assert_eq!(socket["cmd"], "NODE_HANDLE");
+        assert_eq!(socket["type"], "net.Socket");
+        assert_eq!(socket["msg"], MESSAGE);
+        let fd = parse(Kind::Fd);
+        assert_eq!(fd["type"], "fd");
+        assert_eq!(fd["msg"], MESSAGE, "the same message either way");
+        assert!(handle_line(Kind::Fd).ends_with('\n'));
+    }
+
+    #[test]
     fn a_refused_connection_is_sent_again_three_times_like_node_then_closed() {
         let (fd, _peer) = crate::sys::socketpair_cloexec().unwrap();
         let mut conn = Conn { fd, refused: 0 };
@@ -452,7 +491,7 @@ mod tests {
         use std::io::{Read, Write};
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
         let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
-        h.add(1, ours);
+        h.add(1, ours, Kind::Socket);
         let mut client = std::net::TcpStream::connect(h.addr).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let theirs = std::os::unix::net::UnixStream::from(theirs);
@@ -478,6 +517,24 @@ mod tests {
         assert!(String::from_utf8_lossy(&line).contains("NODE_HANDLE") && fd.is_some());
     }
 
+    /// A worker added with `Kind::Fd` gets its connections as `"type":"fd"`,
+    /// with the descriptor attached all the same.
+    #[test]
+    fn an_adopting_worker_gets_its_connections_as_fd() {
+        use std::io::Write;
+        let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
+        let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
+        h.add(1, ours, Kind::Fd);
+        let _client = std::net::TcpStream::connect(h.addr).unwrap();
+        let theirs = std::os::unix::net::UnixStream::from(theirs);
+        theirs.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let (line, fd) = crate::sys::recv_with_fd(theirs.as_fd(), 4096).unwrap();
+        let line = String::from_utf8(line).unwrap();
+        assert!(line.contains(r#""type":"fd""#) && line.contains(MESSAGE), "{line}");
+        assert!(fd.is_some(), "a descriptor came with it");
+        (&theirs).write_all(b"{\"cmd\":\"NODE_HANDLE_ACK\"}\n").unwrap();
+    }
+
     /// A connection accepted here arrives at the other end of the channel
     /// as a working socket, and the next one waits for the acknowledgement.
     #[test]
@@ -485,7 +542,7 @@ mod tests {
         use std::io::{Read, Write};
         let (ours, theirs) = crate::sys::socketpair_cloexec().unwrap();
         let h = Handoff::start("t", "127.0.0.1:0".parse().unwrap()).unwrap();
-        h.add(1, ours);
+        h.add(1, ours, Kind::Socket);
         let mut client = std::net::TcpStream::connect(h.addr).unwrap();
         // The worker's side: read the message and the descriptor.
         let theirs = std::os::unix::net::UnixStream::from(theirs);
