@@ -3,6 +3,15 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- A Bun app that serves TLS itself (`Bun.serve({ tls })`, with no proxy in
+  front) failed every health check, so with `[health]` set each reload rolled
+  back ("not an HTTP response"). The shim's private health socket copied the
+  app's `tls` options; it now stays plain HTTP. The public port keeps its TLS.
+
 ## [0.1.3] — 2026-10-08
 
 ### Added
