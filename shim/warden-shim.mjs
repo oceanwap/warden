@@ -233,6 +233,9 @@ function openPrivateBun(options) {
     p.port = undefined;
     p.hostname = undefined;
     p.reusePort = false;
+    // Warden checks this socket over plain HTTP: an app that serves TLS
+    // itself must not make the private socket TLS too.
+    p.tls = undefined;
     privateServer = originalServe.call(Bun, p);
     privatePath = path;
     return path;
