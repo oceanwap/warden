@@ -61,6 +61,11 @@ APPS (familiar from PM2):
                      --basic-auth user:pass (or --basic-auth-username/-password)
                      --html-max-age SECONDS (browsers reuse HTML pages that long; default:
                      revalidate on every page load)
+    expose <host>... --app <app>   Send a hostname to the app through nginx: writes the
+                     app's nginx site file, checks it (nginx -t), reloads nginx, and records
+                     the hostnames in the app's config. HTTPS: --acme <email> (nginx gets a
+                     Let's Encrypt certificate itself) or --cert/--key; --websocket/--sse
+                     PATH, --remove, --dry-run (--help)
     save             Remember the running apps, worker counts and stopped state
     resurrect        Start what `save` remembered (and wardend, if it is not running), the
                      apps at the same time but no more than one per CPU core at once:
@@ -181,6 +186,8 @@ pub enum Command {
     WattpmMigrate(Box<crate::migrate_wattpm::Opts>),
     /// `warden gui-install`: the desktop app of this release (install.sh --gui-only).
     GuiInstall(Box<crate::gui_install::Opts>),
+    /// `warden expose <host> --app <app>`: the app's nginx site file.
+    Expose(Box<crate::expose::Opts>),
     /// `warden upgrade`: the newest release installed, everything restarted onto it.
     Upgrade(Box<crate::upgrade::Opts>),
     /// wardend, the internal entry point (not in `--help`): launchd, systemd, the
@@ -370,6 +377,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     // Its --version is a release (as install.sh's), not "print the version".
     if argv.first().map(String::as_str) == Some("gui-install") {
         return crate::gui_install::parse_args(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("expose") {
+        return crate::expose::parse_args(&argv[1..]);
     }
     if argv.first().map(String::as_str) == Some("upgrade") {
         return crate::upgrade::parse_args(&argv[1..]);

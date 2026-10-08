@@ -5,6 +5,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- `warden expose api.example.com --app api`: nginx in front of an app in one
+  command. It writes the app's nginx site file with the settings of
+  `contrib/nginx.conf` (the app's port, the hostnames, a map and upstream
+  named after the app), checks it with `nginx -t`, reloads nginx, and records
+  the hostnames in the app's config (`[expose]`). A failed check puts the
+  previous file back. HTTPS with HTTP/2 and a port 80 redirect: `--acme
+  <email>` has nginx's ACME module get and renew a Let's Encrypt certificate,
+  or `--cert`/`--key` (a certbot certificate in /etc/letsencrypt/live is found);
+  `--websocket` and `--sse` paths; `--remove`; `--dry-run`. Warden stays off
+  the request path: nginx connects to the app's port as before.
+
 ### Fixed
 
 - A Bun app that serves TLS itself (`Bun.serve({ tls })`, with no proxy in

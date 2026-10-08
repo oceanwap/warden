@@ -11,6 +11,7 @@ mod control;
 mod daemon;
 mod doctor;
 mod events;
+mod expose;
 mod fleet;
 mod guard;
 mod gui_install;
@@ -125,6 +126,7 @@ fn main() {
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
         Command::WattpmMigrate(ref o) => rt.block_on(migrate_wattpm::run(&args, o)),
         Command::GuiInstall(ref o) => gui_install::run(o),
+        Command::Expose(ref o) => expose::run(o),
         Command::Upgrade(ref o) => rt.block_on(upgrade::run(o, &args)),
         Command::Wardend(cli::WardendCmd::Run { background: false, resurrect }) => daemon::main(&rt, resurrect),
         Command::Wardend(cli::WardendCmd::Run { background: true, resurrect }) => {
