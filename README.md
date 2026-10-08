@@ -106,6 +106,16 @@ One small VM with 2 CPUs, shared with the load generator: compare the bars, not 
 
 Every number, the method and the caveats, including the one synthetic file per size on a noisy VM: [docs/benchmarks.md](docs/benchmarks.md#static-files-against-nginx-plain-and-compressed-2026-10-03) and [bench/README.md](bench/README.md). `cargo xtask bench` re-runs the suites in the repository.
 
+## Several apps on one server
+
+Each app serves its own TLS and HTTP/2, so nothing needs to sit in front of it. Fastest first:
+
+1. **One address per app.** Point each hostname at its own IP (an IPv6 /64 gives you plenty) and have each app listen on its address at port 443. The kernel picks the app by address, so there is no layer at all: measured level with a single app run bare (313k requests/s on 2 cores). IPv4 visitors need a spare IPv4 per app; otherwise use 2 for them. Warden setting the addresses up for you is the next change.
+2. **One address, Warden's hostname router.** `[route]` on 443 reads the hostname from the TLS hello and hands the connection itself to the app's worker, which then talks to the visitor directly and sees their real IP. With Bun's `server.adopt` (oven-sh/bun#44768) or Node's `node:http`/`node:https`: level with direct on HTTP/2 (226-257k against 232-281k requests/s), a few µs more per new connection.
+3. **The same router, copying bytes.** On stock Bun the router passes the bytes instead, with the visitor's IP kept: 45-80 % of direct depending on the load, at the same or less CPU per request than nginx's stream pass-through.
+
+Setup and every measurement: [docs/routing.md](docs/routing.md).
+
 ## Static files
 
 `warden serve dist 8080` runs Warden's own file server as the app's workers: supervised, health-checked and reloaded like any app.
