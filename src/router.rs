@@ -161,6 +161,7 @@ impl Table {
 
     /// The ports `client_ip`'s routing rules are for: those connections go
     /// to on loopback (not the apps with their own address).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn rule_ports(&self) -> Vec<u16> {
         let mut p: Vec<u16> = self.routes.values().filter(|d| d.address.is_none()).map(|d| d.port).collect();
         p.sort_unstable();
