@@ -1539,6 +1539,100 @@ function installBunStreamHooks() {
 
 if (isBun && longLived) installBunStreamHooks();
 
+// -------------------------------------------------------------- recovery
+//
+// Linux, under a keeper (src/recover.rs): this process holds a copy of
+// Warden's ends of its channels (WARDEN_RECOVER_FDS: fd 5 for fd 3, 6 for
+// fd 4, 7 and 8 for the read ends of stdout and stderr), so a console.log
+// never fails when every Warden process of the app dies at once. Once a
+// second, without keeping the process alive, it looks whether one of the
+// processes that hold this worker (its supervisor, its keeper: `pids`) is
+// still there. When none is, `warden recover-worker` gets those
+// descriptors: it starts wardend again if wardend died too, and hands them
+// to the app's next supervisor, which supervises this worker again (and
+// answers with the processes that hold it now). Nothing else changes: a
+// draining worker stops looking.
+let recoverWatch = null;
+const recoverSpec = (() => {
+  try {
+    return JSON.parse(env.WARDEN_RECOVER || "null");
+  } catch {
+    return null;
+  }
+})();
+const recoverFds = String(env.WARDEN_RECOVER_FDS || "")
+  .split(",")
+  .map(Number)
+  .filter((fd) => Number.isInteger(fd) && fd >= 5 && fd <= 8);
+delete process.env.WARDEN_RECOVER;
+delete process.env.WARDEN_RECOVER_FDS;
+if (recoverSpec && recoverFds.length && !inWorker && process.platform === "linux") watchWarden(recoverSpec);
+
+function watchWarden(spec) {
+  const valid = (p) => Number.isInteger(p) && p > 1;
+  let pids = Array.isArray(spec.pids) ? spec.pids.filter(valid) : [];
+  if (!pids.length || typeof spec.exe !== "string" || typeof spec.socket !== "string") return;
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return !!e && e.code === "EPERM";
+    }
+  };
+  // Child fd 3 + i is our fd 5 + i, when we hold it.
+  const stdio = ["ignore", "pipe", "ignore"];
+  for (let fd = 5; fd <= 8; fd++) stdio.push(recoverFds.includes(fd) ? fd : "ignore");
+  // Not the app's variables nor its directory: the helper may start wardend,
+  // which keeps them.
+  const keep = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "WARDEN_HOME", "WARDEN_RUNTIME_DIR", "WARDEN_NO_DAEMON", "WARDEN_REVIVE_EVERY_MS"];
+  const helperEnv = {};
+  for (const [k, v] of Object.entries(env)) if (keep.includes(k) || k.startsWith("XDG_")) helperEnv[k] = v;
+  const args = ["recover-worker", spec.socket, recoverFds.join(",")];
+  let helper = null;
+  let nextTry = 0;
+  let backoff = 10000; // after a try that failed: up to 5 minutes
+  recoverWatch = setInterval(() => {
+    if (helper || drainStarted || pids.some(alive)) return;
+    // After a try that failed, wait; but not while the app's next supervisor
+    // is there to take this worker (it waits a few seconds only).
+    if (Date.now() < nextTry && !fs.existsSync(spec.socket)) return;
+    let out = "";
+    try {
+      helper = require("node:child_process").spawn(spec.exe, args, { stdio, env: helperEnv, cwd: "/" });
+    } catch {
+      helper = null;
+      nextTry = Date.now() + 10000;
+      return;
+    }
+    helper.on("error", () => {});
+    if (helper.stdout) {
+      helper.stdout.setEncoding("utf8");
+      helper.stdout.on("data", (d) => {
+        if (out.length < 4096) out += d;
+      });
+    }
+    helper.on("close", (code) => {
+      helper = null;
+      let answer = null;
+      try {
+        answer = JSON.parse(out.split("\n")[0]);
+      } catch {}
+      const now = answer && Array.isArray(answer.pids) ? answer.pids.filter(valid) : [];
+      if (code === 0 && now.length) {
+        pids = now;
+        backoff = 10000;
+      } else {
+        nextTry = Date.now() + backoff;
+        backoff = Math.min(backoff * 2, 300000);
+      }
+    });
+    if (typeof helper.unref === "function") helper.unref();
+    if (helper.stdout && typeof helper.stdout.unref === "function") helper.stdout.unref();
+  }, 1000);
+  if (typeof recoverWatch.unref === "function") recoverWatch.unref();
+}
+
 // ---------------------------------------------------------------- common
 
 function closePrivateSocket() {
@@ -1766,6 +1860,7 @@ async function drain() {
   if (drainStarted) return;
   drainStarted = true;
   draining = true;
+  if (recoverWatch) clearInterval(recoverWatch);
   stopReadingWardenCommands();
   report({ ev: "draining" });
   drainBunApps();

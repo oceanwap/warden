@@ -52,7 +52,7 @@
 
 use super::ProcIdentity;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,6 +125,14 @@ pub struct Record {
     pub written_ms: u64,
     pub supervisor: Member,
     pub workers: Vec<Member>,
+    /// The supervisor's keeper (`crate::keeper`), if it had one: while it
+    /// runs, the workers are its to hand over, not orphans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keeper: Option<Member>,
+    /// What the supervisor knew of each worker that can hand itself back to
+    /// a later supervisor (`crate::recover`), by pid.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<u32, crate::keeper::Meta>,
 }
 
 // ---------------------------------------------------------------- processes
@@ -205,6 +213,9 @@ pub struct Ctx<'a> {
     pub boot: Option<&'a str>,
     /// The asking process.
     pub me: u32,
+    /// Its keeper: a record whose keeper is this one is not another
+    /// supervisor's (the keeper restarted us).
+    pub keeper: Option<u32>,
 }
 
 /// Which of the record's workers are orphans (see the module doc for the
@@ -218,8 +229,14 @@ pub fn plan(rec: &Record, cx: &Ctx<'_>) -> Plan {
         }
     }
     let sup = &rec.supervisor;
-    if cx.procs.identity(sup.pid).is_some_and(|id| id.start == sup.start) {
+    let running = |m: &Member| cx.procs.identity(m.pid).is_some_and(|id| id.start == m.start);
+    if running(sup) {
         plan.live_supervisor = Some(sup.clone());
+        return plan;
+    }
+    // Its keeper runs: it restarts the supervisor and hands the workers over.
+    if let Some(k) = rec.keeper.as_ref().filter(|k| Some(k.pid) != cx.keeper && running(k)) {
+        plan.live_supervisor = Some(k.clone());
         return plan;
     }
     let my_group = cx.procs.identity(cx.me).map(|id| id.pgid);
@@ -565,8 +582,18 @@ pub struct Registry {
 impl Registry {
     fn new(dir: &Path, app: &str, me: Member, boot: Option<String>) -> Registry {
         let file = dir.join(file_name(app, me.pid));
-        let rec =
-            Record { v: VERSION, app: app.into(), boot, written_ms: now_ms(), supervisor: me, workers: Vec::new() };
+        let keeper = crate::keeper::client::keeper_pid()
+            .and_then(|pid| super::proc_identity(pid).map(|id| Member { pid, start: id.start, label: String::new() }));
+        let rec = Record {
+            v: VERSION,
+            app: app.into(),
+            boot,
+            written_ms: now_ms(),
+            supervisor: me,
+            workers: Vec::new(),
+            keeper,
+            meta: BTreeMap::new(),
+        };
         Registry { file, rec, known: HashMap::new(), failing: false }
     }
 
@@ -585,12 +612,14 @@ impl Registry {
         self.rec.workers.iter().map(|m| (m.pid, m.label.clone())).collect()
     }
 
-    /// The supervisor's workers are these (`pid`, label): write the record if
-    /// they are not what it says. A process that cannot be read (it has
-    /// already exited) is left out: it cannot be told from another later.
-    pub fn note(&mut self, workers: &[(u32, String)]) {
+    /// The supervisor's workers are these (`pid`, label, what a later
+    /// supervisor needs to take it back): write the record if they are not
+    /// what it says. A process that cannot be read (it has already exited)
+    /// is left out: it cannot be told from another later.
+    pub fn note(&mut self, workers: &[(u32, String, Option<crate::keeper::Meta>)]) {
         let mut now: Vec<Member> = Vec::with_capacity(workers.len());
-        for (pid, label) in workers {
+        let mut meta = BTreeMap::new();
+        for (pid, label, m) in workers {
             let member = match self.known.get(pid) {
                 Some(m) => Member { label: label.clone(), ..m.clone() },
                 None => {
@@ -600,13 +629,17 @@ impl Registry {
             };
             self.known.insert(*pid, member.clone());
             now.push(member);
+            if let Some(m) = m {
+                meta.insert(*pid, m.clone());
+            }
         }
-        self.known.retain(|pid, _| workers.iter().any(|(p, _)| p == pid));
+        self.known.retain(|pid, _| workers.iter().any(|(p, _, _)| p == pid));
         now.sort_by_key(|m| m.pid);
-        if now == self.rec.workers && self.file.exists() {
+        if now == self.rec.workers && meta == self.rec.meta && self.file.exists() {
             return;
         }
         self.rec.workers = now;
+        self.rec.meta = meta;
         self.rec.written_ms = now_ms();
         self.write();
     }
@@ -706,7 +739,7 @@ pub async fn start(s: Settings<'_>) -> Option<Registry> {
 /// Read the records of the app, stop what is orphaned, and drop the records
 /// that have been dealt with.
 pub async fn sweep(s: &Settings<'_>, procs: &dyn Procs, boot: Option<&str>, me: u32) {
-    let cx = Ctx { procs, boot, me };
+    let cx = Ctx { procs, boot, me, keeper: crate::keeper::client::keeper_pid() };
     let mut orphans: Vec<Orphan> = Vec::new();
     // Records to remove once their orphans are stopped: path, pids.
     let mut done: Vec<(PathBuf, Vec<u32>)> = Vec::new();
@@ -818,7 +851,7 @@ pub async fn sweep(s: &Settings<'_>, procs: &dyn Procs, boot: Option<&str>, me: 
 /// The apps with workers a dead supervisor left running now, for `warden
 /// doctor`: `(app, supervisor pid, orphans)`. Only reads.
 pub fn running_orphans(dir: &Path, procs: &dyn Procs, boot: Option<&str>, me: u32) -> Vec<(String, u32, Vec<Orphan>)> {
-    let cx = Ctx { procs, boot, me };
+    let cx = Ctx { procs, boot, me, keeper: None };
     read_all(dir, None)
         .into_iter()
         .filter_map(|f| f.record.ok())
@@ -910,11 +943,20 @@ mod tests {
     }
 
     fn record(sup: Member, workers: Vec<Member>) -> Record {
-        Record { v: VERSION, app: "api".into(), boot: Some("boot-1".into()), written_ms: 1, supervisor: sup, workers }
+        Record {
+            v: VERSION,
+            app: "api".into(),
+            boot: Some("boot-1".into()),
+            written_ms: 1,
+            supervisor: sup,
+            workers,
+            keeper: None,
+            meta: BTreeMap::new(),
+        }
     }
 
     fn cx(fake: &Fake) -> Ctx<'_> {
-        Ctx { procs: fake, boot: Some("boot-1"), me: 900 }
+        Ctx { procs: fake, boot: Some("boot-1"), me: 900, keeper: None }
     }
 
     // ------------------------------------------------------------- planning
@@ -953,6 +995,41 @@ mod tests {
             fake.add(101, id(start, 1, 101), OnTerm::Exits);
             assert!(plan(&record(m(100, 1000), vec![m(101, 1001)]), &cx(&fake)).orphans.is_empty(), "{start}");
         }
+    }
+
+    #[test]
+    fn a_running_keeper_keeps_the_workers_unless_it_is_ours() {
+        let fake = Fake::default();
+        fake.add(99, id(999, 1, 99), OnTerm::Exits); // the keeper, alive, same start
+        fake.add(101, id(1001, 99, 101), OnTerm::Exits); // reparented to it
+        let rec = Record { keeper: Some(m(99, 999)), ..record(m(100, 1000), vec![m(101, 1001)]) };
+        let p = plan(&rec, &cx(&fake));
+        assert!(p.orphans.is_empty(), "it hands them to the supervisor it restarts");
+        assert_eq!(p.live_supervisor, Some(m(99, 999)));
+        // The supervisor that keeper restarted: they are its to take back.
+        let ours = Ctx { keeper: Some(99), ..cx(&fake) };
+        assert_eq!(plan(&rec, &ours).orphans.len(), 1);
+        // The keeper is gone (its pid is another process's now): orphans.
+        fake.add(99, id(5555, 1, 99), OnTerm::Exits);
+        assert_eq!(plan(&rec, &cx(&fake)).orphans.len(), 1);
+    }
+
+    #[test]
+    fn the_record_keeps_what_a_later_supervisor_needs_to_take_a_worker_back() {
+        let dir = std::env::temp_dir().join(format!("warden-orphans-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = Registry::for_test(&dir, "api");
+        let me = std::process::id();
+        let meta = crate::keeper::Meta { slot: 2, inst: 7, recoverable: true, ..Default::default() };
+        reg.note(&[(me, "2".into(), Some(meta.clone()))]);
+        let read = read_all(&dir, Some("api")).pop().unwrap().record.unwrap();
+        assert_eq!(read.meta.get(&me), Some(&meta));
+        // Older records (no `meta`, no `keeper`) still read.
+        let old = r#"{"v":1,"app":"api","supervisor":{"pid":5,"start":2},"workers":[]}"#;
+        let rec = parse(old, "api").unwrap();
+        assert!(rec.meta.is_empty() && rec.keeper.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1011,7 +1088,7 @@ mod tests {
         let p = plan(&rec, &cx(&fake));
         assert!(p.from_an_earlier_boot && p.orphans.is_empty());
         // A boot id that cannot be read, on either side, is not a reason to ignore it.
-        let unknown = Ctx { procs: &fake, boot: None, me: 900 };
+        let unknown = Ctx { procs: &fake, boot: None, me: 900, keeper: None };
         assert_eq!(plan(&rec, &unknown).orphans.len(), 1);
         rec.boot = None;
         assert_eq!(plan(&rec, &cx(&fake)).orphans.len(), 1);
@@ -1334,7 +1411,7 @@ mod tests {
         // Two real children: their identities are read.
         let mut a = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let mut b = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        reg.note(&[(b.id(), "2".into()), (a.id(), "1".into())]);
+        reg.note(&[(b.id(), "2".into(), None), (a.id(), "1".into(), None)]);
         let rec = read();
         assert_eq!(rec.workers.iter().map(|w| w.pid).collect::<Vec<_>>(), {
             let mut v = vec![a.id(), b.id()];
@@ -1346,11 +1423,11 @@ mod tests {
         }
         let before = std::fs::metadata(&reg.file).unwrap().modified().unwrap();
         std::thread::sleep(Duration::from_millis(20));
-        reg.note(&[(a.id(), "1".into()), (b.id(), "2".into())]);
+        reg.note(&[(a.id(), "1".into(), None), (b.id(), "2".into(), None)]);
         assert_eq!(std::fs::metadata(&reg.file).unwrap().modified().unwrap(), before, "unchanged: not rewritten");
 
         // One goes: the record follows; a pid that cannot be read is not recorded.
-        reg.note(&[(a.id(), "1".into()), (0x7fff_fff0, "9".into())]);
+        reg.note(&[(a.id(), "1".into(), None), (0x7fff_fff0, "9".into(), None)]);
         assert_eq!(read().workers.iter().map(|w| w.pid).collect::<Vec<_>>(), [a.id()]);
         // The record is removed when the supervisor is done.
         reg.close();

@@ -82,6 +82,20 @@ impl Warden {
         Warden { child, cfg, dir, port, stopped: Default::default() }
     }
 
+    /// Start Warden again on the same config and directory (after its
+    /// processes were killed), its log appended to the same file.
+    fn start_again(&mut self, env: &[(&str, &str)]) {
+        let log = std::fs::OpenOptions::new().append(true).open(self.dir.join("warden.log")).unwrap();
+        self.child = Command::new(BIN)
+            .args(["start", "-c"])
+            .arg(&self.cfg)
+            .envs(env.iter().copied())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+    }
+
     fn cli(&self, args: &[&str]) -> (i32, String) {
         let out = Command::new(BIN).args(args).arg("-c").arg(&self.cfg).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
@@ -1371,6 +1385,79 @@ fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(w.log().contains("the keeper process of this app died"), "{}", w.log());
+}
+
+/// Every Warden process of the app killed at once (the supervisor and its
+/// keeper; wardend is tested in `wardend_and_the_app_come_back_by_themselves`):
+/// the workers keep serving and printing (a Node app's `console.log` must not
+/// fail), and the next Warden of the app takes the same workers back, their
+/// output included, and supervises them: a crash is restarted, and a stop
+/// stops them.
+fn every_warden_process_killed(name: &str, cfg: &str, port: u16) {
+    let mut w = Warden::start(name, port, cfg);
+    let s = w.wait_for("2 ready", T, ready(2));
+    let before = pid_set(&s);
+    let sup = w.supervisor();
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    w.child.kill().unwrap();
+    w.child.wait().unwrap();
+    let t0 = Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < Duration::from_secs(2) {
+        assert!(get(port, &format!("/say?w=alone-{n}")).is_some(), "request {n} with no Warden failed");
+        n += 1;
+        // Under `[logging] max_lines_per_sec` when the output is read all at once.
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(before.iter().all(|p| running(*p)), "the workers live on");
+
+    w.start_again(&[]);
+    let s = w.wait_for("the same workers, supervised again", T, |s| s["workers_ready"] == 2 && pid_set(s) == before);
+    assert!(s["workers"].as_array().unwrap().iter().all(|x| x["restarts"] == 0), "{s:#}");
+    // The log writer is asynchronous: wait for the last line.
+    let log = w.wait_log(&format!("fixture says alone-{} ", n - 1), T);
+    assert!(log.contains("worker kept running while no Warden process of this app ran; supervised again"), "{log}");
+    for i in 0..n {
+        let line = format!("fixture says alone-{i} ");
+        assert!(log.contains(&line), "what a worker printed with no Warden is in the log: {line}\n{log}");
+    }
+    every_warning_has_a_hint(&log);
+    for _ in 0..20 {
+        assert!(get(port, "/say?w=back").is_some());
+    }
+
+    let victim = *before.iter().next().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let s = w.wait_for("the crashed worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    let pids = pid_set(&s);
+    let (code, _) = w.terminate(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "{}", w.log());
+    assert!(pids.iter().all(|p| !running(*p)), "the workers stopped with it");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bun_workers_hand_themselves_back_when_every_warden_process_dies() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    every_warden_process_killed("recover-bun", &gated("recover-bun", port, 2, ""), port);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn node_workers_hand_themselves_back_when_every_warden_process_dies() {
+    if !have_node() {
+        return;
+    }
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"recover-node\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n\
+         [shutdown]\ndrain_ms = 100\n",
+        fixture("node_app.mjs")
+    );
+    every_warden_process_killed("recover-node", &cfg, port);
 }
 
 /// Without the keeper (`WARDEN_KEEPER=0`); with it, the keeper starts the
@@ -3560,6 +3647,50 @@ fn wardend_comes_back_when_killed_but_not_when_stopped_on_purpose() {
     assert!(out.contains("wardend: stopped"), "{out}");
     std::thread::sleep(Duration::from_secs(1));
     assert!(wardend_pid(&f, &ALWAYS_ON).is_none(), "kill stops it for good");
+}
+
+/// wardend, the keeper and the supervisor all killed at once: nothing of
+/// Warden's is left, and nothing is restarted by hand. The workers start
+/// wardend again themselves, wardend starts the app, and the app takes the
+/// same workers back, which served throughout.
+#[cfg(target_os = "linux")]
+#[test]
+fn wardend_and_the_app_come_back_by_themselves() {
+    if !have_bun() {
+        return;
+    }
+    let f = Fleet::new("wd-recover");
+    let port = free_port();
+    std::fs::write(f.home.join("api.toml"), gated("api", port, 2, "")).unwrap();
+    let (code, out) = f.cli_env(&["start", "api"], &ALWAYS_ON);
+    assert_eq!(code, 0, "{out}");
+    f.wait("2 ready", |f| f.app("api")["status"]["workers_ready"] == 2);
+    let before: HashSet<u64> = f.pids("api").into_iter().collect();
+    let status = f.app("api")["status"].clone();
+    let wardend = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs");
+    let (keeper, sup) = (status["pid"].as_i64().unwrap() as i32, status["supervisor_pid"].as_i64().unwrap() as i32);
+    for p in [wardend, sup, keeper] {
+        unsafe { libc::kill(p, libc::SIGKILL) };
+    }
+    let t0 = Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < Duration::from_secs(2) {
+        assert!(get(port, &format!("/say?w=alone-{n}")).is_some(), "request {n} failed");
+        n += 1;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    f.wait("wardend and the app back, with the same workers", |f| {
+        let s = &f.app("api")["status"];
+        s["workers_ready"] == 2
+            && s["supervisor_pid"].as_i64().is_some_and(|p| p as i32 != sup)
+            && f.pids("api").into_iter().collect::<HashSet<u64>>() == before
+    });
+    assert!(wardend_pid(&f, &ALWAYS_ON).is_some_and(|p| p != wardend), "a new wardend");
+    for _ in 0..20 {
+        assert!(get(port, "/say?w=back").is_some());
+    }
+    let log = std::fs::read_to_string(f.home.join("state/logs/api.log")).unwrap_or_default();
+    assert!(log.contains("worker kept running while no Warden process of this app ran; supervised again"), "{log}");
 }
 
 /// With `WARDEN_NO_DAEMON=1` nothing starts it, and nothing brings it back.

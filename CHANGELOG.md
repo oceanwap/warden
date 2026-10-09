@@ -23,6 +23,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   wardend or systemd takes over. `status` gains `supervisor_pid`; `pid` is
   the keeper's (what wardend and systemd watch). `[restart]
   keep_workers_on_crash = false` or `WARDEN_KEEPER=0` turns it off.
+- Workers come back under Warden when every Warden process of their app
+  dies at once (the supervisor and the keeper, with wardend or not; Linux,
+  Bun and Node apps under the shim). Each worker holds a copy of Warden's
+  ends of its channels, so its output never hits a closed pipe (a Node app
+  that logged crashed with EPIPE right away), and when it sees its
+  supervisor and keeper gone it starts wardend again if needed and hands
+  itself to the app's next supervisor, which wardend starts. The same
+  workers are supervised again, with what they printed meanwhile; no
+  request failed in testing, about 3 s from the kill to supervised again.
+  wardend, when it starts, now starts any app whose workers run with no
+  Warden process (workers not under the shim are replaced one by one).
+  New workers also never reuse a kept worker's instance number (it names
+  that worker's private socket).
 - `cargo xtask chaos`: `kill-supervisor` now kills the supervisor under the
   keeper and checks that the same workers serve throughout; the new
   `kill-keeper` kills the app's process, as `kill-supervisor` did.

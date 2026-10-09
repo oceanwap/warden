@@ -346,6 +346,11 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             let _ = tx.send(Event::KeeperGone);
         });
         kept = sup.adopt_kept(attach);
+        // Workers left by a supervisor and keeper that died together.
+        let back = crate::recover::take_back(&sup.cfg.app.name, &sup.runtime_dir, &kept).await;
+        if !back.is_empty() {
+            kept.extend(sup.take_back(back, true));
+        }
     }
 
     // `warden save` recorded a worker count / stopped state for this app:
@@ -753,6 +758,7 @@ impl Supervisor {
             sockets: i.sockets.clone(),
             listening,
             threads: i.threads.iter().filter(|(_, t)| t.listening && !t.crashed).map(|(id, _)| *id).collect(),
+            recoverable: i.handle.recoverable,
         }
     }
 
@@ -786,11 +792,15 @@ impl Supervisor {
                 (i.kept_meta.as_ref() != Some(&m)).then_some((*id, m))
             })
             .collect();
+        if changed.is_empty() {
+            return;
+        }
         for (id, meta) in changed {
             let Some(i) = self.insts.get_mut(&id) else { continue };
             crate::keeper::client::send(&crate::keeper::Msg::Meta { pid: i.handle.pid, meta: meta.clone() }, &[]);
             i.kept_meta = Some(meta);
         }
+        self.note_workers();
     }
 
     /// The workers the keeper kept through the previous supervisor's crash:
@@ -803,9 +813,8 @@ impl Supervisor {
                 self.kept_listener = Some(fd);
             }
         }
-        let mut pids = Vec::new();
         if attach.kept.is_empty() {
-            return pids;
+            return Vec::new();
         }
         let live = attach.kept.iter().filter(|w| w.exited.is_none()).count();
         warn!(
@@ -814,8 +823,24 @@ impl Supervisor {
             restarts = attach.restarts,
             hint = "the previous supervisor crashed (the keeper's log line says how); the workers served throughout",
         );
+        self.take_back(attach.kept, false)
+    }
+
+    /// Workers that kept running without this supervisor: handed over by the
+    /// keeper, or `recovered`, handed back by themselves after the previous
+    /// supervisor and its keeper both died (`crate::recover`; this keeper
+    /// gets a copy of their descriptors then). Those that were serving go
+    /// back into their slots, the rest are stopped. Their pids: the orphan
+    /// sweep leaves them alone.
+    fn take_back(&mut self, kept: Vec<crate::keeper::client::KeptWorker>, recovered: bool) -> Vec<u32> {
+        let mut pids = Vec::new();
+        // New workers never take the instance number of a kept one: it names
+        // the kept worker's private socket.
+        if let Some(max) = kept.iter().map(|w| w.meta.inst).max() {
+            self.next_inst = self.next_inst.max(max + 1);
+        }
         let ids = self.slot_ids();
-        for w in attach.kept {
+        for w in kept {
             pids.push(w.pid);
             let m = w.meta;
             if let Some(e) = w.exited {
@@ -847,7 +872,8 @@ impl Supervisor {
                 fds: w.fds,
                 logs: w.logs,
             };
-            let handle = process::adopt(adopted, inst_id, self.proc_tx.clone());
+            let mut handle = process::adopt(adopted, inst_id, self.proc_tx.clone());
+            handle.recoverable = m.recoverable;
             let role = if fits { Role::Current } else { Role::Retiring };
             let mut inst = Instance::new(m.slot, handle, role);
             inst.started = Instant::now().checked_sub(w.age).unwrap_or(inst.started);
@@ -861,6 +887,9 @@ impl Supervisor {
                 inst.threads.entry(*t).or_default().listening = true;
             }
             self.insts.insert(inst_id, inst);
+            if recovered {
+                self.keeper_spawned(inst_id);
+            }
             if w.dropped > 0 {
                 warn!(
                     "some of a worker's output was lost while the supervisor was down",
@@ -897,11 +926,19 @@ impl Supervisor {
                     continue;
                 }
             }
-            info!(
-                "worker kept running through the supervisor's restart; supervised again",
-                worker = m.label,
-                pid = w.pid
-            );
+            if recovered {
+                info!(
+                    "worker kept running while no Warden process of this app ran; supervised again",
+                    worker = m.label,
+                    pid = w.pid
+                );
+            } else {
+                info!(
+                    "worker kept running through the supervisor's restart; supervised again",
+                    worker = m.label,
+                    pid = w.pid
+                );
+            }
             self.mark_ready(inst_id);
         }
         self.note_workers();
@@ -943,7 +980,14 @@ impl Supervisor {
         if self.orphans.is_none() {
             return;
         }
-        let workers: Vec<(u32, String)> = self.insts.values().map(|i| (i.handle.pid, self.inst_label(i))).collect();
+        // Under a keeper, what a later supervisor needs to take a worker
+        // back if this one and the keeper both die (`crate::recover`).
+        let keeping = crate::keeper::client::active();
+        let workers: Vec<(u32, String, Option<crate::keeper::Meta>)> = self
+            .insts
+            .iter()
+            .map(|(id, i)| (i.handle.pid, self.inst_label(i), keeping.then(|| self.keeper_meta(*id, i))))
+            .collect();
         if let Some(o) = self.orphans.as_mut() {
             o.note(&workers);
         }
@@ -1219,10 +1263,11 @@ impl Supervisor {
     /// (`slot_id` is then 0).
     fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
         let a = &self.cfg.app;
-        let env: Vec<(String, String)> =
+        let mut env: Vec<(String, String)> =
             self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
         // Warden's own code reports on fd 3 (`process::Spec::ipc_nonblocking`).
         let ipc_nonblocking;
+        let mut recoverable = false;
         let (program, args) = match self.cfg.workers.mode {
             // A standby (slot 0) runs the workers' command; the shim defers
             // its listen until promoted. In the pinned release, as workers
@@ -1239,6 +1284,10 @@ impl Supervisor {
             }
             Mode::Process => {
                 ipc_nonblocking = self.shim_path.is_some();
+                if let Some(v) = self.recover_env() {
+                    env.push((crate::recover::ENV.into(), v));
+                    recoverable = true;
+                }
                 #[cfg(target_os = "linux")]
                 if let Some(ip) = a.address {
                     ensure_address(ip);
@@ -1263,7 +1312,27 @@ impl Supervisor {
             handoff: self.handoff_on && slot_id != STANDBY_SLOT,
             ipc_nonblocking,
             preamble: self.ticket_preamble(slot_id).unwrap_or_default(),
+            recoverable,
         }
+    }
+
+    /// What a worker under the shim needs to hand itself back to a later
+    /// supervisor if every Warden process dies (`crate::recover`): Linux,
+    /// under a keeper. `None` otherwise.
+    fn recover_env(&self) -> Option<String> {
+        if !cfg!(target_os = "linux") || self.shim_path.is_none() {
+            return None;
+        }
+        let keeper = crate::keeper::client::keeper_pid()?;
+        if !crate::keeper::client::active() {
+            return None;
+        }
+        let spec = crate::recover::Spec {
+            exe: self.exe.clone(),
+            socket: crate::recover::socket_path(&self.runtime_dir, &self.cfg.app.name)?,
+            pids: vec![std::process::id(), keeper],
+        };
+        serde_json::to_string(&spec).ok()
     }
 
     /// The line that gives a worker the app's TLS ticket key: workers run

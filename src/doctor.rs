@@ -719,6 +719,8 @@ mod tests {
             written_ms: 1,
             supervisor: Member { pid: 0x7fff_ff00, start: 1, label: String::new() },
             workers: vec![Member { pid: child.id(), start, label: "1".into() }],
+            keeper: None,
+            meta: Default::default(),
         };
         let file = dir.join(orphans::file_name("api", 0x7fff_ff00));
         std::fs::write(&file, serde_json::to_string(&rec).unwrap()).unwrap();

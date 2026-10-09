@@ -44,6 +44,10 @@ pub struct Spec {
     /// (the shim reads them first thing: the shared TLS ticket key). Empty:
     /// nothing.
     pub preamble: Vec<u8>,
+    /// Linux, under a keeper, with the shim: the worker also holds Warden's
+    /// ends of its channels (`sys::SPARE_FD`), so they outlive every Warden
+    /// process, and hands them back to a later supervisor (`crate::recover`).
+    pub recoverable: bool,
 }
 
 /// `[logging] worker_output`.
@@ -206,6 +210,9 @@ pub struct Handle {
     /// Under a keeper: a copy of each of the worker's descriptors, for the
     /// keeper (`take_keep`).
     keep: Vec<(crate::keeper::FdKind, OwnedFd)>,
+    /// It holds Warden's ends of its channels and hands them back to a later
+    /// supervisor (`Spec::recoverable`, `crate::recover`).
+    pub recoverable: bool,
 }
 
 impl Handle {
@@ -308,10 +315,20 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     let handoff_child = handoff.as_ref().map(|(_, child)| std::os::fd::AsRawFd::as_raw_fd(child));
 
     let mut cmd = Command::new(&spec.program);
+    let recoverable = spec.recoverable;
+    // Capture mode, recoverable: our own pipes (read ends here), so the
+    // worker can get a copy of the read ends too.
+    let mut own_capture: Option<(OwnedFd, OwnedFd)> = None;
     // Direct mode: our own pipes (read end, file, stream), spliced into
     // the files on the output thread.
     let mut direct: Vec<(OwnedFd, PathBuf, &'static str)> = Vec::new();
     let (stdout, stderr) = match &spec.output {
+        Output::Capture if recoverable => {
+            let (out_r, out_w) = pipe()?;
+            let (err_r, err_w) = pipe()?;
+            own_capture = Some((out_r, err_r));
+            (Stdio::from(out_w), Stdio::from(err_w))
+        }
         Output::Capture => (Stdio::piped(), Stdio::piped()),
         Output::Inherit => (Stdio::inherit(), Stdio::inherit()),
         Output::Direct(files) => {
@@ -352,9 +369,42 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     for k in crate::keeper::ENVS {
         cmd.env_remove(k);
     }
+    let mut spares = [-1; crate::sys::SPARES];
+    if recoverable {
+        use std::os::fd::{AsFd, AsRawFd};
+        let (out, err) = match &own_capture {
+            Some((out, err)) => (Some(out), Some(err)),
+            None => {
+                let find = |s: &str| direct.iter().find(|(_, _, stream)| *stream == s).map(|(fd, _, _)| fd);
+                (find("stdout"), find("stderr"))
+            }
+        };
+        // Room for a few seconds of output while no Warden reads it: the
+        // writes of an app block (Node on Linux) once a pipe is full. Root
+        // only: a user's pipes share a soft limit (fs.pipe-user-pages-soft,
+        // 64 MB), past which every new pipe of that user gets a page or two.
+        if crate::sys::is_root() {
+            for fd in [out, err].into_iter().flatten() {
+                let _ = crate::sys::set_pipe_size(fd.as_fd(), RECOVER_PIPE_BYTES);
+            }
+        }
+        spares[0] = ipc_ours.as_raw_fd();
+        spares[1] = handoff.as_ref().map_or(-1, |(ours, _)| ours.as_raw_fd());
+        spares[2] = out.map_or(-1, |fd| fd.as_raw_fd());
+        spares[3] = err.map_or(-1, |fd| fd.as_raw_fd());
+        // Which of them it holds: a closed one's number may be a file of the
+        // app's later.
+        let held: Vec<String> = spares
+            .iter()
+            .enumerate()
+            .filter(|(_, fd)| **fd >= 0)
+            .map(|(i, _)| (crate::sys::SPARE_FD + i as i32).to_string())
+            .collect();
+        cmd.env("WARDEN_RECOVER_FDS", held.join(","));
+    }
     // The IPC socket at fd 3; and, if Warden dies without cleaning up
     // (SIGKILL), the workers go with it (where the OS can).
-    crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD, handoff_child);
+    crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD, handoff_child, spares);
     let mut child = cmd.spawn()?;
     // Our copies of the pipes' write ends (in `cmd`) and of the worker's end
     // of the IPC socket: only the worker's remain, so its exit is EOF.
@@ -392,10 +442,13 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             }
         }
     };
-    let captured = [
-        (child.stdout.take().map(|o| o.into_owned_fd()), "stdout"),
-        (child.stderr.take().map(|e| e.into_owned_fd()), "stderr"),
-    ];
+    let captured = match own_capture {
+        Some((out, err)) => [(Some(Ok(out)), "stdout"), (Some(Ok(err)), "stderr")],
+        None => [
+            (child.stdout.take().map(|o| o.into_owned_fd()), "stdout"),
+            (child.stderr.take().map(|e| e.into_owned_fd()), "stderr"),
+        ],
+    };
     for (pipe, stream) in captured {
         if let Some(pipe) = pipe {
             if let Ok(fd) = &pipe {
@@ -506,7 +559,7 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
-    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep })
+    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep, recoverable })
 }
 
 fn stream_kind(stream: &str) -> crate::keeper::FdKind {
@@ -617,7 +670,7 @@ pub fn adopt(a: Adopted, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         reaped_by_waiter.set(Some(signal));
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note: None, sent: sent.get() });
     });
-    Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep }
+    Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep, recoverable: false }
 }
 
 /// A process that is not our child: told apart from a later one with its pid
@@ -723,6 +776,9 @@ fn output_receiver(
         }
     }
 }
+
+/// A recoverable worker's output pipes hold this much (`sys::set_pipe_size`).
+const RECOVER_PIPE_BYTES: i32 = 1 << 20;
 
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     crate::sys::pipe_cloexec()
@@ -1344,6 +1400,7 @@ mod tests {
                     handoff: false,
                     ipc_nonblocking: false,
                     preamble: Vec::new(),
+                    recoverable: false,
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -1405,6 +1462,7 @@ mod tests {
             handoff: false,
             ipc_nonblocking: false,
             preamble: Vec::new(),
+            recoverable: false,
         }
     }
 
@@ -1435,6 +1493,7 @@ mod tests {
                     handoff: false,
                     ipc_nonblocking: false,
                     preamble: Vec::new(),
+                    recoverable: false,
                 };
                 let quiet = spawn(quiet, 2, tx).unwrap();
                 // Written 50 ms apart: all ten in the log well within 3 s, each read
@@ -1488,6 +1547,7 @@ mod tests {
                     handoff: false,
                     ipc_nonblocking: false,
                     preamble: Vec::new(),
+                    recoverable: false,
                 };
                 let h = spawn(spec, 9, tx).unwrap();
                 h.relabel("2");
@@ -1541,6 +1601,7 @@ mod tests {
                     handoff: false,
                     ipc_nonblocking: false,
                     preamble: Vec::new(),
+                    recoverable: false,
                 };
                 let h = spawn(spec, 3, tx).unwrap();
                 async fn next(rx: &mut mpsc::UnboundedReceiver<ProcEvent>) -> ProcEvent {
@@ -1589,6 +1650,7 @@ mod tests {
                     handoff: false,
                     ipc_nonblocking: false,
                     preamble: Vec::new(),
+                    recoverable: false,
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);
