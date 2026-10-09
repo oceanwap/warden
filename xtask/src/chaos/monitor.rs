@@ -169,6 +169,11 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
         zombies.retain(|k, _| seen_z.contains(k));
         // Orphans: a worker whose supervisor is gone drains and exits
         // (PDEATHSIG); one still running after grace_period + 10 s leaked.
+        // macOS: the workers a restarted supervisor took back stay children of
+        // init (no subreaper there), so ppid 1 alone is no orphan: one a live
+        // supervisor lists as its worker is supervised, and its clock starts
+        // when it is no longer listed. `None`: not asked yet this scan.
+        let mut listed: Option<Option<std::collections::HashSet<u32>>> = None;
         let mut seen_o = Vec::new();
         for s in &ours {
             let role = role_of.get(&s.pid).map(|r| r.0).unwrap_or(Role::Other);
@@ -181,14 +186,19 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
             }
             let key = (s.pid, s.start);
             seen_o.push(key);
+            if cfg!(target_os = "macos") {
+                match listed.get_or_insert_with(|| listed_workers(&fleet)) {
+                    Some(pids) if pids.contains(&s.pid) => {
+                        orphans.remove(&key);
+                        continue;
+                    }
+                    // The list could not be read (an app mid-restart): undecided this scan.
+                    None => continue,
+                    Some(_) => {}
+                }
+            }
             let first = *orphans.entry(key).or_insert(t);
-            // macOS: the workers a restarted supervisor took back stay children of
-            // init (no subreaper there), so ppid 1 alone is no orphan; one a live
-            // supervisor lists as its worker is supervised.
-            if t - first > (GRACE_S + 10) as f64
-                && !(cfg!(target_os = "macos") && listed_worker(&fleet, s.pid) != Some(false))
-                && reported.insert(key)
-            {
+            if t - first > (GRACE_S + 10) as f64 && reported.insert(key) {
                 let argv = procfs::cmdline(s.pid).join(" ");
                 sh.with_mon(|m| {
                     m.problems.push((
@@ -225,12 +235,15 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
     }
 }
 
-/// Is `pid` a worker some app's supervisor lists (`warden list --json`)?
-/// `None` when the list could not be read (an app mid-restart): undecided,
-/// the next scan asks again.
-fn listed_worker(fleet: &Fleet, pid: u32) -> Option<bool> {
+/// The workers every app's supervisor lists (`warden list --json`); `None`
+/// when the list could not be read.
+fn listed_workers(fleet: &Fleet) -> Option<std::collections::HashSet<u32>> {
     let apps = fleet.list().ok()?;
-    Some(apps.iter().any(|a| {
-        a["status"]["workers"].as_array().is_some_and(|ws| ws.iter().any(|w| w["pid"].as_u64() == Some(pid as u64)))
-    }))
+    Some(
+        apps.iter()
+            .filter_map(|a| a["status"]["workers"].as_array())
+            .flatten()
+            .filter_map(|w| w["pid"].as_u64().map(|p| p as u32))
+            .collect(),
+    )
 }

@@ -1405,7 +1405,7 @@ fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
         assert!(t0.elapsed() < Duration::from_secs(10), "still running:\n{}", w.log());
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(w.log().contains("the keeper process of this app died"), "{}", w.log());
+    w.wait_log("the keeper process of this app died", T);
 }
 
 /// Every Warden process of the app killed at once (the supervisor and its
