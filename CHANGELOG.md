@@ -73,6 +73,9 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   gone: a wardend started right after (`warden startup` handing it to
   systemd, `warden update`) found the old one's lock still held and exited
   at once.
+- A supervisor restarted by its keeper (after a crash, or `warden update`)
+  stopped the workers of an app scaled up since it started (`warden scale`)
+  and started new ones: it now keeps them, and the app its size.
 
 - On Bun 1.4, a reload or scale-down no longer cuts requests sent on idle
   keep-alive connections to a draining worker. Bun 1.4's `server.stop()`

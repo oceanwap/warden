@@ -1492,6 +1492,36 @@ fn an_upgrade_moves_the_keeper_and_supervisor_to_another_binary_and_keeps_the_wo
     assert!(pids.iter().all(|p| !running(*p)), "the workers stopped with it");
 }
 
+/// `warden update` of an app scaled up since it started, right after a
+/// reload: every worker is kept, the scaled-up ones too, and so is their age.
+#[test]
+fn an_upgrade_of_a_scaled_up_app_keeps_every_worker() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start("reup", port, &gated("reup", port, 2, ""));
+    w.wait_for("2 ready", T, ready(2));
+    let (code, out) = w.cli(&["scale", "3"]);
+    assert_eq!(code, 0, "{out}");
+    w.wait_for("3 ready", T, ready(3));
+    let (code, out) = w.cli(&["safe-reload"]);
+    assert_eq!(code, 0, "{out}");
+    let before = pid_set(&w.status().unwrap());
+    let sup = w.supervisor();
+    std::thread::sleep(Duration::from_secs(2));
+    let next = w.dir.join("warden-next");
+    std::fs::copy(BIN, &next).unwrap();
+    let next = std::fs::canonicalize(&next).unwrap();
+    let (_, out) = w.request(&format!(r#"{{"cmd":"upgrade","exe":"{}"}}"#, next.display()));
+    assert!(out.contains(r#""ok":true"#), "{out}");
+    let s = w.wait_for("the new supervisor", T, |s| {
+        s["workers_ready"] == 3 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
+    });
+    assert_eq!(pid_set(&s), before, "every worker kept:\n{}", w.log());
+    assert!(s["workers"].as_array().unwrap().iter().all(|x| x["uptime_secs"].as_u64() >= Some(2)), "{s:#}");
+}
+
 /// Every Warden process of the app killed at once (the supervisor and its
 /// keeper; wardend is tested in `wardend_and_the_app_come_back_by_themselves`):
 /// the workers keep serving and printing (a Node app's `console.log` must not

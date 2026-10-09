@@ -338,6 +338,20 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
 
     let mut sup = Supervisor::new(cfg, cfg_path, runtime_dir, (shim_path, host_path), tx, proc_tx);
 
+    // `warden save` recorded a worker count / stopped state for this app:
+    // honour it, as `pm2 resurrect` would after a reboot.
+    // Before the kept workers are taken back: their slots are counted against it.
+    let saved = crate::fleet::saved_state(&sup.cfg.app.name, sup.cfg_path.as_deref());
+    if let Some(s) = saved.as_ref().filter(|s| s.workers != sup.count && (1..=1024).contains(&s.workers)) {
+        info!(
+            "using the worker count saved by `warden save`",
+            config = sup.count,
+            saved = s.workers,
+            hint = "run `warden save` again after scaling to change it",
+        );
+        sup.count = s.workers;
+    }
+
     // Under a keeper (`crate::keeper`): the workers outlive this supervisor,
     // and those a crashed one left are taken back before anything starts.
     let attach = crate::keeper::client::connect(sup.cfg.stop_signal(), sup.cfg.grace_period());
@@ -356,18 +370,6 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         }
     }
 
-    // `warden save` recorded a worker count / stopped state for this app:
-    // honour it, as `pm2 resurrect` would after a reboot.
-    let saved = crate::fleet::saved_state(&sup.cfg.app.name, sup.cfg_path.as_deref());
-    if let Some(s) = saved.as_ref().filter(|s| s.workers != sup.count && (1..=1024).contains(&s.workers)) {
-        info!(
-            "using the worker count saved by `warden save`",
-            config = sup.count,
-            saved = s.workers,
-            hint = "run `warden save` again after scaling to change it",
-        );
-        sup.count = s.workers;
-    }
     info!(
         "starting application",
         app = sup.cfg.app.name,
@@ -887,6 +889,26 @@ impl Supervisor {
         // the kept worker's private socket.
         if let Some(max) = kept.iter().map(|w| w.meta.inst).max() {
             self.next_inst = self.next_inst.max(max + 1);
+        }
+        // The previous supervisor was scaled up since the count this one
+        // starts with (`warden scale` not saved): its serving workers keep
+        // their slots, and the app its size.
+        let top = kept
+            .iter()
+            .filter(|w| {
+                w.exited.is_none() && w.meta.role == role_name(Role::Current) && w.meta.ready && !w.meta.stopping
+            })
+            .map(|w| w.meta.slot)
+            .filter(|s| (1..=1024).contains(s))
+            .max();
+        if let Some(top) = top.filter(|t| self.cfg.workers.mode == Mode::Process && *t > self.count) {
+            info!(
+                "keeping the worker count the previous supervisor ran",
+                config = self.count,
+                running = top,
+                hint = "`warden scale <app> N` changes it; `warden save` keeps it across restarts",
+            );
+            self.count = top;
         }
         let ids = self.slot_ids();
         for w in kept {
