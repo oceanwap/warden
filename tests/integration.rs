@@ -6483,18 +6483,36 @@ fn bun_drain_keeps_the_handler_the_app_reloaded() {
         std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
     };
     // The new worker listens, Warden signals the old one, and the old one
-    // closes its listener when its drain starts (it then drains for 4 s).
+    // starts its drain (4 s).
     w.wait_log("draining old process", T);
-    let t0 = Instant::now();
-    while listeners(port) != 1 {
-        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_bun_drain_started(&w, port, "/whoami");
     let (head, body) = exchange(&mut s, "/whoami");
     assert_eq!(body, format!("v2 {who}"), "the drain brought back the handler the app replaced");
     assert!(head.contains("connection: close"), "no Connection: close in the drain: {head}");
     let out = reload.join().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Wait until the old Bun worker's drain has started. Bun 1.3: it stops
+/// accepting then (one listener left). From Bun 1.4, where stopping closes
+/// idle keep-alive connections, it accepts until the end of its drain window
+/// and answers with `Connection: close`: a new connection that gets that
+/// header reached it in its drain.
+fn wait_bun_drain_started(w: &Warden, port: u16, path: &str) {
+    let t0 = Instant::now();
+    while listeners(port) != 1 {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let _ = write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            if String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase().contains("connection: close") {
+                return;
+            }
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// Bun `routes` (functions, a static Response, per-method handlers) and the
@@ -6534,11 +6552,7 @@ fn bun_drain_closes_connections_answered_by_routes_and_error_handlers() {
         std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
     };
     w.wait_log("draining old process", T);
-    let t0 = Instant::now();
-    while listeners(port) != 1 {
-        assert!(t0.elapsed() < Duration::from_secs(10), "the old worker never started draining\n{}", w.log());
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_bun_drain_started(&w, port, "/r");
     for (p, s) in paths.iter().zip(socks.iter_mut()) {
         write!(s, "GET {p} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let mut buf = [0u8; 4096];

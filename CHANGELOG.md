@@ -24,6 +24,17 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   less server CPU (median 437 against 457 µs, 10 interleaved rounds). A
   router and a supervisor of different versions still work together.
 
+### Fixed
+
+- On Bun 1.4, a reload or scale-down no longer cuts requests sent on idle
+  keep-alive connections to a draining worker. Bun 1.4's `server.stop()`
+  closes idle keep-alive connections at once (1.3 kept them open), so a
+  request a client was sending on one right then was lost (4 of 219 in the
+  keep-alive test, over 3 reloads). On Bun 1.4 a draining worker now keeps
+  accepting through `drain_ms`, answering with `Connection: close` so
+  clients move to the new workers, and stops accepting at its end, as Node
+  workers do. Bun 1.3 is unchanged.
+
 ## [0.1.4] — 2026-10-08
 
 ### Added
