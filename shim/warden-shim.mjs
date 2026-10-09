@@ -64,7 +64,14 @@ const nodeReusePort = forceReusePort && ["linux", "freebsd", "dragonfly", "sunos
 // on the app's port then takes those connections instead of listening.
 // Bun takes a handed-over socket from 1.4.0 on (1.3.x: "TODO case
 // net.Socket", and the connection is lost): older ones listen as before.
-const bunTakesSockets = !isBun || (([maj, min]) => maj > 1 || (maj === 1 && min >= 4))(Bun.version.split(".").map(Number));
+const bun14 = isBun && (([maj, min]) => maj > 1 || (maj === 1 && min >= 4))(Bun.version.split(".").map(Number));
+const bunTakesSockets = !isBun || bun14;
+// From Bun 1.4, server.stop(false) also closes idle keep-alive connections
+// at once (1.3 kept them open until stop(true)), cutting a request a client
+// is sending on one right then. There a drain keeps accepting through its
+// window, answering with `Connection: close` so clients move to the new
+// workers, and stops accepting at its end (see drain()).
+const bunStopClosesIdle = bun14;
 const handoff = env.WARDEN_HANDOFF === "1" && !inWorker && typeof process.send === "function" && bunTakesSockets;
 // `[app] address` on Linux: the workers still listen on the app's port
 // themselves (the kernel spreads it), and only the hostname router's
@@ -1763,10 +1770,15 @@ async function drain() {
   report({ ev: "draining" });
   drainBunApps();
   await markNodeResponsesClose();
-  for (const s of servers) stopAccepting(s);
+  if (!bunStopClosesIdle) for (const s of servers) stopAccepting(s);
+  let stoppedAccepting = !bunStopClosesIdle;
   const t0 = Date.now();
   for (;;) {
     const elapsed = Date.now() - t0;
+    if (!stoppedAccepting && elapsed >= drainMs) {
+      for (const s of servers) stopAccepting(s);
+      stoppedAccepting = true;
+    }
     // Every round: WebSockets aren't in pending(), and at the long-lived
     // deadline this closes WebSockets and ends SSE responses.
     const longLivedBusy = longLived && longLivedStep(elapsed);

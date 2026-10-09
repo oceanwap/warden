@@ -6,18 +6,19 @@ const checks: Record<string, unknown> = {};
 const sse = new ReadableStream({ pull: (c) => c.close() });
 checks.hooked = new Response(sse, { headers: { "content-type": "text/event-stream" } }).body !== sse;
 const nativeText = (name: string, s: string) => s.includes(name) && /\{\s*\[native code\]\s*\}$/.test(s);
-const throwsNative = (f: () => unknown, message: string) => {
+const throwsNative = (f: () => unknown, messages: readonly string[]) => {
   try {
     f();
     return false;
   } catch (e) {
-    return e instanceof TypeError && e.message === message;
+    return e instanceof TypeError && messages.includes(e.message);
   }
 };
 
 for (const [name, C, make, statics, noNew] of [
-  ["Response", Response, () => new Response("x"), ["error", "json", "redirect"], "Response constructor cannot be invoked without 'new'"],
-  ["ReadableStream", ReadableStream, () => new ReadableStream(), [], "Constructor called as a function"],
+  ["Response", Response, () => new Response("x"), ["error", "json", "redirect"], ["Response constructor cannot be invoked without 'new'"]],
+  // Bun 1.3, then Bun 1.4.
+  ["ReadableStream", ReadableStream, () => new ReadableStream(), [], ["Constructor called as a function", "Use `new ReadableStream(...)` instead of `ReadableStream(...)`"]],
 ] as const) {
   const x = make();
   class Sub extends (C as any) {}
