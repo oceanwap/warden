@@ -82,6 +82,7 @@ impl Warden {
         Warden { child, cfg, dir, port, stopped: Default::default() }
     }
 
+    #[cfg(target_os = "linux")]
     /// Start Warden again on the same config and directory (after its
     /// processes were killed), its log appended to the same file.
     fn start_again(&mut self, env: &[(&str, &str)]) {
@@ -1393,6 +1394,7 @@ fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
 /// fail), and the next Warden of the app takes the same workers back, their
 /// output included, and supervises them: a crash is restarted, and a stop
 /// stops them.
+#[cfg(target_os = "linux")]
 fn every_warden_process_killed(name: &str, cfg: &str, port: u16) {
     let mut w = Warden::start(name, port, cfg);
     let s = w.wait_for("2 ready", T, ready(2));
