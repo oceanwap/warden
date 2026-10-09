@@ -27,10 +27,15 @@
     Warden's environment turns the handoff off (`=1` turns it on elsewhere,
     as the tests do on Linux). It is decided when the supervisor starts: an
     app scaled from 1 worker to more needs a `warden restart`.
-  - No parent-death signal: workers outlive a supervisor killed with
-    SIGKILL (or one that crashed, or that launchd killed in the middle of a
-    shutdown). Warden stops them the next time the app starts, before it
-    starts new ones: [below](#workers-a-killed-supervisor-leaves-behind-macos).
+  - A supervisor that crashes is started again by the app's keeper, which
+    takes back its workers as on Linux; macOS has no child subreaper, so the
+    keeper sees a kept worker's exit by its pid and start time (every half
+    second) rather than its exit code, and the listening socket of the
+    connection handoff is kept too. No parent-death signal: without a keeper
+    (`keep_workers_on_crash = false`), or when the keeper itself is killed
+    in the middle of a shutdown, workers outlive their supervisor. Warden
+    stops them the next time the app starts, before it starts new ones:
+    [below](#workers-a-killed-supervisor-leaves-behind-macos).
   - `warden serve` opens static files with `openat` confined by the kernel
     (`O_RESOLVE_BENEATH` on macOS 15+, `O_NOFOLLOW_ANY` before) on a thread,
     instead of `openat2` inline (same confinement, slower).
@@ -54,7 +59,9 @@
 
 ## Workers a killed supervisor leaves behind (macOS)
 
-On Linux a worker gets SIGTERM the moment its supervisor dies
+Under the app's keeper (the default) a crashed supervisor's workers are
+kept on purpose and supervised again; this section is about the cases
+without one. On Linux a worker gets SIGTERM the moment its supervisor dies
 (`PR_SET_PDEATHSIG`). macOS has no such thing, so a supervisor that is killed
 (`kill -9`, a crash, launchd's timeout in the middle of a shutdown; a normal
 `warden stop` or SIGTERM stops its workers first) leaves them running, still

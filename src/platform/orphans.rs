@@ -646,6 +646,9 @@ pub struct Settings<'a> {
     /// Told how many workers were found and how many are gone: what
     /// `status` shows while the sweep runs.
     pub progress: Arc<Progress>,
+    /// Workers this supervisor took back from its keeper (`crate::keeper`):
+    /// its own now, never orphans.
+    pub keep: Vec<u32>,
 }
 
 /// On this OS, does a supervisor keep and sweep records? macOS: yes.
@@ -655,6 +658,11 @@ pub struct Settings<'a> {
 /// run the whole thing against real processes.
 pub fn enabled() -> bool {
     if super::current().capabilities().orphan_sweep {
+        return true;
+    }
+    // Under a keeper workers outlive their supervisor on Linux too: if the
+    // keeper and the supervisor are both killed, the next start stops them.
+    if crate::keeper::client::active() {
         return true;
     }
     #[cfg(all(debug_assertions, target_os = "linux"))]
@@ -727,7 +735,9 @@ pub async fn sweep(s: &Settings<'_>, procs: &dyn Procs, boot: Option<&str>, me: 
                 continue;
             }
         };
-        let p = plan(&rec, &cx);
+        let mut p = plan(&rec, &cx);
+        // Taken back from the keeper: this supervisor's workers now.
+        p.orphans.retain(|o| !s.keep.contains(&o.member.pid));
         if let Some(sup) = &p.live_supervisor {
             // Another supervisor of this app is running (a second one, on
             // another control socket): its workers are its own.
@@ -1390,7 +1400,14 @@ mod tests {
     }
 
     fn settings(dir: &Path, grace: Duration) -> Settings<'_> {
-        Settings { app: "api", stop_signal: TERM, grace, dir: dir.to_path_buf(), progress: Arc::default() }
+        Settings {
+            app: "api",
+            stop_signal: TERM,
+            grace,
+            dir: dir.to_path_buf(),
+            progress: Arc::default(),
+            keep: Vec::new(),
+        }
     }
 
     /// A record of this boot (the real one: the sweep ignores any other).

@@ -55,10 +55,10 @@ OPTIONS:
     --out FILE         Where to write the JSON (default bench/results/chaos-<time>-seed<S>.json)
     -h, --help         This help
 
-FAULTS: kill-worker, kill-standby, kill-supervisor, kill-wardend, stop-worker,
-stop-supervisor, stop-wardend, reload, safe-reload, restart, restart-hard,
-scale, overlap, bad-config, release-swap, throw-thread, log-flood, disk-full,
-crash-loop, oom-kill, memory-recycle
+FAULTS: kill-worker, kill-standby, kill-supervisor, kill-keeper, kill-wardend,
+stop-worker, stop-supervisor, stop-wardend, reload, safe-reload, restart,
+restart-hard, scale, overlap, bad-config, release-swap, throw-thread,
+log-flood, disk-full, crash-loop, oom-kill, memory-recycle
 
 NEEDS: Linux or macOS, bun, node >= 22.12. Linux, as root: the namespace, the
 tmpfs (disk-full) and a memory cgroup (oom-kill). npm, once, for the NestJS

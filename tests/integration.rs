@@ -48,6 +48,8 @@ struct Warden {
     cfg: PathBuf,
     dir: PathBuf,
     port: u16,
+    /// The supervisor SIGSTOP went to, for SIGCONT (a stopped one can't say its pid).
+    stopped: std::cell::Cell<Option<u32>>,
 }
 
 impl Warden {
@@ -77,7 +79,7 @@ impl Warden {
             .stderr(log)
             .spawn()
             .unwrap();
-        Warden { child, cfg, dir, port }
+        Warden { child, cfg, dir, port, stopped: Default::default() }
     }
 
     fn cli(&self, args: &[&str]) -> (i32, String) {
@@ -182,8 +184,25 @@ impl Warden {
         s["workers"].as_array().unwrap().iter().filter_map(|w| w["pid"].as_u64()).collect()
     }
 
+    /// To Warden's process, which passes it on to the supervisor (under the
+    /// keeper); SIGSTOP and SIGCONT, which no process can pass on, go to the
+    /// supervisor itself.
     fn signal(&self, sig: i32) {
-        unsafe { libc::kill(self.child.id() as i32, sig) };
+        let pid = match sig {
+            libc::SIGSTOP => {
+                let pid = self.supervisor();
+                self.stopped.set(Some(pid));
+                pid
+            }
+            libc::SIGCONT => self.stopped.take().unwrap_or_else(|| self.supervisor()),
+            _ => self.child.id(),
+        };
+        unsafe { libc::kill(pid as i32, sig) };
+    }
+
+    /// The supervisor's pid: the keeper's child (`supervisor_pid`), or Warden's own.
+    fn supervisor(&self) -> u32 {
+        self.status().and_then(|s| s["supervisor_pid"].as_u64()).map_or(self.child.id(), |p| p as u32)
     }
 
     /// Warden stopped (SIGSTOP) until the returned guard is dropped (SIGCONT,
@@ -1214,8 +1233,14 @@ fn systemd_ready_and_watchdog_pings_stop_when_frozen() {
 }
 
 fn fault_warden(name: &str, fault: &str, count: usize) -> (Warden, u16) {
+    fault_warden_env(name, fault, count, &[])
+}
+
+fn fault_warden_env(name: &str, fault: &str, count: usize, env: &[(&str, &str)]) -> (Warden, u16) {
     let port = free_port();
-    let w = Warden::start_env(name, port, &gated(name, port, count, ""), &[("WARDEN_FAULT", fault)]);
+    let mut env = env.to_vec();
+    env.push(("WARDEN_FAULT", fault));
+    let w = Warden::start_env(name, port, &gated(name, port, count, ""), &env);
     (w, port)
 }
 
@@ -1272,12 +1297,91 @@ fn a_panicking_control_request_only_drops_that_request() {
     w.wait_for("still supervising", T, ready(1));
 }
 
+/// kill -9 of the supervisor: its keeper (the process Warden was started
+/// as) starts it again, and the new one takes back the same workers, which
+/// serve throughout. What they print meanwhile is in the log, and they are
+/// supervised again: a worker that crashes after it is replaced.
+#[test]
+fn a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let mut w = Warden::start("keeper", port, &gated("keeper", port, 2, ""));
+    let s = w.wait_for("2 ready", T, ready(2));
+    let before = pid_set(&s);
+    assert_eq!(s["pid"].as_u64(), Some(w.child.id() as u64), "the app's process is the keeper");
+    let sup = w.supervisor();
+    assert_ne!(sup, w.child.id(), "the supervisor is the keeper's child");
+
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    let (mut ok, t0) = (0, Instant::now());
+    while t0.elapsed() < Duration::from_secs(2) {
+        let said = format!("while-{ok}");
+        assert!(get(port, &format!("/say?w={said}")).is_some(), "request {ok} failed:\n{}", w.log());
+        ok += 1;
+    }
+    let s = w.wait_for("the new supervisor", T, |s| {
+        s["workers_ready"] == 2 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
+    });
+    assert_eq!(pid_set(&s), before, "the same workers:\n{}", w.log());
+    assert!(s["workers"].as_array().unwrap().iter().all(|x| x["restarts"] == 0), "{s:#}");
+    assert_eq!(s["pid"].as_u64(), Some(w.child.id() as u64));
+    let log = w.log();
+    assert!(log.contains("the supervisor died; its workers keep serving and it is starting again"), "{log}");
+    assert!(log.contains("taking back the workers that kept running workers=2"), "{log}");
+    for n in 0..ok {
+        assert!(log.contains(&format!("fixture says while-{n} ")), "output of request {n} is in the log:\n{log}");
+    }
+    every_warning_has_a_hint(&log);
+
+    // Supervised again: a crash is seen and the worker replaced.
+    let victim = *before.iter().next().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let s = w.wait_for("the crashed worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    assert!(
+        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains("SIGKILL"))),
+        "{s:#}"
+    );
+
+    // SIGTERM to the keeper: a clean stop of everything.
+    let pids = pid_set(&s);
+    let (code, _) = w.terminate(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "{}", w.log());
+    assert!(pids.iter().all(|p| !running(*p)), "the workers stopped with it");
+}
+
+/// The keeper killed (kill -9): the supervisor tells the workers to stop and
+/// exits, as if killed with it, so wardend or systemd can start the app again.
+#[test]
+fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let mut w = Warden::start("keeper-kill", port, &gated("keeper-kill", port, 2, ""));
+    let s = w.wait_for("2 ready", T, ready(2));
+    let sup = w.supervisor();
+    let pids = pid_set(&s);
+    w.child.kill().unwrap();
+    w.child.wait().unwrap();
+    let t0 = Instant::now();
+    while running(sup as u64) || pids.iter().any(|p| running(*p)) {
+        assert!(t0.elapsed() < Duration::from_secs(10), "still running:\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(w.log().contains("the keeper process of this app died"), "{}", w.log());
+}
+
+/// Without the keeper (`WARDEN_KEEPER=0`); with it, the keeper starts the
+/// supervisor again and the workers keep serving
+/// (`a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers`).
 #[test]
 fn a_panic_in_the_event_loop_exits_and_takes_workers_down() {
     if !have_bun() {
         return;
     }
-    let (mut w, port) = fault_warden("fault-tick", "tick:4", 2);
+    let (mut w, port) = fault_warden_env("fault-tick", "tick:4", 2, &[("WARDEN_KEEPER", "0")]);
     let t0 = Instant::now();
     let code = loop {
         if let Some(st) = w.child.try_wait().unwrap() {
@@ -3695,15 +3799,18 @@ fn wardend_restarts_a_killed_supervisor_and_apps_outlive_it() {
     assert!(env.split(|b| *b == 0).any(|kv| kv == b"WARDEN_LAUNCH=background"));
 
     // A hung supervisor is reported, never killed: its workers keep serving.
-    unsafe { libc::kill(new_pid as i32, libc::SIGSTOP) };
+    // The hint names the stuck process: the keeper's child.
+    let stuck = f.app("api")["status"]["supervisor_pid"].as_u64().unwrap();
+    assert_ne!(stuck, new_pid, "the supervisor runs under its keeper");
+    unsafe { libc::kill(stuck as i32, libc::SIGSTOP) };
     let unresponsive = ev.wait("unresponsive", sup_event("api", "unresponsive"));
     assert_eq!(unresponsive["pid"].as_u64(), Some(new_pid));
     let a = d.app("api");
     assert_eq!(a["state"], "unreachable", "{a:#}");
-    assert!(a["problem"].as_str().unwrap().contains(&format!("gdb -p {new_pid}")), "{a:#}");
+    assert!(a["problem"].as_str().unwrap().contains(&format!("gdb -p {stuck}")), "{a:#}");
     assert!(get(port, "/whoami").is_some(), "workers still serve");
-    assert!(alive(new_pid));
-    unsafe { libc::kill(new_pid as i32, libc::SIGCONT) };
+    assert!(alive(new_pid) && alive(stuck));
+    unsafe { libc::kill(stuck as i32, libc::SIGCONT) };
     ev.wait("responsive", sup_event("api", "responsive"));
     assert!(d.log().contains("supervisor is unresponsive; not killing it"), "{}", d.log());
 
@@ -4536,8 +4643,8 @@ fn a_supervisor_that_dies_says_no_bye() {
     if !have_bun() {
         return;
     }
-    // The event loop panics on its 8th tick.
-    let (mut w, _port) = fault_warden("sub-panic", "tick:8", 1);
+    // The event loop panics on its 8th tick; no keeper starts it again.
+    let (mut w, _port) = fault_warden_env("sub-panic", "tick:8", 1, &[("WARDEN_KEEPER", "0")]);
     w.wait_for("1 ready worker", T, ready(1));
     let mut ev = Events::open(&w, r#"{"cmd":"subscribe"}"#);
     assert_eq!(ev.next()["type"], "hello");
@@ -7160,7 +7267,7 @@ impl Warden {
             .stderr(log)
             .spawn()
             .unwrap();
-        Warden { child, cfg, dir, port }
+        Warden { child, cfg, dir, port, stopped: Default::default() }
     }
 }
 
@@ -8238,13 +8345,15 @@ fn sleep_tag(which: u32) -> String {
 /// killed with SIGKILL; the next supervisor of the app stops it before
 /// starting new ones (src/platform/orphans.rs). A debug build on Linux can
 /// behave that way (`WARDEN_TEST_MACOS_ORPHANS`), which runs the record, the
-/// sweep and the log against real processes.
+/// sweep and the log against real processes. Without the keeper
+/// (`WARDEN_KEEPER=0`), which would keep the workers on and supervise them
+/// again instead.
 #[test]
 fn a_killed_supervisors_workers_are_stopped_when_the_app_starts_again() {
     let tag = sleep_tag(0);
     let _sleepers = Sleepers(tag.clone());
     let f = Fleet::new("orphans");
-    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1"), ("WARDEN_KEEPER", "0")];
     let cmd = format!("exec sleep {tag}");
     let start = ["start", "/bin/sh", "--name", "orphan", "--interpreter", "none", "-i", "2", "--", "-c", &cmd];
     let (code, out) = f.cli_env(&start, &env);
@@ -8361,7 +8470,7 @@ fn records_of_processes_that_are_not_orphans_are_left_alone() {
         vec![member(live_worker.id(), start_ticks(live_worker.id() as u64), "1")],
     );
 
-    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let env = [("WARDEN_TEST_MACOS_ORPHANS", "1"), ("WARDEN_KEEPER", "0")];
     let (code, out) = f.cli_env(&["start", "sleep 300", "--name", "safe"], &env);
     assert_eq!(code, 0, "{out}");
     f.wait("the worker", |f| f.pids("safe").len() == 1);
@@ -8392,7 +8501,7 @@ fn records_of_processes_that_are_not_orphans_are_left_alone() {
 /// `ready_timeout` and `grace_period`, and the workers it will start next obey
 /// SIGTERM. Returns the old workers' pids and the dead supervisor's.
 fn app_with_stubborn_orphans(f: &Fleet, name: &str, tag: &str, ready_timeout: u64, grace: u64) -> (Vec<u64>, u64) {
-    let hook = [("WARDEN_TEST_MACOS_ORPHANS", "1")];
+    let hook = [("WARDEN_TEST_MACOS_ORPHANS", "1"), ("WARDEN_KEEPER", "0")];
     let cmd = format!("trap '' TERM; exec sleep {tag}");
     let start = ["start", "/bin/sh", "--name", name, "--interpreter", "none", "-i", "2", "--", "-c", &cmd];
     let (code, out) = f.cli_env(&start, &hook);
@@ -8425,6 +8534,7 @@ fn start_in_the_background(f: &Fleet, name: &str) -> (Child, PathBuf) {
         .env_remove("WARDEN_CONFIG")
         .env("WARDEN_NO_DAEMON", "1")
         .env("WARDEN_TEST_MACOS_ORPHANS", "1")
+        .env("WARDEN_KEEPER", "0")
         .current_dir(&f.home)
         .stdout(file.try_clone().unwrap())
         .stderr(file)
@@ -8511,7 +8621,7 @@ fn warden_start_waits_for_a_sweep_that_outlasts_ready_timeout() {
     // ready_wait = 2 + 15 = 17 s; the old workers die of SIGKILL at 18 s.
     let (old, dead) = app_with_stubborn_orphans(&f, "slowboot", &tag, 2, 18);
     let t0 = Instant::now();
-    let (code, out) = f.cli_env(&["start", "slowboot"], &[("WARDEN_TEST_MACOS_ORPHANS", "1")]);
+    let (code, out) = f.cli_env(&["start", "slowboot"], &[("WARDEN_TEST_MACOS_ORPHANS", "1"), ("WARDEN_KEEPER", "0")]);
     let took = t0.elapsed();
     assert_eq!(code, 0, "{out}");
     assert!(took > Duration::from_secs(17), "the sweep outlasted the 17 s bound: {took:?}");

@@ -478,6 +478,10 @@ pub struct Restart {
     pub schedule: Option<String>,
     /// Exit codes that mean "done, don't restart" (PM2's `stop_exit_codes`).
     pub stop_exit_codes: Vec<i32>,
+    /// When Warden's supervisor of this app crashes, its workers keep
+    /// serving: a small keeper process holds them and hands them to the
+    /// supervisor it starts again (`crate::keeper`). Off: they stop with it.
+    pub keep_workers_on_crash: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -1035,6 +1039,7 @@ impl Default for Restart {
             failed_cooldown: 300,
             schedule: None,
             stop_exit_codes: Vec::new(),
+            keep_workers_on_crash: true,
         }
     }
 }

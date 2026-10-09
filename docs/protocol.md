@@ -101,7 +101,7 @@ Every event has a `type`. Times (`at_ms`) are Unix milliseconds.
 
 | `type` | Fields | When |
 |---|---|---|
-| `hello` | `protocol`, `app` (absent from `wardend`), `pid`, `version` | first line of a stream |
+| `hello` | `protocol`, `app` (absent from `wardend`), `pid` (the app's process, its keeper, as `status`'s `pid`; `supervisor_pid` there is the supervisor under it), `version` | first line of a stream |
 | `status` | `app`, `status` (`control::Status`) | snapshot, then every interval |
 | `worker` | `app`, `worker`, `standby` (hot standbys only), `event`, `pid`, `detail`, `at_ms` | a worker changed state |
 | `rollout` | `app`, `rollout` (`control::RolloutStatus`) | a rollout started or changed phase |
@@ -540,9 +540,11 @@ else would:
   error line with the last lines of the app's log and the fix);
   `warden start <app>` clears that.
 - **Hung supervisors are reported, not killed.** Its workers are probably
-  still serving (they own their listeners), and killing the supervisor
-  stops them (parent-death signal). `wardend` logs `unresponsive` with the
-  pid and how to get a stack (`gdb -p` / `cat /proc/<pid>/stack`).
+  still serving (they own their listeners), and wardend can only kill the
+  app's keeper, which stops them. `wardend` logs `unresponsive` with the
+  supervisor's pid and how to get a stack (`gdb -p` / `cat /proc/<pid>/stack`);
+  `kill -9` of that pid makes the keeper start a new supervisor that
+  takes the workers back.
 - **`wardend` itself** runs under systemd (`contrib/wardend.service`,
   `Restart=always`, `KillMode=process`; `warden startup` installs it, and
   `warden kill` then stops the unit, not just the process), under launchd

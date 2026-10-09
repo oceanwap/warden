@@ -203,12 +203,21 @@ pub struct Handle {
     /// Warden's end of the fd-4 handoff socket, until `take_handoff` gives
     /// it to the dispatcher (when the worker is ready).
     handoff: Option<OwnedFd>,
+    /// Under a keeper: a copy of each of the worker's descriptors, for the
+    /// keeper (`take_keep`).
+    keep: Vec<(crate::keeper::FdKind, OwnedFd)>,
 }
 
 impl Handle {
     /// The handoff socket (once): connections for this worker go over it.
     pub fn take_handoff(&mut self) -> Option<OwnedFd> {
         self.handoff.take()
+    }
+
+    /// The copies of the worker's descriptors for the keeper (once; none
+    /// without a keeper).
+    pub fn take_keep(&mut self) -> Vec<(crate::keeper::FdKind, OwnedFd)> {
+        std::mem::take(&mut self.keep)
     }
 
     /// Is this process dying of SIGKILL, from anyone: reaped by its waiter
@@ -338,8 +347,11 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
     }
     cmd.env("WARDEN_IPC_FD", IPC_FD.to_string());
     // How the supervisor was launched is not the workers' business (a
-    // worker running `warden` itself would misreport).
+    // worker running `warden` itself would misreport), nor is its keeper.
     cmd.env_remove(crate::events::LAUNCH_ENV);
+    for k in crate::keeper::ENVS {
+        cmd.env_remove(k);
+    }
     // The IPC socket at fd 3; and, if Warden dies without cleaning up
     // (SIGKILL), the workers go with it (where the OS can).
     crate::sys::pre_exec_worker(cmd.as_std_mut(), child_fd, IPC_FD, handoff_child);
@@ -369,21 +381,40 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
             let _ = ctl.send((libc::SIGKILL, true));
         }
     };
+    // Under a keeper: a copy of each descriptor, which it holds through a
+    // crash of this supervisor (`crate::keeper`).
+    let keeping = crate::keeper::client::active();
+    let mut keep: Vec<(crate::keeper::FdKind, OwnedFd)> = Vec::new();
+    let mut keep_copy = |kind: crate::keeper::FdKind, fd: &OwnedFd| {
+        if keeping {
+            if let Ok(c) = fd.try_clone() {
+                keep.push((kind, c));
+            }
+        }
+    };
     let captured = [
         (child.stdout.take().map(|o| o.into_owned_fd()), "stdout"),
         (child.stderr.take().map(|e| e.into_owned_fd()), "stderr"),
     ];
     for (pipe, stream) in captured {
         if let Some(pipe) = pipe {
+            if let Ok(fd) = &pipe {
+                keep_copy(stream_kind(stream), fd);
+            }
             let on_fail = reader_failed(stream, ctl_tx.clone(), label.clone());
-            start_capture(pipe, shared_label.clone(), stream, spec.max_lines_per_sec, on_fail);
+            start_capture(pipe, Vec::new(), shared_label.clone(), stream, spec.max_lines_per_sec, on_fail);
         }
     }
     if let Output::Direct(files) = &spec.output {
         for (fd, path, stream) in direct {
+            keep_copy(stream_kind(stream), &fd);
             let on_fail = reader_failed(stream, ctl_tx.clone(), label.clone());
-            start_direct(fd, path, files.policy.clone(), label.clone(), stream, on_fail);
+            start_direct(fd, Vec::new(), path, files.policy.clone(), label.clone(), stream, on_fail);
         }
+    }
+    keep_copy(crate::keeper::FdKind::Ipc, &ipc_ours);
+    if let Some(ours) = &handoff {
+        keep_copy(crate::keeper::FdKind::Handoff, ours);
     }
     let mut ipc = None;
     match ipc_stream(ipc_ours) {
@@ -475,7 +506,189 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         let _ = events.send(ProcEvent::Exited { inst, code, signal, note, sent: sent.get() });
     });
 
-    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff })
+    Ok(Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep })
+}
+
+fn stream_kind(stream: &str) -> crate::keeper::FdKind {
+    if stream == "stderr" { crate::keeper::FdKind::Err } else { crate::keeper::FdKind::Out }
+}
+
+/// A worker a keeper kept through the death of the supervisor that started
+/// it: its descriptors and what it wrote meanwhile (`crate::keeper`).
+pub struct Adopted {
+    pub pid: u32,
+    /// Its start time (`platform::ProcIdentity::start`): it is signalled only
+    /// while that process is still the one with its pid.
+    pub start: Option<u64>,
+    pub label: String,
+    pub output: Output,
+    pub max_lines_per_sec: u32,
+    pub fds: Vec<(crate::keeper::FdKind, OwnedFd)>,
+    pub logs: Vec<(crate::keeper::FdKind, Vec<u8>)>,
+}
+
+/// Take over a running worker this supervisor did not start (it is not our
+/// child): read its output and fd 3 as `spawn` does, signal it through a
+/// pidfd (Linux) or after checking its start time, and learn of its exit
+/// from the keeper (with its exit status) or, failing that, by watching it
+/// (status unknown). The `Handle` and its events are those of `spawn`.
+pub fn adopt(a: Adopted, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) -> Handle {
+    use crate::keeper::FdKind;
+    let Adopted { pid, start, label, output, max_lines_per_sec, fds, mut logs } = a;
+    let shared_label = Label::new(&label);
+    let (ctl_tx, mut ctl_rx) = mpsc::unbounded_channel::<(i32, bool)>();
+    let mut head = |kind: FdKind| -> Vec<u8> {
+        logs.iter().position(|(k, _)| *k == kind).map(|i| logs.swap_remove(i).1).unwrap_or_default()
+    };
+    let mut keep: Vec<(FdKind, OwnedFd)> = Vec::new();
+    let (mut ipc, mut handoff) = (None, None);
+    for (kind, fd) in fds {
+        if let Ok(c) = fd.try_clone() {
+            keep.push((kind, c));
+        }
+        let stream = if kind == FdKind::Err { "stderr" } else { "stdout" };
+        let on_fail = {
+            let ctl = ctl_tx.clone();
+            let label = label.clone();
+            move |msg: String| {
+                crate::error!(
+                    "worker's output reader failed; killing the worker so it restarts cleanly",
+                    worker = label,
+                    panic = msg,
+                    hint = "this is a Warden bug: please report it with the log lines above",
+                );
+                let _ = ctl.send((libc::SIGKILL, true));
+            }
+        };
+        match (kind, &output) {
+            (FdKind::Out | FdKind::Err, Output::Capture) => {
+                start_capture(Ok(fd), head(kind), shared_label.clone(), stream, max_lines_per_sec, on_fail);
+            }
+            (FdKind::Out | FdKind::Err, Output::Direct(files)) => {
+                let (out, err) = files.paths(&label);
+                let path = if kind == FdKind::Err { err.unwrap_or(out) } else { out };
+                start_direct(fd, head(kind), path, files.policy.clone(), label.clone(), stream, on_fail);
+            }
+            (FdKind::Out | FdKind::Err, Output::Inherit) => {}
+            (FdKind::Ipc, _) => match ipc_stream(fd) {
+                Ok((rx, tx)) => {
+                    ipc = Some(tx);
+                    let fut = pump_ipc(rx, inst, events.clone(), label.clone());
+                    tokio::task::spawn_local(async move {
+                        if let Err(m) = crate::guard::catch_unwind(fut).await {
+                            on_fail(m);
+                        }
+                    });
+                }
+                Err(e) => crate::warn!(
+                    "cannot use the kept worker's IPC socket; the watchdog is off for it",
+                    worker = label,
+                    error = e,
+                    hint = "this is a Warden bug: please report it",
+                ),
+            },
+            (FdKind::Handoff, _) => handoff = Some(fd),
+        }
+    }
+    let watch = Watch::open(pid, start);
+    let mut exit_rx = crate::keeper::client::exit_of(pid);
+    let sent = std::rc::Rc::new(std::cell::Cell::new(exit::Sent::default()));
+    let sent_by_waiter = sent.clone();
+    let reaped = Rc::new(std::cell::Cell::new(None));
+    let reaped_by_waiter = reaped.clone();
+    tokio::task::spawn_local(async move {
+        let ended = loop {
+            tokio::select! {
+                r = &mut exit_rx => break r.ok(),
+                _ = watch.gone() => {
+                    // Its status is the keeper's to tell (its parent on Linux).
+                    break tokio::time::timeout(std::time::Duration::from_millis(500), &mut exit_rx).await.ok().and_then(Result::ok);
+                }
+                Some((sig, to_group)) = ctl_rx.recv() => {
+                    if watch.signal(sig, to_group) {
+                        let mut s = sent_by_waiter.get();
+                        s.add(sig);
+                        sent_by_waiter.set(s);
+                    }
+                }
+            }
+        };
+        let (code, signal) = ended.map(|e| (e.code, e.signal)).unwrap_or((None, None));
+        reaped_by_waiter.set(Some(signal));
+        let _ = events.send(ProcEvent::Exited { inst, code, signal, note: None, sent: sent.get() });
+    });
+    Handle { pid, ctl: ctl_tx, ipc, label: shared_label, reaped, handoff, keep }
+}
+
+/// A process that is not our child: told apart from a later one with its pid
+/// by a pidfd (Linux) or by its start time.
+struct Watch {
+    pid: u32,
+    start: Option<u64>,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<tokio::io::unix::AsyncFd<OwnedFd>>,
+}
+
+impl Watch {
+    fn open(pid: u32, start: Option<u64>) -> Watch {
+        #[cfg(target_os = "linux")]
+        {
+            // Only if it is still the process that was kept.
+            let same = crate::platform::proc_identity(pid).is_some_and(|id| Some(id.start) == start);
+            let pidfd = if same {
+                crate::sys::pidfd_open(pid).ok().and_then(|fd| tokio::io::unix::AsyncFd::new(fd).ok())
+            } else {
+                None
+            };
+            Watch { pid, start, pidfd }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Watch { pid, start }
+    }
+
+    /// Still the process that was kept?
+    fn alive(&self) -> bool {
+        crate::platform::proc_identity(self.pid).is_some_and(|id| Some(id.start) == self.start)
+    }
+
+    /// Returns once it has exited.
+    async fn gone(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.pidfd {
+            let _ = fd.readable().await;
+            return;
+        }
+        loop {
+            if !self.alive() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Signal it (`group`: its process group), if it is still there. Whether
+    /// a signal went out.
+    fn signal(&self, sig: i32, group: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.pidfd {
+            use std::os::fd::AsFd as _;
+            // Not exited yet (the pidfd is readable once it has): its group
+            // still has it, so the group's id is still its pid.
+            if group && !crate::sys::wait_readable(fd.get_ref().as_fd(), 0).unwrap_or(true) {
+                if let Ok(p) = i32::try_from(self.pid) {
+                    if crate::sys::kill(-p, sig).is_ok() {
+                        return true;
+                    }
+                }
+            }
+            return crate::sys::pidfd_send_signal(fd.get_ref().as_fd(), sig).is_ok();
+        }
+        if !self.alive() {
+            return false;
+        }
+        crate::sys::signal_child(self.pid, sig, group);
+        true
+    }
 }
 
 /// Warden's end of the IPC socket, non-blocking: a tokio stream for the
@@ -613,12 +826,25 @@ impl Turns {
     }
 }
 
-/// Forward a child stream line by line to the log, capping line length and rate.
-async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream: &'static str, limit: u32) {
+/// Forward a child stream line by line to the log, capping line length and
+/// rate. `head`: output read before (by the keeper while no supervisor
+/// did), logged first.
+async fn pump_output(
+    rx: tokio::net::unix::pipe::Receiver,
+    head: Vec<u8>,
+    label: Label,
+    stream: &'static str,
+    limit: u32,
+) {
     crate::guard::fault(stream);
     let mut turns = Turns::new();
     let mut line: Vec<u8> = Vec::new();
     let mut rate = RateLimit::new(if limit == 0 { u32::MAX } else { limit });
+    if !head.is_empty() {
+        let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
+        split_lines(&head, &mut line, &mut |l: &mut Vec<u8>| keep(&mut batch, l, &mut rate));
+        crate::logging::worker_output_batch(batch);
+    }
     loop {
         if let Err(e) = rx.readable().await {
             crate::warn!("stopped reading worker output", worker = label.get(), stream = stream, error = e);
@@ -679,6 +905,7 @@ async fn pump_output(rx: tokio::net::unix::pipe::Receiver, label: Label, stream:
 /// pipe nobody reads).
 fn start_capture(
     pipe: std::io::Result<OwnedFd>,
+    head: Vec<u8>,
     label: Label,
     stream: &'static str,
     limit: u32,
@@ -690,7 +917,7 @@ fn start_capture(
         let Some(rx) = output_receiver(pipe, &label.get(), stream) else { return };
         tokio::task::spawn_local(async move {
             let _active = active;
-            if let Err(m) = crate::guard::catch_unwind(pump_output(rx, label, stream, limit)).await {
+            if let Err(m) = crate::guard::catch_unwind(pump_output(rx, head, label, stream, limit)).await {
                 on_fail(m);
             }
         });
@@ -702,6 +929,7 @@ fn start_capture(
 /// restarts (its writes would otherwise block on a pipe nobody reads).
 fn start_direct(
     pipe: OwnedFd,
+    head: Vec<u8>,
     path: PathBuf,
     policy: crate::logging::RotatePolicy,
     label: String,
@@ -712,7 +940,7 @@ fn start_direct(
     crate::logging::on_output_thread(Box::new(move || {
         tokio::task::spawn_local(async move {
             let _active = active;
-            if let Err(m) = crate::guard::catch_unwind(pump_direct(pipe, path, policy, label, stream)).await {
+            if let Err(m) = crate::guard::catch_unwind(pump_direct(pipe, head, path, policy, label, stream)).await {
                 on_fail(m);
             }
         });
@@ -724,6 +952,7 @@ fn start_direct(
 /// that inherited its stdout are gone, so its last lines are drained.
 async fn pump_direct(
     pipe: OwnedFd,
+    head: Vec<u8>,
     path: PathBuf,
     policy: crate::logging::RotatePolicy,
     label: String,
@@ -747,6 +976,24 @@ async fn pump_direct(
             return;
         }
     };
+    if !head.is_empty() {
+        // Read by the keeper while no supervisor did: appended first, as is.
+        let appended = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &head));
+        if let Err(e) = appended {
+            crate::warn!(
+                "cannot write the output kept while the supervisor was down",
+                worker = label,
+                stream = stream,
+                file = path.display(),
+                error = e,
+                hint = "check that the log file's directory is writable",
+            );
+        }
+    }
     let file = crate::logging::DirectWriter::open(path, policy, &label, stream);
     let mut turns = Turns::new();
     // `warden logs -f`: the unfinished line so far (only while someone follows).

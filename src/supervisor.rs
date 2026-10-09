@@ -92,6 +92,8 @@ enum Event {
     },
     /// `[watchdog] port_lost`: what each watched worker was seen listening on.
     Ports(Vec<(u64, portwatch::Seen)>),
+    /// The keeper's channel ended: it died (`crate::keeper`).
+    KeeperGone,
 }
 
 struct HealthState {
@@ -209,6 +211,9 @@ pub struct Supervisor {
     /// started here until it ends (they hold the port), and what `status`
     /// says meanwhile (`sweep_status`).
     sweep: Option<Sweeping>,
+    /// macOS handoff: the app's listening socket the keeper kept through a
+    /// crash of the previous supervisor (`open_handoff` takes it).
+    kept_listener: Option<std::os::fd::OwnedFd>,
 }
 
 /// The sweep of a killed supervisor's workers, run by `run_local`'s loop.
@@ -330,6 +335,19 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
 
     let mut sup = Supervisor::new(cfg, cfg_path, runtime_dir, (shim_path, host_path), tx, proc_tx);
 
+    // Under a keeper (`crate::keeper`): the workers outlive this supervisor,
+    // and those a crashed one left are taken back before anything starts.
+    let attach = crate::keeper::client::connect(sup.cfg.stop_signal(), sup.cfg.grace_period());
+    let mut kept: Vec<u32> = Vec::new();
+    if let Some(attach) = attach {
+        crate::sys::workers_outlive_the_supervisor();
+        let tx = sup.tx.clone();
+        crate::keeper::client::listen(move || {
+            let _ = tx.send(Event::KeeperGone);
+        });
+        kept = sup.adopt_kept(attach);
+    }
+
     // `warden save` recorded a worker count / stopped state for this app:
     // honour it, as `pm2 resurrect` would after a reboot.
     let saved = crate::fleet::saved_state(&sup.cfg.app.name, sup.cfg_path.as_deref());
@@ -393,8 +411,10 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
         grace: sup.cfg.grace_period(),
         dir: crate::platform::orphans::dir(&crate::fleet::state_dir()),
         progress: progress.clone(),
+        keep: kept,
     };
-    let saved_stopped = saved.as_ref().is_some_and(|s| s.stopped);
+    // Workers taken back from the keeper run: the saved state is older.
+    let saved_stopped = saved.as_ref().is_some_and(|s| s.stopped) && sup.insts.is_empty();
     let mut sweeping: Option<Sweep<'_>> = None;
     if crate::platform::orphans::enabled() {
         let longest = crate::platform::orphans::longest(settings.grace);
@@ -430,6 +450,7 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             }
         }
         sup.publish_rollout();
+        sup.keeper_sync();
         // No router left running (`warden stop`, or the end): the app ports
         // answer directly again until a router worker starts.
         #[cfg(target_os = "linux")]
@@ -464,6 +485,8 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     // and control tasks deliver replies already sent (e.g. to the `shutdown`
     // that ended us) before the runtime goes away. Bounded: 50-200 ms.
     control::say_bye(&sup.cfg.app.name, &sup.shutdown_reason, Duration::from_millis(50), control::BYE_FLUSH).await;
+    // The keeper ends with us, as we end: on purpose.
+    crate::keeper::client::bye();
     // Best effort: a leftover socket is detected and replaced at the next start.
     let _ = std::fs::remove_file(&socket);
     Ok(())
@@ -707,13 +730,210 @@ impl Supervisor {
             start_attempt: None,
             orphans: None,
             sweep: None,
+            kept_listener: None,
             cfg,
             cfg_path,
         }
     }
 
+    /// What the keeper is told of a worker (`crate::keeper::Meta`).
+    fn keeper_meta(&self, inst_id: u64, i: &Instance) -> crate::keeper::Meta {
+        let mut listening: Vec<u16> = i.listening.iter().copied().collect();
+        listening.sort_unstable();
+        crate::keeper::Meta {
+            slot: i.slot,
+            role: role_name(i.role).into(),
+            ready: i.ready_at.is_some(),
+            stopping: i.stopping,
+            inst: inst_id,
+            label: self.inst_label(i),
+            handoff: i.handoff,
+            adopt: i.adopt,
+            host: i.handoff_host.clone(),
+            sockets: i.sockets.clone(),
+            listening,
+            threads: i.threads.iter().filter(|(_, t)| t.listening && !t.crashed).map(|(id, _)| *id).collect(),
+        }
+    }
+
+    /// A worker just started: the keeper gets a copy of its descriptors.
+    fn keeper_spawned(&mut self, inst_id: u64) {
+        if !crate::keeper::client::active() {
+            return;
+        }
+        let Some(i) = self.insts.get(&inst_id) else { return };
+        let meta = self.keeper_meta(inst_id, i);
+        let Some(i) = self.insts.get_mut(&inst_id) else { return };
+        let fds = i.handle.take_keep();
+        let kinds = fds.iter().map(|(k, _)| *k).collect();
+        let msg = crate::keeper::Msg::Spawned { pid: i.handle.pid, meta: meta.clone(), fds: kinds };
+        use std::os::fd::AsFd as _;
+        let borrowed: Vec<_> = fds.iter().map(|(_, f)| f.as_fd()).collect();
+        crate::keeper::client::send(&msg, &borrowed);
+        i.kept_meta = Some(meta);
+    }
+
+    /// Tell the keeper what changed about the workers since the last event.
+    fn keeper_sync(&mut self) {
+        if !crate::keeper::client::active() {
+            return;
+        }
+        let changed: Vec<(u64, crate::keeper::Meta)> = self
+            .insts
+            .iter()
+            .filter_map(|(id, i)| {
+                let m = self.keeper_meta(*id, i);
+                (i.kept_meta.as_ref() != Some(&m)).then_some((*id, m))
+            })
+            .collect();
+        for (id, meta) in changed {
+            let Some(i) = self.insts.get_mut(&id) else { continue };
+            crate::keeper::client::send(&crate::keeper::Msg::Meta { pid: i.handle.pid, meta: meta.clone() }, &[]);
+            i.kept_meta = Some(meta);
+        }
+    }
+
+    /// The workers the keeper kept through the previous supervisor's crash:
+    /// those that were serving go back into their slots, the rest (starting,
+    /// standbys, being replaced or stopped) are stopped. Their pids: the
+    /// orphan sweep leaves them alone.
+    fn adopt_kept(&mut self, attach: crate::keeper::client::Attach) -> Vec<u32> {
+        for (name, fd) in attach.listeners {
+            if name == "handoff" {
+                self.kept_listener = Some(fd);
+            }
+        }
+        let mut pids = Vec::new();
+        if attach.kept.is_empty() {
+            return pids;
+        }
+        let live = attach.kept.iter().filter(|w| w.exited.is_none()).count();
+        warn!(
+            "this supervisor was restarted by its keeper; taking back the workers that kept running",
+            workers = live,
+            restarts = attach.restarts,
+            hint = "the previous supervisor crashed (the keeper's log line says how); the workers served throughout",
+        );
+        let ids = self.slot_ids();
+        for w in attach.kept {
+            pids.push(w.pid);
+            let m = w.meta;
+            if let Some(e) = w.exited {
+                let reason = describe_exit(e.code, e.signal);
+                warn!(
+                    "worker exited while the supervisor was down",
+                    worker = m.label,
+                    pid = w.pid,
+                    reason = reason,
+                    hint = "its slot starts a new worker; `warden logs <app> --worker N` shows its last output",
+                );
+                continue;
+            }
+            let taken = self.slots.get(&m.slot).is_some_and(|s| s.current.is_some());
+            let fits = m.role == role_name(Role::Current)
+                && m.ready
+                && !m.stopping
+                && ids.contains(&m.slot)
+                && !taken
+                && (!m.handoff || self.handoff_on);
+            let inst_id = self.next_inst;
+            self.next_inst += 1;
+            let adopted = process::Adopted {
+                pid: w.pid,
+                start: w.start,
+                label: m.label.clone(),
+                output: process::Output::from_config(&self.cfg.logging),
+                max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
+                fds: w.fds,
+                logs: w.logs,
+            };
+            let handle = process::adopt(adopted, inst_id, self.proc_tx.clone());
+            let role = if fits { Role::Current } else { Role::Retiring };
+            let mut inst = Instance::new(m.slot, handle, role);
+            inst.started = Instant::now().checked_sub(w.age).unwrap_or(inst.started);
+            inst.oom_counter = self.oom.own();
+            inst.sockets = m.sockets.clone();
+            inst.listening = m.listening.iter().copied().collect();
+            inst.handoff = m.handoff;
+            inst.adopt = m.adopt;
+            inst.handoff_host = m.host.clone();
+            for t in &m.threads {
+                inst.threads.entry(*t).or_default().listening = true;
+            }
+            self.insts.insert(inst_id, inst);
+            if w.dropped > 0 {
+                warn!(
+                    "some of a worker's output was lost while the supervisor was down",
+                    worker = m.label,
+                    pid = w.pid,
+                    bytes = w.dropped,
+                    hint = "the keeper keeps the last 1 MB of each stream while no supervisor reads it",
+                );
+            }
+            if !fits {
+                info!(
+                    "stopping a worker kept from the previous supervisor: it was not serving",
+                    worker = m.label,
+                    pid = w.pid,
+                    role = m.role,
+                    ready = m.ready,
+                );
+                self.stop_instance(inst_id);
+                continue;
+            }
+            let slot = self.slots.entry(m.slot).or_insert_with(|| Slot::new(m.slot));
+            slot.current = Some(inst_id);
+            slot.state = State::Starting;
+            if m.handoff {
+                if let Err(e) = self.open_handoff(m.host.as_deref()) {
+                    error!(
+                        "cannot take connections for a kept worker",
+                        worker = m.label,
+                        pid = w.pid,
+                        error = e,
+                        hint = "another process holds the app's port; the worker is restarted",
+                    );
+                    self.kill_instance(inst_id);
+                    continue;
+                }
+            }
+            info!(
+                "worker kept running through the supervisor's restart; supervised again",
+                worker = m.label,
+                pid = w.pid
+            );
+            self.mark_ready(inst_id);
+        }
+        self.note_workers();
+        pids
+    }
+
     fn is_worker_mode(&self) -> bool {
         self.cfg.workers.mode == Mode::Worker
+    }
+
+    /// The keeper died (kill -9, an OOM kill): to wardend and systemd the app
+    /// died with it. End as a supervisor killed without a keeper does: each
+    /// worker gets the stop signal (the parent-death signal's SIGTERM) and
+    /// drains alone, and we exit at once, without `bye` (wardend restarts the
+    /// app) and leaving the control socket and the workers' record to the
+    /// next supervisor, which may already be starting.
+    fn keeper_gone(&mut self) -> ! {
+        error!(
+            "the keeper process of this app died; its workers are told to stop and this supervisor exits",
+            workers = self.insts.len(),
+            hint = "the keeper is the app's process to wardend and systemd: they start the app again; if nothing \
+                    killed it, this is a Warden bug: please report it with the log lines above",
+        );
+        // Now, not through the handles' tasks: we exit before they would run.
+        let sig = self.cfg.stop_signal();
+        for i in self.insts.values() {
+            crate::sys::signal_child(i.handle.pid, sig, true);
+        }
+        // Not their output: they drain for a while, and a CLI asking us
+        // meanwhile would wait.
+        crate::logging::flush_lines(Duration::from_millis(200));
+        std::process::exit(1);
     }
 
     /// The processes this supervisor has now, for the record that lets the
@@ -904,6 +1124,10 @@ impl Supervisor {
         self.start_attempt = Some(StartAttempt::default());
         for id in self.slot_ids() {
             let slot = self.slots.entry(id).or_insert_with(|| Slot::new(id));
+            // Taken back from the keeper, serving already.
+            if slot.current.is_some() {
+                continue;
+            }
             slot.tracker.reset();
             slot.failed_at = None;
             slot.token += 1;
@@ -968,6 +1192,7 @@ impl Supervisor {
             st.instance = instance;
         }
         self.insts.insert(inst_id, inst);
+        self.keeper_spawned(inst_id);
         self.note_workers();
         if self.is_worker_mode() {
             info!("host starting", pid = pid, workers = self.count, role = role_name(role));
@@ -1345,6 +1570,7 @@ impl Supervisor {
             Event::StandbyGateDue { inst } => self.standby_gates(inst),
             Event::StandbyChecked { inst, result } => self.on_standby_checked(inst, result),
             Event::StandbyVerified { inst, result } => self.on_standby_verified(inst, result),
+            Event::KeeperGone => self.keeper_gone(),
         }
     }
 
@@ -1414,6 +1640,7 @@ impl Supervisor {
                 if msg.handoff == Some(true) && !inst.handoff {
                     inst.handoff = true;
                     inst.adopt = msg.adopt == Some(true);
+                    inst.handoff_host = msg.host.clone();
                     if let Err(e) = self.open_handoff(msg.host.as_deref()) {
                         let pid = self.insts.get(&inst_id).map(|i| i.handle.pid).unwrap_or(0);
                         error!(
@@ -1641,7 +1868,11 @@ impl Supervisor {
     }
 
     fn check_all_ready(&mut self) {
-        let all = !self.slots.is_empty() && self.slots.values().all(|s| s.state == State::Running);
+        // Every slot, also those not started yet (after a restart by the keeper,
+        // the slots of workers that kept running are there before the rest).
+        let all = !self.slots.is_empty()
+            && self.slots.values().all(|s| s.state == State::Running)
+            && self.slot_ids().iter().all(|id| self.slots.contains_key(id));
         if all && !self.announced_ready {
             self.announced_ready = true;
             info!("all workers ready", workers = self.count, startup_ms = self.started.elapsed().as_millis());
@@ -1661,6 +1892,7 @@ impl Supervisor {
         if let (true, Some(h)) = (inst.handoff, self.handoff.as_ref()) {
             h.remove(inst_id);
         }
+        crate::keeper::client::send(&crate::keeper::Msg::Gone { pid: inst.handle.pid }, &[]);
         self.note_workers();
         for sock in inst.sockets.values() {
             let _ = std::fs::remove_file(sock);
@@ -2038,16 +2270,30 @@ impl Supervisor {
             Some("localhost") => std::net::Ipv4Addr::LOCALHOST.into(),
             Some(h) => h.parse().map_err(|_| std::io::Error::other(format!("not an IP address: {h}")))?,
         };
-        let h = crate::handoff::Handoff::start(&self.cfg.app.name, std::net::SocketAddr::new(ip, port))
-            // No IPv6 here: any IPv4 address.
-            .or_else(|e| match host {
-                None | Some("") | Some("::") => crate::handoff::Handoff::start(
-                    &self.cfg.app.name,
-                    std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port),
-                ),
-                _ => Err(e),
-            })?;
-        let mut h = h;
+        let listener = match self.kept_listener.take() {
+            // Kept open by the keeper through the previous supervisor's crash.
+            Some(l) => l,
+            None => {
+                let l = crate::handoff::Handoff::listen(std::net::SocketAddr::new(ip, port))
+                    // No IPv6 here: any IPv4 address.
+                    .or_else(|e| match host {
+                        None | Some("") | Some("::") => crate::handoff::Handoff::listen(std::net::SocketAddr::new(
+                            std::net::Ipv4Addr::UNSPECIFIED.into(),
+                            port,
+                        )),
+                        _ => Err(e),
+                    })?;
+                // The keeper holds it open if this supervisor crashes: visitors
+                // then wait in its queue instead of being refused.
+                {
+                    use std::os::fd::AsFd as _;
+                    let m = crate::keeper::Msg::Listener { name: "handoff".into() };
+                    crate::keeper::client::send(&m, &[l.as_fd()]);
+                }
+                l
+            }
+        };
+        let mut h = crate::handoff::Handoff::with_listener(&self.cfg.app.name, listener)?;
         self.serve_router(&mut h);
         info!(
             "workers take connections from Warden",
@@ -3138,8 +3384,16 @@ impl Supervisor {
             stopped: self.stopped,
             log_file: crate::logging::file_path().map(|p| p.display().to_string()),
             version: env!("CARGO_PKG_VERSION").into(),
-            pid: me,
-            uptime_secs: self.started.elapsed().as_secs(),
+            // Under a keeper the app's process is the keeper: wardend watches
+            // it, and a crash of this supervisor is not the app's end.
+            pid: crate::keeper::client::keeper_pid().unwrap_or(me),
+            uptime_secs: crate::keeper::client::started_ms()
+                .map(|t| {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    now.as_millis().saturating_sub(t as u128) as u64 / 1000
+                })
+                .unwrap_or_else(|| self.started.elapsed().as_secs()),
+            supervisor_pid: crate::keeper::client::keeper_pid().map(|_| me),
             workers_configured: self.count,
             workers_ready: ready,
             healthy: if self.cfg.health.enabled && !self.cfg.health.url.is_empty() {

@@ -92,13 +92,29 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   stdout, journald) and the output thread, which reads every worker's stdout
   and stderr (captured, or spliced into files with `worker_output =
   "direct"`), so however fast a worker prints, the supervisor answers on time.
+- **keeper** (`src/keeper.rs`; the process `warden start` runs as, the
+  one systemd and wardend see): starts the supervisor above as its child
+  and keeps, over a Unix socket pair (length-prefixed JSON frames with
+  descriptors attached, SCM_RIGHTS), a copy of each worker's stdout,
+  stderr and fd 3 and what the supervisor knows of it (slot, role,
+  readiness, sockets), plus the macOS hand-off listener. It does nothing
+  else while the supervisor runs, and passes signals and sd_notify on.
+  When the supervisor dies without saying goodbye, the workers become the
+  keeper's children (Linux: `PR_SET_CHILD_SUBREAPER`; macOS: watched by
+  pid and start time), the keeper reads their output into a 1 MB ring per
+  stream, starts a new supervisor (at once, then with backoff; 6 deaths in
+  60 s and it stops the workers), and hands everything over: the new
+  supervisor adopts the serving workers into their slots (pidfd on Linux),
+  replays their output and stops any that were mid-rollout. If the keeper
+  dies, the supervisor stops its workers and exits.
+  `keep_workers_on_crash = false` runs the supervisor alone.
 - **Workers**: the application. Each binds the shared port itself.
 - **wardend** (always on, one per host and user; `warden wardend` runs it): one socket
   for every app's live events and commands (the CLI's `warden events`,
   `warden-gui`), and a second level of supervision: it restarts supervisors
   that `warden start` launched in the background when they die (backoff, give
   up after 10 deaths in 10 min), and reports hung ones without killing them
-  (their workers die with them). It holds no workers and no state an app
+  (it can only kill the keeper, and the workers stop with it). It holds no workers and no state an app
   needs: killing it stops nothing. Under systemd every app is its own unit and
   wardend only watches; under launchd, in containers and for background apps
   it also resurrects the saved apps (once per boot). It keeps a 24 h
@@ -369,7 +385,9 @@ spawn (WARDEN_STANDBY=1) ─► standby_ready ─► gates ─► STANDBY ─pro
    when a worker's leader exits, whatever is left in its group is SIGKILLed.)
 
 A second SIGTERM/SIGINT skips the wait. Recommended unit uses `KillMode=mixed`
-so only Warden gets the first SIGTERM and orchestrates the drain.
+so only Warden gets the first SIGTERM and orchestrates the drain: the
+keeper, the unit's main process, passes it to the supervisor and exits
+after it, with its exit status.
 
 Seen from a proxy in front, a drain is: pooled connections answered with
 `Connection: close` for `drain_ms`, requests in flight completed, long-lived

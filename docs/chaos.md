@@ -84,10 +84,11 @@ injection (the kill, the `SIGCONT`, the CLI returning) to that point.
 |---|---|---|
 | `kill-worker` | `kill -9` of a random worker of a random app (worker mode: the host) | requests in flight on it; connections queued on its listener; worker mode: the app down until the host restarts (documented: the threads go together) |
 | `kill-standby` | `kill -9` of `api-bun`'s standby | nothing |
-| `kill-supervisor` | `kill -9` of a random app's supervisor; wardend must restart it | the app down until then (documented: the workers drain and exit with it, PDEATHSIG) |
+| `kill-supervisor` | `kill -9` of a random app's supervisor; its keeper must start it again with the same workers, all still alive | nothing (without a keeper: as `kill-keeper`) |
+| `kill-keeper` | `kill -9` of a random app's keeper (the app's process); wardend must restart the app | the app down until then (documented: the supervisor tells the workers to stop and exits) |
 | `kill-wardend` | `kill -9` of wardend, started again 0.5–3 s later (as systemd would) | nothing |
 | `stop-worker` | `SIGSTOP` of a worker for `watchdog.timeout` + 2.5–4.5 s; the watchdog must kill it | requests on it; worker mode: the app down |
-| `stop-supervisor` | `SIGSTOP` of a supervisor for 2–9 s | nothing; its workers must survive |
+| `stop-supervisor` | `SIGSTOP` of a supervisor (not its keeper) for 2–9 s | nothing; its workers must survive |
 | `stop-wardend` | `SIGSTOP` of wardend for 2–9 s | nothing; no supervisor may be restarted |
 | `reload`, `safe-reload`, `restart` | the operation on a random app; must exit 0 | queued connections reset with `tcp_migrate_req = 0` |
 | `restart-hard` | `warden restart <app> --hard` | the app down for a moment (documented) |
@@ -102,8 +103,8 @@ injection (the kill, the `SIGCONT`, the CLI returning) to that point.
 | `oom-kill` | a worker of `oom` allocates twice the cgroup's limit (`/grow`): the kernel must kill it, and Warden restart it and report it as an OOM kill: the slot's `last_exit`, the `worker crashed` log line with its `hint=`, wardend's `oom` alert | requests on that worker |
 | `memory-recycle` | a worker of `memhog` grows 300 MB over `max_memory`: Warden must replace it gracefully within 60 s (new worker first, the old one drained), not count a crash, log `worker scheduled for replacement … max_memory` and send a `recycled` alert | as `reload` (nothing else may be lost) |
 
-`kill-supervisor` never picks `oom`: wardend restarts a supervisor in its
-own cgroup, so the app would leave the memory cgroup.
+`kill-keeper` and `kill-supervisor` never pick `oom`: wardend restarts an
+app in its own cgroup, so the app would leave the memory cgroup.
 
 ## Invariants
 
@@ -287,4 +288,4 @@ The first CI runs, 2026-10-01, on 2-vCPU runners, release build:
 - A wardend killed *while* a supervisor is dead: faults run one at a time,
   so wardend is always back before the next supervisor dies.
 - An app's memory cgroup after wardend restarts its supervisor: the new
-  supervisor lands in wardend's cgroup (so `kill-supervisor` skips `oom`).
+  supervisor lands in wardend's cgroup (so `kill-keeper` skips `oom`).

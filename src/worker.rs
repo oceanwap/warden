@@ -266,6 +266,10 @@ pub struct Instance {
     pub handoff: bool,
     /// ...as a bare descriptor (`crate::handoff::Kind::Fd`).
     pub adopt: bool,
+    /// The address the app asked to listen on, with the handoff.
+    pub handoff_host: Option<String>,
+    /// What the keeper was last told of it (`crate::keeper::Meta`).
+    pub kept_meta: Option<crate::keeper::Meta>,
     pub slot: usize,
     pub handle: Handle,
     pub started: Instant,
@@ -331,6 +335,8 @@ impl Instance {
         Instance {
             handoff: false,
             adopt: false,
+            handoff_host: None,
+            kept_meta: None,
             standby: (role == Role::Standby).then(StandbyGates::default),
             standby_number: None,
             promoted_at: None,

@@ -147,8 +147,14 @@ pub struct Status {
     pub log_file: Option<String>,
     #[serde(default)]
     pub version: String,
+    /// The app's process: the supervisor, or its keeper when it has one (the
+    /// process that started with the app and outlives the supervisor's
+    /// crashes). `uptime_secs` is that process's.
     pub pid: u32,
     pub uptime_secs: u64,
+    /// The supervisor's own pid, when it runs under a keeper (`pid`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pid: Option<u32>,
     pub workers_configured: usize,
     pub workers_ready: usize,
     pub healthy: Option<bool>,
