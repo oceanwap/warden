@@ -688,7 +688,7 @@ impl Supervisor {
             count: cfg.workers.count,
             slots: BTreeMap::new(),
             insts: HashMap::new(),
-            next_inst: 1,
+            next_inst: first_free_inst(&runtime_dir, &cfg.app.name),
             tx,
             proc_tx,
             roll: None,
@@ -861,8 +861,9 @@ impl Supervisor {
                 && ids.contains(&m.slot)
                 && !taken
                 && (!m.handoff || self.handoff_on);
-            let inst_id = self.next_inst;
-            self.next_inst += 1;
+            // The id it was started with: its health socket and WARDEN_INSTANCE carry it.
+            let inst_id = if m.inst > 0 && !self.insts.contains_key(&m.inst) { m.inst } else { self.next_inst };
+            self.next_inst = self.next_inst.max(inst_id + 1);
             let adopted = process::Adopted {
                 pid: w.pid,
                 start: w.start,
@@ -2594,6 +2595,7 @@ impl Supervisor {
                             failures = inst.health_fails,
                             error = e,
                             action = action,
+                            hint = "`warden status` shows the failing check; `warden logs <app> --worker N` what the worker printed",
                         );
                         let (wid, fails) = (if worker_mode { 0 } else { slot }, inst.health_fails);
                         emit(&self.cfg.app.name, wid, WorkerEvent::Unhealthy, Some(pid), || {
@@ -2634,6 +2636,7 @@ impl Supervisor {
                 failing = failing,
                 workers = live.len(),
                 outage_threshold = threshold,
+                hint = "most workers fail their checks at once, which points at something they share (a database, the network); replacements resume when they pass",
             );
         } else if !outage && self.outage {
             info!("fleet health recovered: replacements resumed", failing = failing, workers = live.len());
@@ -3635,9 +3638,39 @@ impl TicketKey {
     }
 }
 
+/// The first instance id above every `<app>.h<inst>-<worker>.sock` in the
+/// runtime directory. Ids name the workers' health sockets, so a supervisor
+/// started while an earlier one's workers still drain (its keeper killed, or
+/// a restart) must not reuse theirs: a draining worker removes its socket as
+/// it exits, which would take the new worker's with it.
+fn first_free_inst(runtime_dir: &Path, app: &str) -> u64 {
+    let prefix = format!("{app}.h");
+    let Ok(dir) = std::fs::read_dir(runtime_dir) else { return 1 };
+    dir.filter_map(|e| {
+        let name = e.ok()?.file_name().into_string().ok()?;
+        let rest = name.strip_prefix(&prefix)?.strip_suffix(".sock")?;
+        rest.split_once('-')?.0.parse::<u64>().ok()
+    })
+    .max()
+    .map_or(1, |n| n + 1)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_ids_start_above_the_health_sockets_left_in_the_runtime_directory() {
+        let dir = std::env::temp_dir().join(format!("wsup-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(first_free_inst(&dir, "api"), 1, "an empty directory");
+        assert_eq!(first_free_inst(&dir.join("missing"), "api"), 1);
+        for f in ["api.h3-1.sock", "api.h12-2.sock", "api.sock", "control.sock", "other.h40-1.sock", "api.hx-1.sock"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        assert_eq!(first_free_inst(&dir, "api"), 13, "above the draining workers' 3 and 12, not another app's 40");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn worker_mode_is_refused_on_macos_only() {

@@ -13,6 +13,25 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_warden");
 
+/// Where tests put their files. macOS's `$TMPDIR` (/var/folders/...) is too
+/// long for the Unix socket paths under it (104 bytes at most), so /tmp there.
+fn tmp() -> std::path::PathBuf {
+    if cfg!(target_os = "macos") { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+/// `warden`, kept away from this machine's real launchd job: on macOS every
+/// `start`, `kill`, `update` and `startup` would otherwise read, kickstart or
+/// rewrite ~/Library/LaunchAgents/io.github.oceanwap.warden.daemon.plist. A
+/// test that wants a launchd job sets both variables again (`Fakes::launchd_env`).
+fn warden() -> Command {
+    let mut cmd = Command::new(BIN);
+    if cfg!(target_os = "macos") {
+        let dir = tmp().join("warden-tests-launchd");
+        cmd.env("WARDEN_LAUNCHD_DIR", &dir).env("WARDEN_LAUNCHCTL", dir.join("no-launchctl"));
+    }
+    cmd
+}
+
 fn fixture(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
@@ -64,14 +83,14 @@ impl Warden {
     /// `stall_stdout`: Warden's stdout is a pipe nobody reads (a stuck log
     /// consumer); stderr still goes to the log file.
     fn start_opts(name: &str, port: u16, toml: &str, env: &[(&str, &str)], stall_stdout: bool) -> Warden {
-        let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-it-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("warden.toml");
         let text = format!("{toml}\n[control]\nsocket = \"{}\"\n", dir.join("w.sock").display());
         std::fs::write(&cfg, text).unwrap();
         let log = std::fs::File::create(dir.join("warden.log")).unwrap();
-        let child = Command::new(BIN)
+        let child = warden()
             .args(["start", "-c"])
             .arg(&cfg)
             .envs(env.iter().copied())
@@ -98,7 +117,7 @@ impl Warden {
     }
 
     fn cli(&self, args: &[&str]) -> (i32, String) {
-        let out = Command::new(BIN).args(args).arg("-c").arg(&self.cfg).output().unwrap();
+        let out = warden().args(args).arg("-c").arg(&self.cfg).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
         (out.status.code().unwrap_or(-1), text)
     }
@@ -594,24 +613,20 @@ fn every_warning_has_a_hint(log: &str) {
 
 #[test]
 fn cli_errors() {
-    let dir = std::env::temp_dir().join(format!("warden-it-cli-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-cli-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("bad.toml");
     std::fs::write(&cfg, "[app]\nname = \"x\"\n[workers]\ncount = 0\n").unwrap();
-    let out = Command::new(BIN).args(["check", "-c"]).arg(&cfg).output().unwrap();
+    let out = warden().args(["check", "-c"]).arg(&cfg).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("workers.count"));
 
-    let out = Command::new(BIN)
-        .args(["status", "--socket"])
-        .arg(dir.join("nobody.sock"))
-        .stdout(Stdio::null())
-        .output()
-        .unwrap();
+    let out =
+        warden().args(["status", "--socket"]).arg(dir.join("nobody.sock")).stdout(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("Is it running?"));
 
-    let out = Command::new(BIN).arg("--help").output().unwrap();
+    let out = warden().arg("--help").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("reload"));
 }
 
@@ -718,7 +733,7 @@ fn node_tls_workers_resume_each_others_sessions() {
     if !have_node() || !have_openssl() || !cfg!(target_os = "linux") {
         return;
     }
-    let sess = std::env::temp_dir().join(format!("warden-tickets-{}.pem", std::process::id()));
+    let sess = tmp().join(format!("warden-tickets-{}.pem", std::process::id()));
     let port = free_port();
     let cfg = gated("tickets", port, 2, "command = \"node\"").replace(&fixture("app.ts"), &fixture("node_https.mjs"));
     let w = Warden::start("tickets", port, &cfg);
@@ -740,7 +755,7 @@ fn a_node_app_keeps_its_own_ticket_keys() {
     if !have_node() || !have_openssl() {
         return;
     }
-    let sess = std::env::temp_dir().join(format!("warden-own-tickets-{}.pem", std::process::id()));
+    let sess = tmp().join(format!("warden-own-tickets-{}.pem", std::process::id()));
     let outside = free_port();
     let mut plain = Command::new("node")
         .arg(fixture("node_https.mjs"))
@@ -1209,7 +1224,7 @@ fn systemd_ready_and_watchdog_pings_stop_when_frozen() {
     if !have_bun() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("warden-it-notify-sock-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-notify-sock-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("notify.sock");
@@ -1335,6 +1350,8 @@ fn a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers
         let said = format!("while-{ok}");
         assert!(get(port, &format!("/say?w={said}")).is_some(), "request {ok} failed:\n{}", w.log());
         ok += 1;
+        // Under the 10k lines/s output cap, which would drop lines a fast machine prints.
+        std::thread::sleep(Duration::from_millis(1));
     }
     let s = w.wait_for("the new supervisor", T, |s| {
         s["workers_ready"] == 2 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
@@ -1354,8 +1371,11 @@ fn a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers
     let victim = *before.iter().next().unwrap();
     unsafe { libc::kill(victim as i32, libc::SIGKILL) };
     let s = w.wait_for("the crashed worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    // macOS has no subreaper: a worker taken back is not the new supervisor's
+    // child, so its exit status cannot be read, only that it is gone.
+    let said = if cfg!(target_os = "linux") { "SIGKILL" } else { "unknown exit" };
     assert!(
-        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains("SIGKILL"))),
+        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains(said))),
         "{s:#}"
     );
 
@@ -1385,7 +1405,7 @@ fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
         assert!(t0.elapsed() < Duration::from_secs(10), "still running:\n{}", w.log());
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(w.log().contains("the keeper process of this app died"), "{}", w.log());
+    w.wait_log("the keeper process of this app died", T);
 }
 
 /// Every Warden process of the app killed at once (the supervisor and its
@@ -1460,6 +1480,48 @@ fn node_workers_hand_themselves_back_when_every_warden_process_dies() {
         fixture("node_app.mjs")
     );
     every_warden_process_killed("recover-node", &cfg, port);
+}
+
+/// A reload after the keeper restarted the supervisor: the new workers' health
+/// sockets must not share names with the taken-back workers', which remove
+/// theirs as they exit (instance ids are part of the name).
+#[test]
+fn a_reload_after_a_supervisor_restart_keeps_the_new_workers_health_sockets() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("inst-reuse", port, 2, "").replace(
+        "[health]\npath = \"/health\"\n",
+        "[health]\npath = \"/health\"\ninterval = 1\nfailure_threshold = 2\ninitial_delay = 0\n",
+    );
+    let w = Warden::start("inst-reuse", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    // Instances 3 and 4 after a reload, while a fresh supervisor would count from 1.
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("reloaded", T, ready(2));
+    let sup = w.supervisor();
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    let kept = w.wait_for("taken back", T, |s| {
+        s["workers_ready"] == 2 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
+    });
+    assert_eq!(pid_set(&kept), pid_set(&s));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("reloaded again", T, |s| s["workers_ready"] == 2 && pid_set(s).is_disjoint(&pid_set(&kept)));
+    // The old workers drain and exit; each new one keeps its own socket.
+    std::thread::sleep(Duration::from_secs(2));
+    let sockets: Vec<String> = std::fs::read_dir(&w.dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("inst-reuse.h") && n.ends_with(".sock"))
+        .collect();
+    assert_eq!(sockets.len(), 2, "one health socket per new worker: {sockets:?}");
+    let log = w.log();
+    let after = log.rsplit("taking back the workers").next().unwrap_or("");
+    assert!(!after.contains("worker unhealthy"), "a new worker lost its health socket:\n{log}");
+    assert_eq!(pid_set(&w.status().unwrap()), pid_set(&s), "the same workers serve");
 }
 
 /// Without the keeper (`WARDEN_KEEPER=0`); with it, the keeper starts the
@@ -1719,7 +1781,7 @@ struct Fleet {
 
 impl Fleet {
     fn new(name: &str) -> Fleet {
-        let home = std::env::temp_dir().join(format!("wf-{name}-{}", std::process::id()));
+        let home = tmp().join(format!("wf-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         Fleet { home }
@@ -1730,7 +1792,7 @@ impl Fleet {
     }
 
     fn cli_env(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
-        let out = Command::new(BIN)
+        let out = warden()
             .args(args)
             .env("WARDEN_HOME", &self.home)
             .env("WARDEN_RUNTIME_DIR", self.home.join("run"))
@@ -2004,7 +2066,7 @@ fn node_responses_are_counted_by_status() {
 /// false` turns the counting off (no figures at all, not zeros).
 #[test]
 fn static_responses_are_counted_and_can_be_turned_off() {
-    let dir = std::env::temp_dir().join(format!("warden-it-site-staticrq-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-site-staticrq-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("site")).unwrap();
     std::fs::write(dir.join("site/index.html"), "<h1>home</h1>").unwrap();
@@ -2317,7 +2379,7 @@ fn output_flood_budget_and_keep_all() {
     for keep_all in [false, true] {
         let port = free_port();
         let name = if keep_all { "flood-all" } else { "flood-budget" };
-        let dir = std::env::temp_dir().join(format!("warden-it-{name}-out-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-it-{name}-out-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let out = dir.join("out.log");
         let cfg = format!(
@@ -2613,7 +2675,7 @@ fn log_history_search_and_pipes() {
     assert_eq!(v["fields"]["worker"], "1");
 
     // Piping into `head`: stops quietly.
-    let mut child = Command::new(BIN)
+    let mut child = warden()
         .args(["logs", "chatty", "--history"])
         .env("WARDEN_HOME", &f.home)
         .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
@@ -2663,7 +2725,7 @@ fn get_close(port: u16, path: &str, extra: &str) -> (u16, std::collections::Hash
 /// closed and serve the same bytes.
 #[test]
 fn static_open_modes_agree_and_keep_the_root_closed() {
-    let dir = std::env::temp_dir().join(format!("warden-it-open-modes-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-open-modes-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let site = dir.join("site");
     std::fs::create_dir_all(site.join("sub")).unwrap();
@@ -2786,7 +2848,7 @@ fn static_accept_errors_back_off_and_say_why() {
             let _ = self.0.wait();
         }
     }
-    let dir = std::env::temp_dir().join(format!("warden-it-emfile-{io}-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-emfile-{io}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("site")).unwrap();
     std::fs::write(dir.join("site/index.html"), "hi").unwrap();
@@ -2853,7 +2915,7 @@ fn static_accept_errors_back_off_and_say_why() {
 #[test]
 fn static_cache_hits_match_and_stay_fresh() {
     let io = "epoll";
-    let dir = std::env::temp_dir().join(format!("warden-it-cache-{io}-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-cache-{io}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let site = dir.join("site");
     std::fs::create_dir_all(site.join("docs")).unwrap();
@@ -3343,7 +3405,7 @@ impl Wardend {
     fn start_args(f: &Fleet, args: &[&str], env: &[(&str, &str)]) -> Wardend {
         let out = f.home.join("wardend.out");
         let file = std::fs::File::create(&out).unwrap();
-        let child = Command::new(BIN)
+        let child = warden()
             .args(args)
             .env("WARDEN_HOME", &f.home)
             .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
@@ -3474,7 +3536,7 @@ fn supervisor_pid(f: &Fleet, app: &str) -> u64 {
 
 /// A `warden` child whose stdout lines arrive on a channel.
 fn spawn_lines(f: &Fleet, args: &[&str]) -> (Child, std::sync::mpsc::Receiver<String>) {
-    let mut child = Command::new(BIN)
+    let mut child = warden()
         .args(args)
         .env("WARDEN_HOME", &f.home)
         .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
@@ -4791,7 +4853,7 @@ fn a_supervisor_that_dies_says_no_bye() {
 
 /// A scratch directory next to (not inside) a Warden's, which `start` wipes.
 fn direct_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("warden-it-{name}-direct-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-{name}-direct-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -4935,12 +4997,12 @@ fn direct_output_needs_a_file_per_worker_process() {
     let base = "[app]\nname = \"dc\"\ncommand = \"sh\"\n[workers]\ncount = 2\n[logging]\nworker_output = \"direct\"\n\
                 out_file = \"/tmp/dc-out.log\"\n";
     std::fs::write(&cfg, base).unwrap();
-    let out = Command::new(BIN).arg("check").arg("-c").arg(&cfg).output().unwrap();
+    let out = warden().arg("check").arg("-c").arg(&cfg).output().unwrap();
     let text = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.contains("workers.count = 2") && text.contains("per_worker_files = true"), "{text}");
     std::fs::write(&cfg, format!("{base}per_worker_files = true\n")).unwrap();
-    let out = Command::new(BIN).arg("check").arg("-c").arg(&cfg).output().unwrap();
+    let out = warden().arg("check").arg("-c").arg(&cfg).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4971,8 +5033,7 @@ fn direct_output_flush_and_logs() {
 
     // `-f` shows new lines as they are written.
     let before = *ticks().last().unwrap();
-    let mut follow =
-        Command::new(BIN).args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
+    let mut follow = warden().args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
     let mut reader = std::io::BufReader::new(follow.stdout.take().unwrap());
     let mut newer = None;
     let t0 = Instant::now();
@@ -5017,8 +5078,7 @@ fn logs_follow_takes_a_burst_whole() {
     );
     let w = Warden::start("follow-burst", 0, &cfg);
     w.wait_log("worker ready", T);
-    let mut follow =
-        Command::new(BIN).args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
+    let mut follow = warden().args(["logs", "-f", "-n", "1", "-c"]).arg(&w.cfg).stdout(Stdio::piped()).spawn().unwrap();
     let mut reader = std::io::BufReader::new(follow.stdout.take().unwrap());
     let mut line = String::new();
     // The snapshot line: the follower is subscribed from here on.
@@ -5471,6 +5531,7 @@ fn sleeper_config(f: &Fleet, name: &str) {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "systemd only: macOS always takes the launchd path")]
 fn startup_installs_system_units_and_wardend() {
     let f = Fleet::new("st-system");
     sleeper_config(&f, "api");
@@ -5568,6 +5629,7 @@ fn startup_installs_system_units_and_wardend() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "systemd only: macOS always takes the launchd path")]
 fn kill_and_delete_after_startup_stop_a_supervisor_running_outside_its_unit() {
     // Review R1: after `warden startup` installed a unit for an app that
     // still runs in the background, `systemctl stop` would succeed on the
@@ -5604,6 +5666,7 @@ fn kill_and_delete_after_startup_stop_a_supervisor_running_outside_its_unit() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "systemd only: macOS always takes the launchd path")]
 fn startup_installs_user_units_and_lingering() {
     let f = Fleet::new("st-user");
     sleeper_config(&f, "api");
@@ -5801,6 +5864,7 @@ fn wardend_resurrect_starts_the_saved_apps() {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "systemd only: macOS always takes the launchd path")]
 fn wardend_start_uses_the_systemd_unit_and_kill_stops_the_wardend_unit() {
     let f = Fleet::new("wd-units");
     sleeper_config(&f, "api");
@@ -6345,7 +6409,7 @@ impl Nginx {
             eprintln!("skipping: nginx is not installed (`apt-get install nginx`)");
             return None;
         };
-        let dir = std::env::temp_dir().join(format!("warden-it-nginx-{name}-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-it-nginx-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let port = free_port();
@@ -6592,7 +6656,7 @@ fn keep_alive_requests<R>(port: u16, request: String, f: impl FnOnce() -> R) -> 
 fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
     {
         let io = "epoll";
-        let dir = std::env::temp_dir().join(format!("warden-it-static-drain-{io}-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-it-static-drain-{io}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
@@ -6720,7 +6784,7 @@ fn bun_drain_keeps_the_handler_the_app_reloaded() {
     // our connection still open to it.
     let reload = {
         let cfg = w.cfg.clone();
-        std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
+        std::thread::spawn(move || warden().args(["reload", "-c"]).arg(&cfg).output().unwrap())
     };
     // The new worker listens, Warden signals the old one, and the old one
     // starts its drain (4 s).
@@ -6789,7 +6853,7 @@ fn bun_drain_closes_connections_answered_by_routes_and_error_handlers() {
         .collect();
     let reload = {
         let cfg = w.cfg.clone();
-        std::thread::spawn(move || Command::new(BIN).args(["reload", "-c"]).arg(&cfg).output().unwrap())
+        std::thread::spawn(move || warden().args(["reload", "-c"]).arg(&cfg).output().unwrap())
     };
     w.wait_log("draining old process", T);
     wait_bun_drain_started(&w, port, "/r");
@@ -6848,7 +6912,7 @@ fn node_https_drain_waits_for_requests_in_flight() {
     if !have_node() {
         return;
     }
-    let tls = std::env::temp_dir().join(format!("warden-it-tls-{}", std::process::id()));
+    let tls = tmp().join(format!("warden-it-tls-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tls);
     std::fs::create_dir_all(&tls).unwrap();
     let made = Command::new("openssl")
@@ -7042,7 +7106,7 @@ fn surge_failure_rolls_back_the_whole_batch() {
 
 /// releases/v1..v3 (each a copy of the release fixture) and `current` -> v1.
 fn release_tree(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("warden-it-rel-{name}-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-rel-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for v in ["v1", "v2", "v3"] {
         std::fs::create_dir_all(dir.join("releases").join(v)).unwrap();
@@ -7269,7 +7333,7 @@ fn oom_kill_is_told_apart_from_a_kill_9() {
         return;
     }
     let port = free_port();
-    let events = std::env::temp_dir().join(format!("warden-it-memory.events-{}", std::process::id()));
+    let events = tmp().join(format!("warden-it-memory.events-{}", std::process::id()));
     std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
     let ev = events.display().to_string();
     let w = Warden::start_env("oomfake", port, &simple("oomfake", port, 1, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
@@ -7305,7 +7369,7 @@ fn one_oom_kill_for_two_sigkill_deaths_is_reported_as_uncertain() {
         return;
     }
     let port = free_port();
-    let events = std::env::temp_dir().join(format!("warden-it-memory.events-two-{}", std::process::id()));
+    let events = tmp().join(format!("warden-it-memory.events-two-{}", std::process::id()));
     std::fs::write(&events, "low 0\nhigh 0\nmax 5\noom 2\noom_kill 3\noom_group_kill 0\n").unwrap();
     let ev = events.display().to_string();
     let w = Warden::start_env("oomtwo", port, &simple("oomtwo", port, 2, ""), &[("WARDEN_TEST_MEMORY_EVENTS", &ev)]);
@@ -7383,7 +7447,7 @@ impl Warden {
     /// Like `start`, with Warden (and so its workers) in the cgroup whose
     /// `cgroup.procs` is `procs`.
     fn start_in_cgroup(name: &str, port: u16, toml: &str, procs: &std::path::Path) -> Warden {
-        let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-it-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("warden.toml");
@@ -8327,7 +8391,7 @@ fn a_watcher_that_panics_is_reported_and_a_reload_starts_another() {
 fn a_control_socket_in_the_watched_directory_does_not_hide_the_app() {
     // `Warden::start` puts the socket (w.sock), the log and the config in this directory.
     let name = "watchsock";
-    let dir = std::env::temp_dir().join(format!("warden-it-{name}-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-{name}-{}", std::process::id()));
     let toml = format!(
         "[app]\nname = \"{name}\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n\
          working_directory = {:?}\n[watch]\nenabled = true\ndebounce_ms = 200\ninterval_ms = 100\n",
@@ -8432,6 +8496,12 @@ fn watching_no_files_says_so() {
 /// Is `pid` a live process? A zombie, which only waits for its parent to
 /// collect it, is not (`kill(pid, 0)` says yes to it).
 fn running(pid: u64) -> bool {
+    if !cfg!(target_os = "linux") {
+        // No /proc: ps prints nothing for a pid that is gone, and Z for a zombie.
+        let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        return !stat.trim().is_empty() && !stat.trim_start().starts_with('Z');
+    }
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with(['Z', 'X'])))
 }
@@ -8660,7 +8730,7 @@ fn app_with_stubborn_orphans(f: &Fleet, name: &str, tag: &str, ready_timeout: u6
 fn start_in_the_background(f: &Fleet, name: &str) -> (Child, PathBuf) {
     let out = f.home.join(format!("start-{name}.out"));
     let file = std::fs::File::create(&out).unwrap();
-    let child = Command::new(BIN)
+    let child = warden()
         .args(["start", name])
         .env("WARDEN_HOME", &f.home)
         .env("WARDEN_RUNTIME_DIR", f.home.join("run"))
@@ -8775,7 +8845,7 @@ fn warden_start_waits_for_a_sweep_that_outlasts_ready_timeout() {
 /// folder it serves, and they are served: the default `compress_dir`.
 #[test]
 fn a_static_site_keeps_its_compressed_copies_in_the_state_folder() {
-    let base = std::env::temp_dir().join(format!("warden-it-copies-site-{}", std::process::id()));
+    let base = tmp().join(format!("warden-it-copies-site-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (site, home) = (base.join("site"), base.join("home"));
     std::fs::create_dir_all(&site).unwrap();

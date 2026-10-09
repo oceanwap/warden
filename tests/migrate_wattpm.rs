@@ -14,6 +14,23 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_warden");
+
+/// Where tests put their files. macOS's `$TMPDIR` (/var/folders/...) is too
+/// long for the Unix socket paths under it (104 bytes at most), so /tmp there.
+fn tmp() -> std::path::PathBuf {
+    if cfg!(target_os = "macos") { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+/// `warden`, kept away from this machine's real launchd job (see the same
+/// function in tests/integration.rs).
+fn warden() -> Command {
+    let mut cmd = Command::new(BIN);
+    if cfg!(target_os = "macos") {
+        let dir = tmp().join("warden-tests-launchd");
+        cmd.env("WARDEN_LAUNCHD_DIR", &dir).env("WARDEN_LAUNCHCTL", dir.join("no-launchctl"));
+    }
+    cmd
+}
 const RUNTIME: &str = "https://schemas.platformatic.dev/@platformatic/runtime/3.71.0.json";
 const NODE: &str = "https://schemas.platformatic.dev/@platformatic/node/3.71.0.json";
 const SECRET: &str = "s3cr3t value";
@@ -77,7 +94,7 @@ struct Dir {
 
 impl Dir {
     fn new(name: &str) -> Dir {
-        let root = std::env::temp_dir().join(format!("wm-{name}-{}", std::process::id()));
+        let root = tmp().join(format!("wm-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         Dir { root }
@@ -116,7 +133,7 @@ impl Dir {
 
     fn warden_env(&self, cwd: &Path, args: &[&str], extra: &[(&str, &std::ffi::OsStr)]) -> Out {
         let home = self.path("whome");
-        let out = Command::new(BIN)
+        let out = warden()
             .args(args)
             .envs(extra.iter().copied())
             .env("WARDEN_HOME", &home)
@@ -152,7 +169,7 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
-        let _ = Command::new(BIN)
+        let _ = warden()
             .args(["kill", "--yes"])
             .env("WARDEN_HOME", self.path("whome"))
             .env("WARDEN_RUNTIME_DIR", self.path("whome/run"))

@@ -238,12 +238,11 @@ macOS has no `/proc`: the harness reads processes with `ps` (one call for
 the whole table) and `lsof` (fds, a worker's working directory). It leaves
 out, and lists at the start and in the report: the pid namespace and the
 tmpfs (`disk-full`), memory cgroups (`oom` app, `oom-kill`), `memhog` and
-`memory-recycle` (Warden reads workers' RSS from `/proc`), and
-`kill-supervisor` (no parent-death signal: the workers of a SIGKILLed
-supervisor keep running until the app starts again, and the sweep then
-stops them, as docs/platforms.md says; the chaos run does not check that
-yet), and `api-node` (Node has no `reusePort` on macOS, so its 3
-workers cannot share the port). Connections are not spread across
+`memory-recycle` (Warden reads workers' RSS from `/proc`), the `threads`
+app (Bun worker mode is Linux only), and `api-node` (Node has no
+`reusePort` on macOS, so its 3 workers cannot share the port).
+`kill-supervisor` runs there too: the keeper watches the workers by pid
+and start time instead of as their subreaper. Connections are not spread across
 `SO_REUSEPORT` listeners there, which changes which worker answers, not
 what may fail.
 

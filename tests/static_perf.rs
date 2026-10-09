@@ -27,6 +27,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Where tests put their files. macOS's `$TMPDIR` (/var/folders/...) is too
+/// long for the Unix socket paths under it (104 bytes at most), so /tmp there.
+fn tmp() -> std::path::PathBuf {
+    if cfg!(target_os = "macos") { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_warden");
 
 fn bin() -> String {
@@ -48,7 +54,7 @@ struct Tmp(PathBuf);
 
 impl Tmp {
     fn new(name: &str) -> Tmp {
-        let dir = std::env::temp_dir().join(format!("warden-perf-{name}-{}", std::process::id()));
+        let dir = tmp().join(format!("warden-perf-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Tmp(dir)
@@ -1582,7 +1588,7 @@ mod linux {
     /// What `strace` (with `args`) wrote about `pid` while `work` ran; None
     /// when strace is missing or cannot attach.
     fn strace(pid: u32, args: &[&str], work: impl FnOnce()) -> Option<String> {
-        let out = std::env::temp_dir().join(format!("warden-perf-strace-{}-{pid}", std::process::id()));
+        let out = tmp().join(format!("warden-perf-strace-{}-{pid}", std::process::id()));
         let mut strace = Command::new("strace")
             .args(args)
             .args(["-f", "-p", &pid.to_string(), "-o"])

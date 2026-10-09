@@ -459,14 +459,9 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     if !rss {
         notes.push("Warden reads workers' RSS from /proc (Linux): no `memhog` app, memory-recycle is skipped".into());
     }
-    // docs/platforms.md: without a parent-death signal the workers of a
-    // SIGKILLed supervisor keep running (and serving) next to the new ones.
-    let pdeathsig = cfg!(target_os = "linux");
-    if !pdeathsig {
-        notes.push(
-            "no parent-death signal on this OS (a killed supervisor's workers live on): kill-supervisor is skipped"
-                .into(),
-        );
+    let worker_mode = cfg!(target_os = "linux");
+    if !worker_mode {
+        notes.push("Bun worker mode runs on Linux only: no `threads` app".into());
     }
     // Node's reusePort (libuv) is Linux's (and some BSDs'): not macOS's.
     let node_shared_port = cfg!(target_os = "linux");
@@ -476,7 +471,7 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
     for n in &notes {
         println!("chaos: note: {n}");
     }
-    let opt = fleet::Optional { nest, oom: cgroup.is_some(), rss, node_shared_port };
+    let opt = fleet::Optional { nest, oom: cgroup.is_some(), rss, node_shared_port, worker_mode };
     let specs: Vec<AppSpec> = fleet::specs(&opt)?;
     let logs = home.join("logs");
     let crash_flag = home.join("crash-flag");
@@ -575,7 +570,6 @@ fn run(o: &Opts, root: &Path, bin: &Path, in_ns: bool) -> Result<(), String> {
         .filter(|k| *k != "disk-full" || tmpfs)
         .filter(|k| *k != "oom-kill" || fleet.cgroup.is_some())
         .filter(|k| *k != "memory-recycle" || rss)
-        .filter(|k| *k != "kill-supervisor" || pdeathsig)
         .collect();
     let bound = Duration::from_secs(o.bound);
     let run_for = Duration::from_secs_f64(o.minutes * 60.0);

@@ -30,7 +30,8 @@
   - A supervisor that crashes is started again by the app's keeper, which
     takes back its workers as on Linux; macOS has no child subreaper, so the
     keeper sees a kept worker's exit by its pid and start time (every half
-    second) rather than its exit code, and the listening socket of the
+    second) rather than its exit code (its `last_exit` reads "unknown exit"
+    when it dies later), and the listening socket of the
     connection handoff is kept too. No parent-death signal: without a keeper
     (`keep_workers_on_crash = false`), or when the keeper itself is killed
     in the middle of a shutdown, workers outlive their supervisor. Warden
