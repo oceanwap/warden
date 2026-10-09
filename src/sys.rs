@@ -3410,7 +3410,7 @@ mod tests {
             for len in 0..300 {
                 let hay = &data[start..start + len];
                 assert_eq!(memchr(b'\n', hay), None);
-                for needle in [b'a', b'e', b'j'] {
+                for needle in *b"aej" {
                     assert_eq!(memchr(needle, hay), hay.iter().position(|&b| b == needle), "start {start} len {len}");
                 }
                 if len > 0 {
