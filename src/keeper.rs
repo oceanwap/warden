@@ -91,7 +91,7 @@ pub enum FdKind {
 
 /// What the supervisor knows of a worker, kept by the keeper so the next
 /// supervisor can put the worker back where it was.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Meta {
     pub slot: usize,
@@ -113,6 +113,8 @@ pub struct Meta {
     pub listening: Vec<u16>,
     /// Worker mode: the Workers (threads) that listen.
     pub threads: Vec<usize>,
+    /// It can hand itself back to a later supervisor (`crate::recover`).
+    pub recoverable: bool,
 }
 
 mod pairs {
@@ -315,6 +317,10 @@ struct Kept {
     /// Its supervisor died: the keeper reports its exit (it is the keeper's
     /// child on Linux, nobody's it can wait for on macOS).
     orphan: bool,
+    /// Not the supervisor's child (one it took back after an earlier
+    /// supervisor and keeper died, `crate::recover`): never the keeper's
+    /// child either, told apart by its start time as on macOS.
+    foreign: bool,
     exited: Option<Exit>,
     /// Output read while no supervisor did: per stream.
     rings: Vec<(FdKind, std::rc::Rc<std::cell::RefCell<Ring>>)>,
@@ -589,10 +595,14 @@ impl Keeper {
     /// could send `Gone`). macOS: not our children; the same process is still
     /// there if its start time is.
     fn poll_orphans(&mut self) {
-        let orphans: Vec<(u32, Option<u64>)> =
-            self.kept.iter().filter(|(_, k)| k.orphan && k.exited.is_none()).map(|(pid, k)| (*pid, k.start)).collect();
-        for (pid, start) in orphans {
-            if cfg!(target_os = "linux") {
+        let orphans: Vec<(u32, Option<u64>, bool)> = self
+            .kept
+            .iter()
+            .filter(|(_, k)| k.orphan && k.exited.is_none())
+            .map(|(pid, k)| (*pid, k.start, k.foreign))
+            .collect();
+        for (pid, start, foreign) in orphans {
+            if cfg!(target_os = "linux") && !foreign {
                 match crate::sys::try_reap(pid) {
                     Ok(None) => {}
                     Ok(Some((code, signal))) => self.worker_exited(pid, Exit { code, signal }, true),
@@ -651,7 +661,12 @@ impl Keeper {
                 }
             }
             Msg::Spawned { pid, meta, fds: kinds } => {
-                let start = crate::platform::proc_identity(pid).map(|id| id.start);
+                let id = crate::platform::proc_identity(pid);
+                let start = id.map(|id| id.start);
+                let foreign = match (id, self.sup.as_ref()) {
+                    (Some(id), Some(s)) => id.ppid != s.pid,
+                    _ => false,
+                };
                 let fds = kinds.into_iter().zip(fds).collect();
                 self.kept.insert(
                     pid,
@@ -661,6 +676,7 @@ impl Keeper {
                         meta,
                         fds,
                         orphan: false,
+                        foreign,
                         exited: None,
                         rings: Vec::new(),
                         drained: false,
@@ -915,14 +931,18 @@ impl Keeper {
         if self.stopping.is_some() {
             return;
         }
-        let live: Vec<(u32, Option<u64>)> =
-            self.kept.iter().filter(|(_, k)| k.orphan && k.exited.is_none()).map(|(p, k)| (*p, k.start)).collect();
+        let live: Vec<(u32, Option<u64>, bool)> = self
+            .kept
+            .iter()
+            .filter(|(_, k)| k.orphan && k.exited.is_none())
+            .map(|(p, k)| (*p, k.start, k.foreign))
+            .collect();
         if live.is_empty() {
             self.finish();
         }
         info!("stopping the workers the supervisor left", app = self.app, workers = live.len());
-        for (pid, start) in live {
-            signal_kept(pid, start, self.stop_signal);
+        for (pid, start, foreign) in live {
+            signal_kept(pid, start, foreign, self.stop_signal);
         }
         let now = Instant::now();
         self.stopping = Some((now + self.grace, now + self.grace + Duration::from_secs(5)));
@@ -938,7 +958,7 @@ impl Keeper {
             self.killed = true;
             for (pid, k) in &self.kept {
                 if k.orphan && k.exited.is_none() {
-                    signal_kept(*pid, k.start, libc::SIGKILL);
+                    signal_kept(*pid, k.start, k.foreign, libc::SIGKILL);
                 }
             }
         }
@@ -953,10 +973,11 @@ impl Keeper {
 }
 
 /// Signal a kept worker's process group, if it is still the process that was
-/// kept (on Linux an unreaped child of ours: its pid can't be reused).
-fn signal_kept(pid: u32, start: Option<u64>, sig: i32) {
-    let same =
-        cfg!(target_os = "linux") || crate::platform::proc_identity(pid).is_some_and(|id| Some(id.start) == start);
+/// kept (on Linux an unreaped child of ours, unless `foreign`: its pid can't
+/// be reused).
+fn signal_kept(pid: u32, start: Option<u64>, foreign: bool, sig: i32) {
+    let same = (cfg!(target_os = "linux") && !foreign)
+        || crate::platform::proc_identity(pid).is_some_and(|id| Some(id.start) == start);
     if same {
         crate::sys::signal_child(pid, sig, true);
     }

@@ -27,6 +27,7 @@ mod migrate_wattpm;
 mod networking;
 mod platform;
 mod process;
+mod recover;
 mod restart;
 mod router;
 mod schedule;
@@ -57,6 +58,10 @@ fn main() {
     // Internal: the worker process of an app with a [route] section.
     if argv.first().map(String::as_str) == Some("route") {
         std::process::exit(router::main());
+    }
+    // Internal: started by the shim of a worker whose Warden processes all died.
+    if argv.first().map(String::as_str) == Some("recover-worker") {
+        std::process::exit(recover::helper_main(&argv[1..]));
     }
     // Internal: a compression in the background, started by such a worker.
     if argv.first().map(String::as_str) == Some("static-compress") {

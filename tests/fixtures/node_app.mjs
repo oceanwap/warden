@@ -5,6 +5,7 @@
 //   FIXTURE_BLOCK_MS=<ms>     block the event loop for <ms> every 400 ms (event-loop delay)
 //   FIXTURE_TLS_DIR=<dir>     serve https with <dir>/key.pem and <dir>/cert.pem
 // Endpoints: /whoami -> "<pid>:<NODE_APP_INSTANCE>", /slow?ms=N -> answers after N ms,
+//            /say?w=X -> prints "fixture says X <pid>" to stdout, answers like /whoami,
 //            /status?code=N -> answers with status N,
 //            /fill-ipc -> fills fd 3 with heartbeats until it is full (hours of them,
 //                         Warden stopped); answers the bytes written
@@ -27,6 +28,11 @@ const handler = (req, res) => {
       while (n < 256 << 20) n += fs.writeSync(3, line);
     } catch {}
     res.end(String(n));
+    return;
+  }
+  if (url.pathname === "/say") {
+    console.log(`fixture says ${url.searchParams.get("w")} ${process.pid}`);
+    res.end(who());
     return;
   }
   if (url.pathname === "/slow") {

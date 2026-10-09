@@ -1487,6 +1487,29 @@ fn parse_tcp_listen(msg: &[u8]) -> Option<TcpListen> {
     })
 }
 
+/// What kind of file a descriptor is: `S_IFSOCK`, `S_IFIFO`, … (`S_IFMT` bits).
+pub fn fd_type(fd: BorrowedFd<'_>) -> io::Result<libc::mode_t> {
+    // SAFETY: a zeroed `stat` is valid for fstat to fill in.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat writes into `st`, which lives for the call; `fd` is borrowed.
+    check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+    Ok(st.st_mode & libc::S_IFMT)
+}
+
+/// Linux: make a pipe hold `bytes` (F_SETPIPE_SZ; the kernel rounds up to
+/// pages, and refuses more than /proc/sys/fs/pipe-max-size unless root).
+#[cfg(target_os = "linux")]
+pub fn set_pipe_size(fd: BorrowedFd<'_>, bytes: i32) -> io::Result<()> {
+    // SAFETY: fcntl(F_SETPIPE_SZ) on a borrowed descriptor, an integer argument.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETPIPE_SZ, bytes) }).map(|_| ())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_pipe_size(fd: BorrowedFd<'_>, bytes: i32) -> io::Result<()> {
+    let _ = (fd, bytes);
+    Ok(())
+}
+
 // ------------------------------------------------ between fork and exec
 //
 // These run in the child after fork(2) and before exec: only
@@ -1563,28 +1586,55 @@ pub fn child_new_session() -> io::Result<()> {
 /// being async-signal-safe: this one calls nothing but the two helpers
 /// above, so it allocates and locks nothing after fork. `ipc_fd` must stay
 /// open until the command is spawned.
-pub fn pre_exec_worker(cmd: &mut std::process::Command, ipc_fd: RawFd, target: RawFd, handoff: Option<RawFd>) {
+pub fn pre_exec_worker(
+    cmd: &mut std::process::Command,
+    ipc_fd: RawFd,
+    target: RawFd,
+    handoff: Option<RawFd>,
+    spares: [RawFd; SPARES],
+) {
     use std::os::unix::process::CommandExt;
     // SAFETY: the closure only calls `child_dup_ipc` (dup2, fcntl),
     // `child_dup_above` (fcntl) and `child_parent_death_signal` (prctl or
     // nothing; an atomic load in debug builds): all async-signal-safe, no
-    // allocation, no locks. It captures three integers.
+    // allocation, no locks. It captures integers.
     unsafe {
         cmd.pre_exec(move || {
-            // The handoff channel goes to `target + 1`: first out of the way
-            // (it may be `target` itself), then into place after fd 3.
+            // The handoff channel goes to `target + 1` and the spares from
+            // `SPARE_FD` on: first out of the way (any of them may be where
+            // another one goes), then into place.
             let handoff = match handoff {
-                Some(fd) => Some(child_dup_above(fd, target + 2)?),
+                Some(fd) => Some(child_dup_above(fd, SPARE_FD + SPARES as RawFd)?),
                 None => None,
             };
+            let mut moved = [-1; SPARES];
+            for (m, fd) in moved.iter_mut().zip(spares) {
+                if fd >= 0 {
+                    *m = child_dup_above(fd, SPARE_FD + SPARES as RawFd)?;
+                }
+            }
             child_dup_ipc(ipc_fd, target)?;
             if let Some(fd) = handoff {
                 child_dup_ipc(fd, target + 1)?;
+            }
+            for (i, fd) in moved.into_iter().enumerate() {
+                if fd >= 0 {
+                    child_dup_ipc(fd, SPARE_FD + i as RawFd)?;
+                }
             }
             child_parent_death_signal(libc::SIGTERM)
         });
     }
 }
+
+/// Where a worker holds, untouched, a copy of Warden's ends of its channels
+/// (`crate::recover`): fd 5 Warden's end of fd 3, fd 6 of fd 4 (handoff),
+/// fd 7 the read end of its stdout pipe, fd 8 of its stderr pipe; any of
+/// them may be closed. Holding them keeps the channels open when every
+/// Warden process dies at once (no EPIPE for the app's output), and the
+/// worker hands copies back to the next supervisor.
+pub const SPARE_FD: RawFd = 5;
+pub const SPARES: usize = 4;
 
 /// Receive one message and the descriptor riding on it, if any (the other
 /// end of [`send_with_fd`]), close-on-exec. Blocks like the socket does.
@@ -1852,6 +1902,24 @@ pub fn take_inherited_socket(raw: RawFd) -> Option<OwnedFd> {
     }
     // SAFETY: an open socket descriptor that, by the caller's contract,
     // nothing else in this process owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl on a descriptor we own, integer arguments only.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).ok()?;
+    Some(fd)
+}
+
+/// Take ownership of inherited descriptor `raw` (3 or above) if it is open,
+/// whatever it is, and make it close-on-exec.
+pub fn take_inherited_fd(raw: RawFd) -> Option<OwnedFd> {
+    if raw < 3 {
+        return None;
+    }
+    // SAFETY: fcntl(F_GETFD) on an integer: EBADF for a closed descriptor.
+    if unsafe { libc::fcntl(raw, libc::F_GETFD) } < 0 {
+        return None;
+    }
+    // SAFETY: an open descriptor that, by the caller's contract, nothing
+    // else in this process owns.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: fcntl on a descriptor we own, integer arguments only.
     check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).ok()?;
@@ -2856,7 +2924,7 @@ mod tests {
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", "read -r line <&3; echo \"got $line\" >&3; echo $$; ps -o pgid= -p $$ >&3"])
             .stdout(std::process::Stdio::piped());
-        pre_exec_worker(&mut cmd, cfd, 3, None);
+        pre_exec_worker(&mut cmd, cfd, 3, None, [-1; SPARES]);
         pre_exec_new_session(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         drop(theirs); // only the child's copy remains: its exit is EOF here

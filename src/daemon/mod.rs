@@ -842,6 +842,33 @@ impl Daemon {
         self.core.borrow_mut().start(name, answering)
     }
 
+    /// Start every app with workers running and no Warden process of its own
+    /// (`platform::orphans` records them).
+    async fn restart_orphaned(&self) {
+        let dir = crate::platform::orphans::dir(&fleet::state_dir());
+        let boot = crate::platform::boot_id();
+        let me = std::process::id();
+        let found = crate::platform::orphans::running_orphans(&dir, &crate::platform::orphans::Os, boot.as_deref(), me);
+        let apps: std::collections::BTreeSet<String> = found.into_iter().map(|(app, _, _)| app).collect();
+        for app in apps {
+            crate::warn!(
+                "an app's workers are running with no Warden process; starting it again so it supervises them",
+                app = app,
+                hint = "its supervisor and keeper died together; workers under the shim are taken back, others are \
+                        replaced one by one",
+            );
+            let r = self.start(&app).await;
+            if !r.ok {
+                crate::error!(
+                    "could not start an app whose workers run unsupervised",
+                    app = app,
+                    error = r.message.unwrap_or_default(),
+                    hint = format!("`warden start {app}` starts it"),
+                );
+            }
+        }
+    }
+
     /// `--resurrect`: start every app `warden save` recorded that is not
     /// running, in the background, watched like any other. Once per boot:
     /// when launchd (KeepAlive) restarts a crashed wardend, apps the user
@@ -1113,6 +1140,14 @@ async fn run(resurrect: bool) -> Result<(), String> {
     let watchdog = crate::systemd::watchdog_requested();
     crate::guard::spawn_essential("wardend socket", serve(d.clone(), listener));
     crate::guard::spawn_essential("wardend host metrics", host_loop(d.clone()));
+    // Apps whose workers run with neither a supervisor nor a keeper: every
+    // Warden process died together (wardend among them, or it would have
+    // restarted them). Started again, they take their workers back
+    // (`crate::recover`), or stop and replace them.
+    {
+        let d = d.clone();
+        tokio::task::spawn_local(async move { d.restart_orphaned().await });
+    }
     if resurrect {
         d.discover();
         // In the background: waiting for each batch of apps must not hold up the events, the

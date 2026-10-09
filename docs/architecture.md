@@ -108,6 +108,21 @@ Studied `@platformatic/runtime` 3.71.0 (details in `research/watt-findings.md`).
   replays their output and stops any that were mid-rollout. If the keeper
   dies, the supervisor stops its workers and exits.
   `keep_workers_on_crash = false` runs the supervisor alone.
+  If the supervisor and the keeper die together (wardend with them, or
+  not), Linux workers under the shim carry on and come back by themselves
+  (`src/recover.rs`): each holds a copy of Warden's ends of its channels
+  (fd 5: Warden's end of fd 3, 6: of fd 4, 7 and 8: the read ends of its
+  stdout and stderr; `WARDEN_RECOVER_FDS` says which are open), so its
+  output never meets a closed pipe. The shim checks once a second whether
+  the supervisor or keeper named in `WARDEN_RECOVER` still runs; when
+  neither does, it runs `warden recover-worker` with those descriptors,
+  which starts wardend if it died, waits for the app's next supervisor
+  (wardend starts the apps whose recorded workers run unsupervised) and
+  passes them over `<runtime dir>/<app>.recover.sock` (SCM_RIGHTS; the
+  sender must be a child of the worker it names, of the same user). The
+  supervisor's orphan record (`platform::orphans`) keeps the keeper and
+  what the keeper's `Meta` says of each worker, so the next supervisor
+  adopts them exactly as from a keeper, and gives its own keeper a copy.
 - **Workers**: the application. Each binds the shared port itself.
 - **wardend** (always on, one per host and user; `warden wardend` runs it): one socket
   for every app's live events and commands (the CLI's `warden events`,

@@ -105,6 +105,20 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   says `pid` (the keeper) and `supervisor_pid`. `[restart]
   keep_workers_on_crash = false` (or `WARDEN_KEEPER=0`) runs the
   supervisor alone, as earlier releases did.
+- If the supervisor and the keeper die together (one `kill -9` of the
+  group, wardend gone with them or not), workers under the shim on Linux
+  keep serving and come back under Warden by themselves. Each holds a
+  copy of Warden's ends of its own pipes and fd 3, so nothing it prints
+  fails (a Node `console.log` to a closed pipe kills the app); its output
+  waits in the pipe (1 MB as root, 64 KB otherwise). Once a second the shim looks whether its
+  supervisor or keeper still runs; when neither does, it starts `warden
+  recover-worker`, which starts wardend again if it died, and hands the
+  descriptors to the app's next supervisor. wardend, when it starts,
+  starts every app whose recorded workers run with no Warden process.
+  That supervisor waits up to 5 s for them and supervises those that
+  answer exactly as after a supervisor crash: same pids, their output,
+  health checks, restarts, `warden stop`. Measured: 0 failed requests,
+  about 3 s from the kill to supervised again, with wardend killed too.
 - If the keeper is SIGKILLed, the supervisor tells each worker to stop
   (the stop signal, to its process group) and exits without `bye`, so
   wardend or systemd starts the app again. Without a keeper, workers are

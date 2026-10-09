@@ -93,6 +93,18 @@ pub(crate) async fn watch() {
     }
 }
 
+/// Start wardend if it died (not when it was stopped on purpose, nor when
+/// launchd or systemd runs it), and wait for it to answer. For `warden
+/// recover-worker`: the app it waits for comes back through wardend.
+pub(crate) async fn revive_if_died() {
+    if client::disabled() || crate::startup::wardend_managed() {
+        return;
+    }
+    if probe(&socket_path()).await == Probe::Died {
+        let _ = revive().await;
+    }
+}
+
 enum Revived {
     Started,
     /// Another supervisor got there first.
