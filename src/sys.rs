@@ -3808,20 +3808,27 @@ mod tests {
     /// leads its own process group.
     #[test]
     fn pre_exec_supervisor_keeps_the_channel_and_starts_a_process_group() {
-        let (ours, theirs) = socketpair_cloexec().unwrap();
+        // Descriptors past 9 first: the channel's number is then one a shell
+        // can't redirect to (dash), as in a test run with many open files.
+        let _filler: Vec<OwnedFd> = (0..12).map(|_| socketpair_cloexec().unwrap().0).collect();
+        let (_ours, theirs) = socketpair_cloexec().unwrap();
+        let n = theirs.as_raw_fd();
+        assert!(n > 9);
+        // The shell only tells whether descriptor n is open after exec.
         let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(format!("printf ok >&{}; sleep 5", theirs.as_raw_fd()));
-        pre_exec_supervisor(&mut cmd, theirs.as_raw_fd());
+        cmd.arg("-c").arg(format!("if [ -e /dev/fd/{n} ]; then echo kept; else echo closed; fi; exec sleep 5"));
+        cmd.stdout(std::process::Stdio::piped());
+        pre_exec_supervisor(&mut cmd, n);
         let mut child = cmd.spawn().unwrap();
         drop(theirs);
-        let mut buf = [0u8; 2];
-        assert!(wait_readable(ours.as_fd(), 5000).unwrap());
-        assert_eq!(recv_fds(ours.as_fd(), &mut buf).unwrap().0, 2);
-        assert_eq!(&buf, b"ok");
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
         // SAFETY: getpgid on a child pid we have not reaped yet.
-        assert_eq!(unsafe { libc::getpgid(child.id() as i32) }, child.id() as i32);
+        let pgid = unsafe { libc::getpgid(child.id() as i32) };
         let _ = child.kill();
         let _ = child.wait();
+        assert_eq!(line.trim(), "kept", "the channel survives exec");
+        assert_eq!(pgid, child.id() as i32, "its own process group");
     }
 
     /// The signal reaches the process the pidfd refers to; ESRCH once it has
