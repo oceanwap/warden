@@ -21,10 +21,12 @@ pub enum Listener {
 }
 
 /// The most processes a walk looks at, and how deep it goes: a server tree
-/// is a shell, a package manager and the server, sometimes a worker per CPU.
+/// is a shell, a package manager and the server, sometimes a worker per CPU;
+/// a monorepo dev script stacks more (`bun run dev` → dotenv → turbo's node
+/// shim → turbo → `bun run dev` → the server is five generations down).
 /// A fork bomb below the app must not turn every status call into a scan.
 pub(super) const MAX_PROCESSES: usize = 64;
-pub(super) const MAX_DEPTH: usize = 4;
+pub(super) const MAX_DEPTH: usize = 8;
 
 /// What `root` and the processes below it listen on, sorted and without
 /// duplicates (processes that share a socket, like a forking server's
@@ -179,6 +181,17 @@ mod tests {
         f.tree.insert(13, (vec![], vec![tcp(9229)]));
         let got = of_tree(&f, 10).unwrap();
         assert_eq!(got, [tcp(3001), tcp(9229), Listener::Unix { path: "/tmp/a.sock".into() }]);
+    }
+
+    #[test]
+    fn a_turbo_monorepo_shows_the_servers_five_generations_down() {
+        // bun run dev (1) → dotenv (2) → turbo shim (3) → turbo (4) → bun run dev (5) → astro (6, 3003).
+        let mut f = Fake::default();
+        for pid in 1..=5 {
+            f.tree.insert(pid, (vec![pid + 1], vec![]));
+        }
+        f.tree.insert(6, (vec![], vec![tcp(3003)]));
+        assert_eq!(of_tree(&f, 1).unwrap(), [tcp(3003)]);
     }
 
     #[test]
