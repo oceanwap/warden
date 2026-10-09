@@ -1,0 +1,79 @@
+# The integration tests on Bun's newest release (`latest`) and its nightly
+# build (`canary`), once a day and by hand. CI pins its Bun versions
+# (BUN_VERSION, BUN_NEXT_VERSION in ci.yml); this run is what notices a Bun
+# change that breaks Warden before users upgrade to it. The shim is the part
+# most exposed: it wraps Bun.serve, node:http, Response, ReadableStream and
+# Function.prototype.toString.
+#
+# A red run here is a heads-up, not a broken main: look at what changed in
+# Bun, then fix the shim or report it upstream. When `server.adopt(fd)` lands
+# in a canary, the adopt test (a_bun_serve_tls_app_adopts_handed_over_
+# connections) starts taking its adopt branch here first.
+name: Bun canary
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bun-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+  NODE_VERSION: "22"
+
+jobs:
+  integration:
+    name: integration (Bun ${{ matrix.bun }})
+    strategy:
+      fail-fast: false
+      matrix:
+        bun: [latest, canary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ matrix.bun }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: bench/package-lock.json
+      - name: npm ci (bench/)
+        working-directory: bench
+        run: npm ci --no-audit --no-fund
+      - name: apt-get install nginx strace
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends nginx strace
+      - name: Bun version
+        run: |
+          v="$(bun --version) ($(bun --revision))"
+          echo "$v"
+          echo "::notice title=Bun ${{ matrix.bun }}::$v"
+      - name: cargo test --test integration
+        run: |
+          set -o pipefail
+          cargo test --test integration 2>&1 | tee integration.log
+      - name: cargo test --test static_perf
+        if: ${{ !cancelled() }}
+        env:
+          WARDEN_REQUIRE_STRACE: "1"
+        run: |
+          set -o pipefail
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cargo test --test static_perf 2>&1 | tee static_perf.log
+      - name: annotate failing tests
+        if: failure()
+        run: python3 .github/annotate-test-failures.py integration.log static_perf.log

@@ -40,6 +40,10 @@ env:
   RUST_TOOLCHAIN: "1.95.0"
   # What the integration tests and the benchmarks run on.
   BUN_VERSION: "1.3.13"
+  # The newest Bun, for the paths that need 1.4 (taking handed-over
+  # connections, worker mode at full speed): the linux-bun-1-4 job. Bump it
+  # on purpose too; the Bun canary workflow tries `latest` and `canary` daily.
+  BUN_NEXT_VERSION: "1.4.2"
   NODE_VERSION: "22"
   ACTIONLINT_VERSION: "1.7.12"
 
@@ -201,6 +205,52 @@ jobs:
       - name: annotate failing tests
         if: failure()
         run: python3 .github/annotate-test-failures.py unit.log integration.log static_perf.log
+
+  # The integration tests again on the newest Bun: on 1.3.13 the shim takes
+  # its pre-1.4 branches (no handed-over connections), so the 1.4 ones run
+  # only here. Linux x86_64 only, when code changed.
+  linux-bun-1-4:
+    name: linux-x86_64 (newest Bun)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_NEXT_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: bench/package-lock.json
+      - name: npm ci (bench/)
+        working-directory: bench
+        run: npm ci --no-audit --no-fund
+      - name: apt-get install nginx strace
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends nginx strace
+      - run: bun --version
+      - name: cargo test --test integration
+        run: |
+          set -o pipefail
+          cargo test --test integration 2>&1 | tee integration.log
+      - name: cargo test --test static_perf
+        if: ${{ !cancelled() }}
+        env:
+          WARDEN_REQUIRE_STRACE: "1"
+        run: |
+          set -o pipefail
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cargo test --test static_perf 2>&1 | tee static_perf.log
+      - name: annotate failing tests
+        if: failure()
+        run: python3 .github/annotate-test-failures.py integration.log static_perf.log
 
   macos:
     needs: changes
