@@ -2156,7 +2156,12 @@ fn node_responses_are_counted_by_status() {
             let _ = get(port, &format!("/status?code={code}"));
         }
     }
-    let s = wait_status(&w, "the responses counted", |s| s["requests"]["total"]["5xx"] == 3);
+    // Each worker reports its counts with its heartbeat: wait for all 31,
+    // not for the 503s alone (one worker may have answered all three).
+    let s = wait_status(&w, "the responses counted", |s| {
+        let t = &s["requests"]["total"];
+        ["2xx", "3xx", "4xx", "5xx"].iter().map(|k| t[*k].as_u64().unwrap_or(0)).sum::<u64>() >= 31
+    });
     let total = &s["requests"]["total"];
     assert_eq!(
         (&total["2xx"], &total["3xx"], &total["4xx"], &total["404"], &total["5xx"]),
