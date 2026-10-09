@@ -128,6 +128,77 @@ let promoted = false;
 let ipcReader = null;
 let ipcOpen = true;
 
+// ------------------------------------------------------ TLS session tickets
+//
+// Every worker would make its own ticket key, so a visitor's session ticket
+// would only resume on the worker that issued it: 1 in N with N workers on a
+// shared port, the rest paying for a full handshake (a third more server CPU
+// under Node). Warden gives all of an app's workers one key, on fd 3 before
+// the worker runs (WARDEN_TLS_TICKET=1; never in the environment): a fixed
+// 132-byte line, `warden-tls-ticket <since> <key>`, read here before anything
+// else reads fd 3. The key moves forward every 12 hours from `since`, by a
+// one-way step (HMAC-SHA512), the same in every worker, so a worker never
+// holds the key of an earlier period. Node only: Bun.serve ignores
+// `ticketKeys` (1.4). A server the app gave its own `ticketKeys` keeps them.
+const TICKET_PERIOD_MS = 12 * 3600 * 1000;
+let ticketSeed = null; // { since (ms), key (48 bytes, period 0) } until first used
+let ticketKey = null; // { period, key } in use
+const ticketServers = new Set();
+if (env.WARDEN_TLS_TICKET === "1" && !inWorker && ipcFd != null) {
+  delete process.env.WARDEN_TLS_TICKET;
+  try {
+    const buf = Buffer.alloc(132);
+    let n = 0;
+    // Written before this process started: all there, or nothing.
+    for (let tries = 0; n < buf.length && tries < 4; tries++) n += fs.readSync(ipcFd, buf, n, buf.length - n, null);
+    const m = /^warden-tls-ticket ([0-9a-f]{16}) ([0-9a-f]{96})\n$/.exec(buf.toString("latin1"));
+    if (m && !isBun) ticketSeed = { since: parseInt(m[1], 16) * 1000, key: Buffer.from(m[2], "hex") };
+    buf.fill(0);
+  } catch {} // no key: each worker keeps its own, as without Warden
+}
+
+// The key of the period `now` is in, from the seed or the key in use.
+function currentTicketKey(now) {
+  const period = Math.max(0, Math.floor((now - (ticketSeed?.since ?? ticketKey.since)) / TICKET_PERIOD_MS));
+  if (!ticketKey) {
+    ticketKey = { since: ticketSeed.since, period: 0, key: Buffer.from(ticketSeed.key) };
+    ticketSeed.key.fill(0);
+    ticketSeed = null;
+  }
+  // Only forward: a clock set back keeps the key in use.
+  while (ticketKey.period < period) {
+    const next = require("node:crypto").createHmac("sha512", ticketKey.key).update("warden ticket key").digest().subarray(0, 48);
+    ticketKey.key.fill(0);
+    ticketKey.key = Buffer.from(next);
+    ticketKey.period++;
+  }
+  return ticketKey.key;
+}
+
+function shareTicketKey(server) {
+  if (server.ticketKeys !== undefined || ticketServers.has(server)) return; // the app's own
+  try {
+    server.setTicketKeys(currentTicketKey(Date.now()));
+  } catch {
+    return;
+  }
+  ticketServers.add(server);
+  if (ticketServers.size === 1) scheduleTicketStep();
+}
+
+function scheduleTicketStep() {
+  const next = ticketKey.since + (ticketKey.period + 1) * TICKET_PERIOD_MS;
+  setTimeout(() => {
+    const key = currentTicketKey(Date.now());
+    for (const server of ticketServers) {
+      try {
+        server.setTicketKeys(key);
+      } catch {}
+    }
+    scheduleTicketStep();
+  }, Math.max(1000, next - Date.now())).unref();
+}
+
 function report(msg) {
   msg.worker = workerId;
   if (inWorker) {
@@ -592,6 +663,9 @@ if (!isBun) {
     if (this !== privateServer) {
       if (appAddress) args = withAddress(args);
       trackNodeServer(this);
+      if ((ticketSeed || ticketKey) && isTlsServer(this) && (appPort == null || nodeListenPort(args) === appPort)) {
+        shareTicketKey(this);
+      }
       if (standby && !promoted && deferNodeListen(this, args)) return this;
       if (handoff && isHttpServer(this) && takeHandoff(this, args, origListen)) return this;
       if (nodeReusePort) args = withReusePort(args);

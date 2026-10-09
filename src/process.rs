@@ -40,6 +40,10 @@ pub struct Spec {
     /// (`sys::prepare_ipc_socket`). Other programs get a blocking socket, as
     /// a plain read or write of fd 3 expects.
     pub ipc_nonblocking: bool,
+    /// Bytes waiting on fd 3 when the worker starts, written before it runs
+    /// (the shim reads them first thing: the shared TLS ticket key). Empty:
+    /// nothing.
+    pub preamble: Vec<u8>,
 }
 
 /// `[logging] worker_output`.
@@ -282,6 +286,10 @@ pub fn spawn(spec: Spec, inst: u64, events: mpsc::UnboundedSender<ProcEvent>) ->
         std::os::fd::AsFd::as_fd(&ipc_child),
         spec.ipc_nonblocking,
     );
+    if !spec.preamble.is_empty() {
+        // Into the socket's buffer, never blocking: the worker isn't running yet.
+        crate::sys::send(std::os::fd::AsFd::as_fd(&ipc_ours), &spec.preamble, false)?;
+    }
 
     // fd 4 (handoff only): Warden passes accepted connections over it.
     let handoff = if spec.handoff { Some(crate::sys::socketpair_cloexec()?) } else { None };
@@ -1088,6 +1096,7 @@ mod tests {
                     max_lines_per_sec: 0,
                     handoff: false,
                     ipc_nonblocking: false,
+                    preamble: Vec::new(),
                 };
                 spawn(spec, 42, tx).unwrap();
                 // Exit and IPC arrive on independent tasks; accept either order.
@@ -1148,6 +1157,7 @@ mod tests {
             max_lines_per_sec: 1,
             handoff: false,
             ipc_nonblocking: false,
+            preamble: Vec::new(),
         }
     }
 
@@ -1177,6 +1187,7 @@ mod tests {
                     max_lines_per_sec: 0,
                     handoff: false,
                     ipc_nonblocking: false,
+                    preamble: Vec::new(),
                 };
                 let quiet = spawn(quiet, 2, tx).unwrap();
                 // Written 50 ms apart: all ten in the log well within 3 s, each read
@@ -1229,6 +1240,7 @@ mod tests {
                     max_lines_per_sec: 0,
                     handoff: false,
                     ipc_nonblocking: false,
+                    preamble: Vec::new(),
                 };
                 let h = spawn(spec, 9, tx).unwrap();
                 h.relabel("2");
@@ -1281,6 +1293,7 @@ mod tests {
                     max_lines_per_sec: 0,
                     handoff: false,
                     ipc_nonblocking: false,
+                    preamble: Vec::new(),
                 };
                 let h = spawn(spec, 3, tx).unwrap();
                 async fn next(rx: &mut mpsc::UnboundedReceiver<ProcEvent>) -> ProcEvent {
@@ -1328,6 +1341,7 @@ mod tests {
                     max_lines_per_sec: 0,
                     handoff: false,
                     ipc_nonblocking: false,
+                    preamble: Vec::new(),
                 };
                 let h = spawn(spec, 1, tx).unwrap();
                 h.signal(libc::SIGTERM);

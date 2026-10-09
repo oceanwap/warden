@@ -653,6 +653,84 @@ fn a_node_http2_app_serving_tls_itself_passes_health_checks() {
     assert_eq!(s["last_rollout"]["ok"], true);
 }
 
+/// One TLS connection to `port` with openssl: `-sess_out` saves its
+/// session, `-sess_in` offers a saved one. The pid that answered and
+/// whether the session was resumed.
+fn tls_session(port: u16, flag: &str, file: &std::path::Path) -> (String, bool) {
+    let mut child = Command::new("openssl")
+        .args(["s_client", "-connect", &format!("127.0.0.1:{port}"), "-servername", "localhost", "-ign_eof", flag])
+        .arg(file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let out = String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).to_string();
+    let pid =
+        out.lines().rev().find(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_digit())).unwrap_or("").to_string();
+    (pid, out.lines().any(|l| l.starts_with("Reused,")))
+}
+
+fn have_openssl() -> bool {
+    Command::new("openssl").arg("version").output().is_ok_and(|o| o.status.success())
+}
+
+/// A Node TLS app's workers share one session-ticket key, so a visitor's
+/// ticket resumes on whichever worker the kernel picks (each worker's own
+/// key would resume 1 in 2 here), and after a reload too.
+#[test]
+fn node_tls_workers_resume_each_others_sessions() {
+    if !have_node() || !have_openssl() || !cfg!(target_os = "linux") {
+        return;
+    }
+    let sess = std::env::temp_dir().join(format!("warden-tickets-{}.pem", std::process::id()));
+    let port = free_port();
+    let cfg = gated("tickets", port, 2, "command = \"node\"").replace(&fixture("app.ts"), &fixture("node_https.mjs"));
+    let w = Warden::start("tickets", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    tls_session(port, "-sess_out", &sess);
+    let runs: Vec<(String, bool)> = (0..16).map(|_| tls_session(port, "-sess_in", &sess)).collect();
+    assert!(runs.iter().all(|(_, reused)| *reused), "{runs:?}\n{}", w.log());
+    assert_eq!(runs.iter().map(|(p, _)| p).collect::<HashSet<_>>().len(), 2, "both workers answered: {runs:?}");
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(tls_session(port, "-sess_in", &sess).1, "the new workers have the same key");
+    let _ = std::fs::remove_file(&sess);
+}
+
+/// An app that sets its own `ticketKeys` keeps them: a session from the
+/// same app run outside Warden resumes under it.
+#[test]
+fn a_node_app_keeps_its_own_ticket_keys() {
+    if !have_node() || !have_openssl() {
+        return;
+    }
+    let sess = std::env::temp_dir().join(format!("warden-own-tickets-{}.pem", std::process::id()));
+    let outside = free_port();
+    let mut plain = Command::new("node")
+        .arg(fixture("node_https.mjs"))
+        .env("PORT", outside.to_string())
+        .env("FIXTURE_TICKET_KEYS", "1")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + T;
+    while std::net::TcpStream::connect(("127.0.0.1", outside)).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    tls_session(outside, "-sess_out", &sess);
+    let _ = plain.kill();
+    let _ = plain.wait();
+
+    let port = free_port();
+    let extra = "command = \"node\"\nenv = { FIXTURE_TICKET_KEYS = \"1\" }";
+    let cfg = gated("own-tickets", port, 2, extra).replace(&fixture("app.ts"), &fixture("node_https.mjs"));
+    let w = Warden::start("own-tickets", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    assert!(tls_session(port, "-sess_in", &sess).1, "the app's own key\n{}", w.log());
+    let _ = std::fs::remove_file(&sess);
+}
+
 #[test]
 fn safe_reload_replaces_every_worker_through_the_gates() {
     if !have_bun() {

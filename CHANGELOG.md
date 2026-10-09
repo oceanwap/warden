@@ -3,6 +3,27 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- A Node TLS app's workers share one session-ticket key, so a returning
+  visitor resumes their TLS session on whichever worker the kernel picks,
+  not only on the one that issued the ticket (1 in N before, with N
+  workers). A resumed handshake took a third less server CPU (Node 22, 1,229
+  → 831 µs per connection); with 2 workers under Warden, returning visitors
+  cost 5-20 % less server CPU and got 14-30 % more connections per second
+  (3 interleaved rounds against 0.1.4). The key is made when the app's supervisor
+  starts, handed to each worker on fd 3 before it runs, never written to
+  disk or the environment, and steps forward every 12 hours by a one-way
+  hash. An app that sets its own `ticketKeys` keeps them. Not yet for
+  Bun.serve, which ignores `ticketKeys`.
+- The `[route]` router no longer waits for the app's supervisor to confirm
+  each handed-over connection: once the socket is sent, it is the
+  supervisor's. New TLS connections through the hand-off took about 4 %
+  less server CPU (median 437 against 457 µs, 10 interleaved rounds). A
+  router and a supervisor of different versions still work together.
+
 ## [0.1.4] — 2026-10-08
 
 ### Added

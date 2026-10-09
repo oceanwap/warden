@@ -137,6 +137,8 @@ pub struct Supervisor {
     runtime_dir: PathBuf,
     shim_path: Option<PathBuf>,
     host_path: Option<PathBuf>,
+    /// The TLS session-ticket key the app's workers share (`TicketKey`).
+    ticket_key: Option<TicketKey>,
     /// Worker mode on macOS or an old Bun (`config::worker_mode_hint`): asked once at start.
     worker_mode_hint: Option<String>,
     force_kill: bool,
@@ -674,6 +676,7 @@ impl Supervisor {
             runtime_dir,
             shim_path,
             host_path,
+            ticket_key: TicketKey::new(),
             worker_mode_hint: None,
             force_kill: false,
             port_look_inflight: false,
@@ -1034,7 +1037,19 @@ impl Supervisor {
             max_lines_per_sec: self.cfg.logging.max_lines_per_sec,
             handoff: self.handoff_on && slot_id != STANDBY_SLOT,
             ipc_nonblocking,
+            preamble: self.ticket_preamble(slot_id).unwrap_or_default(),
         }
+    }
+
+    /// The line that gives a worker the app's TLS ticket key: workers run
+    /// under the shim (process mode, not the static server or the router).
+    fn ticket_preamble(&self, slot_id: usize) -> Option<Vec<u8>> {
+        let shim = self.shim_path.is_some() && self.cfg.workers.mode == Mode::Process;
+        let own_server = slot_id != STANDBY_SLOT && (self.cfg.static_files.is_some() || self.cfg.route.is_some());
+        if !shim || own_server {
+            return None;
+        }
+        self.ticket_key.as_ref().map(TicketKey::line)
     }
 
     /// The variables a worker process starts with on top of the supervisor's
@@ -1088,6 +1103,10 @@ impl Supervisor {
             }
             add("NODE_CHANNEL_FD", "4".into());
             add("NODE_CHANNEL_SERIALIZATION_MODE", "json".into());
+        }
+        if self.ticket_preamble(slot_id).is_some() {
+            // The shim reads the shared ticket key off fd 3 first thing.
+            add("WARDEN_TLS_TICKET", "1".into());
         }
         if let Some(ip) = a.address {
             // The shim makes the app's listen on its port use this address.
@@ -3261,6 +3280,36 @@ fn skip_entries(path: PathBuf, log: bool) -> Vec<watch::Skip> {
         }
     }
     v
+}
+
+/// One TLS session-ticket key for all of an app's workers (Node's
+/// `ticketKeys`). Each worker would otherwise make its own, and a visitor's
+/// ticket would only resume a session on the worker that issued it: with N
+/// workers sharing the port, 1 in N. Made at the supervisor's start, held in
+/// memory, given to each worker on fd 3 before it runs (never in its
+/// environment). The shim moves it forward one step every 12 hours from
+/// `since`, a one-way hash, so a worker holds no key of an earlier period.
+struct TicketKey {
+    /// Unix seconds when the key was made.
+    since: u64,
+    key: [u8; 48],
+}
+
+impl TicketKey {
+    fn new() -> Option<TicketKey> {
+        use std::io::Read as _;
+        let mut key = [0u8; 48];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut key)).ok()?;
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        Some(TicketKey { since, key })
+    }
+
+    /// `warden-tls-ticket <since, 16 hex digits> <key, 96 hex digits>\n`:
+    /// a fixed 132 bytes, so the shim reads exactly this and nothing after it.
+    fn line(&self) -> Vec<u8> {
+        let hex: String = self.key.iter().map(|b| format!("{b:02x}")).collect();
+        format!("warden-tls-ticket {:016x} {hex}\n", self.since).into_bytes()
+    }
 }
 
 #[cfg(test)]
