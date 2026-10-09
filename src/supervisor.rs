@@ -129,6 +129,9 @@ pub struct Supervisor {
     /// Workers waiting for a graceful replacement (health, memory, lifetime, hang).
     pending_replace: BTreeMap<usize, (String, bool)>,
     shutting_down: bool,
+    /// `warden update`: once the reply is out, hand the workers to the keeper
+    /// and exit; the keeper restarts from this warden binary.
+    upgrade_to: Option<PathBuf>,
     /// `warden stop`: workers stopped, supervisor idle.
     stopped: bool,
     /// `warden restart` (all): start everything again once all have exited.
@@ -452,6 +455,9 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             Some((req, reply)) = ctl_rx.recv() => {
                 let resp = sup.on_request(req);
                 let _ = reply.send(resp);
+                if let Some(exe) = sup.upgrade_to.clone() {
+                    sup.leave_for(&exe).await;
+                }
             }
         }
         sup.publish_rollout();
@@ -495,6 +501,48 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     // Best effort: a leftover socket is detected and replaced at the next start.
     let _ = std::fs::remove_file(&socket);
     Ok(())
+}
+
+/// Can the warden binary `exe` run this app: does it read its config
+/// (`warden check`), within 10 s? Before the keeper execs it, when nothing has
+/// changed yet. Without a config file: does it run at all (`warden version`).
+fn preflight(exe: &Path, cfg: Option<&Path>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(exe);
+    match cfg {
+        Some(c) => cmd.arg("check").arg("--config").arg(c),
+        None => cmd.arg("version"),
+    };
+    for v in crate::keeper::ENVS {
+        cmd.env_remove(v);
+    }
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let t0 = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if t0.elapsed() < Duration::from_secs(10) => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("it did not finish within 10 s".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut err = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    let err = err.trim().lines().last().unwrap_or("").trim_start_matches("warden: ").to_string();
+    Err(if err.is_empty() { format!("it exited with {status}") } else { err })
 }
 
 /// Write the embedded shim / host scripts into the runtime directory.
@@ -696,6 +744,7 @@ impl Supervisor {
             last_rollout: None,
             pending_replace: BTreeMap::new(),
             shutting_down: false,
+            upgrade_to: None,
             stopped: false,
             start_after_stop: false,
             app_health: HealthState { healthy: None, failures: 0 },
@@ -3002,6 +3051,52 @@ impl Supervisor {
         }
     }
 
+    /// `warden update`: move to the warden binary `exe` without stopping the
+    /// app, through the keeper (`crate::keeper`), once `exe` has read this
+    /// app's config.
+    fn request_upgrade(&mut self, exe: PathBuf) -> Response {
+        if !crate::keeper::client::active() {
+            return Response::err(
+                "this app runs without a keeper ([restart] keep_workers_on_crash = false, WARDEN_KEEPER=0, or a \
+                 platform that refused it): only a restart moves it to another warden binary",
+            );
+        }
+        if self.shutting_down {
+            return Response::err("shutting down");
+        }
+        if self.roll.is_some() {
+            return Response::err("a rollout is running: try again once it has ended (`warden status` shows it)");
+        }
+        if !exe.is_absolute() {
+            return Response::err(format!("{}: not an absolute path", exe.display()));
+        }
+        if let Err(e) = preflight(&exe, self.cfg_path.as_deref()) {
+            return Response::err(format!("{} cannot run this app ({e}); nothing changed", exe.display()));
+        }
+        info!(
+            "moving to another warden binary: the keeper restarts from it, the workers keep serving",
+            exe = exe.display(),
+            workers = self.insts.len(),
+        );
+        self.upgrade_to = Some(exe);
+        Response::ok("moving to the new warden binary; the workers keep serving")
+    }
+
+    /// Exit for `warden update`, leaving the workers to the keeper as a crash
+    /// would: no stop signal, no `bye`, the control socket and the workers'
+    /// record left for the next supervisor (it replaces the one, keeps the
+    /// workers in the other).
+    async fn leave_for(&mut self, exe: &Path) -> ! {
+        crate::keeper::client::upgrade(exe);
+        // The reply to `upgrade` is on its way to the CLI: let it go out.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Every line read so far reaches the log; the rest stays in the
+        // pipes for the next supervisor (the keeper reads it meanwhile).
+        crate::logging::stop_reading_output(Duration::from_millis(500));
+        crate::logging::flush_lines(Duration::from_millis(500));
+        std::process::exit(0);
+    }
+
     fn on_request(&mut self, req: Request) -> Response {
         if let Some(r) = self.request_during_sweep(&req) {
             return r;
@@ -3057,6 +3152,7 @@ impl Supervisor {
                 self.begin_shutdown("shutdown request");
                 Response::ok("shutting down")
             }
+            Request::Upgrade { exe } => self.request_upgrade(PathBuf::from(exe)),
             Request::Restart { worker: None, hard } => {
                 if self.shutting_down {
                     return Response::err("shutting down");

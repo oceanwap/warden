@@ -248,6 +248,23 @@ AFTER=$(worker_pids "$API")
 check "every worker replaced by the reload ($BEFORE -> $AFTER)" disjoint "$BEFORE" "$AFTER"
 check "$API answers after the reload" http_ok "$PORT_API"
 
+note "warden update: the apps move to this binary without a restart"
+MAIN=$(mainpid "warden@$API.service")
+SUP=$(app_field "$API" '.status.supervisor_pid')
+N0=$(sc show -p NRestarts --value "warden@$API.service")
+BEFORE=$(worker_pids "$API")
+run_ok "warden update --yes" w update --yes
+wait_for "$API 3/3 ready after the update" 30 app_ready "$API" 3
+check "$API keeps its unit's main process (the keeper, $MAIN)" test "$(mainpid "warden@$API.service")" = "$MAIN"
+check "$API has a new supervisor (was $SUP)" test "$(app_field "$API" '.status.supervisor_pid')" != "$SUP"
+check "$API keeps its workers ($BEFORE)" test "$(worker_pids "$API")" = "$BEFORE"
+check "systemd restarted nothing (NRestarts $N0)" \
+  test "$(sc show -p NRestarts --value "warden@$API.service")" = "$N0"
+check "warden@$API, warden@$SITE and wardend active" \
+  sc is-active --quiet "warden@$API.service" "warden@$SITE.service" wardend.service
+wait_for "the new wardend sees $API, supervised by systemd" 20 wardend_sees "$API" systemd
+check "$API answers after the update" http_ok "$PORT_API"
+
 # ------------------------------------------------------- reboot (user mode)
 
 if [ "$MODE" = user ]; then

@@ -906,6 +906,10 @@ async fn pump_output(
             crate::warn!("stopped reading worker output", worker = label.get(), stream = stream, error = e);
             break;
         }
+        // Leaving the workers to the next supervisor: the rest is its to read.
+        if crate::logging::output_stopped() {
+            return;
+        }
         // Everything this read produced goes to the log as one batch.
         let mut batch = crate::logging::OutputBatch::new(&label.get(), stream);
         let read = READ_BUF.with(|buf| {

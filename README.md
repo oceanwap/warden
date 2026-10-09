@@ -73,7 +73,7 @@ warden startup                 # systemd units (sudo for system units) or a laun
 warden resurrect               # start what `save` remembered
 ```
 
-After upgrading the binary, `warden update` restarts every supervisor and wardend from it; the apps stop for a few seconds. Every command and option: [docs/commands.md](docs/commands.md).
+After upgrading the binary, `warden update` moves every supervisor and wardend to it; the apps keep serving. Every command and option: [docs/commands.md](docs/commands.md).
 
 ## Benchmarks
 

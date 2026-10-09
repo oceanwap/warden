@@ -150,10 +150,11 @@ the host to the new binary, run
 sudo warden update
 ```
 
-which saves, stops every supervisor and wardend, and starts them again from the
-binary on disk (the apps start in parallel, one per CPU core at a time;
-`--parallel` changes that). The GUI has the same under Settings, "Restart
-everything". Run it when restarting every app is acceptable.
+which saves and moves every supervisor and wardend to the binary on disk. The
+apps keep serving: their workers are handed to the new supervisors (an app
+without a keeper is restarted instead, in parallel with the others, one per
+CPU core at a time; `--parallel` changes that). The GUI has the same under
+Settings, "Restart everything".
 
 Units that `warden startup` wrote name the binary's path: `/usr/bin/warden` for
 a package, so an upgrade keeps them valid. If you move from `install.sh`

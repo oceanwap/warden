@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1406,6 +1406,90 @@ fn a_killed_keeper_takes_its_supervisor_and_workers_down() {
         std::thread::sleep(Duration::from_millis(50));
     }
     w.wait_log("the keeper process of this app died", T);
+}
+
+/// The keeper moved to another warden binary (`upgrade`, what `warden update` sends): the
+/// supervisor leaves its workers, the keeper re-executes itself from the new binary (same
+/// pid), and the supervisor it starts from there takes the workers back. Requests are answered
+/// throughout, and the workers are supervised again. A binary that can't read the config is
+/// refused first, and nothing changes.
+#[test]
+fn an_upgrade_moves_the_keeper_and_supervisor_to_another_binary_and_keeps_the_workers() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let mut w = Warden::start("upgrade", port, &gated("upgrade", port, 2, ""));
+    let s = w.wait_for("2 ready", T, ready(2));
+    let before = pid_set(&s);
+    let sup = w.supervisor();
+    let upgrade = |exe: &Path| format!(r#"{{"cmd":"upgrade","exe":"{}"}}"#, exe.display());
+
+    let (_, out) = w.request(&upgrade(Path::new("/bin/false")));
+    assert!(out.contains(r#""ok":false"#) && out.contains("nothing changed"), "{out}");
+    assert_eq!(w.supervisor(), sup, "refused: the same supervisor");
+
+    let next = w.dir.join("warden-next");
+    std::fs::copy(BIN, &next).unwrap();
+    let next = std::fs::canonicalize(&next).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let (mut n, mut failed) = (0, Vec::new());
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if get(port, &format!("/say?w=moving-{n}")).is_none() {
+                    failed.push(n);
+                }
+                n += 1;
+                // Under the 10k lines/s output cap.
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (n, failed)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let (_, out) = w.request(&upgrade(&next));
+    assert!(out.contains(r#""ok":true"#), "{out}");
+    let s = w.wait_for("the new supervisor", T, |s| {
+        s["workers_ready"] == 2 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (n, failed) = load.join().unwrap();
+    assert!(failed.is_empty(), "requests {failed:?} of {n} failed during the move:\n{}", w.log());
+    assert_eq!(pid_set(&s), before, "the same workers:\n{}", w.log());
+    assert_eq!(s["pid"].as_u64(), Some(w.child.id() as u64), "the keeper keeps its pid");
+    assert_eq!(s["build"]["path"].as_str(), Some(next.to_str().unwrap()), "{s:#}");
+    assert!(s["workers"].as_array().unwrap().iter().all(|x| x["restarts"] == 0), "{s:#}");
+    let log = w.wait_log(&format!("fixture says moving-{} ", n - 1), T);
+    for needle in [
+        "moving to another warden binary: the keeper restarts from it, the workers keep serving",
+        "the keeper runs the new warden binary",
+        "taking back the workers that kept running workers=2",
+    ] {
+        assert!(log.contains(needle), "{needle}:\n{log}");
+    }
+    assert!(!log.contains("the supervisor died"), "a move is no crash:\n{log}");
+    for i in 0..n {
+        assert!(log.contains(&format!("fixture says moving-{i} ")), "output of request {i} is in the log:\n{log}");
+    }
+    every_warning_has_a_hint(&log);
+
+    // Supervised again: a crash is seen (on Linux the worker is still the keeper's child after
+    // the exec, so its exit status too) and the worker replaced.
+    let victim = *before.iter().next().unwrap();
+    unsafe { libc::kill(victim as i32, libc::SIGKILL) };
+    let s = w.wait_for("the crashed worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    let said = if cfg!(target_os = "linux") { "SIGKILL" } else { "unknown exit" };
+    assert!(
+        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains(said))),
+        "{s:#}"
+    );
+    let pids = pid_set(&s);
+    let (code, _) = w.terminate(Duration::from_secs(10));
+    assert_eq!(code, Some(0), "{}", w.log());
+    assert!(pids.iter().all(|p| !running(*p)), "the workers stopped with it");
 }
 
 /// Every Warden process of the app killed at once (the supervisor and its
@@ -3831,33 +3915,56 @@ fn resurrect_starts_no_more_apps_at_once_than_parallel_allows() {
     assert!(out.contains("--parallel only applies"), "{out}");
 }
 
-/// `warden update`: save, kill, resurrect. Every supervisor and wardend are new processes, the apps
-/// that ran are running, and the one that was stopped stays stopped.
+/// `warden update`: every app moves to the warden binary that runs it, and wardend restarts
+/// from it. An app with a keeper keeps its process (the keeper re-executes itself) and its
+/// workers, under a new supervisor; one without is restarted. The app that was stopped stays
+/// stopped.
 #[test]
-fn update_restarts_every_supervisor_and_wardend() {
+fn update_moves_every_app_and_wardend_to_this_binary() {
     let f = Fleet::new("wd-update");
     sleeper_config(&f, "one");
     sleeper_config(&f, "two");
     sleeper_config(&f, "idle");
+    std::fs::write(
+        f.home.join("bare.toml"),
+        "[app]\nname = \"bare\"\ncommand = \"sh\"\nargs = [\"-c\", \"exec sleep 600\"]\n[restart]\n\
+         keep_workers_on_crash = false\n",
+    )
+    .unwrap();
     let (code, out) = f.cli_env(&["start", "all"], &ALWAYS_ON);
     assert_eq!(code, 0, "{out}");
     f.ok(&["stop", "idle"]);
-    let before = (supervisor_pid(&f, "one"), supervisor_pid(&f, "two"), supervisor_pid(&f, "idle"));
+    let app = |name: &str| f.app(name)["status"].clone();
+    let worker = |s: &Value| s["workers"][0]["pid"].as_u64();
+    let before: Vec<Value> = ["one", "two", "idle", "bare"].map(app).into();
     let wardend = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs");
 
     let (code, out) = f.cli_env(&["update", "--yes"], &ALWAYS_ON);
     assert_eq!(code, 0, "{out}");
-    for step in
-        ["update: saving what runs", "update: stopping every supervisor and wardend", "update: starting them again"]
-    {
+    for step in [
+        "update: saving what runs",
+        "one: moving to this warden binary; its workers keep serving",
+        "idle: runs warden",
+        "its workers stay stopped",
+        "bare: this app runs without a keeper",
+        "update: restarting wardend",
+    ] {
         assert!(out.contains(step), "{step}:\n{out}");
     }
-    f.wait("the apps are back", |f| f.app("one")["status"]["pid"].is_u64() && f.app("two")["status"]["pid"].is_u64());
-    assert_ne!(supervisor_pid(&f, "one"), before.0, "one has a new supervisor");
-    assert_ne!(supervisor_pid(&f, "two"), before.1, "two has a new supervisor");
-    let idle = f.app("idle");
-    assert_eq!(idle["status"]["stopped"], true, "an app that was stopped stays stopped: {idle}");
-    assert_ne!(idle["status"]["pid"].as_u64(), Some(before.2), "though its supervisor is new too");
+    for (name, was) in ["one", "two"].iter().zip(&before) {
+        let now = app(name);
+        assert_eq!(now["pid"], was["pid"], "{name} keeps its process (the keeper): {now:#}");
+        assert_ne!(now["supervisor_pid"], was["supervisor_pid"], "{name} has a new supervisor");
+        assert!(worker(&now).is_some() && worker(&now) == worker(was), "{name} keeps its worker: {now:#}");
+        assert!(out.contains(&format!("{name}: runs warden")), "{name}:\n{out}");
+    }
+    let idle = app("idle");
+    assert_eq!(idle["stopped"], true, "an app that was stopped stays stopped: {idle}");
+    assert_ne!(idle["supervisor_pid"], before[2]["supervisor_pid"], "though its supervisor is new too");
+    f.wait("bare is back", |f| f.app("bare")["status"]["workers_ready"] == 1);
+    let bare = app("bare");
+    assert_ne!(bare["pid"], before[3]["pid"], "bare has no keeper: it was restarted");
+    assert_ne!(worker(&bare), worker(&before[3]), "with a new worker");
     let after = wardend_pid(&f, &ALWAYS_ON).expect("wardend runs again");
     assert_ne!(after, wardend, "a new wardend");
 
@@ -3867,10 +3974,10 @@ fn update_restarts_every_supervisor_and_wardend() {
     assert_eq!(code, 0, "{out}");
     let (code, out) = f.cli_env(&["update", "--yes"], &ALWAYS_ON);
     assert_eq!(code, 0, "{out}");
-    for name in ["one", "two", "idle"] {
+    for name in ["one", "two", "idle", "bare"] {
         assert!(out.contains(&format!("{name}: not running; kept in the saved list")), "{name}:\n{out}");
     }
-    assert!(out.contains("saved 3 app(s)") && out.contains("dump.json.bak"), "{out}");
+    assert!(out.contains("saved 4 app(s)") && out.contains("dump.json.bak"), "{out}");
     f.wait("the apps are back again", |f| {
         f.app("one")["status"]["pid"].is_u64() && f.app("two")["status"]["pid"].is_u64()
     });

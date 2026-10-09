@@ -1,5 +1,5 @@
 //! `warden upgrade`: the newest release, installed over this warden, and every supervisor and
-//! wardend restarted from it (`warden update`), so nothing is left to do. It runs the install.sh
+//! wardend moved to it (`warden update`), so nothing is left to do. It runs the install.sh
 //! built into this binary (as `warden gui-install` does): the download is checked against the
 //! release's SHA256SUMS, and the GUI is upgraded with the CLI when it is installed.
 //!
@@ -19,9 +19,9 @@ USAGE:
 
 Finds the newest release, downloads it for this machine, checks it against the
 release's SHA256SUMS and installs it over this warden (and the desktop app, when
-it is installed). Then every app's supervisor and wardend restart on the new
-version (`warden update`): the apps stop for a few seconds, and are running
-again when it ends. Nothing is restarted when nothing was running.
+it is installed). Then every app's supervisor and wardend move to the new
+version (`warden update`): the apps keep serving (one without a keeper stops
+for a few seconds). Nothing is restarted when nothing was running.
 
 OPTIONS:
     --check          Only say whether a newer release exists (exit 0 either way)
@@ -249,8 +249,8 @@ pub async fn run(o: &Opts, args: &Args) -> i32 {
     let script = script_args(&target, &exe, gui.as_deref(), o.dry_run);
     if !o.yes && !o.dry_run && crate::sys::isatty(0) {
         eprint!(
-            "Install warden {} (this is {current}) and restart every app's supervisor and wardend on it? The apps \
-             stop for a few seconds. [y/N] ",
+            "Install warden {} (this is {current}) and move every app's supervisor and wardend to it? The apps keep \
+             serving. [y/N] ",
             target.trim_start_matches('v')
         );
         let mut answer = String::new();
