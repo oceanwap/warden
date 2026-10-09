@@ -63,7 +63,7 @@ pub fn judge_failure(
     let lost_conn = matches!(f.class, ErrClass::Reset | ErrClass::Eof);
     for r in &during {
         if r.allow.down && (matches!(f.class, ErrClass::Refused) || lost_conn) {
-            return Ok("app down by design (supervisor killed, worker-mode host killed, restart --hard, crash loop)");
+            return Ok("app down by design (keeper killed, worker-mode host killed, restart --hard, crash loop)");
         }
         if r.allow.killed && f.fresh && lost_conn {
             return Ok("queued on a killed worker's listener");

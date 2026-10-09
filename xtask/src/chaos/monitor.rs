@@ -182,7 +182,13 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
             let key = (s.pid, s.start);
             seen_o.push(key);
             let first = *orphans.entry(key).or_insert(t);
-            if t - first > (GRACE_S + 10) as f64 && reported.insert(key) {
+            // macOS: the workers a restarted supervisor took back stay children of
+            // init (no subreaper there), so ppid 1 alone is no orphan; one a live
+            // supervisor lists as its worker is supervised.
+            if t - first > (GRACE_S + 10) as f64
+                && !(cfg!(target_os = "macos") && listed_worker(&fleet, s.pid))
+                && reported.insert(key)
+            {
                 let argv = procfs::cmdline(s.pid).join(" ");
                 sh.with_mon(|m| {
                     m.problems.push((
@@ -217,4 +223,13 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// Is `pid` a worker some app's supervisor lists (`warden list --json`)?
+fn listed_worker(fleet: &Fleet, pid: u32) -> bool {
+    fleet.list().is_ok_and(|apps| {
+        apps.iter().any(|a| {
+            a["status"]["workers"].as_array().is_some_and(|ws| ws.iter().any(|w| w["pid"].as_u64() == Some(pid as u64)))
+        })
+    })
 }

@@ -1371,8 +1371,11 @@ fn a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers
     let victim = *before.iter().next().unwrap();
     unsafe { libc::kill(victim as i32, libc::SIGKILL) };
     let s = w.wait_for("the crashed worker replaced", T, |s| s["workers_ready"] == 2 && !pid_set(s).contains(&victim));
+    // macOS has no subreaper: a worker taken back is not the new supervisor's
+    // child, so its exit status cannot be read, only that it is gone.
+    let said = if cfg!(target_os = "linux") { "SIGKILL" } else { "unknown exit" };
     assert!(
-        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains("SIGKILL"))),
+        s["workers"].as_array().unwrap().iter().any(|x| x["last_exit"].as_str().is_some_and(|e| e.contains(said))),
         "{s:#}"
     );
 
