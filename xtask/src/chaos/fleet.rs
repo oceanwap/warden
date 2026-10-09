@@ -419,6 +419,8 @@ pub struct Optional {
     /// Node can share a port (libuv's reusePort: Linux, not macOS): the
     /// `api-node` app, 3 Node workers with surge rollouts.
     pub node_shared_port: bool,
+    /// `threads` app: Bun worker mode, which Warden runs on Linux only.
+    pub worker_mode: bool,
 }
 
 /// The apps of the soak; ports are picked free.
@@ -459,6 +461,9 @@ pub fn specs(opt: &Optional) -> Result<Vec<AppSpec>, String> {
     if !opt.node_shared_port {
         v.retain(|a| a.name != "api-node");
     }
+    if !opt.worker_mode {
+        v.retain(|a| a.name != "threads");
+    }
     if opt.rss {
         // `[limits] max_memory`: a worker made to grow is recycled gracefully.
         v.push(AppSpec { name: "memhog", chaos_app: true, max_memory: MEMHOG_LIMIT_MB, ..base.clone() });
@@ -483,7 +488,8 @@ mod tests {
 
     #[test]
     fn configs_have_one_table_each() {
-        let all = specs(&Optional { nest: true, oom: true, rss: true, node_shared_port: true }).unwrap();
+        let all =
+            specs(&Optional { nest: true, oom: true, rss: true, node_shared_port: true, worker_mode: true }).unwrap();
         let paths = Paths {
             home: Path::new("/h"),
             logs: Path::new("/h/logs"),
@@ -507,8 +513,8 @@ mod tests {
         assert!(t.contains("args = [\"main.ts\"]") && t.contains("working_directory = \"/r/bench/nest\""), "{t}");
         assert!(t.contains("path = \"/health\""), "gated like the other apps: {t}");
         let names = |o: Optional| specs(&o).unwrap().iter().map(|s| s.name).collect::<Vec<_>>();
-        let none = names(Optional { nest: false, oom: false, rss: false, node_shared_port: false });
-        for left_out in ["nest", "oom", "memhog", "api-node"] {
+        let none = names(Optional { nest: false, oom: false, rss: false, node_shared_port: false, worker_mode: false });
+        for left_out in ["nest", "oom", "memhog", "api-node", "threads"] {
             assert!(!none.contains(&left_out), "{left_out}: {none:?}");
         }
         assert!(none.contains(&"api-bun") && none.contains(&"ws-bun"), "{none:?}");

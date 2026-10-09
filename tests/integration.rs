@@ -8451,6 +8451,12 @@ fn watching_no_files_says_so() {
 /// Is `pid` a live process? A zombie, which only waits for its parent to
 /// collect it, is not (`kill(pid, 0)` says yes to it).
 fn running(pid: u64) -> bool {
+    if !cfg!(target_os = "linux") {
+        // No /proc: ps prints nothing for a pid that is gone, and Z for a zombie.
+        let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        return !stat.trim().is_empty() && !stat.trim_start().starts_with('Z');
+    }
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .is_ok_and(|s| s.rsplit_once(')').is_some_and(|(_, rest)| !rest.trim_start().starts_with(['Z', 'X'])))
 }
