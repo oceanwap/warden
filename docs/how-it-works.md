@@ -68,12 +68,16 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   app's own `server.reload()` still works (and a drain never brings back a
   handler the app replaced). A Node `https` server is tracked on its TLS
   connections. Known gap: `http2` servers are not tracked.
-- The shim reports to Warden over a blocking socket. A supervisor that stops
-  reading (SIGSTOPped, or hung) for several minutes fills it with
-  heartbeats, and the workers then block writing the next one; a dead
-  supervisor is not the same (workers are signalled and carry on or exit).
-  `[watchdog]` on the supervisor itself (systemd's `WatchdogSec=`) is what
-  covers a hung supervisor.
+- The shim's reports never wait for Warden. Its end of fd 3 is
+  non-blocking, with room for hours of heartbeats (4 MB where the system
+  allows it). If a supervisor stops reading (SIGSTOPped, hung, a frozen VM),
+  only the latest heartbeat is kept and other reports wait in order until
+  there is room, so the worker's event loop never blocks on Warden. The
+  app's own stdout and stderr are ordinary pipes: an app that logs more than
+  a pipe holds while its supervisor is stopped waits on its next write, as
+  it would under any process manager. `[watchdog]` on the supervisor itself
+  (systemd's `WatchdogSec=`) is what restarts a hung supervisor. A dead
+  supervisor is different: see the parent-death point below.
 - On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
   bodies in a drain (one call frame per `new Response`, which JSC inlines:
   no measurable difference, `bench/shim-cost.ts`). The wrappers pass for
