@@ -16,6 +16,7 @@ pub const KINDS: &[&str] = &[
     "kill-worker",
     "kill-standby",
     "kill-supervisor",
+    "kill-keeper",
     "kill-wardend",
     "stop-worker",
     "stop-supervisor",
@@ -98,6 +99,7 @@ pub fn run(kind: &'static str, n: usize, cx: &mut Ctx) -> Fault {
         "kill-worker" => kill_worker(cx, &mut f),
         "kill-standby" => kill_standby(cx, &mut f),
         "kill-supervisor" => kill_supervisor(cx, &mut f),
+        "kill-keeper" => kill_keeper(cx, &mut f),
         "kill-wardend" => kill_wardend(cx, &mut f),
         "stop-worker" => stop_worker(cx, &mut f),
         "stop-supervisor" => stop_supervisor(cx, &mut f),
@@ -134,6 +136,12 @@ fn status(cx: &Ctx, app: &str) -> Option<Value> {
 
 fn pid_of(v: &Value) -> Option<u32> {
     v["pid"].as_u64().map(|p| p as u32)
+}
+
+/// The supervisor under the app's keeper (`None` without a keeper: `pid` is
+/// the supervisor then).
+fn supervisor_of(v: &Value) -> Option<u32> {
+    v["supervisor_pid"].as_u64().map(|p| p as u32)
 }
 
 /// A random RUNNING worker: (worker id, pid).
@@ -247,23 +255,63 @@ fn kill_standby(cx: &mut Ctx, f: &mut Fault) {
 
 fn kill_supervisor(cx: &mut Ctx, f: &mut Fault) {
     let apps = cx.fleet.apps.clone();
-    // Not the `oom` app: wardend restarts a supervisor in its own cgroup, so
-    // the app would leave the memory cgroup the oom-kill fault needs.
+    // Not the `oom` app: wardend restarts an app in its own cgroup, so the
+    // app would leave the memory cgroup the oom-kill fault needs (here too,
+    // without a keeper).
     let Some(spec) = pick(cx, &apps, |a| !a.oom) else { return };
     f.app = Some(spec.name.into());
     let Some(st) = status(cx, spec.name) else { return };
-    let Some(pid) = pid_of(&st) else { return };
+    let Some(pid) = supervisor_of(&st) else {
+        // No keeper: the supervisor is the app's process.
+        return kill_app_process(cx, f, spec, &st);
+    };
+    // The keeper starts it again and the same workers serve throughout
+    // (a hot standby is started anew: it was not serving).
+    let mut workers: Vec<u32> =
+        st["workers"].as_array().map(|a| a.iter().filter_map(pid_of).collect()).unwrap_or_default();
+    workers.extend(pid_of(&st["host"]));
+    f.detail = format!("kill -9 of the supervisor pid {pid}; its keeper starts it again with the same workers");
+    let from = Instant::now();
+    kill9(cx, pid);
+    recover(cx, f, from);
+    let Some(after) = status(cx, spec.name) else { return };
+    if supervisor_of(&after) == Some(pid) {
+        f.problems.push(format!("the supervisor pid is still {pid} after kill -9"));
+    }
+    let gone: Vec<u32> = workers.iter().copied().filter(|p| !procfs::alive(*p)).collect();
+    if !gone.is_empty() {
+        f.problems.push(format!("workers {gone:?} did not survive the supervisor's kill -9 (the keeper keeps them)"));
+    }
+    f.detail += &format!(" (new pid {})", supervisor_of(&after).unwrap_or(0));
+}
+
+/// kill -9 of the app's process (its keeper): the supervisor stops the
+/// workers and exits, and wardend starts the app again.
+fn kill_keeper(cx: &mut Ctx, f: &mut Fault) {
+    let apps = cx.fleet.apps.clone();
+    let Some(spec) = pick(cx, &apps, |a| !a.oom) else { return };
+    f.app = Some(spec.name.into());
+    let Some(st) = status(cx, spec.name) else { return };
+    if supervisor_of(&st).is_none() {
+        f.skipped = Some("the app runs without a keeper".into());
+        return;
+    }
+    kill_app_process(cx, f, spec, &st);
+}
+
+fn kill_app_process(cx: &mut Ctx, f: &mut Fault, spec: &AppSpec, st: &Value) {
+    let Some(pid) = pid_of(st) else { return };
     f.allow = Allow { killed: true, planned: true, down: true };
-    for w in all_worker_pids(&st) {
+    for w in all_worker_pids(st) {
         cx.sh.doom_pid(w);
     }
-    f.detail = format!("kill -9 of the supervisor pid {pid}; wardend restarts it");
+    f.detail = format!("kill -9 of the app's process pid {pid}; wardend restarts it");
     let from = Instant::now();
     kill9(cx, pid);
     recover(cx, f, from);
     if let Some(new) = status(cx, spec.name).and_then(|s| pid_of(&s)) {
         if new == pid {
-            f.problems.push(format!("the supervisor pid is still {pid} after kill -9"));
+            f.problems.push(format!("the app's pid is still {pid} after kill -9"));
         }
         f.detail += &format!(" (new pid {new})");
     }
@@ -323,7 +371,7 @@ fn stop_supervisor(cx: &mut Ctx, f: &mut Fault) {
     let Some(spec) = pick(cx, &apps, |_| true) else { return };
     f.app = Some(spec.name.into());
     let Some(st) = status(cx, spec.name) else { return };
-    let Some(pid) = pid_of(&st) else { return };
+    let Some(pid) = supervisor_of(&st).or_else(|| pid_of(&st)) else { return };
     let Some(start) = start_of(pid) else { return };
     let workers = all_worker_pids(&st);
     let hold = cx.rng.range(2.0, 9.0);

@@ -276,6 +276,7 @@ mod tests {
             version: "0".into(),
             pid: 1,
             uptime_secs: 10,
+            supervisor_pid: None,
             workers_configured: 2,
             workers_ready: 1,
             healthy: Some(true),

@@ -2074,6 +2074,16 @@ fn write_loop(rx: Receiver<Queued>, sinks: Sinks) {
     }
 }
 
+/// Wait (up to `timeout`) for queued lines to be written, not for worker
+/// output: for an exit that leaves workers running.
+pub fn flush_lines(timeout: Duration) {
+    let l = logger();
+    let t0 = Instant::now();
+    while l.pending.load(Ordering::Relaxed) > 0 && t0.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Wait (up to `timeout`) for queued lines to be written, and for worker
 /// output to be drained from the pipes of workers that have exited. Called
 /// before exit.

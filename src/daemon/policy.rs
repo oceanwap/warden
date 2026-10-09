@@ -235,6 +235,7 @@ pub(crate) mod tests {
             version: "0".into(),
             pid: 42,
             uptime_secs: 1,
+            supervisor_pid: None,
             workers_configured: 1,
             workers_ready: 1,
             healthy: None,

@@ -18,6 +18,7 @@ mod gui_install;
 mod handoff;
 mod health;
 mod ids;
+mod keeper;
 mod logging;
 mod logview;
 mod metrics;
@@ -182,8 +183,25 @@ fn run_supervisor(rt: &tokio::runtime::Runtime, args: &cli::Args, path: PathBuf)
     if let Some(s) = args.socket.clone() {
         c.control.socket = Some(s);
     }
+    let mut no_keeper = None;
+    if keeper::wanted(&c) {
+        match keeper::prepare() {
+            Ok(()) => {
+                // The supervisor writes the log files; the keeper's few lines
+                // go to the same place as its own (stdout, or the background
+                // log file).
+                logging::init(c.logging.level, c.logging.timestamps, logging::Files::default());
+                guard::install_panic_hook();
+                return keeper::run(rt, &c);
+            }
+            Err(e) => no_keeper = Some(e),
+        }
+    }
     logging::init(c.logging.level, c.logging.timestamps, c.log_files());
     guard::install_panic_hook();
+    if let Some(e) = no_keeper {
+        keeper::no_keeper(e);
+    }
     let cfg_path = std::fs::canonicalize(&path).unwrap_or(path);
     let run = std::panic::AssertUnwindSafe(|| rt.block_on(supervisor::run(c, Some(cfg_path))));
     let code = match std::panic::catch_unwind(run) {

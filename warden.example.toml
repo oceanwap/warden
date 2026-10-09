@@ -49,6 +49,8 @@ backoff_max = 10000                          # ms
 failed_cooldown = 300                        # s before a FAILED worker is retried (0 = never)
 # schedule = "0 3 * * *"                     # example; rolling restart on a cron schedule, local time (PM2's cron_restart)
 stop_exit_codes = []                         # exit codes that mean "done, don't restart" (PM2's stop_exit_codes)
+keep_workers_on_crash = true                 # a crashed supervisor is started again by the app's keeper and takes
+                                             # back the same workers, which serve throughout; read at start
 
 [shutdown]
 grace_period = 30                            # s to exit after the stop signal before SIGKILL

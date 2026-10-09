@@ -29,15 +29,18 @@ ExecReload=/usr/local/bin/warden safe-reload --config /etc/warden/%i.toml
 # reloads): leave room for canary_soak + gates for every worker.
 TimeoutStartSec=600
 Restart=always
-# A Warden crash takes its workers down (they drain and exit ~0.7 s later);
-# come back quickly. The outage is drain + RestartSec + app startup.
+# The main process is the app's keeper: a supervisor crash is handled
+# inside it (the keeper starts the supervisor again; the workers keep
+# serving). If the keeper itself dies, the workers drain and exit ~0.7 s
+# later; come back quickly. The outage is drain + RestartSec + app startup.
 RestartSec=500ms
 # Warden pings every second while its event loop keeps up; if it hangs
 # (e.g. stdout stalled), systemd restarts it. Traffic is unaffected until then.
 WatchdogSec=10
 
-# Only Warden gets the first SIGTERM and orchestrates the drain; systemd
-# SIGKILLs the whole cgroup if it is still there after TimeoutStopSec.
+# Only Warden's keeper gets the first SIGTERM and passes it to the
+# supervisor, which orchestrates the drain; systemd SIGKILLs the whole
+# cgroup if it is still there after TimeoutStopSec.
 KillMode=mixed
 KillSignal=SIGTERM
 # grace_period (30 s) + margin

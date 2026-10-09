@@ -2,6 +2,10 @@
 //! Lets a `Type=notify` unit report "started" only once workers are listening.
 
 pub fn notify(state: &str) {
+    // Under a keeper, the unit's main process is the keeper: it says it.
+    if crate::keeper::client::notify(state) {
+        return;
+    }
     let Some(path) = std::env::var_os("NOTIFY_SOCKET") else { return };
     let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else { return };
     let p = path.to_string_lossy();
@@ -56,6 +60,10 @@ pub fn own_unit() -> Option<String> {
 }
 
 fn detect_own_unit() -> Option<String> {
+    // Under a keeper: the keeper is the unit's main process and said which.
+    if let Some(unit) = crate::keeper::client::unit() {
+        return unit;
+    }
     std::env::var_os("INVOCATION_ID")?;
     let exec_pid = std::env::var("SYSTEMD_EXEC_PID").ok();
     if !started_by_systemd(exec_pid.as_deref(), std::process::id(), parent_is_systemd) {

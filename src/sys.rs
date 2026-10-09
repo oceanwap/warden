@@ -1510,10 +1510,9 @@ pub fn child_dup_ipc(child_fd: RawFd, target: RawFd) -> io::Result<()> {
 /// The child gets `sig` when its parent thread (Warden) dies.
 #[cfg(target_os = "linux")]
 pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
-    // Tests of the macOS orphan sweep run on Linux with workers that outlive
-    // their supervisor (debug builds only). An atomic load: this runs between
-    // fork and exec.
-    #[cfg(debug_assertions)]
+    // Workers that outlive their supervisor: kept by the app's keeper
+    // (`crate::keeper`), or, in tests of the macOS orphan sweep, as on macOS.
+    // An atomic load: this runs between fork and exec.
     if WORKERS_OUTLIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(());
     }
@@ -1521,16 +1520,24 @@ pub fn child_parent_death_signal(sig: i32) -> io::Result<()> {
     check(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, sig as libc::c_ulong) }).map(|_| ())
 }
 
-/// Set by [`test_workers_outlive_the_supervisor`].
-#[cfg(all(target_os = "linux", debug_assertions))]
+/// Set by [`workers_outlive_the_supervisor`].
+#[cfg(target_os = "linux")]
 static WORKERS_OUTLIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on workers do not get SIGTERM when their supervisor dies: the
+/// app's keeper holds them through a supervisor crash (`crate::keeper`).
+/// A no-op where there is no parent-death signal.
+pub fn workers_outlive_the_supervisor() {
+    #[cfg(target_os = "linux")]
+    WORKERS_OUTLIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// From now on workers do not get SIGTERM when their supervisor dies, as on
 /// macOS: how a Linux test makes the orphans the sweep is for
 /// (`WARDEN_TEST_MACOS_ORPHANS`, `platform::orphans`). Debug builds only.
 #[cfg(all(target_os = "linux", debug_assertions))]
 pub fn test_workers_outlive_the_supervisor() {
-    WORKERS_OUTLIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    workers_outlive_the_supervisor();
 }
 
 /// Not Linux: there is no parent-death signal, so this is a no-op. On macOS
@@ -1630,13 +1637,29 @@ pub fn child_dup_above(fd: RawFd, min: RawFd) -> io::Result<RawFd> {
 /// (MSG_NOSIGNAL on Linux, SO_NOSIGPIPE on the socket elsewhere). The
 /// descriptor rides on the first byte, so a short write still delivered it.
 pub fn send_with_fd(sock: BorrowedFd<'_>, buf: &[u8], fd: BorrowedFd<'_>) -> io::Result<usize> {
+    send_fds(sock, buf, &[fd])
+}
+
+/// The most descriptors [`send_fds`] sends and [`recv_fds`] takes in one message.
+pub const MAX_FDS: usize = 16;
+
+/// Send `buf` with `fds` attached (SCM_RIGHTS, none: a plain send) on a
+/// Unix socket: the receiver gets its own copies. Never raises SIGPIPE
+/// (MSG_NOSIGNAL on Linux, SO_NOSIGPIPE on the socket elsewhere). The
+/// descriptors ride on the first byte, so a short write still delivered
+/// them. At most [`MAX_FDS`].
+pub fn send_fds(sock: BorrowedFd<'_>, buf: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<usize> {
+    if fds.len() > MAX_FDS {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{} descriptors in one message", fds.len())));
+    }
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_NOSIGNAL;
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
-    let raw = fd.as_raw_fd();
+    let raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let data_len = std::mem::size_of_val(raw.as_slice());
     // SAFETY: CMSG_SPACE/CMSG_LEN are pure size computations.
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let space = if raw.is_empty() { 0 } else { (unsafe { libc::CMSG_SPACE(data_len as u32) }) as usize };
     let mut control = vec![0u8; space];
     let mut iov = libc::iovec { iov_base: buf.as_ptr() as *mut libc::c_void, iov_len: buf.len() };
     // SAFETY: an all-zero msghdr is valid; the fields set below point at
@@ -1644,20 +1667,236 @@ pub fn send_with_fd(sock: BorrowedFd<'_>, buf: &[u8], fd: BorrowedFd<'_>) -> io:
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = space as _;
-    // SAFETY: `control` is CMSG_SPACE bytes for one descriptor, so the first
-    // header and its data fit; the header is written before its data is.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut RawFd, raw);
+    if !raw.is_empty() {
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = space as _;
+        // SAFETY: `control` is CMSG_SPACE bytes for these descriptors, so the
+        // first header and its data fit; the header is written before its
+        // data is, and the data is copied unaligned.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(data_len as u32) as _;
+            std::ptr::copy_nonoverlapping(raw.as_ptr() as *const u8, libc::CMSG_DATA(cmsg), data_len);
+        }
     }
     // SAFETY: `msg` is fully initialized and its buffers are alive.
     let n = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, flags) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
+}
+
+/// Receive into `buf`, and the descriptors riding on those bytes, if any
+/// (the other end of [`send_fds`]; at most [`MAX_FDS`]), close-on-exec.
+/// Blocks like the socket does. 0 bytes: end of stream.
+pub fn recv_fds(sock: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE((MAX_FDS * std::mem::size_of::<RawFd>()) as u32) } as usize;
+    let mut control = vec![0u8; space];
+    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+    // SAFETY: an all-zero msghdr is valid; its pointers are set to live buffers.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    // SAFETY: `msg` points at buffers that outlive the call.
+    let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, flags) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut fds = Vec::new();
+    // SAFETY: recvmsg filled `control` and set msg_controllen; CMSG_FIRSTHDR
+    // and CMSG_NXTHDR stay within it, and each SCM_RIGHTS header's data holds
+    // (cmsg_len - CMSG_LEN(0)) / sizeof(int) descriptors that are now ours,
+    // read unaligned.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let bytes = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+                for i in 0..bytes / std::mem::size_of::<RawFd>() {
+                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    for f in &fds {
+        set_cloexec(std::os::fd::AsFd::as_fd(f), false)?;
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(io::Error::other("more descriptors than one message may carry; extra ones were closed"));
+    }
+    Ok((n as usize, fds))
+}
+
+/// Make this process the reaper of its orphaned descendants: a worker
+/// whose supervisor died becomes our child, not init's, so we get its exit
+/// status (`crate::keeper`). Linux only.
+#[cfg(target_os = "linux")]
+pub fn set_child_subreaper() -> io::Result<()> {
+    // SAFETY: prctl(PR_SET_CHILD_SUBREAPER) takes an integer flag.
+    check(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1 as libc::c_ulong) }).map(|_| ())
+}
+
+/// pidfd_send_signal(2): signal the process `pidfd` refers to, never another
+/// one that took its pid since. ESRCH once it has exited.
+#[cfg(target_os = "linux")]
+pub fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: i32) -> io::Result<()> {
+    // SAFETY: plain syscall on a borrowed descriptor and integers; the
+    // siginfo pointer is null, which the call allows.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd() as libc::c_long,
+            sig as libc::c_long,
+            std::ptr::null::<libc::siginfo_t>(),
+            0 as libc::c_long,
+        )
+    };
+    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// One exited child, reaped without waiting: `(pid, exit code, signal)`;
+/// `None` when no child has exited (or there are none).
+pub fn reap_any() -> Option<(u32, Option<i32>, Option<i32>)> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: waitpid writes the status into a live int; WNOHANG never blocks.
+    let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+    if pid <= 0 {
+        return None;
+    }
+    let (code, signal) = if libc::WIFEXITED(status) {
+        (Some(libc::WEXITSTATUS(status)), None)
+    } else if libc::WIFSIGNALED(status) {
+        (None, Some(libc::WTERMSIG(status)))
+    } else {
+        (None, None)
+    };
+    Some((pid as u32, code, signal))
+}
+
+/// One child of ours, if it has exited: reaped, with `(exit code, signal)`.
+/// `Ok(None)`: still running. ECHILD: not our child (any more): someone else
+/// reaped it, or it never was.
+pub fn try_reap(pid: u32) -> io::Result<Option<(Option<i32>, Option<i32>)>> {
+    let mut status: libc::c_int = 0;
+    // SAFETY: waitpid writes the status into a live int; WNOHANG never blocks.
+    let rc = check(unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) })?;
+    if rc == 0 {
+        return Ok(None);
+    }
+    Ok(Some(if libc::WIFEXITED(status) {
+        (Some(libc::WEXITSTATUS(status)), None)
+    } else if libc::WIFSIGNALED(status) {
+        (None, Some(libc::WTERMSIG(status)))
+    } else {
+        (None, None)
+    }))
+}
+
+/// End this process the way a child of ours ended: the same exit code, or
+/// the same signal (default action restored first, so it is not caught), so
+/// whoever waits for us sees what the child did (`crate::keeper`).
+pub fn exit_like(code: Option<i32>, signal: Option<i32>) -> ! {
+    if let Some(sig) = signal {
+        // SAFETY: restoring the default action and raising a signal take
+        // integers only; a fatal default action ends the process here.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    std::process::exit(code.unwrap_or(if signal.is_some() { 128 + signal.unwrap_or(0) } else { 1 }))
+}
+
+/// Set up the supervisor a keeper starts, between fork and exec: the
+/// keeper's channel `keep_fd` survives exec, and the supervisor leads its own
+/// process group (a terminal's Ctrl-C reaches the keeper only, which passes
+/// it on once). If the keeper dies, the supervisor sees its channel end and
+/// stops its workers. The safe face of `Command::pre_exec`: fcntl and setpgid
+/// only, both async-signal-safe, no allocation.
+pub fn pre_exec_supervisor(cmd: &mut std::process::Command, keep_fd: RawFd) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure calls fcntl and setpgid on integers:
+    // async-signal-safe, no allocation, no locks. It captures one integer.
+    unsafe {
+        cmd.pre_exec(move || {
+            check(libc::fcntl(keep_fd, libc::F_SETFD, 0))?;
+            check(libc::setpgid(0, 0))?;
+            Ok(())
+        });
+    }
+}
+
+/// Take ownership of a socket descriptor this process inherited by number
+/// (the keeper's channel, `crate::keeper`): `None` unless `raw` is an open
+/// socket above stderr. It is made close-on-exec, so workers don't inherit it.
+/// The caller must be the only one to take that number.
+pub fn take_inherited_socket(raw: RawFd) -> Option<OwnedFd> {
+    if raw < 3 {
+        return None;
+    }
+    // SAFETY: fstat writes into a zeroed stat buffer we own; a closed or
+    // invalid descriptor is EBADF, not undefined behaviour.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(raw, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return None;
+    }
+    // SAFETY: an open socket descriptor that, by the caller's contract,
+    // nothing else in this process owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: fcntl on a descriptor we own, integer arguments only.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).ok()?;
+    Some(fd)
+}
+
+/// Wait until `fd` is readable (or `ms` passed; -1: no limit): poll(2) on one
+/// descriptor. True when it is (or has hung up).
+pub fn wait_readable(fd: BorrowedFd<'_>, ms: i32) -> io::Result<bool> {
+    wait_for(fd, libc::POLLIN, ms)
+}
+
+/// Wait until `fd` can be written to (or `ms` passed).
+pub fn wait_writable(fd: BorrowedFd<'_>, ms: i32) -> io::Result<bool> {
+    wait_for(fd, libc::POLLOUT, ms)
+}
+
+fn wait_for(fd: BorrowedFd<'_>, events: libc::c_short, ms: i32) -> io::Result<bool> {
+    let mut p = libc::pollfd { fd: fd.as_raw_fd(), events, revents: 0 };
+    loop {
+        // SAFETY: one live pollfd, count 1.
+        let n = unsafe { libc::poll(&mut p, 1, ms) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        return Ok(n == 1 && p.revents & (events | libc::POLLHUP | libc::POLLERR) != 0);
+    }
+}
+
+/// O_NONBLOCK on or off. On an open file description: every copy of the
+/// descriptor (a dup, one passed over a socket) sees it.
+pub fn set_nonblocking(fd: BorrowedFd<'_>, on: bool) -> io::Result<()> {
+    // SAFETY: fcntl on a borrowed descriptor with integer arguments only.
+    unsafe {
+        let fl = check(libc::fcntl(fd.as_raw_fd(), libc::F_GETFL))?;
+        let want = if on { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK };
+        if want != fl {
+            check(libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, want))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run `cmd`'s child in a new session (`child_new_session`): detached from
@@ -1676,6 +1915,7 @@ pub fn pre_exec_new_session(cmd: &mut std::process::Command) {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::os::fd::{AsFd, IntoRawFd};
 
     /// flock is per open file description: a second open of the same file
     /// waits (here: reports `false`) until the first is closed.
@@ -3487,5 +3727,144 @@ mod tests {
         let mut inet = bare;
         inet[0] = libc::AF_INET as u8;
         assert_eq!(parse_unix_listen(&inet), None);
+    }
+
+    fn is_cloexec(fd: RawFd) -> bool {
+        // SAFETY: fcntl(F_GETFD) on a descriptor number, integer arguments.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    /// Descriptors sent with [`send_fds`] arrive as working copies, close-on-
+    /// exec, with the bytes they rode on; more than [`MAX_FDS`] is refused.
+    #[test]
+    fn send_fds_passes_working_copies_that_recv_fds_takes_close_on_exec() {
+        let (a, b) = socketpair_cloexec().unwrap();
+        let (r, w) = pipe_cloexec().unwrap();
+        assert_eq!(send_fds(a.as_fd(), b"hello", &[r.as_fd(), w.as_fd()]).unwrap(), 5);
+        let mut buf = [0u8; 16];
+        let (n, fds) = recv_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(fds.len(), 2);
+        assert!(fds.iter().all(|f| is_cloexec(f.as_raw_fd())));
+        // The received write end feeds the original read end.
+        let mut wcopy = std::fs::File::from(fds.into_iter().nth(1).unwrap());
+        wcopy.write_all(b"x").unwrap();
+        let mut got = [0u8; 1];
+        std::fs::File::from(r).read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"x");
+        // No descriptors: a plain message.
+        send_fds(a.as_fd(), b"plain", &[]).unwrap();
+        let (n, fds) = recv_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!((&buf[..n], fds.len()), (&b"plain"[..], 0));
+        let many: Vec<BorrowedFd<'_>> = (0..=MAX_FDS).map(|_| w.as_fd()).collect();
+        assert_eq!(send_fds(a.as_fd(), b"x", &many).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        // The other end gone: end of stream, not an error.
+        drop(a);
+        assert_eq!(recv_fds(b.as_fd(), &mut buf).unwrap().0, 0);
+    }
+
+    /// Only an open socket above stderr is taken, and it is made close-on-exec.
+    #[test]
+    fn take_inherited_socket_takes_only_a_socket() {
+        assert!(take_inherited_socket(2).is_none(), "stdio is never taken");
+        let (r, _w) = pipe_cloexec().unwrap();
+        assert!(take_inherited_socket(r.as_raw_fd()).is_none(), "a pipe is not a socket");
+        let (a, _b) = socketpair_cloexec().unwrap();
+        // SAFETY: test-only: clear FD_CLOEXEC on a descriptor we own.
+        unsafe { libc::fcntl(a.as_raw_fd(), libc::F_SETFD, 0) };
+        let raw = a.into_raw_fd();
+        let taken = take_inherited_socket(raw).expect("a socket");
+        assert_eq!(taken.as_raw_fd(), raw);
+        assert!(is_cloexec(raw));
+    }
+
+    #[test]
+    fn wait_readable_and_writable_report_readiness() {
+        let (a, b) = socketpair_cloexec().unwrap();
+        assert!(!wait_readable(b.as_fd(), 0).unwrap(), "nothing sent yet");
+        assert!(wait_writable(a.as_fd(), 0).unwrap());
+        send_fds(a.as_fd(), b"x", &[]).unwrap();
+        assert!(wait_readable(b.as_fd(), 1000).unwrap());
+        // A hang-up counts as readable: the read then sees the end.
+        let (c, d) = socketpair_cloexec().unwrap();
+        drop(c);
+        assert!(wait_readable(d.as_fd(), 1000).unwrap());
+    }
+
+    #[test]
+    fn set_nonblocking_turns_o_nonblock_on_and_off() {
+        let (a, _b) = socketpair_cloexec().unwrap();
+        // SAFETY: fcntl(F_GETFL) on a descriptor we own.
+        let nonblock = |fd: &OwnedFd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK != 0;
+        set_nonblocking(a.as_fd(), true).unwrap();
+        assert!(nonblock(&a));
+        let mut buf = [0u8; 1];
+        assert_eq!(recv_fds(a.as_fd(), &mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        set_nonblocking(a.as_fd(), false).unwrap();
+        assert!(!nonblock(&a));
+    }
+
+    /// The keeper's channel survives exec in the supervisor it starts, which
+    /// leads its own process group.
+    #[test]
+    fn pre_exec_supervisor_keeps_the_channel_and_starts_a_process_group() {
+        // Descriptors past 9 first: the channel's number is then one a shell
+        // can't redirect to (dash), as in a test run with many open files.
+        let _filler: Vec<OwnedFd> = (0..12).map(|_| socketpair_cloexec().unwrap().0).collect();
+        let (_ours, theirs) = socketpair_cloexec().unwrap();
+        let n = theirs.as_raw_fd();
+        assert!(n > 9);
+        // The shell only tells whether descriptor n is open after exec.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("if [ -e /dev/fd/{n} ]; then echo kept; else echo closed; fi; exec sleep 5"));
+        cmd.stdout(std::process::Stdio::piped());
+        pre_exec_supervisor(&mut cmd, n);
+        let mut child = cmd.spawn().unwrap();
+        drop(theirs);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        // SAFETY: getpgid on a child pid we have not reaped yet.
+        let pgid = unsafe { libc::getpgid(child.id() as i32) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(line.trim(), "kept", "the channel survives exec");
+        assert_eq!(pgid, child.id() as i32, "its own process group");
+    }
+
+    /// The signal reaches the process the pidfd refers to; ESRCH once it has
+    /// been reaped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pidfd_send_signal_signals_that_process() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let pidfd = pidfd_open(child.id()).unwrap();
+        pidfd_send_signal(pidfd.as_fd(), libc::SIGKILL).unwrap();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(pidfd_send_signal(pidfd.as_fd(), libc::SIGKILL).unwrap_err().raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // reaped by `try_reap`, the function under test
+    fn try_reap_tells_running_exited_and_not_ours() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read x; exit 3"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(try_reap(pid).unwrap(), None, "still running");
+        drop(child.stdin.take());
+        let t0 = std::time::Instant::now();
+        let exit = loop {
+            if let Some(e) = try_reap(pid).unwrap() {
+                break e;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(exit, (Some(3), None));
+        assert_eq!(try_reap(pid).unwrap_err().raw_os_error(), Some(libc::ECHILD), "reaped: no longer ours");
+        assert_eq!(try_reap(1).unwrap_err().raw_os_error(), Some(libc::ECHILD), "never ours");
     }
 }

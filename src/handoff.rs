@@ -116,8 +116,20 @@ enum Back {
 
 impl Handoff {
     /// Listen on `addr` and start the dispatcher thread.
+    #[cfg(test)]
     pub fn start(app: &str, addr: SocketAddr) -> io::Result<Handoff> {
-        let listener = crate::sys::listen_tcp(addr, false, 1024)?;
+        Self::with_listener(app, Self::listen(addr)?)
+    }
+
+    /// The app's port, listened on as the dispatcher does.
+    pub fn listen(addr: SocketAddr) -> io::Result<OwnedFd> {
+        Ok(OwnedFd::from(crate::sys::listen_tcp(addr, false, 1024)?))
+    }
+
+    /// A dispatcher accepting on `listener` (from [`Handoff::listen`], or the
+    /// one the keeper kept through a crash of the supervisor).
+    pub fn with_listener(app: &str, listener: OwnedFd) -> io::Result<Handoff> {
+        let listener = std::net::TcpListener::from(listener);
         let addr = listener.local_addr()?;
         Self::spawn(app, Some(OwnedFd::from(listener)), Some(addr))
     }

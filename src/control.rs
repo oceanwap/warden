@@ -290,7 +290,8 @@ async fn subscribe(
     let hello = Event::Hello {
         protocol: crate::events::PROTOCOL,
         app: Some(app.clone()),
-        pid: std::process::id(),
+        // The app's process, as in `status` (under a keeper, the keeper's).
+        pid: status.pid,
         version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut out = Subscriber { w, app: app.clone() };
@@ -647,6 +648,7 @@ mod tests {
             version: "test".into(),
             pid: 1,
             uptime_secs: 0,
+            supervisor_pid: None,
             workers_configured: 1,
             workers_ready: 1,
             healthy: None,
@@ -719,7 +721,8 @@ mod tests {
         let (mut lines, _w, server) = subscribed(APP, r#"{"cmd":"subscribe","interval_ms":250}"#).await;
         match next(&mut lines).await {
             Some(Event::Hello { protocol, app, pid, .. }) => {
-                assert_eq!((protocol, app.as_deref(), pid), (crate::events::PROTOCOL, Some(APP), std::process::id()));
+                // The app's pid from its status (under a keeper, the keeper's).
+                assert_eq!((protocol, app.as_deref(), pid), (crate::events::PROTOCOL, Some(APP), status_of(APP).pid));
             }
             other => panic!("expected hello, got {other:?}"),
         }

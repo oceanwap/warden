@@ -81,6 +81,7 @@ path = "/health"          # checked on each worker's private socket
 | `failed_cooldown` | `300` | Seconds before a FAILED worker is retried (`0` = never) |
 | `schedule` | none | Rolling restart on a cron schedule, local time (PM2's `cron_restart`), e.g. `"0 3 * * *"` |
 | `stop_exit_codes` | `[]` | Exit codes that mean "done, don't restart" (PM2's `stop_exit_codes`) |
+| `keep_workers_on_crash` | `true` | If Warden's supervisor of the app crashes, the workers keep serving: the app's keeper process starts the supervisor again and hands it the same workers ([how it works](how-it-works.md)). `false`: one process, and the workers stop with it. Read when the app starts (`WARDEN_KEEPER=0` in Warden's environment also turns it off) |
 
 ## `[shutdown]`
 

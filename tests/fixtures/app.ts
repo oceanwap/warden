@@ -104,6 +104,9 @@ function handler(tag: string) {
       case "/sick":
         sick = true;
         break;
+      case "/say":
+        console.log(`fixture says ${new URL(req.url).searchParams.get("w")} ${who}`);
+        break;
       case "/leak":
         for (let i = 0; i < 20; i++) hoard.push(new Uint8Array(10 * 1024 * 1024).fill(1));
         break;

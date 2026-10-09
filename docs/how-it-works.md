@@ -77,7 +77,7 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   a pipe holds while its supervisor is stopped waits on its next write, as
   it would under any process manager. `[watchdog]` on the supervisor itself
   (systemd's `WatchdogSec=`) is what restarts a hung supervisor. A dead
-  supervisor is different: see the parent-death point below.
+  supervisor is different: see the keeper point below.
 - On Bun, the shim wraps `Response` and `ReadableStream`, so it can end SSE
   bodies in a drain (one call frame per `new Response`, which JSC inlines:
   no measurable difference, `bench/shim-cost.ts`). The wrappers pass for
@@ -88,10 +88,30 @@ are in [`architecture.md`](architecture.md) (findings F1–F14) and
   `Bun.inspect(Response)` shows `[Function: Response]` rather than
   `[class Response]`, and their own property names list `prototype` before
   the statics. `[shutdown] long_lived_timeout = 0` leaves both untouched.
-- If Warden is SIGKILLed, workers are signalled via `PR_SET_PDEATHSIG` (direct
-  children only). Under systemd the cgroup takes care of the rest.
-  macOS has no parent-death signal: the next start of the app stops the
-  workers a SIGKILLed supervisor left behind (docs/platforms.md).
+- An app runs as two Warden processes: the keeper (the process
+  `warden start` started, the one wardend and systemd see) and its child,
+  the supervisor, which does everything else. The keeper holds a copy of
+  each worker's pipes and fd 3 and, on macOS, of the listening socket the
+  supervisor hands connections from. If the supervisor dies (a crash, a
+  panic, an OOM kill, `kill -9`), the workers keep serving: on Linux they
+  become the keeper's children (`PR_SET_CHILD_SUBREAPER`), the keeper reads
+  their output into 1 MB per stream, starts the supervisor again at once
+  (then with backoff; after 6 deaths in a minute it stops the workers and
+  exits), and hands it the workers, their descriptors and the output it
+  kept. The new supervisor supervises them again, with their uptime and
+  their pids; a worker that died meanwhile is started again, and a hot
+  standby or a worker caught mid-rollout is stopped and replaced (it was
+  not serving). `status`
+  says `pid` (the keeper) and `supervisor_pid`. `[restart]
+  keep_workers_on_crash = false` (or `WARDEN_KEEPER=0`) runs the
+  supervisor alone, as earlier releases did.
+- If the keeper is SIGKILLed, the supervisor tells each worker to stop
+  (the stop signal, to its process group) and exits without `bye`, so
+  wardend or systemd starts the app again. Without a keeper, workers are
+  signalled via `PR_SET_PDEATHSIG` (direct children only). Under systemd the
+  cgroup takes care of the rest. macOS has no parent-death signal: the next
+  start of the app stops the workers a SIGKILLed supervisor left behind
+  (docs/platforms.md).
 - Don't run Warden as PID 1 in a container; use `tini`, or `docker run --init`, to reap orphans.
 - A log consumer that can't keep up (a stuck journald, a full disk) costs
   log lines, never supervision: lines past the queue bounds are dropped,

@@ -5,6 +5,28 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- A crash of an app's supervisor no longer touches its workers. `warden
+  start` now runs as the app's keeper: a small process that starts the
+  supervisor, holds a copy of each worker's pipes and fd 3, and becomes the
+  workers' parent if the supervisor dies (a panic, an OOM kill, `kill -9`).
+  It reads their output meanwhile (up to 1 MB per stream), starts the
+  supervisor again at once, and hands it the same workers, which it
+  supervises again with their pids and uptime; nothing is restarted but
+  the supervisor. In a 2-minute chaos run (release build, same seed), 6
+  `kill -9`s of a supervisor lost no request and every app was ready again
+  in 193 ms (p50); on 0.1.4 the same fault took the app down for 1.4 s
+  (p50) and lost 243 requests. The keeper costs about 1 MB per app (PSS
+  7.9 MB for keeper and supervisor against 6.9 MB alone). After 6
+  supervisor deaths in a minute the keeper stops the workers and exits, so
+  wardend or systemd takes over. `status` gains `supervisor_pid`; `pid` is
+  the keeper's (what wardend and systemd watch). `[restart]
+  keep_workers_on_crash = false` or `WARDEN_KEEPER=0` turns it off.
+- `cargo xtask chaos`: `kill-supervisor` now kills the supervisor under the
+  keeper and checks that the same workers serve throughout; the new
+  `kill-keeper` kills the app's process, as `kill-supervisor` did.
+
 ### Changed
 
 - A Node TLS app's workers share one session-ticket key, so a returning

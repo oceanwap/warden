@@ -174,6 +174,12 @@ impl Rec {
         }
     }
 
+    /// The process to look at when the app does not answer: its supervisor
+    /// (under a keeper, the keeper's child), else the app's process.
+    fn stuck_pid(&self) -> Option<u32> {
+        self.status.as_ref().and_then(|s| s.supervisor_pid).or(self.pid)
+    }
+
     fn state(&self) -> AppState {
         policy::state(self.phase, self.status.as_deref(), self.unresponsive)
     }
@@ -197,7 +203,7 @@ impl Rec {
                 Some("shutting down on request".into())
             }
             AppState::Stopped => Some(format!("workers stopped; `warden start {name}` starts them")),
-            AppState::Unreachable => Some(match self.pid {
+            AppState::Unreachable => Some(match self.stuck_pid() {
                 Some(pid) => format!(
                     "supervisor pid {pid} does not answer on {}; `cat /proc/{pid}/stack` or `gdb -p {pid}` shows \
                      where it is stuck (wardend never kills it: its workers are probably still serving)",
@@ -443,7 +449,7 @@ impl Core {
             WatchMsg::Unresponsive { pid, detail, .. } => {
                 r.unresponsive = true;
                 let pid = pid.or(r.pid);
-                let shown = pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                let shown = r.stuck_pid().or(pid).map(|p| p.to_string()).unwrap_or_else(|| "?".into());
                 if r.unresponsive_logged.is_none_or(|t| t.elapsed() >= UNRESPONSIVE_LOG_EVERY) {
                     r.unresponsive_logged = Some(Instant::now());
                     crate::warn!(

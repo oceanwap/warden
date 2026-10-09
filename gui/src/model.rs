@@ -491,6 +491,7 @@ pub(crate) mod tests {
             log_file: None,
             version: "0.1.0".into(),
             pid: 42,
+            supervisor_pid: None,
             uptime_secs: 60,
             workers_configured: n,
             workers_ready: n,
