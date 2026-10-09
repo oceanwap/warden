@@ -81,6 +81,13 @@ fn classify(e: &std::io::Error, what: &str) -> Fail {
     (class, format!("{what}: {e}"))
 }
 
+/// macOS refuses options on a socket its peer already reset (EINVAL): a
+/// connection the worker dropped, not a client error.
+fn sockopt(e: &std::io::Error, what: &str) -> Fail {
+    let (class, detail) = classify(e, what);
+    (if e.kind() == ErrorKind::InvalidInput { ErrClass::Reset } else { class }, detail)
+}
+
 #[derive(Debug, Clone)]
 pub struct Failure {
     pub t: f64,
@@ -132,8 +139,8 @@ fn connect(port: u16) -> Result<TcpStream, Fail> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| classify(&e, "connect"))?;
     // Short reads so a stuck read still notices the deadline and `stop`.
-    s.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| classify(&e, "set_read_timeout"))?;
-    s.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| classify(&e, "set_write_timeout"))?;
+    s.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| sockopt(&e, "set_read_timeout"))?;
+    s.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| sockopt(&e, "set_write_timeout"))?;
     let _ = s.set_nodelay(true);
     Ok(s)
 }

@@ -1482,6 +1482,48 @@ fn node_workers_hand_themselves_back_when_every_warden_process_dies() {
     every_warden_process_killed("recover-node", &cfg, port);
 }
 
+/// A reload after the keeper restarted the supervisor: the new workers' health
+/// sockets must not share names with the taken-back workers', which remove
+/// theirs as they exit (instance ids are part of the name).
+#[test]
+fn a_reload_after_a_supervisor_restart_keeps_the_new_workers_health_sockets() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let cfg = gated("inst-reuse", port, 2, "").replace(
+        "[health]\npath = \"/health\"\n",
+        "[health]\npath = \"/health\"\ninterval = 1\nfailure_threshold = 2\ninitial_delay = 0\n",
+    );
+    let w = Warden::start("inst-reuse", port, &cfg);
+    w.wait_for("2 ready", T, ready(2));
+    // Instances 3 and 4 after a reload, while a fresh supervisor would count from 1.
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("reloaded", T, ready(2));
+    let sup = w.supervisor();
+    unsafe { libc::kill(sup as i32, libc::SIGKILL) };
+    let kept = w.wait_for("taken back", T, |s| {
+        s["workers_ready"] == 2 && s["supervisor_pid"].as_u64().is_some_and(|p| p != sup as u64)
+    });
+    assert_eq!(pid_set(&kept), pid_set(&s));
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("reloaded again", T, |s| s["workers_ready"] == 2 && pid_set(s).is_disjoint(&pid_set(&kept)));
+    // The old workers drain and exit; each new one keeps its own socket.
+    std::thread::sleep(Duration::from_secs(2));
+    let sockets: Vec<String> = std::fs::read_dir(&w.dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with("inst-reuse.h") && n.ends_with(".sock"))
+        .collect();
+    assert_eq!(sockets.len(), 2, "one health socket per new worker: {sockets:?}");
+    let log = w.log();
+    let after = log.rsplit("taking back the workers").next().unwrap_or("");
+    assert!(!after.contains("worker unhealthy"), "a new worker lost its health socket:\n{log}");
+    assert_eq!(pid_set(&w.status().unwrap()), pid_set(&s), "the same workers serve");
+}
+
 /// Without the keeper (`WARDEN_KEEPER=0`); with it, the keeper starts the
 /// supervisor again and the workers keep serving
 /// (`a_killed_supervisor_is_started_again_by_its_keeper_and_takes_back_its_workers`).

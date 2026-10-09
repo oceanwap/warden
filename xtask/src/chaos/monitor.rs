@@ -186,7 +186,7 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
             // init (no subreaper there), so ppid 1 alone is no orphan; one a live
             // supervisor lists as its worker is supervised.
             if t - first > (GRACE_S + 10) as f64
-                && !(cfg!(target_os = "macos") && listed_worker(&fleet, s.pid))
+                && !(cfg!(target_os = "macos") && listed_worker(&fleet, s.pid) != Some(false))
                 && reported.insert(key)
             {
                 let argv = procfs::cmdline(s.pid).join(" ");
@@ -226,10 +226,11 @@ pub fn procmon(sh: Arc<Shared>, fleet: Arc<Fleet>, in_namespace: bool) {
 }
 
 /// Is `pid` a worker some app's supervisor lists (`warden list --json`)?
-fn listed_worker(fleet: &Fleet, pid: u32) -> bool {
-    fleet.list().is_ok_and(|apps| {
-        apps.iter().any(|a| {
-            a["status"]["workers"].as_array().is_some_and(|ws| ws.iter().any(|w| w["pid"].as_u64() == Some(pid as u64)))
-        })
-    })
+/// `None` when the list could not be read (an app mid-restart): undecided,
+/// the next scan asks again.
+fn listed_worker(fleet: &Fleet, pid: u32) -> Option<bool> {
+    let apps = fleet.list().ok()?;
+    Some(apps.iter().any(|a| {
+        a["status"]["workers"].as_array().is_some_and(|ws| ws.iter().any(|w| w["pid"].as_u64() == Some(pid as u64)))
+    }))
 }
