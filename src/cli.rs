@@ -70,10 +70,11 @@ APPS (familiar from PM2):
     resurrect        Start what `save` remembered (and wardend, if it is not running), the
                      apps at the same time but no more than one per CPU core at once:
                      --parallel N (-j N; `all`: no limit; $WARDEN_PARALLEL) changes it
-    update           Restart every supervisor and wardend from the warden binary on disk
-                     (save, kill, resurrect: like `pm2 update`). A supervisor keeps the code
-                     it started with, so this is what picks up a rebuild or an upgrade. The
-                     apps stop for a few seconds; asks first on a terminal  [--yes]
+    update           Move every supervisor and wardend to the warden binary on disk (like
+                     `pm2 update`). A supervisor keeps the code it started with, so this is
+                     what picks up a rebuild or an upgrade. The apps keep serving: their
+                     workers are handed to the new supervisors (an app without a keeper is
+                     restarted). Saves first; asks first on a terminal  [--yes]
     upgrade          Install the newest release (checked against its SHA256SUMS; the desktop
                      app too when installed) and restart everything onto it, as `update`
                      does  [--check] [--yes] [--version V] [--dry-run] (--help)
@@ -173,8 +174,8 @@ pub enum Command {
     },
     Save,
     Resurrect,
-    /// `warden update`: save, kill, resurrect: every supervisor and wardend start again from
-    /// the warden binary on disk.
+    /// `warden update`: save, then every supervisor and wardend run again from this warden
+    /// binary; the apps keep serving (`fleet::update`).
     Update,
     Startup(crate::startup::Want),
     Unstartup(crate::startup::Want),

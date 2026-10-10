@@ -132,7 +132,7 @@ Filters: `--grep TEXT`, `--exclude TEXT`, `--ignore-case`, `--since 2h`,
 |---|---|
 | `save` | Remember the running apps, worker counts and stopped state |
 | `resurrect` | Start what `save` remembered (and wardend, if it is not running), the apps at the same time but no more than one per CPU core at once (see [Parallel starts](#parallel-starts)) |
-| `update` | Restart every supervisor and wardend from the `warden` binary on disk (save, kill, resurrect: like `pm2 update`). A supervisor keeps the code it started with, so this is what picks up a rebuild or an upgrade. The apps stop for a few seconds; asks first on a terminal (`--yes`) |
+| `update` | Move every supervisor and wardend to the `warden` binary on disk (like `pm2 update`). A supervisor keeps the code it started with, so this is what picks up a rebuild or an upgrade. Apps keep serving: each keeper re-executes itself from the new binary and its new supervisor takes the same workers back; an app without a keeper is restarted (a few seconds). Saves first; asks first on a terminal (`--yes`) |
 | `startup` | Bring the saved apps and wardend back after a reboot or a crash: systemd units (root: system units; a user or `--user`: your own, with lingering), a launchd job on macOS. Without a service manager it says what to run at boot instead; `--user` or `--system` |
 | `unstartup` | Remove what `startup` installed (apps keep running); `--user` or `--system` |
 | `kill [target]` | Stop every app's supervisor, and wardend when it is every one (asks first on a terminal; `--yes`) |

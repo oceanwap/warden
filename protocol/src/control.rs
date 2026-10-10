@@ -12,6 +12,12 @@ pub enum Request {
     Stop,
     /// Stop all workers and exit the supervisor.
     Shutdown,
+    /// Run the supervisor and its keeper from the warden binary `exe` (`warden update`): the
+    /// keeper re-executes itself from it, keeping its pid and the workers, which keep serving;
+    /// the new supervisor takes them back. Refused without a keeper.
+    Upgrade {
+        exe: String,
+    },
     /// Replace workers one at a time through the health gates (all, or one);
     /// `hard`: stop every worker, then start them again (PM2's `restart`).
     Restart {

@@ -42,9 +42,20 @@ optional (`#[serde(default)]`) so an older CLI or GUI keeps working.
 
 Requests are `control::Request`, tagged by `cmd`: `status`, `stop`,
 `shutdown`, `restart`, `reload`, `scale`, `start`, `reset`, `signal`,
-`config`, `flush`, `logs`, `log-level`, and `subscribe`. Each answers one
-`control::Response` line (`{"ok":true,"message":…,"status":…}`), except
-`logs` (log lines) and `subscribe` (events).
+`config`, `flush`, `logs`, `log-level`, `subscribe` and `upgrade`. Each
+answers one `control::Response` line (`{"ok":true,"message":…,"status":…}`),
+except `logs` (log lines) and `subscribe` (events).
+
+`upgrade` (`{"cmd":"upgrade","exe":"/usr/local/bin/warden"}`, what `warden
+update` sends) moves the app to another warden binary without stopping it:
+`exe` (an absolute path) must first read the app's config (`warden check`,
+within 10 s), else `ok` is false and nothing changes. Once the reply is
+sent, the supervisor exits leaving its workers running, its keeper
+re-executes itself from `exe` (same pid), and the supervisor that keeper
+starts takes the workers back; `status` then shows a new `supervisor_pid`
+and `build.path` = `exe`. Refused without a keeper, during a rollout and
+while shutting down. An older supervisor does not know it (its reply is
+not `ok`): restart it instead.
 
 `config` (`{"cmd":"config","show_secrets":false,"worker":2}`) answers
 `info`: the effective config (`config`, defaults included, `app.env` merged

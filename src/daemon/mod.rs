@@ -1047,7 +1047,7 @@ pub fn main(rt: &tokio::runtime::Runtime, resurrect: bool) -> i32 {
 /// kernel drops it when the process ends however it ends, so a killed wardend never leaves a
 /// lock behind, and a second wardend finds it taken instead of unlinking the first one's socket.
 /// `Ok(None)`: another wardend holds it.
-fn lock_instance(socket: &std::path::Path) -> Result<Option<std::fs::File>, String> {
+pub(super) fn lock_instance(socket: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = socket.parent().unwrap_or(std::path::Path::new("."));
     control::ensure_private_dir(dir)?;

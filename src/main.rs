@@ -189,7 +189,7 @@ fn run_supervisor(rt: &tokio::runtime::Runtime, args: &cli::Args, path: PathBuf)
         c.control.socket = Some(s);
     }
     let mut no_keeper = None;
-    if keeper::wanted(&c) {
+    if keeper::resuming() || keeper::wanted(&c) {
         match keeper::prepare() {
             Ok(()) => {
                 // The supervisor writes the log files; the keeper's few lines

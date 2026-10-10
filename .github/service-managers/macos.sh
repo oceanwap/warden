@@ -199,6 +199,27 @@ expect_eq "$API's supervisor survived wardend's death" "$API_SUP" "$(sup_pid "$A
 expect_eq "$SITE's supervisor survived wardend's death" "$SITE_SUP" "$(sup_pid "$SITE")"
 wait_for "the new wardend sees $API running" 20 wardend_sees "$API"
 
+# ------------------------------------------------------------------- update
+
+note "warden update: the apps move to this binary without a restart"
+workers() { app_field "$1" '[.status.workers[].pid] | sort | map(tostring) | join(",")'; }
+inner() { app_field "$1" '.status.supervisor_pid // empty'; }
+API_KEEPER=$(sup_pid "$API")
+API_INNER=$(inner "$API")
+API_WORKERS=$(workers "$API")
+NODE_WORKERS=$(workers "$NODE")
+run_ok "warden update --yes" w update --yes
+wait_for "$API 1/1 ready after the update" 30 app_ready "$API" 1
+expect_eq "$API keeps its process (the keeper)" "$API_KEEPER" "$(sup_pid "$API")"
+check "$API has a new supervisor (was $API_INNER)" test "$(inner "$API")" != "$API_INNER"
+expect_eq "$API keeps its workers" "$API_WORKERS" "$(workers "$API")"
+expect_eq "$NODE keeps its workers" "$NODE_WORKERS" "$(workers "$NODE")"
+check "$API answers after the update" http_ok "$PORT_API"
+check "$NODE answers after the update" http_ok "$PORT_NODE"
+check "$SITE answers after the update" http_ok "$PORT_SITE"
+wait_for "launchd runs the new wardend for the job" 20 wardend_is_job
+wait_for "the new wardend sees $API running" 20 wardend_sees "$API"
+
 # ------------------------------------------- clean stop, then login / boot
 
 note "warden kill: a clean exit, which launchd leaves stopped"

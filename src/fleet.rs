@@ -2536,52 +2536,145 @@ pub async fn resurrect(args: &Args) -> i32 {
     // was running already (it is not an app's, and it harms nobody). First, so it is there
     // before the apps are, and finds each as it comes up.
     crate::daemon::client::autostart().await;
-    let code = resurrect_inner(args).await;
+    let code = resurrect_inner(args, false).await;
     show_apps(args, false).await;
     code
 }
 
-/// `warden update`: every supervisor and wardend start again from the warden binary on disk,
-/// as `warden save && warden kill --yes && warden resurrect` does. A supervisor keeps the
-/// code it started with (a rebuild or an upgrade replaces the file, not the process), so
-/// this is how a running host picks it up. Nothing is stopped unless the save worked.
+/// `warden update`: every supervisor and wardend run again from this warden binary. A
+/// supervisor keeps the code it started with (a rebuild or an upgrade replaces the file, not
+/// the process), so this is how a running host picks it up.
+///
+/// An app with a keeper (`crate::keeper`, the default) moves without stopping: its supervisor
+/// exits, its keeper re-executes itself from this binary, and the new supervisor takes the
+/// workers back, which serve throughout. Any other app (no keeper, or a supervisor older than
+/// the `upgrade` request) is stopped and started again, as `warden save && warden kill --yes &&
+/// warden resurrect` does. Nothing is touched unless the save worked.
 pub async fn update(args: &Args) -> i32 {
     if !args.yes && crate::sys::isatty(0) {
         eprint!(
-            "Restart every app's supervisor and wardend from this warden binary? The apps stop for a few seconds. \
-             [y/N] "
+            "Move every app's supervisor and wardend to this warden binary? Apps with a keeper (the default) keep \
+             serving; any other app stops for a few seconds. [y/N] "
         );
         let mut answer = String::new();
         let _ = std::io::stdin().read_line(&mut answer);
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            eprintln!("nothing stopped");
+            eprintln!("nothing changed");
             return 1;
         }
     }
     println!("update: saving what runs");
     let code = save_with(args, true).await;
     if code != 0 {
-        eprintln!("warden: the save failed, so nothing was stopped");
+        eprintln!("warden: the save failed, so nothing was changed");
         return code;
     }
-    println!("update: stopping every supervisor and wardend");
-    let kill_all = Args {
-        command: cli::Command::Kill,
-        target: None,
-        config: args.config.clone(),
-        socket: args.socket.clone(),
-        json: false,
-        no_wait: args.no_wait,
-        yes: true,
-        table_only: false,
-        parallel: None,
+    let exe = match std::env::current_exe() {
+        Ok(e) => std::fs::canonicalize(&e).unwrap_or(e),
+        Err(e) => {
+            eprintln!("warden: cannot tell where this warden is: {e}");
+            return 1;
+        }
     };
-    let stopped = kill(&kill_all).await;
-    println!("update: starting them again");
-    stopped.max(resurrect(args).await)
+    let ctx = context(args);
+    let apps: Vec<App> = match resolve(&ctx, Some("all"), false) {
+        Ok(s) => unique_apps(&s).into_iter().filter(|a| a.socket.exists()).collect(),
+        Err(_) => Vec::new(),
+    };
+    let mut worst = 0;
+    let mut moving = Vec::new();
+    let mut restart = Vec::new();
+    for app in apps {
+        let Ok(before) = status_of(&app).await else { continue };
+        let req = Request::Upgrade { exe: exe.to_string_lossy().into_owned() };
+        match call_with(&app, &req, REQUEST_TIMEOUT).await {
+            Ok(r) if r.ok => {
+                println!("{}: moving to this warden binary; its workers keep serving", app.name);
+                moving.push((app, before));
+            }
+            Ok(r) => {
+                let why = r.message.unwrap_or_default();
+                println!("{}: {why}; restarting it instead (it stops for a few seconds)", app.name);
+                restart.push((app, before));
+            }
+            // A supervisor older than `upgrade` cannot read it.
+            Err(e) => {
+                println!("{}: cannot move without a restart ({e}); restarting it", app.name);
+                restart.push((app, before));
+            }
+        }
+    }
+    for (app, before) in &moving {
+        match moved(app, before, &exe).await {
+            Ok(m) => println!("{}: {m}", app.name),
+            Err(e) => {
+                eprintln!("warden: {}: {e}", app.name);
+                worst = 1;
+            }
+        }
+    }
+    for (app, before) in &restart {
+        if let Err(e) = stop_supervisor(app, Some(before), false).await {
+            eprintln!("warden: {}: {e}", app.name);
+            worst = 1;
+        }
+    }
+    // wardend has no apps' work on its path: stopping it stops nothing else.
+    if crate::daemon::client::hello_pid(&crate::daemon::socket_path()).await.is_some() {
+        println!("update: restarting wardend");
+        worst = worst.max(stop_wardend().await);
+    }
+    // wardend, then the apps stopped above and every other saved app that is not running (as
+    // `warden resurrect`; the apps that moved are running).
+    crate::daemon::client::autostart().await;
+    worst = worst.max(resurrect_inner(args, true).await);
+    show_apps(args, false).await;
+    worst
 }
 
-async fn resurrect_inner(args: &Args) -> i32 {
+/// After `upgrade`: wait (up to a minute) for the app's new supervisor to answer, from `exe`,
+/// with its workers back. What it reports, or why it is not there.
+async fn moved(app: &App, before: &Status, exe: &Path) -> Result<String, String> {
+    let old = before.supervisor_pid;
+    let t0 = Instant::now();
+    let mut last = String::from("its supervisor did not answer");
+    while t0.elapsed() < Duration::from_secs(60) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let Ok(st) = status_of(app).await else { continue };
+        if st.supervisor_pid == old || st.pid != before.pid {
+            if st.pid != before.pid {
+                return Err(format!(
+                    "the app restarted (pid {} is now {}) instead of moving; it runs again",
+                    before.pid, st.pid
+                ));
+            }
+            continue;
+        }
+        let from = st.build.as_ref().map(|b| b.path.clone()).unwrap_or_default();
+        if !from.is_empty() && Path::new(&from) != exe {
+            return Err(format!("its new supervisor runs {from}, not {}", exe.display()));
+        }
+        let want = before.workers_ready.min(st.workers_configured);
+        last = if st.stopped {
+            "its workers stay stopped".into()
+        } else {
+            format!("{}/{} workers ready", st.workers_ready, st.workers_configured)
+        };
+        if st.workers_ready >= want {
+            let kept =
+                before.workers.iter().filter(|w| w.pid.is_some() && st.workers.iter().any(|n| n.pid == w.pid)).count();
+            return Ok(format!(
+                "runs warden {} ({last}; {kept} kept serving, supervisor pid {})",
+                st.version,
+                st.supervisor_pid.unwrap_or(st.pid)
+            ));
+        }
+    }
+    Err(format!("not back within 60 s ({last}); `warden status {}` shows it", app.name))
+}
+
+/// Start every saved app that is not running; `quiet`: without a line for those that are.
+async fn resurrect_inner(args: &Args, quiet: bool) -> i32 {
     let dump = match read_dump() {
         Ok(Some(d)) => d,
         Ok(None) => {
@@ -2604,7 +2697,9 @@ async fn resurrect_inner(args: &Args) -> i32 {
         }
         let app = app_from_config(&s.config);
         if reachable(&app) {
-            println!("{}: already running", s.name);
+            if !quiet {
+                println!("{}: already running", s.name);
+            }
             continue;
         }
         to_start.push(app);

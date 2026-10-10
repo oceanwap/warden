@@ -1926,6 +1926,19 @@ pub fn take_inherited_fd(raw: RawFd) -> Option<OwnedFd> {
     Some(fd)
 }
 
+/// Keep `fd` open across this process's next exec (clear FD_CLOEXEC); the
+/// program it runs then takes it with [`take_inherited_fd`].
+pub fn keep_across_exec(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor the caller owns, integer arguments only.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) }).map(|_| ())
+}
+
+/// Undo [`keep_across_exec`]: `fd` closes at the next exec again.
+pub fn set_cloexec_on(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor the caller owns, integer arguments only.
+    check(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) }).map(|_| ())
+}
+
 /// Wait until `fd` is readable (or `ms` passed; -1: no limit): poll(2) on one
 /// descriptor. True when it is (or has hung up).
 pub fn wait_readable(fd: BorrowedFd<'_>, ms: i32) -> io::Result<bool> {
