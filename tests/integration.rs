@@ -72,6 +72,21 @@ struct Warden {
 }
 
 impl Warden {
+    /// The directory of a start: `warden-it-<name>-<pid>`, and for each later
+    /// start of the same name in this run a new one (`-2`, `-3`...). Two tests
+    /// may use the same name at once, and a test that starts a name again
+    /// must not share the control socket path with the instance it just
+    /// stopped: on linux-arm64 a second `loopnode` there went unreachable
+    /// right after its workers were ready.
+    fn dir_for(name: &str) -> PathBuf {
+        static STARTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut starts = STARTS.lock().unwrap_or_else(|e| e.into_inner());
+        starts.push(name.to_string());
+        let n = starts.iter().filter(|s| *s == name).count();
+        let pid = std::process::id();
+        tmp().join(if n == 1 { format!("warden-it-{name}-{pid}") } else { format!("warden-it-{name}-{pid}-{n}") })
+    }
+
     fn start(name: &str, port: u16, toml: &str) -> Warden {
         Self::start_env(name, port, toml, &[])
     }
@@ -83,7 +98,7 @@ impl Warden {
     /// `stall_stdout`: Warden's stdout is a pipe nobody reads (a stuck log
     /// consumer); stderr still goes to the log file.
     fn start_opts(name: &str, port: u16, toml: &str, env: &[(&str, &str)], stall_stdout: bool) -> Warden {
-        let dir = tmp().join(format!("warden-it-{name}-{}", std::process::id()));
+        let dir = Warden::dir_for(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("warden.toml");
@@ -7452,7 +7467,7 @@ impl Warden {
     /// Like `start`, with Warden (and so its workers) in the cgroup whose
     /// `cgroup.procs` is `procs`.
     fn start_in_cgroup(name: &str, port: u16, toml: &str, procs: &std::path::Path) -> Warden {
-        let dir = tmp().join(format!("warden-it-{name}-{}", std::process::id()));
+        let dir = Warden::dir_for(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("warden.toml");
