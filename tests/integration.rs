@@ -639,7 +639,13 @@ fn cli_errors() {
     let out =
         warden().args(["status", "--socket"]).arg(dir.join("nobody.sock")).stdout(Stdio::null()).output().unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Is it running?"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"), "{out:?}");
+    // A socket a killed supervisor left behind refuses: still "not running", and why.
+    let left = dir.join("left.sock");
+    drop(std::os::unix::net::UnixListener::bind(&left).unwrap());
+    let out = warden().args(["status", "--socket"]).arg(&left).stdout(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running (its control socket"), "{out:?}");
 
     let out = warden().arg("--help").output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("reload"));

@@ -209,7 +209,7 @@ For each scenario, the reviewer records what the operator sees (log lines,
 | S11 | `SIGKILL` / `SIGSTOP` of Warden | Workers drain and exit / keep serving; watchdog pings stop |
 | S12 | Stalled stdout (log consumer stops reading) | Supervision unaffected; dropped-line counter reported |
 | S13 | Runtime directory world-writable or a symlink | Refuses to start with the reason and the fix |
-| S14 | Control socket unreachable (Warden down) | CLI exit 2 with "Is it running?" |
+| S14 | Control socket unreachable (Warden down) | CLI exit 2 with "not running" |
 | S15 | Injected panics (`WARDEN_FAULT=waiter:1`, `stdout:1`, `control:1`, `tick:3`) | Per §2 B5; no stuck slot; clear ERROR line |
 
 ## 4. Mechanical checks

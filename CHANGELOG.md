@@ -3,6 +3,15 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- An app that is not running reads as such: `warden status` and the other
+  commands say "not running", and when a supervisor that was killed left its
+  control socket behind, they say so, instead of "cannot reach warden at …
+  (Connection refused). Is it running?".
+
 ## [0.1.5] — 2026-10-10
 
 ### Added

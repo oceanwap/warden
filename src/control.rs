@@ -535,15 +535,27 @@ async fn write_json(w: &mut tokio::net::unix::OwnedWriteHalf, v: &Response) -> s
     w.write_all(s.as_bytes()).await
 }
 
+/// Why the supervisor on `path` cannot be asked: not running (no socket, or one a supervisor
+/// that was killed left behind, which refuses), or something else.
+fn unreachable(path: &Path, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!("not running (no control socket at {})", path.display()),
+        std::io::ErrorKind::ConnectionRefused => format!(
+            "not running (its control socket {} is left from a run that ended without removing it; \
+             the next start replaces it)",
+            path.display()
+        ),
+        _ => format!("cannot reach warden at {} ({e}). Is it running?", path.display()),
+    }
+}
+
 /// Client side: send one request. For `logs`, lines are written to `out` as they arrive.
 pub async fn call(
     path: &Path,
     req: &Request,
     out: &mut (dyn std::io::Write + Send),
 ) -> Result<Option<Response>, String> {
-    let stream = UnixStream::connect(path)
-        .await
-        .map_err(|e| format!("cannot reach warden at {} ({e}). Is it running?", path.display()))?;
+    let stream = UnixStream::connect(path).await.map_err(|e| unreachable(path, &e))?;
     let (r, mut w) = stream.into_split();
     let mut s = serde_json::to_string(req).map_err(|e| e.to_string())?;
     s.push('\n');
