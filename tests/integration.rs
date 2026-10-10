@@ -6809,6 +6809,14 @@ fn keep_alive_requests<R>(port: u16, request: String, f: impl FnOnce() -> R) -> 
     (r, n(0), n(1), n(2))
 }
 
+/// The drain window of the `*_drain_answers_keep_alive_*` tests. A connection
+/// still idle when the window ends is closed, so a request the client sends
+/// just then is cut: by design, and what a client that held its connection
+/// idle for the whole window risks. The client here sends every 10 ms, but on
+/// a busy machine (tests run 12 at a time in CI) it can stall longer than the
+/// default 500 ms; with 3 s it is the drain that is tested, not the scheduler.
+const DRAIN: &str = "[shutdown]\ndrain_ms = 3000\n";
+
 /// Found by `cargo xtask chaos`: a draining static worker closed its idle
 /// keep-alive connections at once, so a client sending its next request at
 /// that moment lost it. Now requests during the drain get `Connection: close`.
@@ -6822,7 +6830,7 @@ fn static_drain_answers_keep_alive_requests_instead_of_cutting_them() {
         std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
         let port = free_port();
         let cfg = format!(
-            "[app]\nname = \"sdrain-{io}\"\nport = {port}\n[workers]\ncount = 2\n[static]\nroot = \"{}\"\n",
+            "[app]\nname = \"sdrain-{io}\"\nport = {port}\n[workers]\ncount = 2\n[static]\nroot = \"{}\"\n{DRAIN}",
             dir.display()
         );
         let w = Warden::start_env(&format!("sdrain-{io}"), port, &cfg, &[]);
@@ -6851,7 +6859,7 @@ fn node_drain_answers_keep_alive_requests_instead_of_cutting_them() {
     }
     let port = free_port();
     let cfg = format!(
-        "[app]\nname = \"ndrain\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n",
+        "[app]\nname = \"ndrain\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n{DRAIN}",
         fixture("node_app.mjs")
     );
     let w = Warden::start("ndrain", port, &cfg);
@@ -6878,8 +6886,10 @@ fn bun_drain_answers_keep_alive_requests_instead_of_cutting_them() {
         return;
     }
     let port = free_port();
-    let cfg =
-        format!("[app]\nname = \"bdrain\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n", fixture("app.ts"));
+    let cfg = format!(
+        "[app]\nname = \"bdrain\"\nargs = [\"{}\"]\nport = {port}\n[workers]\ncount = 2\n{DRAIN}",
+        fixture("app.ts")
+    );
     let w = Warden::start("bdrain", port, &cfg);
     w.wait_for("ready", T, ready(2));
     let ((), ok, cut, fresh) = keep_alive_through(port, "/whoami", || {
