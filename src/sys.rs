@@ -2168,21 +2168,29 @@ mod tests {
             line.push(b[0] as char);
         }
         let grandchild: i32 = line.trim().parse().unwrap();
+        // Watched by pidfd from before the signal: readable once it has
+        // exited, whoever reaps it and whatever reuses its pid later. (Read
+        // from /proc after a 2 s poll, a busy arm64 runner once reported it
+        // alive.)
+        #[cfg(target_os = "linux")]
+        let pidfd = pidfd_open(grandchild as u32).unwrap();
         signal_child(child.id(), libc::SIGKILL, true);
         child.wait().unwrap();
-        // Gone, or a zombie waiting for init to reap it: either way it was killed.
+        // The bound only matters if the signal missed it; a loaded machine
+        // can take a while to schedule its exit.
         #[cfg(target_os = "linux")]
-        let dead =
-            || std::fs::read_to_string(format!("/proc/{grandchild}/stat")).map(|s| s.contains(") Z ")).unwrap_or(true);
-        // No /proc: gone once launchd has reaped it.
+        let gone = wait_readable(pidfd.as_fd(), 10_000).unwrap();
+        // No pidfds: gone once launchd has reaped it.
         #[cfg(not(target_os = "linux"))]
-        let dead = || kill(grandchild, 0).is_err();
-        let t0 = std::time::Instant::now();
-        while !dead() && t0.elapsed() < std::time::Duration::from_secs(2) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let gone = dead();
-        assert!(gone, "grandchild survived the group signal");
+        let gone = {
+            let t0 = std::time::Instant::now();
+            while kill(grandchild, 0).is_ok() && t0.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            kill(grandchild, 0).is_err()
+        };
+        let state = std::fs::read_to_string(format!("/proc/{grandchild}/stat")).unwrap_or_default();
+        assert!(gone, "grandchild survived the group signal: {state}");
         // Nonsense pids are ignored, not sent to process 0/1.
         signal_child(0, libc::SIGTERM, true);
         signal_child(1, libc::SIGTERM, false);
@@ -3423,7 +3431,7 @@ mod tests {
             for len in 0..300 {
                 let hay = &data[start..start + len];
                 assert_eq!(memchr(b'\n', hay), None);
-                for needle in [b'a', b'e', b'j'] {
+                for needle in *b"aej" {
                     assert_eq!(memchr(needle, hay), hay.iter().position(|&b| b == needle), "start {start} len {len}");
                 }
                 if len > 0 {

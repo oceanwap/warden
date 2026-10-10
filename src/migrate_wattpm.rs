@@ -2518,7 +2518,7 @@ async fn run_inner(args: &Args, o: &Opts) -> Result<i32, String> {
         }
         // Nothing is written through a link, and nothing that is there is replaced without --overwrite
         // (the env file may hold what the app needs and nothing else has).
-        let targets = [Some(cfg_path.clone()), Some(out_dir.join(&env_name)).filter(|_| !a.env.is_empty())];
+        let targets = [Some(cfg_path.clone()), (!a.env.is_empty()).then_some(out_dir.join(&env_name))];
         if let Some(why) = targets.iter().flatten().find_map(|t| blocked(t, o.overwrite)) {
             eprintln!("warden: {}: {why}", a.id);
             a.skip = Some(why);

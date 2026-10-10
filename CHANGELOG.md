@@ -3,7 +3,7 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.1.5] — 2026-10-10
 
 ### Added
 
@@ -76,7 +76,6 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 - A supervisor restarted by its keeper (after a crash, or `warden update`)
   stopped the workers of an app scaled up since it started (`warden scale`)
   and started new ones: it now keeps them, and the app its size.
-
 - On Bun 1.4, a reload or scale-down no longer cuts requests sent on idle
   keep-alive connections to a draining worker. Bun 1.4's `server.stop()`
   closes idle keep-alive connections at once (1.3 kept them open), so a
@@ -85,6 +84,19 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   accepting through `drain_ms`, answering with `Connection: close` so
   clients move to the new workers, and stops accepting at its end, as Node
   workers do. Bun 1.3 is unchanged.
+- An app whose servers run deep below its worker shows their ports again.
+  The listener walk went four processes down; a turbo monorepo's dev
+  script (`bun run dev`, dotenv, turbo's node shim, turbo, `bun run dev`,
+  the server) puts its servers five down, so the app showed no ports. It
+  now goes eight down.
+- After a restart that took workers back, a reload no longer leaves the new
+  workers without health sockets. The supervisor numbered its workers from 1
+  again, so new workers reused the taken-back ones' socket names and lost
+  their sockets when those drained (on macOS they were then marked
+  unhealthy). Taken-back workers keep their numbers and new ones count on
+  from above them.
+- On macOS the integration tests no longer read or rewrite the user's real
+  wardend LaunchAgent; each test gets a throwaway launchd directory.
 
 ## [0.1.4] — 2026-10-08
 

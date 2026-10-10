@@ -312,6 +312,49 @@ pub fn user_name(uid: u32) -> String {
 }
 
 #[cfg(test)]
+pub(crate) mod test_sleep {
+    //! A `sleep 60` for tests that read a child's environment. Not the
+    //! system's: macOS 27 no longer shows the environment of Apple's own
+    //! binaries (`/bin/sleep`; `ps eww` shows none either), only of everyone
+    //! else's, which is what Warden supervises. So the sleeper is this test
+    //! binary under the name `sleep`: a hard link beside it.
+
+    use std::process::{Command, Stdio};
+
+    const MARKER: &str = "WARDEN_TEST_SLEEP";
+
+    /// `sleep 60`: the command name is `sleep`, the command line has `60`.
+    pub(crate) fn command() -> Command {
+        let exe = std::env::current_exe().unwrap();
+        // Beside the test binary (the same filesystem, and `cargo clean` removes it).
+        let dir = exe.with_extension("sleep");
+        let link = dir.join("sleep");
+        // Once: tests run in parallel, and one must not remove the link another is starting.
+        static LINK: std::sync::Once = std::sync::Once::new();
+        LINK.call_once(|| {
+            std::fs::create_dir_all(&dir).unwrap();
+            let _ = std::fs::remove_file(&link);
+            std::fs::hard_link(&exe, &link).unwrap();
+        });
+        // libtest's name for `asleep` below: the module path without the crate.
+        let test = format!("{}::asleep", module_path!().split_once("::").unwrap().1);
+        let mut c = Command::new(link);
+        // `60` is a second filter that matches no test: there for the command line.
+        c.args(["--ignored", "--exact", &test, "60"]).env(MARKER, "1").stdout(Stdio::null()).stderr(Stdio::null());
+        c
+    }
+
+    /// What `command()` runs. Does nothing in a test run that includes ignored tests.
+    #[test]
+    #[ignore = "the child process of command(), not a test"]
+    fn asleep() {
+        if std::env::var_os(MARKER).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod contract_tests {
     //! The same questions asked of whatever adapter this OS has. They run on
     //! Linux in CI and on a Mac with `cargo test`: both must pass them.
@@ -320,13 +363,12 @@ pub(crate) mod contract_tests {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// `sh -c 'exec sleep 60'` with a marker in its environment, in `dir`.
+    /// `sleep 60` (`test_sleep`) with a marker in its environment, in `dir`.
     struct Sleeper(Child);
 
     impl Sleeper {
         fn start(dir: &std::path::Path) -> Sleeper {
-            let child = Command::new("sh")
-                .args(["-c", "exec sleep 60"])
+            let child = test_sleep::command()
                 .env("WARDEN_PLATFORM_TEST", "two words")
                 .current_dir(dir)
                 .stdin(Stdio::null())
