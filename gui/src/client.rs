@@ -813,6 +813,15 @@ mod tests {
         }
     }
 
+    /// Wait until the listener just dropped on `path` refuses connections: for a
+    /// moment it can still take one (seen on macOS 27, one run in four).
+    fn closed(path: &Path) {
+        let t0 = std::time::Instant::now();
+        while answers(path) && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn a_socket_file_left_by_a_dead_wardend_does_not_hide_a_live_one() {
         let d = Dir::new("socks");
@@ -821,6 +830,7 @@ mod tests {
         assert_eq!(choose_socket(&own, &system, answers), own);
         // The user's is a file nobody listens on (a wardend that was killed), the system's lives.
         drop(std::os::unix::net::UnixListener::bind(&own).unwrap());
+        closed(&own);
         let live = std::os::unix::net::UnixListener::bind(&system).unwrap();
         assert!(own.exists() && !answers(&own) && answers(&system));
         assert_eq!(choose_socket(&own, &system, answers), system);
@@ -831,8 +841,10 @@ mod tests {
         };
         assert_eq!(choose_socket(&own, &system, answers), own);
         drop(own_live);
+        closed(&own);
         // Neither answers: the one that is there, the user's first, so the error names it.
         drop(live);
+        closed(&system);
         assert_eq!(choose_socket(&own, &system, answers), own);
         std::fs::remove_file(&own).unwrap();
         assert_eq!(choose_socket(&own, &system, answers), system, "only the system's file is there");
