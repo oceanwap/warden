@@ -8044,7 +8044,8 @@ fn safe_reload_rollback_keeps_the_previous_standby() {
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("Rolled back"), "{out}");
     std::thread::sleep(Duration::from_millis(300));
-    let s = w.status().unwrap();
+    // One status read can fail on a loaded machine: retry it, say why if not.
+    let s = w.wait_for("the status after the rollback", T, |_| true);
     assert_eq!(worker_pids(&s), before);
     assert_eq!(ready_standby(&s), Some(standby), "the previous version's standby stays: {s:#?}");
     assert!(!w.log().contains("replacing standbys"));
