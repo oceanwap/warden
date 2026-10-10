@@ -375,9 +375,16 @@ pub(crate) mod contract_tests {
                 .spawn()
                 .unwrap();
             let s = Sleeper(child);
-            // Wait for the exec: the command name is `sleep`.
+            // Wait for the exec to finish: the command name is `sleep`, and
+            // the new environment is in place. Linux renames the process
+            // before it sets up the new stack, so in between the environment
+            // reads as empty.
+            let exec_done = |pid| {
+                proc_name(pid).as_deref() == Some("sleep")
+                    && (!current().capabilities().proc_environ || proc_environ(pid).is_some_and(|e| !e.is_empty()))
+            };
             let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_secs(5) && proc_name(s.0.id()).as_deref() != Some("sleep") {
+            while t0.elapsed() < Duration::from_secs(5) && !exec_done(s.0.id()) {
                 std::thread::sleep(Duration::from_millis(10));
             }
             s
@@ -433,6 +440,9 @@ pub(crate) mod contract_tests {
         assert_eq!(proc_identity(0x7fff_fff0), None, "no such process");
 
         // A child in a group of its own: its parent is this process, its group its pid.
+        // Linux counts start times in clock ticks (10 ms): a child started in
+        // the same tick as this process would share its start.
+        std::thread::sleep(Duration::from_millis(30));
         let mut child = Command::new("sleep").arg("60").process_group(0).stdin(Stdio::null()).spawn().unwrap();
         let id = proc_identity(child.id()).expect("identity of the child");
         assert_eq!((id.ppid, id.pgid), (me(), child.id()), "{id:?}");
