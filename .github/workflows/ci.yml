@@ -15,8 +15,14 @@
 # happen when someone has looked at a CI run on it, not by itself in the
 # middle of a release. macOS follows `macos-latest`.
 # The workspace also has protocol/ (the wire types) and gui/ (warden-gui):
-# every job builds and lints all of it; the GUI's tests run on linux-x86_64
-# (unit, headless rendering with iced_test, and against a real wardend).
+# every job builds and lints all of it; the GUI's tests run in the gui job
+# (unit, headless rendering with iced_test, and against a real wardend), next
+# to linux-x86_64 rather than in it, so neither waits for the other.
+#
+# The integration tests run 12 at a time instead of one per CPU (4 on a hosted
+# runner): most of each test is waiting for a process to start or stop, so
+# this halves the step (about 150 s to 75 s) without loading the runner. The
+# static_perf tests stay at the default: they compare CPU time.
 name: CI
 
 on:
@@ -88,13 +94,12 @@ jobs:
       - name: npm ci (bench/)
         working-directory: bench
         run: npm ci --no-audit --no-fund
-      # The GUI's SSH test (gui/tests/ssh.rs) runs an sshd of its own, and the
-      # proxy test (tests/integration.rs) an nginx of its own, each on a free
-      # port with its own config; both skip without them.
-      - name: apt-get install openssh-server nginx strace
+      # The proxy test (tests/integration.rs) runs an nginx of its own, on a
+      # free port with its own config; it skips without it.
+      - name: apt-get install nginx strace
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends openssh-server nginx strace
+          sudo apt-get install -y -q --no-install-recommends nginx strace
       - run: cargo fmt --all --check
       - run: shellcheck install.sh install-gui.sh scripts/*.sh .github/code-changed.sh .github/release-notes.sh contrib/nfpm-preremove.sh contrib/nfpm-gui-preremove.sh
       # The macOS release script, with stubs for the Mac-only tools; and the
@@ -110,6 +115,42 @@ jobs:
         run: |
           set -o pipefail
           cargo test --bin warden 2>&1 | tee unit.log
+      - name: cargo test --test integration
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
+      - name: cargo test --test static_perf
+        if: ${{ !cancelled() }}
+        env:
+          WARDEN_REQUIRE_STRACE: "1"
+        run: |
+          set -o pipefail
+          # strace attaches to the static workers the tests start, which are
+          # not its children: Ubuntu's Yama (ptrace_scope 1) refuses that.
+          sudo sysctl -w kernel.yama.ptrace_scope=0
+          cargo test --test static_perf 2>&1 | tee static_perf.log
+      # Job logs need a login to read; annotations don't: name the failing
+      # tests and their panic messages there.
+      - name: annotate failing tests
+        if: failure()
+        run: python3 .github/annotate-test-failures.py unit.log integration.log static_perf.log
+
+  # The GUI and protocol tests, on the same toolchain as linux-x86_64.
+  gui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # The GUI's SSH test (gui/tests/ssh.rs) runs an sshd of its own, on a
+      # free port with its own config; it skips without it.
+      - name: apt-get install openssh-server
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends openssh-server
       # The GUI's integration test drives target/debug/warden.
       - name: GUI and protocol tests
         run: |
@@ -126,26 +167,9 @@ jobs:
           path: gui-snapshots/*.png
           if-no-files-found: warn
           retention-days: 7
-      - name: cargo test --test integration
-        if: ${{ !cancelled() }}
-        run: |
-          set -o pipefail
-          cargo test --test integration 2>&1 | tee integration.log
-      - name: cargo test --test static_perf
-        if: ${{ !cancelled() }}
-        env:
-          WARDEN_REQUIRE_STRACE: "1"
-        run: |
-          set -o pipefail
-          # strace attaches to the static workers the tests start, which are
-          # not its children: Ubuntu's Yama (ptrace_scope 1) refuses that.
-          sudo sysctl -w kernel.yama.ptrace_scope=0
-          cargo test --test static_perf 2>&1 | tee static_perf.log
-      # Job logs need a login to read; annotations don't: name the failing
-      # tests and their panic messages there.
       - name: annotate failing tests
         if: failure()
-        run: python3 .github/annotate-test-failures.py unit.log gui.log integration.log static_perf.log
+        run: python3 .github/annotate-test-failures.py gui.log
 
   # The workflow files themselves (and the shell in their `run:` steps, through
   # shellcheck). The Release workflow only ever runs for a release or a dry
@@ -194,7 +218,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --test integration 2>&1 | tee integration.log
+          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         run: |
@@ -239,7 +263,7 @@ jobs:
       - name: cargo test --test integration
         run: |
           set -o pipefail
-          cargo test --test integration 2>&1 | tee integration.log
+          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         env:

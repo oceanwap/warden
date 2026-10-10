@@ -65,7 +65,7 @@ jobs:
       - name: cargo test --test integration
         run: |
           set -o pipefail
-          cargo test --test integration 2>&1 | tee integration.log
+          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         env:
