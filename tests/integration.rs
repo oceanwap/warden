@@ -4221,8 +4221,10 @@ fn wardend_gives_up_on_a_supervisor_that_keeps_dying() {
     let a = d.wait_app("api gave up", "api", |a| a["state"] == "gave_up");
     assert!(a["problem"].as_str().unwrap().contains("warden start api"), "{a:#}");
     assert_eq!(a["supervisor_restarts"], 2);
+    // wardend's log is written by a thread of its own: the event can come first.
+    wait_log(&d, "then run `warden start api`");
     let log = d.log();
-    assert!(log.contains("ERROR wardend gave up restarting it") || log.contains("gave up restarting it"), "{log}");
+    assert!(log.contains("gave up restarting it"), "{log}");
     assert!(log.contains("last_lines=") && log.contains("then run `warden start api`"), "{log}");
     std::thread::sleep(Duration::from_millis(1000));
     assert!(f.app("api")["status"].is_null(), "not restarted after giving up");
