@@ -4154,10 +4154,14 @@ fn wardend_restarts_a_killed_supervisor_and_apps_outlive_it() {
     assert_eq!(a["supervisor_pid"].as_u64(), Some(new_pid));
     assert_eq!(supervisor_pid(&f, "api"), new_pid);
     assert!(d.log().contains("supervisor died; restarting it app=api"), "{}", d.log());
-    // Restarted with the environment it was started with, not wardend's.
-    let env = std::fs::read(format!("/proc/{new_pid}/environ")).unwrap();
-    assert!(env.split(|b| *b == 0).any(|kv| kv == b"WD_ORIGIN_MARK=kept"));
-    assert!(env.split(|b| *b == 0).any(|kv| kv == b"WARDEN_LAUNCH=background"));
+    // Restarted with the environment it was started with, not wardend's
+    // (read from /proc, so checked on Linux only).
+    #[cfg(target_os = "linux")]
+    {
+        let env = std::fs::read(format!("/proc/{new_pid}/environ")).unwrap();
+        assert!(env.split(|b| *b == 0).any(|kv| kv == b"WD_ORIGIN_MARK=kept"));
+        assert!(env.split(|b| *b == 0).any(|kv| kv == b"WARDEN_LAUNCH=background"));
+    }
 
     // A hung supervisor is reported, never killed: its workers keep serving.
     // The hint names the stuck process: the keeper's child.
@@ -4603,6 +4607,8 @@ fn wardend_history_survives_restarts_and_a_bad_file_is_moved_aside() {
 /// `on = ["oom"]` fires on the supervisor's own OOM exit reason, once per OOM
 /// kill, and never for a plain kill -9. A fake `memory.events` (debug builds
 /// only) stands in for the kernel's OOM kill counter.
+/// OOM attribution reads cgroup counters, so it exists on Linux only.
+#[cfg(target_os = "linux")]
 #[test]
 fn wardend_alerts_an_oom_kill_once() {
     if !have_bun() {
@@ -5440,6 +5446,7 @@ fn log_history_reads_every_workers_files() {
 /// `warden env N` prints what worker N really started with: every value
 /// matches its /proc/<pid>/environ (env_file, env, Warden's variables, and
 /// Warden's winning over the app's).
+#[cfg(target_os = "linux")]
 #[test]
 fn env_shows_what_a_worker_starts_with() {
     let dir = direct_dir("env");
