@@ -305,6 +305,10 @@ pub struct Gui {
     pub release: Release,
     /// "Not now" on the release banner (until the window starts again).
     pub release_hidden: bool,
+    /// This window's program when it started ([`release::exe_stamp`]), and whether it has said
+    /// that an update replaced it.
+    pub exe: Option<release::Stamp>,
+    pub exe_told: bool,
     /// A restart that did not finish: the apps may be stopped. Shown, with the way back, until the next try.
     pub restart_note: Option<String>,
     /// What runs is "start the saved apps again", not a restart.
@@ -564,6 +568,8 @@ impl Gui {
             restart_who: None,
             restart_secs: 0,
             release: Release::Unknown,
+            exe: release::exe_stamp(),
+            exe_told: false,
             release_hidden: false,
             restart_note: None,
             resurrecting: false,
@@ -633,6 +639,31 @@ impl Gui {
 
     pub fn selected_app(&self) -> Option<&crate::model::App> {
         self.selected.as_ref().and_then(|s| self.model.apps.get(s))
+    }
+
+    /// Start again when an update replaced this window's program (`now` is not what it started
+    /// from), unless something is open or running: then say so, once. An update started from
+    /// this window (`Release::Updating`) starts it again itself.
+    fn follow_update(&mut self, now: Option<release::Stamp>) -> Task<Message> {
+        if matches!(self.release, Release::Updating { .. }) {
+            return Task::none();
+        }
+        let idle = self.confirm.is_none()
+            && matches!(self.modal, Modal::None)
+            && self.restart_all == RestartAll::Idle
+            && self.busy.is_empty();
+        match release::follow(self.exe, now, idle) {
+            release::Follow::Nothing => Task::none(),
+            release::Follow::Relaunch => match release::relaunch() {
+                Ok(()) => iced::exit(),
+                Err(e) => self.toast(false, format!("Warden was updated; {e}: quit and open it again")),
+            },
+            release::Follow::Tell if self.exe_told => Task::none(),
+            release::Follow::Tell => {
+                self.exe_told = true;
+                self.toast(true, "Warden was updated: quit and open this window again to use the new version".into())
+            }
+        }
     }
 
     fn toast(&mut self, ok: bool, text: String) -> Task<Message> {
@@ -1527,7 +1558,10 @@ impl Gui {
                 // What happened while away (or before this window opened); a newer release,
                 // once per host.
                 let release = if self.release == Release::Unknown { self.check_release() } else { Task::none() };
-                Task::batch([self.fetch_host(), self.fetch_chart(), release])
+                // wardend is back: after an update made in a terminal, on the new version, and
+                // this window is then the old one.
+                let follow = self.follow_update(release::exe_stamp());
+                Task::batch([self.fetch_host(), self.fetch_chart(), release, follow])
             }
             FeedMsg::Batch(b) => {
                 let now = now_ms();
@@ -1721,6 +1755,23 @@ mod tests {
 
     fn gui() -> Gui {
         Gui::with_target(Target::local(Some("/tmp/test-wardend.sock".into())))
+    }
+
+    #[test]
+    fn an_update_behind_an_open_form_is_said_once_and_closes_nothing() {
+        let mut g = connected();
+        let again = || Message::Feed(FeedMsg::Connected { socket: "/tmp/test-wardend.sock".into() });
+        // The program this window started from: wardend coming back changes nothing.
+        let _ = g.update(again());
+        assert!(g.toasts.is_empty() && !g.exe_told);
+        // Replaced on disk while Settings is open: said, and the window stays.
+        g.exe = g.exe.map(|(dev, ino, size, mtime)| (dev, ino + 1, size, mtime));
+        g.modal = Modal::Settings;
+        let _ = g.update(again());
+        assert!(g.toasts.iter().any(|t| t.ok && t.text.contains("Warden was updated")), "{:?}", g.toasts);
+        let _ = g.update(again());
+        assert_eq!(g.toasts.len(), 1, "once");
+        assert!(matches!(g.modal, Modal::Settings));
     }
 
     fn batch(events: Vec<Event>) -> Message {
