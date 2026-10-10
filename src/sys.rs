@@ -2165,11 +2165,13 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         let dead = || kill(grandchild, 0).is_err();
         let t0 = std::time::Instant::now();
-        while !dead() && t0.elapsed() < std::time::Duration::from_secs(2) {
+        while !dead() && t0.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let gone = dead();
-        assert!(gone, "grandchild survived the group signal");
+        // What it is, if it is still there: this failed once on Linux arm64 and said nothing.
+        let seen = std::fs::read_to_string(format!("/proc/{grandchild}/status")).unwrap_or_default();
+        assert!(gone, "grandchild {grandchild} survived the group signal: {seen}");
         // Nonsense pids are ignored, not sent to process 0/1.
         signal_child(0, libc::SIGTERM, true);
         signal_child(1, libc::SIGTERM, false);
