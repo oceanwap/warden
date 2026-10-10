@@ -427,14 +427,16 @@ pub(crate) fn wardend_managed() -> bool {
     fleet::systemctl_bin().is_some() && [Scope::System, Scope::User].into_iter().any(|s| s.has_unit("wardend.service"))
 }
 
+/// Text of a plist, as it was before it was written into XML.
+fn unxml(s: &str) -> String {
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+}
+
 /// The program and arguments of a launchd job, as its plist lists them; `None` when they
 /// cannot be read.
 fn plist_program(text: &str) -> Option<Vec<String>> {
     let rest = &text[text.find("<key>ProgramArguments</key>")?..];
     let array = &rest[..rest.find("</array>")?];
-    let unxml = |s: &str| {
-        s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
-    };
     Some(array.split("<string>").skip(1).filter_map(|s| s.split("</string>").next()).map(unxml).collect())
 }
 
@@ -448,8 +450,46 @@ pub(crate) fn launchd_job_problem(system: bool) -> Option<String> {
         return None;
     }
     let path = plist_path(system);
-    let problem = plist_problem(&std::fs::read_to_string(&path).ok()?)?;
+    let plist = std::fs::read_to_string(&path).ok()?;
+    // Compared when the job would run as this user: the user's own job, root's for root, and
+    // any job in a directory of our own (`$WARDEN_LAUNCHD_DIR`). Root's job seen by another
+    // user is trusted as before.
+    let elsewhere = || {
+        let (euid, uid) = (crate::sys::euid(), crate::sys::uid());
+        let ours = !system || euid == 0 || env_path("WARDEN_LAUNCHD_DIR").is_some();
+        // One whose program cannot be read is trusted, as above.
+        plist_program(&plist)?;
+        plist_elsewhere(&plist, &warden_protocol::paths::runtime_dir(euid, uid), euid, uid).filter(|_| ours)
+    };
+    let problem = plist_problem(&plist).or_else(elsewhere)?;
     Some(format!("the launchd job {} {problem}; `warden startup` writes it again", path.display()))
+}
+
+/// The variables a launchd job's plist sets for its program.
+fn plist_env(text: &str) -> Vec<(String, String)> {
+    let Some(at) = text.find("<key>EnvironmentVariables</key>") else { return Vec::new() };
+    let dict = &text[at..];
+    let dict = &dict[..dict.find("</dict>").unwrap_or(dict.len())];
+    let inside = |s: &str, tag: &str| {
+        let s = &s[s.find(&format!("<{tag}>"))? + tag.len() + 2..];
+        Some(s[..s.find(&format!("</{tag}>"))?].to_string())
+    };
+    dict.split("<key>")
+        .skip(2)
+        .filter_map(|kv| Some((unxml(kv.split("</key>").next()?), unxml(&inside(kv, "string")?))))
+        .collect()
+}
+
+/// A job whose wardend would listen somewhere else than `ours` (this warden's runtime
+/// directory): it is another Warden's (a test's, another `$WARDEN_RUNTIME_DIR`), and starting
+/// it brings no wardend that answers here.
+fn plist_elsewhere(plist: &str, ours: &Path, euid: u32, uid: u32) -> Option<String> {
+    let env = plist_env(plist);
+    let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.into());
+    let theirs = warden_protocol::paths::runtime_dir_with(get, euid, uid);
+    (theirs != ours).then(|| {
+        format!("starts a wardend for {}, not for {} which this warden uses", theirs.display(), ours.display())
+    })
 }
 
 /// What is wrong with the program a launchd job's plist runs, if anything ([`launchd_job_problem`]).
@@ -1005,6 +1045,30 @@ mod tests {
             vec![("PATH".into(), "/bin".into()), ("WARDEN_RUNTIME_DIR".into(), "/r".into())]
         );
         assert_eq!(carried_env(&get, false), vec![("WARDEN_RUNTIME_DIR".to_string(), "/r".to_string())]);
+    }
+
+    #[test]
+    fn a_launchd_job_for_another_runtime_directory_is_found() {
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        let log = Path::new("/tmp/wardend.log");
+        let ours = Path::new("/tmp/warden-501");
+        // What `warden startup` writes from a plain shell, and with PATH carried.
+        let plain = launchd_plist(LAUNCHD_LABEL, &exe, log, &[("PATH".into(), "/a&b:/usr/bin".into())]);
+        assert_eq!(plist_env(&plain), vec![("PATH".to_string(), "/a&b:/usr/bin".to_string())]);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(plist_elsewhere(&plain, ours, 501, 501), None);
+        // One written under another runtime directory (a test run's, here).
+        let env = [
+            ("WARDEN_HOME".to_string(), "/tmp/wv/h".to_string()),
+            ("WARDEN_RUNTIME_DIR".into(), "/tmp/wv/h/run".into()),
+        ];
+        let other = launchd_plist(LAUNCHD_LABEL, &exe, log, &env);
+        assert_eq!(plist_env(&other), env);
+        assert_eq!(
+            plist_elsewhere(&other, ours, 501, 501).as_deref(),
+            Some("starts a wardend for /tmp/wv/h/run, not for /tmp/warden-501 which this warden uses")
+        );
+        assert_eq!(plist_elsewhere(&other, Path::new("/tmp/wv/h/run"), 501, 501), None, "the same one");
     }
 
     #[test]

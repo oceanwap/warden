@@ -2628,6 +2628,16 @@ pub async fn update(args: &Args) -> i32 {
     // `warden resurrect`; the apps that moved are running).
     crate::daemon::client::autostart().await;
     worst = worst.max(resurrect_inner(args, true).await);
+    // The apps run without it, but nothing restarts a supervisor that dies: not a success.
+    let wardend = crate::daemon::socket_path();
+    if !crate::daemon::client::disabled() && crate::daemon::client::hello_pid(&wardend).await.is_none() {
+        eprintln!(
+            "warden: update: the apps run, but wardend does not answer on {}, so nothing restarts a supervisor \
+             that dies; `warden doctor` says why",
+            wardend.display()
+        );
+        worst = 1;
+    }
     show_apps(args, false).await;
     worst
 }

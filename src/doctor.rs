@@ -586,6 +586,10 @@ fn boot() -> Option<Finding> {
         return None;
     }
     let n = saved.len();
+    // A job that cannot start the wardend this warden talks to brings nothing back.
+    if let Some(problem) = [false, true].into_iter().find_map(crate::startup::launchd_job_problem) {
+        return Some(f(Level::Warn, "boot", format!("{n} saved app(s), but {problem}"), Some("warden startup")));
+    }
     Some(match crate::startup::installed() {
         Some(what) => f(Level::Ok, "boot", format!("{n} saved app(s); {what} bring them back after a reboot"), None),
         None if crate::startup::available() => f(
