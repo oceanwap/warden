@@ -5986,6 +5986,45 @@ fn resurrect_starts_wardend_through_launchd_after_kill() {
     let _ = run_with(&f, &["kill", "--yes"], &env);
 }
 
+/// A launchd job that starts a wardend for another runtime directory (a test run's, another
+/// `$WARDEN_RUNTIME_DIR`) is not this warden's: `warden update` must not leave the apps
+/// without wardend while it waits for that job, as 0.1.5 did.
+#[test]
+fn update_starts_wardend_itself_when_the_launchd_job_is_for_another_warden() {
+    let f = Fleet::new("st-foreign");
+    let fakes = Fakes::new(&f, &[]);
+    let mut env = fakes.launchd_env();
+    env.push(("WARDEN_NO_DAEMON".into(), "0".into()));
+    let plist = format!(
+        "<plist><dict><key>ProgramArguments</key><array><string>{BIN}</string><string>wardend</string></array>\
+         <key>EnvironmentVariables</key><dict><key>WARDEN_RUNTIME_DIR</key><string>{}</string></dict></dict></plist>",
+        f.home.join("another-run").display()
+    );
+    std::fs::write(f.home.join("launchd/io.github.oceanwap.warden.daemon.plist"), plist).unwrap();
+    let (code, out) = run_with(&f, &["wardend", "--background"], &env);
+    assert_eq!(code, 0, "{out}");
+    let _ = fakes.take();
+
+    let (code, out) = run_with(&f, &["update", "--yes"], &env);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("update: restarting wardend"), "{out}");
+    assert!(out.contains("starts a wardend for") && out.contains("starting wardend without it meanwhile"), "{out}");
+    assert!(!out.contains("does not answer"), "{out}");
+    assert!(!fakes.take().contains("kickstart"), "the job is not asked to start it");
+    assert_eq!(run_with(&f, &["wardend", "status"], &env).0, 0, "wardend answers after the update");
+
+    // And `doctor` no longer calls that job what brings the apps back.
+    sleeper_config(&f, "api");
+    let (code, out) = run_with(&f, &["start", "api"], &env);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = run_with(&f, &["save"], &env);
+    assert_eq!(code, 0, "{out}");
+    let (_, out) = run_with(&f, &["doctor"], &env);
+    let boot = out.lines().find(|l| l.contains("│ boot ")).unwrap_or_else(|| panic!("{out}"));
+    assert!(boot.contains("WARN") && boot.contains("1 saved app(s), but the launchd job"), "{boot}");
+    let _ = run_with(&f, &["kill", "--yes"], &env);
+}
+
 #[test]
 fn startup_without_a_service_manager_says_what_to_run() {
     if std::path::Path::new("/run/systemd/system").exists() || cfg!(target_os = "macos") {

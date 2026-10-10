@@ -80,6 +80,35 @@ pub fn notify(title: &str, body: &str) {
     }
 }
 
+/// What this window's program is on disk: its file's device, inode, size and modification
+/// time. An update replaces the file, so another stamp than at the start means this window
+/// runs the old version. `None`: the file cannot be read (it is being replaced).
+pub type Stamp = (u64, u64, u64, i64);
+
+pub fn exe_stamp() -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+    Some((m.dev(), m.ino(), m.size(), m.mtime()))
+}
+
+/// What a window does about an update made behind it (`warden upgrade` or the installer in a
+/// terminal): nothing while its program is the one it started from, else it starts again,
+/// unless the user is in the middle of something (`idle` is false): then it only says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Follow {
+    Nothing,
+    Relaunch,
+    Tell,
+}
+
+pub fn follow(start: Option<Stamp>, now: Option<Stamp>, idle: bool) -> Follow {
+    match (start, now) {
+        (Some(a), Some(b)) if a != b && idle => Follow::Relaunch,
+        (Some(a), Some(b)) if a != b => Follow::Tell,
+        _ => Follow::Nothing,
+    }
+}
+
 /// Start this window again, on the program now on disk (the upgrade replaced it): the app
 /// (`open -n`) when this is the one inside Warden.app, else this program. The caller exits.
 pub fn relaunch() -> Result<(), String> {
@@ -112,6 +141,17 @@ fn app_of(exe: &std::path::Path) -> Option<&std::path::Path> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_window_follows_an_update_made_behind_it_when_nothing_is_open() {
+        let (a, b) = (Some((1, 10, 500, 1000)), Some((1, 11, 520, 2000)));
+        assert_eq!(follow(a, a, true), Follow::Nothing, "the program it started from");
+        assert_eq!(follow(a, b, true), Follow::Relaunch);
+        assert_eq!(follow(a, b, false), Follow::Tell, "a form is open: it is not closed under the user");
+        assert_eq!(follow(a, None, true), Follow::Nothing, "being replaced right now: not yet");
+        assert_eq!(follow(None, b, true), Follow::Nothing);
+        assert!(exe_stamp().is_some() && exe_stamp() == exe_stamp());
+    }
 
     #[test]
     fn the_check_is_read_from_the_last_json_line() {

@@ -12,6 +12,26 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   control socket behind, they say so, instead of "cannot reach warden at …
   (Connection refused). Is it running?".
 
+### Fixed
+
+- `warden update` (and `start`, `resurrect`) no longer leaves the apps without
+  wardend when the launchd job is another Warden's. A job that starts a
+  wardend for a different runtime directory (one written under another
+  `$WARDEN_RUNTIME_DIR`, a test run's) was trusted: `update` stopped
+  wardend, asked launchd for that job, said "wardend does not answer yet" and
+  ended with exit code 0. Such a job is now named, with the fix (`warden
+  startup` writes it again), and wardend is started without it meanwhile.
+  `warden doctor` reports it under `boot` instead of saying the job brings
+  the apps back.
+- `warden update` ends with an error (exit code 1) when wardend does not
+  answer afterwards, instead of reporting success.
+- The desktop app starts itself again after an update made outside it
+  (`warden upgrade` or the installer in a terminal, then `warden update`):
+  when wardend comes back and the app's own program on disk is no longer the
+  one it started from, the window reopens on the new version. If a form or a
+  question is open, it only says so and stays. Before, it kept running the
+  old version until it was quit.
+
 ## [0.1.5] — 2026-10-10
 
 ### Added
