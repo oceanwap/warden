@@ -375,9 +375,16 @@ pub(crate) mod contract_tests {
                 .spawn()
                 .unwrap();
             let s = Sleeper(child);
-            // Wait for the exec: the command name is `sleep`.
+            // Wait for the exec: the command name is `sleep`, and then its
+            // environment is there to read (Linux names the process a moment
+            // before it has the new arguments and environment).
+            let exec_done = |pid| {
+                proc_name(pid).as_deref() == Some("sleep")
+                    && (!current().capabilities().proc_environ
+                        || proc_environ(pid).is_some_and(|e| e.iter().any(|(k, _)| k == "WARDEN_PLATFORM_TEST")))
+            };
             let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_secs(5) && proc_name(s.0.id()).as_deref() != Some("sleep") {
+            while t0.elapsed() < Duration::from_secs(5) && !exec_done(s.0.id()) {
                 std::thread::sleep(Duration::from_millis(10));
             }
             s
