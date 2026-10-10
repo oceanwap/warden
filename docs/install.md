@@ -281,12 +281,15 @@ the installer says so at the end. To move everything to the new binary:
 warden update
 ```
 
-`warden update` is `warden save`, then stopping every supervisor and wardend,
-then `warden resurrect`: the apps stop for a few seconds (it asks first on a
-terminal; `--yes` skips that). If the save fails, nothing is stopped. Do it when that is acceptable, or schedule it like a deploy; until
-then the old supervisors keep your apps up as before. A release from before
-`warden update` existed gets the `save`, `kill --yes` and `resurrect`
-commands in the note instead.
+`warden update` saves what runs, then moves every app's supervisor and wardend
+to the new binary without stopping the apps: each app's keeper re-executes
+itself from it and the new supervisor takes the same workers back
+([production.md](production.md#upgrading)). An app without a keeper, or whose
+supervisor is from a release older than this, is stopped and started again
+instead (a few seconds). It asks first on a terminal; `--yes` skips that. If
+the save fails, nothing changes. A release from before `warden update`
+existed gets the `save`, `kill --yes` and `resurrect` commands in the note
+instead.
 
 ## Uninstalling
 

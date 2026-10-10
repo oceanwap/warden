@@ -202,13 +202,20 @@ pub(crate) async fn stop_daemon_process() -> Result<Option<u32>, String> {
     if !r.ok {
         return Err(r.message.unwrap_or_else(|| "wardend refused to stop".into()));
     }
-    // It removes its socket just before it exits.
+    // It removes its socket, then saves its history and exits: a wardend
+    // started before the exit finds its lock taken and exits at once
+    // ("already running"), so wait for the lock too.
     let t0 = Instant::now();
+    let mut gone = false;
     while t0.elapsed() < Duration::from_secs(5) {
-        if !path.exists() || std::os::unix::net::UnixStream::connect(&path).is_err() {
+        gone = gone || !path.exists() || std::os::unix::net::UnixStream::connect(&path).is_err();
+        if gone && super::lock_instance(&path).is_ok_and(|held| held.is_some()) {
             return Ok(Some(pid));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if gone {
+        return Err(format!("wardend (pid {pid}) stopped answering but has not exited 5 s after `shutdown`"));
     }
     Err(format!("wardend (pid {pid}) is still answering 5 s after `shutdown`"))
 }

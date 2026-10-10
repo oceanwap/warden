@@ -84,13 +84,22 @@ crash, with the service manager the host has:
 
 ## Upgrading
 
-`warden update` saves the running apps, stops every supervisor and wardend,
-and starts them again from the `warden` binary on disk (save, kill,
-resurrect: like `pm2 update`). A supervisor keeps the code it started with, so
-this is what picks up a rebuild or an upgrade. The apps stop for a few
-seconds. It asks first on a terminal (`--yes` skips the question), and
-starts the apps in parallel like `resurrect` does (see
-[`commands.md`](commands.md#parallel-starts)).
+`warden update` saves the running apps and moves every supervisor and
+wardend to the `warden` binary on disk (like `pm2 update`). A supervisor keeps
+the code it started with, so this is what picks up a rebuild or an upgrade.
+
+The apps keep serving: each app's keeper (the process `warden start` runs as,
+and the one wardend and systemd watch) re-executes itself from the new binary
+with the same pid, and the supervisor it starts takes the same workers back.
+Nothing restarts but Warden's own processes; the workers keep their pids and
+connections, and what they print meanwhile is kept for the log. An app
+without a keeper (`[restart] keep_workers_on_crash = false`), or whose
+supervisor is older than this way of updating, is stopped and started again
+instead, as before: it stops for a few seconds. wardend restarts too, which
+no app depends on. It asks first on a terminal (`--yes` skips the question).
+
+The workers keep running the code they started with, the shim included: a
+`warden reload` moves them to it, through the health gates.
 
 ## See also
 

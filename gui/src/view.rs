@@ -2182,9 +2182,9 @@ fn restart_all_section(g: &Gui) -> Element<'_, Message> {
     let mut c = column![
         look::section_icon(Icon::Restart, "Restart everything"),
         small(format!(
-            "Saves what runs on {where_}, stops every app's supervisor and wardend, and starts them again from the \
-             installed warden (like `warden update`). Use it after upgrading or rebuilding warden. Apps stop for a \
-             few seconds; stopped apps stay stopped."
+            "Saves what runs on {where_} and moves every app's supervisor and wardend to the installed warden (like \
+             `warden update`). Use it after upgrading or rebuilding warden. Apps keep serving (an app without a \
+             keeper stops for a few seconds); stopped apps stay stopped."
         )),
     ]
     .spacing(8);

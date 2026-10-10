@@ -3,10 +3,18 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.1.5] — 2026-10-09
+## [0.1.5] — 2026-10-10
 
 ### Added
 
+- `warden update` no longer stops the apps. Each app's keeper re-executes
+  itself from the new binary (same pid, so wardend and systemd see nothing
+  change) and the supervisor it starts takes the same workers back, as
+  after a crash: requests are answered throughout and the workers keep
+  their pids, connections and uptime. The new binary must read the app's
+  config first (`warden check`), or nothing changes. An app without a
+  keeper, or whose supervisor is too old to be asked, is restarted as
+  before. `warden upgrade` and the GUI's "Restart everything" use it.
 - A crash of an app's supervisor no longer touches its workers. `warden
   start` now runs as the app's keeper: a small process that starts the
   supervisor, holds a copy of each worker's pipes and fd 3, and becomes the
@@ -61,6 +69,13 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- Stopping wardend now waits until it has exited, not only until its socket is
+  gone: a wardend started right after (`warden startup` handing it to
+  systemd, `warden update`) found the old one's lock still held and exited
+  at once.
+- A supervisor restarted by its keeper (after a crash, or `warden update`)
+  stopped the workers of an app scaled up since it started (`warden scale`)
+  and started new ones: it now keeps them, and the app its size.
 - On Bun 1.4, a reload or scale-down no longer cuts requests sent on idle
   keep-alive connections to a draining worker. Bun 1.4's `server.stop()`
   closes idle keep-alive connections at once (1.3 kept them open), so a

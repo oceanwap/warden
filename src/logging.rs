@@ -1756,6 +1756,27 @@ static DIRECT_THREAD: OnceLock<Option<tokio::sync::mpsc::UnboundedSender<DirectM
 /// Run `start` on the output thread, where direct-mode files are written
 /// (`start` spawns its task with `spawn_local`). If that thread can't run,
 /// `start` runs here, on the caller's LocalSet.
+/// Set by [`stop_reading_output`]: no worker pipe is read any more.
+static OUTPUT_STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop reading worker output, for an exit that leaves the workers to the
+/// next supervisor (`warden update`): what is not read yet stays in the pipes
+/// for it. Returns once the output thread has finished its current turn, so
+/// every line it read is queued by then ([`flush_lines`] writes them).
+pub fn stop_reading_output(timeout: Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    on_output_thread(Box::new(move || {
+        OUTPUT_STOPPED.store(true, Ordering::Relaxed);
+        let _ = tx.send(());
+    }));
+    let _ = rx.recv_timeout(timeout);
+}
+
+/// [`stop_reading_output`] was called: a pump reads nothing more.
+pub fn output_stopped() -> bool {
+    OUTPUT_STOPPED.load(Ordering::Relaxed)
+}
+
 pub fn on_output_thread(start: Box<dyn FnOnce() + Send>) {
     let start = match output_thread() {
         Some(tx) => match tx.send(DirectMsg::Run(start)) {

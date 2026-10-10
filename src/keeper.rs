@@ -38,6 +38,14 @@
 //! from the parent-death signal on Linux, end of the keeper's socket on
 //! macOS): the behaviour of a supervisor without a keeper.
 //!
+//! `warden update` moves an app to a new warden binary without stopping it:
+//! the supervisor sends `upgrade` and exits, leaving its workers as a crash
+//! would, and the keeper, instead of starting it again, re-executes itself
+//! from the new binary ([`Resume`]): same pid (still the process its launcher
+//! watches, and on Linux the parent of the workers it reaped), same
+//! descriptors (kept open across the exec), and the new keeper starts the new
+//! supervisor, which takes the workers back as after a crash.
+//!
 //! The channel is a Unix stream socket: frames of a 4-byte big-endian length
 //! and a JSON [`Msg`], with the descriptors a message carries attached to it.
 
@@ -61,8 +69,10 @@ pub const STARTED_ENV: &str = "WARDEN_KEEPER_STARTED";
 pub const UNIT_ENV: &str = "WARDEN_KEEPER_UNIT";
 /// `0`: no keeper (tests that need a supervisor's workers to die with it).
 pub const OFF_ENV: &str = "WARDEN_KEEPER";
+/// A keeper re-executed from a new binary: the descriptor of its [`Resume`].
+pub const RESUME_ENV: &str = "WARDEN_KEEPER_RESUME_FD";
 /// Every variable above: not passed on to workers.
-pub const ENVS: [&str; 5] = [FD_ENV, PID_ENV, STARTED_ENV, UNIT_ENV, OFF_ENV];
+pub const ENVS: [&str; 6] = [FD_ENV, PID_ENV, STARTED_ENV, UNIT_ENV, OFF_ENV, RESUME_ENV];
 
 /// Buffered output per worker stream while no supervisor reads it.
 const RING: usize = 1 << 20;
@@ -158,6 +168,9 @@ pub enum Msg {
     Notify { state: String },
     /// The supervisor is exiting on purpose (its workers are stopped).
     Bye,
+    /// The supervisor exits next, leaving its workers running: the keeper
+    /// re-executes itself from `exe` and starts the new supervisor from it.
+    Upgrade { exe: PathBuf },
     // ------------------------------------------------ keeper → supervisor
     /// A worker kept through a supervisor's death: `fds`, then the buffered
     /// output of each stream in `logs` (an unlinked file each), attached.
@@ -191,6 +204,42 @@ impl Msg {
             _ => 0,
         }
     }
+}
+
+/// What a keeper hands the binary it re-executes itself from: its workers
+/// and sockets as they are (their descriptors stay open across the exec, by
+/// number here), and what it has counted. Read by a later warden than the
+/// one that wrote it: a field it does not know is skipped, one missing is
+/// its default.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Resume {
+    started_ms: u64,
+    restarts: u32,
+    stop_signal: i32,
+    grace_ms: u64,
+    workers: Vec<ResumeWorker>,
+    listeners: Vec<(String, i32)>,
+    /// The warden version that wrote it, for the log.
+    from: String,
+}
+
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct ResumeWorker {
+    pid: u32,
+    start: Option<u64>,
+    age_ms: u64,
+    meta: Meta,
+    fds: Vec<(FdKind, i32)>,
+    foreign: bool,
+    exited: Option<Exit>,
+}
+
+/// Is this process a keeper re-executed from a new binary? Then it is the
+/// keeper whatever the config says now: it holds the app's workers.
+pub fn resuming() -> bool {
+    std::env::var_os(RESUME_ENV).is_some()
 }
 
 /// Should this `warden run` be a keeper (and start the supervisor as its
@@ -385,6 +434,8 @@ struct Keeper {
     /// waiting at the second.
     stopping: Option<(Instant, Instant)>,
     killed: bool,
+    /// The supervisor said `upgrade`: at its exit, re-execute from this.
+    upgrade: Option<PathBuf>,
 }
 
 /// Run as the keeper of the app `cfg` describes: start the supervisor (this
@@ -439,7 +490,11 @@ async fn keep(cfg: &Config) -> io::Result<Never> {
         term: false,
         stopping: None,
         killed: false,
+        upgrade: None,
     };
+    if resuming() {
+        k.resume();
+    }
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut quit = signal(SignalKind::quit())?;
@@ -522,6 +577,7 @@ impl Keeper {
             .env(PID_ENV, std::process::id().to_string())
             .env(STARTED_ENV, self.started_ms.to_string())
             .env(UNIT_ENV, self.unit.clone().unwrap_or_default())
+            .env_remove(RESUME_ENV)
             // systemd's watchdog pings come from the keeper (`Notify`).
             .env_remove("WATCHDOG_PID");
         crate::sys::pre_exec_supervisor(&mut cmd, theirs.as_raw_fd());
@@ -703,6 +759,7 @@ impl Keeper {
                     s.bye = true;
                 }
             }
+            Msg::Upgrade { exe } => self.upgrade = Some(exe),
             Msg::Kept { .. } | Msg::KeptListener { .. } | Msg::End { .. } | Msg::Exited { .. } => {}
         }
     }
@@ -835,6 +892,19 @@ impl Keeper {
         }
         // One it reaped before it could say `Gone` is not ours to keep.
         self.poll_orphans();
+        if let Some(exe) = self.upgrade.take().filter(|_| !self.term) {
+            let e = self.reexec(&exe);
+            error!(
+                "the keeper could not start the new warden binary; the app goes on with this one",
+                app = self.app,
+                exe = exe.display(),
+                error = e,
+                hint = "the workers keep serving; `warden update` from a working binary tries again",
+            );
+            self.restart_at = Some(Instant::now());
+            self.drain_output();
+            return;
+        }
         self.drain_output();
         let how = crate::worker::describe_exit(exit.code, exit.signal);
         let live = self.live();
@@ -857,6 +927,133 @@ impl Keeper {
             crate::sys::exit_like(exit.code, exit.signal);
         }
         self.schedule_restart(Some(s.pid), &how);
+    }
+
+    /// Become `exe` (`warden update`): exec it with this keeper's arguments,
+    /// the workers' descriptors kept open and described in a [`Resume`].
+    /// Returns only if that failed (then nothing changed).
+    fn reexec(&mut self, exe: &std::path::Path) -> io::Error {
+        let workers: Vec<ResumeWorker> = self
+            .kept
+            .iter()
+            .map(|(pid, k)| ResumeWorker {
+                pid: *pid,
+                start: k.start,
+                age_ms: k.since.elapsed().as_millis() as u64,
+                meta: k.meta.clone(),
+                fds: k.fds.iter().map(|(kind, fd)| (*kind, fd.as_raw_fd())).collect(),
+                foreign: k.foreign,
+                exited: k.exited,
+            })
+            .collect();
+        let resume = Resume {
+            started_ms: self.started_ms,
+            restarts: self.restarts,
+            stop_signal: self.stop_signal,
+            grace_ms: self.grace.as_millis() as u64,
+            workers,
+            listeners: self.listeners.iter().map(|(n, fd)| (n.clone(), fd.as_raw_fd())).collect(),
+            from: env!("CARGO_PKG_VERSION").into(),
+        };
+        let state =
+            match serde_json::to_vec(&resume).map_err(io::Error::other).and_then(|json| self.ring_file(0, &json)) {
+                Ok(f) => f,
+                Err(e) => return e,
+            };
+        let fds = self.kept.values().flat_map(|k| k.fds.iter().map(|(_, fd)| fd.as_fd()));
+        let fds = fds.chain(self.listeners.iter().map(|(_, fd)| fd.as_fd()));
+        for fd in fds.chain(std::iter::once(state.as_fd())) {
+            if let Err(e) = crate::sys::keep_across_exec(fd) {
+                return e;
+            }
+        }
+        info!(
+            "the supervisor left for the new warden binary; the keeper restarts from it, its workers keep serving",
+            app = self.app,
+            exe = exe.display(),
+            workers = self.live(),
+        );
+        crate::logging::flush(Duration::from_secs(1));
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(arg0) = std::env::args_os().next() {
+            std::os::unix::process::CommandExt::arg0(&mut cmd, arg0);
+        }
+        cmd.args(&self.args).env(RESUME_ENV, state.as_raw_fd().to_string());
+        let e = std::os::unix::process::CommandExt::exec(&mut cmd);
+        // Still this binary: the descriptors close at the next exec again
+        // (the supervisor's), and the state file is dropped.
+        for k in self.kept.values() {
+            for (_, fd) in &k.fds {
+                let _ = crate::sys::set_cloexec_on(fd.as_fd());
+            }
+        }
+        for (_, fd) in &self.listeners {
+            let _ = crate::sys::set_cloexec_on(fd.as_fd());
+        }
+        e
+    }
+
+    /// Re-executed from a new binary: take over what the previous one kept.
+    fn resume(&mut self) {
+        let state = std::env::var(RESUME_ENV)
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .and_then(crate::sys::take_inherited_fd)
+            .ok_or_else(|| io::Error::other(format!("{RESUME_ENV} names no open descriptor")))
+            .and_then(|fd| {
+                let mut json = Vec::new();
+                std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut json)?;
+                serde_json::from_slice::<Resume>(&json).map_err(io::Error::other)
+            });
+        let r = match state {
+            Ok(r) => r,
+            Err(e) => {
+                // Its workers run without a keeper now; on Linux they are
+                // still our children, so they are stopped with this app.
+                error!(
+                    "the keeper restarted from a new warden binary but cannot read what it kept; its workers are not \
+                     taken back",
+                    app = self.app,
+                    error = e,
+                    hint = "this is a Warden bug: please report it; `warden restart` replaces the workers",
+                );
+                return;
+            }
+        };
+        self.started_ms = r.started_ms;
+        self.restarts = r.restarts;
+        self.stop_signal = r.stop_signal;
+        self.grace = Duration::from_millis(r.grace_ms);
+        let now = Instant::now();
+        for w in r.workers {
+            let fds = w.fds.into_iter().filter_map(|(kind, raw)| Some((kind, crate::sys::take_inherited_fd(raw)?)));
+            self.kept.insert(
+                w.pid,
+                Kept {
+                    start: w.start,
+                    since: now.checked_sub(Duration::from_millis(w.age_ms)).unwrap_or(now),
+                    meta: w.meta,
+                    fds: fds.collect(),
+                    orphan: true,
+                    foreign: w.foreign,
+                    exited: w.exited,
+                    rings: Vec::new(),
+                    drained: false,
+                },
+            );
+        }
+        self.listeners =
+            r.listeners.into_iter().filter_map(|(n, raw)| Some((n, crate::sys::take_inherited_fd(raw)?))).collect();
+        info!(
+            "the keeper runs the new warden binary; its supervisor starts from it and takes the workers back",
+            app = self.app,
+            from = r.from,
+            to = env!("CARGO_PKG_VERSION"),
+            workers = self.live(),
+        );
+        // Their output, until the new supervisor reads it.
+        self.poll_orphans();
+        self.drain_output();
     }
 
     /// The supervisor is gone (`pid`) or could not start: start it again,
@@ -1282,6 +1479,11 @@ pub mod client {
     pub fn bye() {
         send(&Msg::Bye, &[]);
     }
+
+    /// The supervisor exits next for `exe` (`warden update`); its workers stay.
+    pub fn upgrade(exe: &std::path::Path) {
+        send(&Msg::Upgrade { exe: exe.to_path_buf() }, &[]);
+    }
 }
 
 #[cfg(test)]
@@ -1292,6 +1494,47 @@ mod tests {
         let (a, b) = crate::sys::socketpair_cloexec().unwrap();
         crate::sys::set_nonblocking(b.as_fd(), true).unwrap();
         (a, b)
+    }
+
+    /// What a keeper hands the binary it re-executes itself from reads back
+    /// whole, and a warden newer or older than the writer still reads it: a
+    /// field it does not know is skipped, a missing one is its default.
+    #[test]
+    fn a_resume_is_read_by_another_warden() {
+        let meta = Meta {
+            slot: 2,
+            role: "current".into(),
+            ready: true,
+            inst: 7,
+            sockets: [(1, PathBuf::from("/run/a.sock"))].into(),
+            listening: vec![3000],
+            ..Default::default()
+        };
+        let r = Resume {
+            started_ms: 1_700_000_000_000,
+            restarts: 1,
+            stop_signal: libc::SIGTERM,
+            grace_ms: 5000,
+            workers: vec![ResumeWorker {
+                pid: 41,
+                start: Some(99),
+                age_ms: 1200,
+                meta,
+                fds: vec![(FdKind::Out, 12), (FdKind::Ipc, 13)],
+                foreign: false,
+                exited: Some(Exit { code: Some(0), signal: None }),
+            }],
+            listeners: vec![("handoff".into(), 20)],
+            from: "0.1.5".into(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Resume>(&json).unwrap(), r);
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["later"] = serde_json::json!({ "x": 1 });
+        v["workers"][0]["later"] = serde_json::json!(true);
+        v.as_object_mut().unwrap().remove("restarts");
+        let back: Resume = serde_json::from_value(v).unwrap();
+        assert_eq!((back.restarts, &back.workers, &back.listeners), (0, &r.workers, &r.listeners));
     }
 
     /// Frames arrive whole, in order, each with its own descriptors, however
