@@ -483,13 +483,12 @@ mod tests {
         std::process::id()
     }
 
-    /// `sh -c 'exec sleep 60'` in `dir` with VAR set: killed when dropped.
+    /// `sleep 60` (`test_sleep`) in `dir` with VAR set: killed when dropped.
     struct Sleeper(std::process::Child);
 
     impl Sleeper {
         fn start(dir: &std::path::Path) -> Sleeper {
-            let child = Command::new("sh")
-                .args(["-c", "exec sleep 60"])
+            let child = crate::platform::test_sleep::command()
                 .env("WARDEN_DARWIN_TEST", "hello world")
                 .current_dir(dir)
                 .stdin(Stdio::null())
