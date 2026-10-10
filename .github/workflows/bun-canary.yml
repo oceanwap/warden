@@ -65,7 +65,9 @@ jobs:
       - name: cargo test --test integration
         run: |
           set -o pipefail
-          cargo test --test integration 2>&1 | tee integration.log
+          # Their files on a tmpfs (see the top of ci.yml).
+          sudo mkdir -p /t && sudo mount -t tmpfs -o size=4g,mode=1777 tmpfs /t
+          TMPDIR=/t cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         env:

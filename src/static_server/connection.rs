@@ -135,7 +135,10 @@ async fn serve_requests<R>(
         }
         // Closing: the caller's drop of the connection is close(2), which
         // sends the FIN after the response bytes (no shutdown(2) first).
-        if result.is_err() || !keep || site.draining.load(Ordering::SeqCst) {
+        // Only after a response that said so: one sent as keep-alive just
+        // before a drain began leaves the client free to send its next
+        // request here, which is then answered with `Connection: close`.
+        if result.is_err() || !keep {
             return;
         }
         head.consume(len);
