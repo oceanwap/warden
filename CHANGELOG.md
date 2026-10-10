@@ -5,6 +5,13 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- An app that is not running reads as such: `warden status` and the other
+  commands say "not running", and when a supervisor that was killed left its
+  control socket behind, they say so, instead of "cannot reach warden at …
+  (Connection refused). Is it running?".
+
 ### Fixed
 
 - `warden update` (and `start`, `resurrect`) no longer leaves the apps without

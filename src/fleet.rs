@@ -555,7 +555,7 @@ async fn list(sels: &[Sel], args: &Args, ctx: &Ctx) -> i32 {
                 0
             }
             [(app, Err(e))] => {
-                eprintln!("warden: cannot reach warden at {} ({e}). Is it running?", app.socket.display());
+                eprintln!("warden: {}: {e}", app.name);
                 2
             }
             _ => 2,
