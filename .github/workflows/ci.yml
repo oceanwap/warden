@@ -22,9 +22,11 @@
 # The integration tests run 12 at a time instead of one per CPU (4 on a hosted
 # runner): most of each test is waiting for a process to start or stop, so
 # this halves the step on Linux x86_64 (about 150 s to 75 s).
-# Linux ARM64 runs 8 at a time: at 12, two tests that wait a second or a few
-# for a supervisor to answer or exit timed out there (PR #28's first run). The
-# static_perf tests stay at the default: they compare CPU time.
+# Their files go on a tmpfs (/t, as TMPDIR): on the runner's disk, 12 at a
+# time put I/O pressure at 60% and stalled Warden's own event loop for
+# seconds, which tests that wait a second or a few for an answer saw as a
+# failure. Linux ARM64 runs 8 at a time. The static_perf tests stay at the
+# default: they compare CPU time.
 name: CI
 
 on:
@@ -121,7 +123,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
+          # Their files on a tmpfs (see the top of ci.yml).
+          sudo mkdir -p /t && sudo mount -t tmpfs -o size=4g,mode=1777 tmpfs /t
+          TMPDIR=/t cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         env:
@@ -220,7 +224,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --test integration -- --test-threads=8 2>&1 | tee integration.log
+          # Their files on a tmpfs (see the top of ci.yml).
+          sudo mkdir -p /t && sudo mount -t tmpfs -o size=4g,mode=1777 tmpfs /t
+          TMPDIR=/t cargo test --test integration -- --test-threads=8 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         run: |
@@ -265,7 +271,9 @@ jobs:
       - name: cargo test --test integration
         run: |
           set -o pipefail
-          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
+          # Their files on a tmpfs (see the top of ci.yml).
+          sudo mkdir -p /t && sudo mount -t tmpfs -o size=4g,mode=1777 tmpfs /t
+          TMPDIR=/t cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         env:
