@@ -3,6 +3,16 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- Two workers killed with SIGKILL at the same moment while their cgroup
+  counted one OOM kill: when Warden handled the second death more than 2 s
+  after the first (a host that stalled it), that worker was reported as
+  "killed by another process" instead of "killed by another process or the
+  kernel OOM killer". The uncertainty now holds however late it is handled.
+
 ## [0.1.6] — 2026-10-10
 
 ### Changed

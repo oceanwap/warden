@@ -251,13 +251,18 @@ pub struct OomCounter {
     /// A kill was taken while others could own it: deaths of SIGKILL until
     /// then, with no kill left, may have been the kernel's.
     ambiguous_until: Option<Instant>,
+    /// The other processes seen dying of SIGKILL when a kill was taken
+    /// uncertainly, not handled yet: each may have been the kernel's
+    /// whenever it is handled, even after `ambiguous_until` (a supervisor
+    /// that did not run for a while handles them late).
+    owed: usize,
 }
 
 impl OomCounter {
     /// The counter in `path`, its current count the baseline (`None`: unreadable).
     fn at(path: Option<PathBuf>) -> OomCounter {
         let seen = path.as_deref().and_then(read_counter).unwrap_or(0);
-        OomCounter { path, seen, fresh: VecDeque::new(), warden_kills: VecDeque::new(), ambiguous_until: None }
+        OomCounter { path, seen, fresh: VecDeque::new(), warden_kills: VecDeque::new(), ambiguous_until: None, owed: 0 }
     }
 
     /// Read the counter: kills since the last read are stamped `now`.
@@ -274,6 +279,7 @@ impl OomCounter {
             self.fresh.clear();
             self.warden_kills.clear();
             self.ambiguous_until = None;
+            self.owed = 0;
         } else {
             let new = usize::try_from(n - self.seen).unwrap_or(MAX_FRESH).min(MAX_FRESH);
             self.fresh.extend(std::iter::repeat_n(now, new));
@@ -315,6 +321,9 @@ impl OomCounter {
         }
         self.sample(now);
         self.forget_old(now);
+        // This death may be one of those an earlier uncertain verdict counted.
+        let owed = self.owed > 0;
+        self.owed = self.owed.saturating_sub(1);
         if sent.has(libc::SIGKILL) {
             // Warden's own kill stays Warden's and takes no kill; but a kill
             // waiting now may have been this process's too.
@@ -324,15 +333,17 @@ impl OomCounter {
             return OomVerdict::No;
         }
         if self.fresh.is_empty() {
-            return if self.ambiguous_until.is_some() { OomVerdict::Possible } else { OomVerdict::No };
+            return if owed || self.ambiguous_until.is_some() { OomVerdict::Possible } else { OomVerdict::No };
         }
         let kills = self.fresh.len();
-        let others = rivals().saturating_add(self.warden_kills.len());
+        let rivals = rivals();
+        let others = rivals.saturating_add(self.warden_kills.len());
         self.fresh.pop_front();
         if kills > others {
             OomVerdict::Certain
         } else {
             self.ambiguous_until = Some(crate::restart::later(now, OOM_WINDOW));
+            self.owed = self.owed.max(rivals);
             OomVerdict::Probable
         }
     }
@@ -790,6 +801,12 @@ mod tests {
         c.note(3, t0 + Duration::from_secs(10));
         assert_eq!(c.verdict(KILL, NONE, t0 + Duration::from_secs(10), || 1), V::Certain);
         assert_eq!(c.verdict(KILL, NONE, t0 + Duration::from_secs(10), alone), V::Certain);
+        // The other one handled late (the supervisor did not run for a
+        // while): still uncertain, once.
+        c.note(4, t0 + Duration::from_secs(20));
+        assert_eq!(c.verdict(KILL, NONE, t0 + Duration::from_secs(20), || 1), V::Probable);
+        assert_eq!(c.verdict(KILL, NONE, t0 + Duration::from_secs(27), alone), V::Possible, "handled 7 s late");
+        assert_eq!(c.verdict(KILL, NONE, t0 + Duration::from_secs(28), alone), V::No);
     }
 
     /// A worker that exits by itself (or by any other signal) when a kill is
