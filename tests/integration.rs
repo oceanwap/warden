@@ -2455,20 +2455,23 @@ fn pm2_style_wait_ready_and_sigint() {
     let port = free_port();
     let cfg = format!(
         "[app]\nname = \"pm2app\"\ncommand = \"node\"\nargs = [\"{}\"]\nport = {port}\n\
-         env = {{ FIXTURE_WAIT_READY = \"1500\", FIXTURE_SIGINT_ONLY = \"1\" }}\n\
+         env = {{ FIXTURE_WAIT_READY = \"4000\", FIXTURE_SIGINT_ONLY = \"1\" }}\n\
          [workers]\ncount = 1\nwait_ready = true\n[shutdown]\nsignal = \"SIGINT\"\ngrace_period = 10\n",
         fixture("node_app.mjs")
     );
     let t0 = Instant::now();
     let mut w = Warden::start("pm2app", port, &cfg);
     // Listening early is not enough: ready only after process.send('ready').
+    // The app sends it 4 s after it listens: room for a busy machine (tests
+    // run 12 at a time in CI) between seeing it listen and asking for status.
     w.wait_for("listening", T, |_| get(port, "/whoami").is_some());
     assert_eq!(w.status().unwrap()["workers_ready"], 0, "not ready before process.send('ready')");
     w.wait_for("ready", T, ready(1));
-    assert!(t0.elapsed() >= Duration::from_millis(1400), "{:?}", t0.elapsed());
-    let (code, took) = w.terminate(Duration::from_secs(8));
+    assert!(t0.elapsed() >= Duration::from_millis(3900), "{:?}", t0.elapsed());
+    // SIGKILL would come after the 10 s grace period: well under it is SIGINT.
+    let (code, took) = w.terminate(Duration::from_secs(20));
     assert_eq!(code, Some(0));
-    assert!(took < Duration::from_secs(5), "stopped by SIGINT, not by the SIGKILL after grace: {took:?}");
+    assert!(took < Duration::from_secs(8), "stopped by SIGINT, not by the SIGKILL after grace: {took:?}");
     let log = w.log();
     assert!(log.contains("got SIGINT"), "{log}");
     assert!(!log.contains("ignoring SIGTERM"), "{log}");
