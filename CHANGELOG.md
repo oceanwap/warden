@@ -95,6 +95,12 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   their sockets when those drained (on macOS they were then marked
   unhealthy). Taken-back workers keep their numbers and new ones count on
   from above them.
+- A static site no longer closes a keep-alive connection when a drain (a
+  reload or scale-down) begins while it is answering. The answer said
+  `Connection: keep-alive`, so the client sent its next request on a socket
+  that was then closed, and lost it. Now only an answer that said
+  `Connection: close` ends the connection; a request that arrives during
+  the drain is answered with `Connection: close`.
 - On macOS the integration tests no longer read or rewrite the user's real
   wardend LaunchAgent; each test gets a throwaway launchd directory.
 
