@@ -21,7 +21,9 @@
 #
 # The integration tests run 12 at a time instead of one per CPU (4 on a hosted
 # runner): most of each test is waiting for a process to start or stop, so
-# this halves the step (about 150 s to 75 s) without loading the runner. The
+# this halves the step on Linux x86_64 (about 150 s to 75 s).
+# Linux ARM64 runs 8 at a time: at 12, two tests that wait a second or a few
+# for a supervisor to answer or exit timed out there (PR #28's first run). The
 # static_perf tests stay at the default: they compare CPU time.
 name: CI
 
@@ -218,7 +220,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           set -o pipefail
-          cargo test --test integration -- --test-threads=12 2>&1 | tee integration.log
+          cargo test --test integration -- --test-threads=8 2>&1 | tee integration.log
       - name: cargo test --test static_perf
         if: ${{ !cancelled() }}
         run: |
