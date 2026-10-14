@@ -1650,12 +1650,12 @@ impl Config {
         }
     }
 
-    /// Workers overlap only because Warden doesn't know the app's port: one
-    /// it finds the old worker listening on decides (`supervisor::rollout`).
+    /// Workers overlap without the config saying so: what the old worker
+    /// listens on decides (`supervisor::rollout`). Even under the shim, which
+    /// only reaches the process Warden starts: `bun run dev` starts the
+    /// server in a child without it, so its port takes no second worker.
     pub fn overlap_presumed(&self) -> bool {
-        self.workers.overlap.is_none()
-            && self.overlap()
-            && !(self.shim_enabled() || self.builtin_server() || self.workers.mode == Mode::Worker)
+        self.workers.overlap.is_none() && self.overlap()
     }
 
     pub fn ready_timeout(&self) -> Duration {
@@ -2395,6 +2395,16 @@ level = "info"
         assert!(Config::parse(w).is_ok());
         assert!(Config::parse("[app]\nname = \"a\"\n[workers]\nmode = \"worker\"\n").is_err());
         assert!(Config::parse(&format!("{w}port_strategy = \"offset\"\n")).is_err());
+    }
+
+    /// The shim makes the process Warden starts share its port, not a server
+    /// it starts below it (`bun run dev`): overlap is checked for it too.
+    #[test]
+    fn overlap_under_the_shim_is_still_checked() {
+        let bun = Config::parse("[app]\nname = \"a\"\ncommand = \"bun\"\nargs = [\"run\", \"dev\"]\n").unwrap();
+        assert!(bun.shim_enabled() && bun.overlap() && bun.overlap_presumed());
+        let said = Config::parse("[app]\nname = \"a\"\ncommand = \"bun\"\n[workers]\noverlap = true\n").unwrap();
+        assert!(!said.overlap_presumed(), "the config says so");
     }
 
     #[test]
