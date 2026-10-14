@@ -365,6 +365,23 @@ pub fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
 /// A listening TCP socket, non-blocking and close-on-exec, with
 /// SO_REUSEADDR and optionally SO_REUSEPORT set before bind (std can't).
 pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Result<std::net::TcpListener> {
+    let fd = bind_tcp(addr, reuse_port)?;
+    // SAFETY: listen(2) on a descriptor we own.
+    check(unsafe { libc::listen(fd.as_raw_fd(), backlog) })?;
+    Ok(std::net::TcpListener::from(fd))
+}
+
+/// Could a server bind `addr` now, as servers do (SO_REUSEADDR, so a closed
+/// socket's connections in TIME_WAIT don't count)? With `reuse_port`: next to
+/// the sockets there, as one more in their SO_REUSEPORT group. Only
+/// EADDRINUSE says no: another error (an address gone, a port below 1024)
+/// tells nothing about who holds the port. Never listens, so it takes no
+/// connection from the sockets there.
+pub fn can_bind_tcp(addr: SocketAddr, reuse_port: bool) -> bool {
+    !matches!(bind_tcp(addr, reuse_port), Err(e) if e.raw_os_error() == Some(libc::EADDRINUSE))
+}
+
+fn bind_tcp(addr: SocketAddr, reuse_port: bool) -> io::Result<OwnedFd> {
     let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: socket(2) with constant arguments.
     #[cfg(target_os = "linux")]
@@ -423,9 +440,7 @@ pub fn listen_tcp(addr: SocketAddr, reuse_port: bool, backlog: i32) -> io::Resul
             })?;
         }
     }
-    // SAFETY: listen(2) on a descriptor we own.
-    check(unsafe { libc::listen(fd.as_raw_fd(), backlog) })?;
-    Ok(std::net::TcpListener::from(fd))
+    Ok(fd)
 }
 
 /// One sendfile(2) call: up to `count` bytes of `input` from `*offset` to
@@ -1997,6 +2012,23 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::{AsFd, IntoRawFd};
+
+    /// A port held without SO_REUSEPORT takes no second server; one held
+    /// with it takes another with it (a new worker next to the old), and a
+    /// probe never takes the port.
+    #[test]
+    fn can_bind_tcp_tells_a_held_port_from_a_shared_or_free_one() {
+        let lone = listen_tcp("127.0.0.1:0".parse().unwrap(), false, 8).unwrap();
+        let addr = lone.local_addr().unwrap();
+        assert!(!can_bind_tcp(addr, false) && !can_bind_tcp(addr, true), "held");
+        drop(lone);
+        assert!(can_bind_tcp(addr, false), "free once closed");
+        let shared = listen_tcp(addr, true, 8).unwrap();
+        assert!(can_bind_tcp(addr, true), "one more in its SO_REUSEPORT group");
+        assert!(!can_bind_tcp(addr, false), "but not without SO_REUSEPORT");
+        drop(shared);
+        assert!(listen_tcp(addr, false, 8).is_ok(), "the probes left nothing bound");
+    }
 
     /// flock is per open file description: a second open of the same file
     /// waits (here: reports `false`) until the first is closed.

@@ -39,7 +39,14 @@
 
 use super::*;
 use crate::control::{RolloutOutcome, RolloutStatus};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+
+/// How long a replacement waits for the TCP addresses its old worker
+/// listened on to be free again (a child of it that outlived it, sockets the
+/// kernel is still closing) before it starts anyway: started too early, many
+/// servers take the next port instead.
+const PORT_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -74,12 +81,36 @@ impl Kind {
 /// `Due`: a lane's next gate may be due (its next health check, the end of
 /// its soak, or of its wait for its private socket).
 pub(super) enum GateEvent {
-    Tick { seq: u64 },
-    Due { seq: u64, inst: u64 },
-    Check { seq: u64, inst: u64, result: Result<(), String> },
-    Command { seq: u64, inst: u64, result: Result<(), String> },
-    Preflight { seq: u64, result: Result<(), String> },
-    PauseDone { seq: u64 },
+    Tick {
+        seq: u64,
+    },
+    Due {
+        seq: u64,
+        inst: u64,
+    },
+    Check {
+        seq: u64,
+        inst: u64,
+        result: Result<(), String>,
+    },
+    Command {
+        seq: u64,
+        inst: u64,
+        result: Result<(), String>,
+    },
+    Preflight {
+        seq: u64,
+        result: Result<(), String>,
+    },
+    PauseDone {
+        seq: u64,
+    },
+    /// The addresses a vacated slot's old worker listened on are free (or
+    /// `PORT_WAIT` is over): start its replacement.
+    PortsFree {
+        seq: u64,
+        slot: usize,
+    },
 }
 
 pub(super) struct Roll {
@@ -174,6 +205,8 @@ enum At {
     /// can't overlap, or a slot that wasn't serving (starting, stopping).
     Vacating {
         old: u64,
+        /// The TCP addresses it listened on: the new one starts once they are free.
+        addrs: Vec<SocketAddr>,
     },
     /// The new process took over (its old one, if any, drains in the
     /// background: `Roll::draining`).
@@ -194,7 +227,7 @@ impl At {
         match self {
             At::Starting { new, old, .. } | At::Passed { new, old } => *new == inst || *old == Some(inst),
             At::Verifying(v) => v.new == inst || v.old == Some(inst),
-            At::Vacating { old } => *old == inst,
+            At::Vacating { old, .. } => *old == inst,
             At::Done => false,
         }
     }
@@ -563,6 +596,9 @@ impl Supervisor {
     /// queue is empty and every drain has ended.
     pub(super) fn advance_rollout(&mut self) {
         let overlap = self.cfg.overlap();
+        let presumed = self.cfg.overlap_presumed();
+        // Old workers that can't overlap after all (below), with what they listen on.
+        let mut exclusive: HashMap<usize, Vec<SocketAddr>> = HashMap::new();
         let max_draining = self.cfg.reload.max_draining;
         // The drains this rollout waits for (not one it gave up on, below).
         let draining_now = self.roll.as_ref().map_or(0, |r| r.draining.len());
@@ -578,9 +614,21 @@ impl Supervisor {
                 let Some(id) = roll.queue.pop_front() else { break };
                 let Some(slot) = self.slots.get(&id).filter(|s| !s.removing) else { continue };
                 let serving = slot.current.is_some() && matches!(slot.state, State::Running | State::Restarting);
+                // Warden doesn't know the app's port: whatever the old worker
+                // listens on decides. A port it holds without SO_REUSEPORT
+                // can't take a second worker (it would get EADDRINUSE and,
+                // like many dev servers, move to the next port).
+                if serving && overlap && presumed {
+                    if let Some(i) = slot.current.and_then(|c| self.insts.get(&c)) {
+                        let addrs = tcp_listeners(i.handle.pid);
+                        if !addrs.iter().all(|a| crate::sys::can_bind_tcp(*a, true)) {
+                            exclusive.insert(id, addrs);
+                        }
+                    }
+                }
                 // Stop-then-start, or nothing serving: replaced on its own, as
                 // there is no old worker to fall back on if another lane fails.
-                let alone = !(serving && overlap);
+                let alone = !(serving && overlap) || exclusive.contains_key(&id);
                 if alone && !ids.is_empty() {
                     roll.queue.push_front(id);
                     break;
@@ -644,9 +692,21 @@ impl Supervisor {
             let at = match (serving, current) {
                 // Each worker owns its port, or the app can't share it: stop,
                 // then start (a gap for this worker only).
-                (Some(old), _) if !overlap => {
+                (Some(old), _) if !overlap || exclusive.contains_key(&slot_id) => {
+                    let addrs = match exclusive.remove(&slot_id) {
+                        Some(addrs) => {
+                            info!(
+                                "the old worker listens where a second one can't; stopping it before starting its \
+                                 replacement",
+                                worker = self.label(slot_id),
+                                listening_on = addrs_text(&addrs),
+                            );
+                            addrs
+                        }
+                        None => tcp_listeners(self.pid_of(old)),
+                    };
                     self.stop_instance(old);
-                    At::Vacating { old }
+                    At::Vacating { old, addrs }
                 }
                 (Some(old), _) => match self.start_replacement(slot_id, kind) {
                     Ok(new) => At::Starting { new, old: Some(old), deadline },
@@ -657,8 +717,9 @@ impl Supervisor {
                 },
                 // Starting / stopping: let it finish exiting, then start fresh.
                 (None, Some(old)) => {
+                    let addrs = tcp_listeners(self.pid_of(old));
                     self.stop_instance(old);
-                    At::Vacating { old }
+                    At::Vacating { old, addrs }
                 }
                 (None, None) => match self.spawn_current(slot_id) {
                     Some(new) => At::Starting { new, old: None, deadline },
@@ -743,6 +804,18 @@ impl Supervisor {
         match ev {
             GateEvent::Tick { seq } if Some(seq) == seq_now => self.gate_tick(),
             GateEvent::Due { seq, inst } if Some(seq) == seq_now => self.gate_steps(Some(inst)),
+            GateEvent::PortsFree { seq, slot } if Some(seq) == seq_now => {
+                // Still vacated: not rolled back or stopped meanwhile.
+                let vacated = match &self.roll {
+                    Some(Roll { step: Step::Batch(lanes), .. }) => lanes.iter().any(|l| {
+                        l.slot == slot && matches!(&l.at, At::Vacating { old, .. } if !self.insts.contains_key(old))
+                    }),
+                    _ => false,
+                };
+                if vacated && !self.shutting_down && !self.stopped {
+                    self.spawn_vacated(slot);
+                }
+            }
             GateEvent::Check { seq, inst, result } if Some(seq) == seq_now => self.gate_check(inst, result),
             GateEvent::Command { seq, inst, result } if Some(seq) == seq_now => {
                 let Some((slot, v)) = self.verifying(inst) else { return };
@@ -1192,7 +1265,6 @@ impl Supervisor {
 
     /// Called from `on_exit` for every exited instance.
     pub(super) fn rollout_on_exit(&mut self, inst: u64, reason: &str) {
-        let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
         // An old worker drained (or died, or was killed at grace_period).
         if let Some(roll) = &mut self.roll {
             if let Some(pos) = roll.draining.iter().position(|d| d.old == inst) {
@@ -1224,25 +1296,74 @@ impl Supervisor {
                 v.old = None;
                 return;
             }
-            At::Vacating { .. } => OnExit::Spawn(slot),
+            At::Vacating { addrs, .. } => {
+                if addrs.iter().all(|a| crate::sys::can_bind_tcp(*a, false)) {
+                    OnExit::Spawn(slot)
+                } else {
+                    let (addrs, seq) = (addrs.clone(), self.roll.as_ref().map_or(0, |r| r.seq));
+                    self.wait_for_ports(seq, slot, addrs);
+                    return;
+                }
+            }
             At::Done => return,
         };
         match act {
             OnExit::Fail(slot, msg) => self.fail_at(Some(slot), msg),
-            OnExit::Spawn(slot) => {
-                let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline });
-                match at {
-                    Some(at) => {
-                        if let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll {
-                            if let Some(l) = lanes.iter_mut().find(|l| l.slot == slot) {
-                                l.at = at;
-                            }
-                        }
+            OnExit::Spawn(slot) => self.spawn_vacated(slot),
+        }
+    }
+
+    /// The old worker of a vacated slot is gone (and the addresses it
+    /// listened on are free): start the new one.
+    fn spawn_vacated(&mut self, slot: usize) {
+        let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
+        let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline });
+        match at {
+            Some(at) => {
+                if let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll {
+                    if let Some(l) = lanes.iter_mut().find(|l| l.slot == slot) {
+                        l.at = at;
                     }
-                    None => self.fail_at(Some(slot), "could not start a new worker".into()),
                 }
             }
+            None => self.fail_at(Some(slot), "could not start a new worker".into()),
         }
+    }
+
+    /// The old worker exited but something still listens where it did (a
+    /// child that outlived it, sockets still closing): check again until
+    /// they are free, for up to `PORT_WAIT`, then `PortsFree`.
+    fn wait_for_ports(&self, seq: u64, slot: usize, addrs: Vec<SocketAddr>) {
+        info!(
+            "old worker exited but its port is still in use; waiting for it before starting the replacement",
+            worker = self.label(slot),
+            listening_on = addrs_text(&addrs),
+            up_to_s = PORT_WAIT.as_secs(),
+        );
+        let (tx, label) = (self.tx.clone(), self.label(slot));
+        tokio::task::spawn_local(async move {
+            let until = Instant::now() + PORT_WAIT;
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let busy: Vec<SocketAddr> =
+                    addrs.iter().copied().filter(|a| !crate::sys::can_bind_tcp(*a, false)).collect();
+                if busy.is_empty() {
+                    break;
+                }
+                if Instant::now() >= until {
+                    warn!(
+                        "the old worker's port is still in use; starting the replacement anyway",
+                        worker = label,
+                        busy = addrs_text(&busy),
+                        waited_s = PORT_WAIT.as_secs(),
+                        hint = "a process the old worker left behind still listens there (`lsof -iTCP -sTCP:LISTEN \
+                                -P` names it); the new worker may fail to bind or pick another port",
+                    );
+                    break;
+                }
+            }
+            let _ = tx.send(Event::Gate(GateEvent::PortsFree { seq, slot }));
+        });
     }
 
     /// The replacement (not yet promoted) this rollout is starting or verifying for `slot_id`.
@@ -1536,7 +1657,10 @@ impl Supervisor {
         let label = self.label(l.slot);
         match &l.at {
             At::Starting { new, .. } => format!("worker {label}: starting new process (pid {})", self.pid_of(*new)),
-            At::Vacating { old } => {
+            At::Vacating { old, addrs } if !self.insts.contains_key(old) => {
+                format!("worker {label}: waiting for {} to be free before starting its replacement", addrs_text(addrs))
+            }
+            At::Vacating { old, .. } => {
                 format!(
                     "worker {label}: draining old process (pid {}) before starting its replacement",
                     self.pid_of(*old)
@@ -1601,7 +1725,7 @@ fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
     if lanes.len() == 1 {
         return match &lanes[0].at {
             At::Starting { new, .. } => (3, *new, 0),
-            At::Vacating { old } => (4, *old, 0),
+            At::Vacating { old, .. } => (4, *old, 0),
             At::Verifying(v) => {
                 let detail = match v.stage() {
                     2 => u64::from(u32::MAX),
@@ -1644,6 +1768,23 @@ fn id_list(ids: &[usize]) -> String {
         i = j + 1;
     }
     parts.join(", ")
+}
+
+/// The TCP addresses a worker's process tree listens on.
+fn tcp_listeners(pid: u32) -> Vec<SocketAddr> {
+    crate::platform::listeners_whole(pid)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| match l {
+            crate::platform::Listener::Tcp { port, addr } => Some(SocketAddr::new(addr, port)),
+            crate::platform::Listener::Unix { .. } => None,
+        })
+        .collect()
+}
+
+/// `0.0.0.0:3000` or `[::]:3000, 127.0.0.1:9229`.
+fn addrs_text(addrs: &[SocketAddr]) -> String {
+    addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 async fn check_sockets(sockets: &[PathBuf], path: &str, timeout: Duration) -> Result<(), String> {
@@ -1785,6 +1926,58 @@ wait $!
         assert!(before.iter().all(|old| !r.sup.insts.contains_key(old)), "every old worker is gone");
         assert!(r.sup.slots.values().all(|x| x.state == State::Running && x.current.is_some()));
         (took, most.get())
+    }
+
+    /// A worker that holds its port alone (no SO_REUSEPORT, Warden doesn't
+    /// know the port) and leaves a process holding it for a moment after it
+    /// exits. Started next to it, or as soon as it exits, its replacement
+    /// can't bind and exits 5 (a dev server would take the next port).
+    const LONE_PORT: &str = r#"exec python3 -c '
+import os, signal, socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", int(os.environ["FAKE_PORT"])))
+except OSError:
+    sys.exit(5)
+s.listen(8)
+if os.fork():
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    s.close()
+    os.write(3, b"{\"ev\":\"listening\",\"port\":1}\n")
+    while True:
+        signal.pause()
+os.setsid()
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(0.02)
+time.sleep(0.5)
+'"#;
+
+    /// A restart only starts the new worker once the old one's port is free.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_port_the_old_worker_holds_alone_is_free_before_the_new_one_starts() {
+        if std::process::Command::new("python3").arg("-V").output().is_err() {
+            return;
+        }
+        local(async {
+            let mut r = Rig::new("lone-port", "[workers]\ncount = 1\n[reload]\nhealth_passes = 0\n", LONE_PORT);
+            r.sup.cfg.app.port = None;
+            assert!(r.sup.cfg.overlap_presumed());
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            r.sup.cfg.app.env.insert("FAKE_PORT".into(), port.to_string());
+            r.sup.start_all();
+            r.until("the worker runs", |s| s.slots.values().all(|x| x.state == State::Running)).await;
+            // Its port appears once the forked holder listens; the walk finds it below the worker.
+            let pid = r.sup.insts[&currents(&r.sup)[0]].handle.pid;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tcp_listeners(pid).is_empty() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            restart_all(&mut r).await;
+            r.shutdown().await;
+        })
+        .await;
     }
 
     /// The next worker is replaced while the old ones drain, up to

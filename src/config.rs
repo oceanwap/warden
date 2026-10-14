@@ -1650,6 +1650,14 @@ impl Config {
         }
     }
 
+    /// Workers overlap only because Warden doesn't know the app's port: one
+    /// it finds the old worker listening on decides (`supervisor::rollout`).
+    pub fn overlap_presumed(&self) -> bool {
+        self.workers.overlap.is_none()
+            && self.overlap()
+            && !(self.shim_enabled() || self.builtin_server() || self.workers.mode == Mode::Worker)
+    }
+
     pub fn ready_timeout(&self) -> Duration {
         Duration::from_secs(self.workers.ready_timeout)
     }
