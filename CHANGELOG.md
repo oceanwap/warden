@@ -3,6 +3,20 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- A restart no longer moves an app to another port. For an app whose port
+  Warden doesn't know and that doesn't run under Warden's shim (`npm run dev`,
+  a shell script, Python), the new worker was started next to the old one;
+  the port was still taken, and servers that fall back to the next port
+  (Next.js, Vite) came up there. Warden now checks what the old worker
+  listens on: a port it can't share is freed first (the old worker stops,
+  then the new one starts). After a worker stops, its replacement also waits
+  up to 5 s for the addresses it listened on to be free (a child process
+  that outlived it, sockets still closing).
+
 ## [0.1.6] — 2026-10-10
 
 ### Changed
