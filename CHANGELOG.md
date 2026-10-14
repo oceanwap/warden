@@ -16,6 +16,10 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   then the new one starts). After a worker stops, its replacement also waits
   up to 5 s for the addresses it listened on to be free (a child process
   that outlived it, sockets still closing).
+- The same holds for Bun and Node apps started through a script (`bun run
+  dev`, `npm start`): Warden's shim makes only the process it starts share
+  the port, not a server that process starts, so their restarts alternated
+  between two ports.
 
 ## [0.1.6] — 2026-10-10
 
