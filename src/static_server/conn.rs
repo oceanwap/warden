@@ -292,54 +292,6 @@ impl Drop for Corked<'_> {
     }
 }
 
-/// `Conn::Tls` copies head + file range through encryption: the client
-/// decrypts exactly those bytes (no sendfile under TLS: every byte is
-/// encrypted in userspace before it goes out). Runs on every platform,
-/// unlike the Linux-only connection tests.
-#[cfg(test)]
-mod tests {
-    use super::super::tls;
-    use super::*;
-
-    #[test]
-    fn tls_copies_head_and_file_range() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        rt.block_on(async {
-            use tokio::io::AsyncReadExt;
-            let dir = tls::test_dir("conn");
-            let body: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
-            std::fs::write(dir.join("f.bin"), &body).unwrap();
-            let (cert, key) = tls::test_cert_files(&dir);
-            let cert_pem = std::fs::read(&cert).unwrap();
-            let acceptor = tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
-            // A real loopback socket: `Conn::Tls` holds a socket stream.
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let task_dir = dir.clone();
-            let server = tokio::spawn(async move {
-                let (socket, _) = listener.accept().await.expect("a connection");
-                let tls = tls::accept(&acceptor.clone(), socket).await.expect("the handshake runs");
-                let (_, w) = tokio::io::split(tls);
-                let mut conn = Conn::Tls(w);
-                let file = std::fs::File::open(task_dir.join("f.bin")).unwrap();
-                let n = conn.send_file(b"HEAD:", Source::File(file), 100, 1000).await.unwrap();
-                assert_eq!(n, 1000);
-            });
-            let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let mut client = tls::test_client(b"http/1.1", &cert_pem)
-                .connect("localhost".try_into().unwrap(), socket)
-                .await
-                .expect("the client handshakes");
-            let mut got = vec![0u8; 5 + 1000];
-            client.read_exact(&mut got).await.unwrap();
-            assert_eq!(&got[..5], b"HEAD:");
-            assert_eq!(&got[5..], &body[100..1100]);
-            server.await.unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
-        });
-    }
-}
-
 /// Zero-copy body: the kernel moves file pages to the socket, no userspace
 /// buffer, after the response `head` (empty when it is already part of
 /// what the file holds). In chunks of `SEND_CHUNK`, yielding between them;
@@ -393,4 +345,52 @@ async fn sendfile_all(
         }
     }
     Ok(count)
+}
+
+/// `Conn::Tls` copies head + file range through encryption: the client
+/// decrypts exactly those bytes (no sendfile under TLS: every byte is
+/// encrypted in userspace before it goes out). Runs on every platform,
+/// unlike the Linux-only connection tests.
+#[cfg(test)]
+mod tests {
+    use super::super::tls;
+    use super::*;
+
+    #[test]
+    fn tls_copies_head_and_file_range() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            use tokio::io::AsyncReadExt;
+            let dir = tls::test_dir("conn");
+            let body: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
+            std::fs::write(dir.join("f.bin"), &body).unwrap();
+            let (cert, key) = tls::test_cert_files(&dir);
+            let cert_pem = std::fs::read(&cert).unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
+            // A real loopback socket: `Conn::Tls` holds a socket stream.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task_dir = dir.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("a connection");
+                let tls = tls::accept(&acceptor.clone(), socket).await.expect("the handshake runs");
+                let (_, w) = tokio::io::split(tls);
+                let mut conn = Conn::Tls(w);
+                let file = std::fs::File::open(task_dir.join("f.bin")).unwrap();
+                let n = conn.send_file(b"HEAD:", Source::File(file), 100, 1000).await.unwrap();
+                assert_eq!(n, 1000);
+            });
+            let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = tls::test_client(b"http/1.1", &cert_pem)
+                .connect("localhost".try_into().unwrap(), socket)
+                .await
+                .expect("the client handshakes");
+            let mut got = vec![0u8; 5 + 1000];
+            client.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got[..5], b"HEAD:");
+            assert_eq!(&got[5..], &body[100..1100]);
+            server.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 }

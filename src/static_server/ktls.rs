@@ -444,8 +444,9 @@ fn configure(stream: &tokio::net::TcpStream, gcm: u16, secrets: &rustls::Extract
     };
     let (tx_seq, tx_key, tx_iv) = direction(&secrets.tx, gcm).ok_or(UpError::Tls)?;
     let (rx_seq, rx_key, rx_iv) = direction(&secrets.rx, gcm).ok_or(UpError::Tls)?;
-    crate::sys::ktls_takeover(stream.as_fd(), cipher, tx_key, tx_iv, tx_seq, rx_key, rx_iv, rx_seq)
-        .map_err(|_| UpError::Tls)
+    let tx = crate::sys::KtlsDirection { key: tx_key, iv: tx_iv, seq: tx_seq };
+    let rx = crate::sys::KtlsDirection { key: rx_key, iv: rx_iv, seq: rx_seq };
+    crate::sys::ktls_takeover(stream.as_fd(), cipher, &tx, &rx).map_err(|_| UpError::Tls)
 }
 
 /// The probe behind `probe()`: a connected loopback pair, one side

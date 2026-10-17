@@ -1010,28 +1010,32 @@ pub const KTLS_CIPHER_AES_GCM_128: u16 = 51;
 #[cfg(target_os = "linux")]
 pub const KTLS_CIPHER_AES_GCM_256: u16 = 52;
 
+/// One direction's record crypto for the handover: `key` is 16 bytes for
+/// AES-128-GCM and 32 for AES-256-GCM, `iv` the 12-byte nonce the
+/// handshake derived (its first 4 bytes salt the sequence number, the
+/// last 8 seed it), `seq` where that direction's wire is at.
+#[cfg(target_os = "linux")]
+pub struct KtlsDirection<'a> {
+    pub key: &'a [u8],
+    pub iv: &'a [u8],
+    pub seq: u64,
+}
+
 /// Hand a connected TCP socket's record layer to the kernel (kTLS, Linux):
 /// from here the kernel encrypts what is written and decrypts what is
-/// read, so `sendfile` works on an encrypted connection. `key` is 16
-/// bytes for AES-128-GCM and 32 for AES-256-GCM, `iv` the 12-byte nonce
-/// the handshake derived (its first 4 bytes salt the sequence number, the
-/// last 8 seed it), `tx_seq`/`rx_seq` where each direction's wire is at.
-/// Anything else (wrong lengths, another cipher, no kernel support) is an
-/// error and the socket is untouched enough to close: callers fall back.
+/// read, so `sendfile` works on an encrypted connection. Anything else
+/// (wrong lengths, another cipher, no kernel support) is an error and the
+/// socket is untouched enough to close: callers fall back.
 #[cfg(target_os = "linux")]
 pub fn ktls_takeover(
     sock: BorrowedFd<'_>,
     cipher: u16,
-    tx_key: &[u8],
-    tx_iv: &[u8],
-    tx_seq: u64,
-    rx_key: &[u8],
-    rx_iv: &[u8],
-    rx_seq: u64,
+    tx: &KtlsDirection<'_>,
+    rx: &KtlsDirection<'_>,
 ) -> io::Result<()> {
     ktls_set_ulp(sock)?;
-    ktls_set_crypto(sock, true, cipher, tx_key, tx_iv, tx_seq)?;
-    ktls_set_crypto(sock, false, cipher, rx_key, rx_iv, rx_seq)
+    ktls_set_crypto(sock, true, cipher, tx.key, tx.iv, tx.seq)?;
+    ktls_set_crypto(sock, false, cipher, rx.key, rx.iv, rx.seq)
 }
 
 /// The `"tls"` upper-layer protocol on a TCP socket: the first step of the
