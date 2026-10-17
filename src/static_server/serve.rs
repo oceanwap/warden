@@ -170,8 +170,7 @@ pub(super) async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let tls = match (&site.cfg.cert, &site.cfg.key) {
         (Some(cert), Some(key)) => {
             let config = tls::load(cert, key)?;
-            let flight_cap =
-                std::fs::metadata(cert).map(|m| m.len() as usize).unwrap_or(0) + 65536;
+            let flight_cap = std::fs::metadata(cert).map(|m| m.len() as usize).unwrap_or(0) + 65536;
             Some(Tls {
                 acceptor: tokio_rustls::TlsAcceptor::from(config.clone()),
                 config,
@@ -387,13 +386,7 @@ fn new_plain_connection(
 /// `Conn::Tls` writer that copies bodies instead of sendfile'ing them.
 /// On Linux a peeked TLS 1.3/AES-GCM hello first tries the kTLS handover,
 /// after which the socket serves as plaintext through the normal paths.
-fn new_tls_connection(
-    site: &Arc<Site>,
-    tcp: &Tcp,
-    tls: &Tls,
-    slots: &Arc<Semaphore>,
-    fd: OwnedFd,
-) {
+fn new_tls_connection(site: &Arc<Site>, tcp: &Tcp, tls: &Tls, slots: &Arc<Semaphore>, fd: OwnedFd) {
     // At the limit a connection is dropped before anything is sent, as above.
     // Only this loop takes permits, so one free now is still free below.
     if slots.available_permits() == 0 {

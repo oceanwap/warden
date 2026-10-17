@@ -1002,10 +1002,12 @@ pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
 }
 
 /// Kernel TLS record numbers (linux/tls.h): the TLS version and cipher in
-/// a crypto info struct. Plain numbers, so callers can name what the kernel
-/// was probed for on any platform; only Linux acts on them.
+/// a crypto info struct. Linux-only, like everything that acts on them.
+#[cfg(target_os = "linux")]
 pub const KTLS_VERSION_TLS13: u16 = 0x0304;
+#[cfg(target_os = "linux")]
 pub const KTLS_CIPHER_AES_GCM_128: u16 = 51;
+#[cfg(target_os = "linux")]
 pub const KTLS_CIPHER_AES_GCM_256: u16 = 52;
 
 /// Hand a connected TCP socket's record layer to the kernel (kTLS, Linux):
@@ -1056,14 +1058,7 @@ pub fn ktls_set_ulp(sock: BorrowedFd<'_>) -> io::Result<()> {
 /// and cipher, then IV, key, salt, big-endian sequence), written
 /// field by field so no struct padding is trusted.
 #[cfg(target_os = "linux")]
-pub fn ktls_set_crypto(
-    sock: BorrowedFd<'_>,
-    tx: bool,
-    cipher: u16,
-    key: &[u8],
-    iv: &[u8],
-    seq: u64,
-) -> io::Result<()> {
+pub fn ktls_set_crypto(sock: BorrowedFd<'_>, tx: bool, cipher: u16, key: &[u8], iv: &[u8], seq: u64) -> io::Result<()> {
     let key_len = match cipher {
         KTLS_CIPHER_AES_GCM_128 => 16,
         KTLS_CIPHER_AES_GCM_256 => 32,
@@ -1097,7 +1092,7 @@ pub fn ktls_set_crypto(
 
 /// The upper-layer protocol a socket runs (`ktls_set_ulp` put `"tls"`
 /// there): for tests, which hand a socket over and read back the proof.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub fn ktls_ulp_name(sock: BorrowedFd<'_>) -> io::Result<String> {
     let mut name = [0u8; 16];
     let mut len = name.len() as libc::socklen_t;
@@ -2973,15 +2968,11 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_128, &[0u8; 8], &[0u8; 12], 0)
-                .unwrap_err()
-                .kind(),
+            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_128, &[0u8; 8], &[0u8; 12], 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_256, &[0u8; 32], &[0u8; 4], 0)
-                .unwrap_err()
-                .kind(),
+            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_256, &[0u8; 32], &[0u8; 4], 0).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -3000,21 +2991,10 @@ mod tests {
         assert_eq!(ktls_ulp_name(tx.as_fd()).unwrap(), "tls");
         // Once is once: the kernel refuses to set it again, and a file is
         // not a socket.
-        assert_eq!(
-            ktls_set_ulp(tx.as_fd()).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
+        assert_eq!(ktls_set_ulp(tx.as_fd()).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert!(ktls_ulp_name(std::fs::File::open("/dev/null").unwrap().as_fd()).is_err());
         // No connection, no crypto: a listener refuses loudly.
-        let e = ktls_set_crypto(
-            l.as_fd(),
-            true,
-            KTLS_CIPHER_AES_GCM_128,
-            &[0u8; 16],
-            &[0u8; 12],
-            0,
-        )
-        .unwrap_err();
+        let e = ktls_set_crypto(l.as_fd(), true, KTLS_CIPHER_AES_GCM_128, &[0u8; 16], &[0u8; 12], 0).unwrap_err();
         assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "shapes are fine: the kernel refused");
     }
 

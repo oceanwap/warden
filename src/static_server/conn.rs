@@ -305,14 +305,13 @@ mod tests {
     fn tls_copies_head_and_file_range() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::io::AsyncReadExt;
             let dir = tls::test_dir("conn");
             let body: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
             std::fs::write(dir.join("f.bin"), &body).unwrap();
             let (cert, key) = tls::test_cert_files(&dir);
             let cert_pem = std::fs::read(&cert).unwrap();
-            let acceptor =
-                tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
             // A real loopback socket: `Conn::Tls` holds a socket stream.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

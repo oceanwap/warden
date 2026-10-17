@@ -13,12 +13,12 @@
 //! which cannot feed a TLS connection), and a cached body is copied once per
 //! stream on its way into DATA frames.
 
+use super::Site;
 use super::conn::Conn;
 use super::connection::log_access;
 use super::handler::{Scratch, handle};
 use super::head::parse_head;
 use super::tls::TlsIo;
-use super::Site;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -184,11 +184,7 @@ fn translate(status: u16, raw: &[u8]) -> Result<(http::Response<()>, Bytes), u16
 
 /// HEADERS, then the body in frames within the peer's flow-control window.
 /// False when the client went away first (nothing to count then).
-async fn send(
-    respond: &mut h2::server::SendResponse<Bytes>,
-    response: http::Response<()>,
-    body: Bytes,
-) -> bool {
+async fn send(respond: &mut h2::server::SendResponse<Bytes>, response: http::Response<()>, body: Bytes) -> bool {
     /// One DATA frame at most: larger bodies go out in turns.
     const FRAME: usize = 16 * 1024;
     let mut tx = match respond.send_response(response, body.is_empty()) {
@@ -340,10 +336,7 @@ mod tests {
         // server serves until the client goes away, like a keep-alive
         // connection on the plain path.)
         server.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(5), drive)
-            .await
-            .expect("the client ends")
-            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), drive).await.expect("the client ends").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

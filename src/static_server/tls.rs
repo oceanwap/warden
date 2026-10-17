@@ -59,10 +59,7 @@ pub(super) fn load(cert: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>,
 }
 
 /// The TLS handshake over `io` (a fresh socket, still fully encrypted).
-pub(super) async fn accept<IO>(
-    acceptor: &tokio_rustls::TlsAcceptor,
-    io: IO,
-) -> std::io::Result<TlsIo<IO>>
+pub(super) async fn accept<IO>(acceptor: &tokio_rustls::TlsAcceptor, io: IO) -> std::io::Result<TlsIo<IO>>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -102,13 +99,10 @@ pub(super) fn test_dir(name: &str) -> std::path::PathBuf {
 #[cfg(test)]
 pub(super) fn test_client(alpn: &[u8], cert_pem: &[u8]) -> tokio_rustls::TlsConnector {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cert: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem))
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let cert: Vec<_> = rustls_pemfile::certs(&mut std::io::Cursor::new(cert_pem)).collect::<Result<_, _>>().unwrap();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.into_iter().next().unwrap()).unwrap();
-    let mut cfg =
-        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let mut cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     cfg.alpn_protocols = vec![alpn.to_vec()];
     tokio_rustls::TlsConnector::from(Arc::new(cfg))
 }
@@ -199,8 +193,7 @@ mod tests {
             let tls = accept(&acceptor, server_io).await.expect("handshake 2 runs");
             tls.get_ref().1.handshake_kind()
         });
-        let client =
-            connector2.connect("localhost".try_into().unwrap(), client_io).await.expect("client 2 handshakes");
+        let client = connector2.connect("localhost".try_into().unwrap(), client_io).await.expect("client 2 handshakes");
         assert_eq!(client.get_ref().1.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
         assert_eq!(server.await.unwrap(), Some(rustls::HandshakeKind::Resumed));
         std::fs::remove_dir_all(&dir).unwrap();

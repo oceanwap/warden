@@ -580,8 +580,7 @@ mod tests {
             let site = Arc::new(test_site_at(&dir, false));
             let (cert, key) = tls::test_cert_files(&dir);
             let cert_pem = std::fs::read(&cert).unwrap();
-            let acceptor =
-                tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
             // The idle guard needs a descriptor; nothing sweeps in this test.
             let null = std::fs::File::open("/dev/null").unwrap();
             let fd = std::os::fd::AsRawFd::as_raw_fd(&null);
@@ -603,10 +602,7 @@ mod tests {
                 .connect("localhost".try_into().unwrap(), socket)
                 .await
                 .expect("the client handshakes");
-            client
-                .write_all(b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
+            client.write_all(b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
             // Read the response by its Content-Length, not to EOF: rustls
             // reports a close without close_notify as an error, not clean EOF.
             let mut got = Vec::new();

@@ -326,9 +326,7 @@ async fn upgrade(
         }
         match step {
             Step::Transmit => {
-                AsyncWriteExt::write_all(&mut stream, &out[..pending])
-                    .await
-                    .map_err(|_| UpError::Closed)?;
+                AsyncWriteExt::write_all(&mut stream, &out[..pending]).await.map_err(|_| UpError::Closed)?;
                 pending = 0;
             }
             Step::Wait => {
@@ -417,11 +415,7 @@ fn convert(
 /// Off Linux there is nothing to configure with: the gate never passes, so
 /// this is unreachable, but it keeps one code shape everywhere.
 #[cfg(not(target_os = "linux"))]
-fn configure(
-    _stream: &tokio::net::TcpStream,
-    _gcm: u16,
-    _secrets: &rustls::ExtractedSecrets,
-) -> Result<(), UpError> {
+fn configure(_stream: &tokio::net::TcpStream, _gcm: u16, _secrets: &rustls::ExtractedSecrets) -> Result<(), UpError> {
     Err(UpError::Tls)
 }
 
@@ -430,15 +424,10 @@ fn configure(
 /// a function signature ties the returned borrows to the secrets (a
 /// closure leaves the compiler unable to prove that).
 #[cfg(target_os = "linux")]
-fn direction(
-    secret: &(u64, rustls::ConnectionTrafficSecrets),
-    gcm: u16,
-) -> Option<(u64, &[u8], &[u8])> {
+fn direction(secret: &(u64, rustls::ConnectionTrafficSecrets), gcm: u16) -> Option<(u64, &[u8], &[u8])> {
     use rustls::ConnectionTrafficSecrets::*;
     match (&secret.1, gcm) {
-        (Aes128Gcm { key, iv }, 128) | (Aes256Gcm { key, iv }, 256) => {
-            Some((secret.0, key.as_ref(), iv.as_ref()))
-        }
+        (Aes128Gcm { key, iv }, 128) | (Aes256Gcm { key, iv }, 256) => Some((secret.0, key.as_ref(), iv.as_ref())),
         _ => None,
     }
 }
@@ -447,12 +436,7 @@ fn direction(
 /// call lives): the extracted secrets with their sequence numbers, for the
 /// suite the gate verified. Any refusal closes the connection upstream.
 #[cfg(target_os = "linux")]
-fn configure(
-    stream: &tokio::net::TcpStream,
-    gcm: u16,
-    secrets: &rustls::ExtractedSecrets,
-) -> Result<(), UpError> {
-    use rustls::ConnectionTrafficSecrets::*;
+fn configure(stream: &tokio::net::TcpStream, gcm: u16, secrets: &rustls::ExtractedSecrets) -> Result<(), UpError> {
     let cipher = match gcm {
         128 => crate::sys::KTLS_CIPHER_AES_GCM_128,
         256 => crate::sys::KTLS_CIPHER_AES_GCM_256,
@@ -460,17 +444,8 @@ fn configure(
     };
     let (tx_seq, tx_key, tx_iv) = direction(&secrets.tx, gcm).ok_or(UpError::Tls)?;
     let (rx_seq, rx_key, rx_iv) = direction(&secrets.rx, gcm).ok_or(UpError::Tls)?;
-    crate::sys::ktls_takeover(
-        stream.as_fd(),
-        cipher,
-        tx_key,
-        tx_iv,
-        tx_seq,
-        rx_key,
-        rx_iv,
-        rx_seq,
-    )
-    .map_err(|_| UpError::Tls)
+    crate::sys::ktls_takeover(stream.as_fd(), cipher, tx_key, tx_iv, tx_seq, rx_key, rx_iv, rx_seq)
+        .map_err(|_| UpError::Tls)
 }
 
 /// The probe behind `probe()`: a connected loopback pair, one side
@@ -550,15 +525,9 @@ mod tests {
     #[test]
     fn hellos_parse_to_their_offer() {
         let full = hello(true, &[0x1301, 0x1302, 0x1303], &[b"h2", b"http/1.1"]);
-        assert_eq!(
-            parse_client_hello(&full),
-            Some(Offer { http2: true, tls13: true, gcm128: true, gcm256: true })
-        );
+        assert_eq!(parse_client_hello(&full), Some(Offer { http2: true, tls13: true, gcm128: true, gcm256: true }));
         let h1 = hello(true, &[0x1301], &[b"http/1.1"]);
-        assert_eq!(
-            parse_client_hello(&h1),
-            Some(Offer { http2: false, tls13: true, gcm128: true, gcm256: false })
-        );
+        assert_eq!(parse_client_hello(&h1), Some(Offer { http2: false, tls13: true, gcm128: true, gcm256: false }));
         let old = hello(false, &[0x1301], &[b"h2"]);
         assert_eq!(parse_client_hello(&old).map(|o| o.tls13), Some(false));
         let chacha = hello(true, &[0x1303], &[b"h2"]);
@@ -581,10 +550,7 @@ mod tests {
         let o = Offer { http2: true, tls13: true, gcm128: true, gcm256: false };
         assert!(viable(&o, kernel));
         assert!(!viable(&Offer { tls13: false, ..o }, kernel), "no 1.2");
-        assert!(
-            !viable(&Offer { gcm128: false, gcm256: true, ..o }, kernel),
-            "unprobed suite"
-        );
+        assert!(!viable(&Offer { gcm128: false, gcm256: true, ..o }, kernel), "unprobed suite");
         assert!(!viable(&o, Kernel { gcm128: false, gcm256: false }), "no kernel");
     }
 
@@ -598,7 +564,6 @@ mod tests {
     #[tokio::test]
     async fn kernel_takes_over_both_directions() {
         use super::super::tls;
-        use std::os::fd::AsRawFd;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let probe = probe();
@@ -607,9 +572,7 @@ mod tests {
         let (cert, key) = tls::test_cert_files(&dir);
         let cert_pem = std::fs::read(&cert).unwrap();
         let config = tls::load(&cert, &key).expect("the test chain loads");
-        let listener = std::sync::Arc::new(
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let listener = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let addr = listener.local_addr().unwrap();
         let connector = tls::test_client(b"http/1.1", &cert_pem);
 
@@ -620,20 +583,15 @@ mod tests {
             addr: std::net::SocketAddr,
             config: &Arc<rustls::ServerConfig>,
             connector: &tokio_rustls::TlsConnector,
-        ) -> (
-            rustls::HandshakeKind,
-            std::net::TcpStream,
-            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-        ) {
+        ) -> (rustls::HandshakeKind, std::net::TcpStream, tokio_rustls::client::TlsStream<tokio::net::TcpStream>)
+        {
             let server = tokio::spawn({
                 let config = config.clone();
                 async move {
                     let (stream, _) = listener.accept().await.expect("a connection");
                     let offer = peek_offer(&stream).await.expect("a ClientHello");
                     assert!(offer.tls13 && offer.gcm256, "the test client offers 1.3 + GCM");
-                    let (std, http2) = upgrade(stream, &config, offer, 1 << 16)
-                        .await
-                        .expect("the handover runs");
+                    let (std, http2) = upgrade(stream, &config, offer, 1 << 16).await.expect("the handover runs");
                     assert!(!http2, "no ALPN h2 offered");
                     assert_eq!(ulp_name(&std), "tls", "the kernel took the socket");
                     // This test drives the socket with blocking std IO;
@@ -643,10 +601,7 @@ mod tests {
                 }
             });
             let io = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let client = connector
-                .connect("localhost".try_into().unwrap(), io)
-                .await
-                .expect("the client handshakes");
+            let client = connector.connect("localhost".try_into().unwrap(), io).await.expect("the client handshakes");
             let kind = client.get_ref().1.handshake_kind().unwrap();
             (kind, server.await.unwrap(), client)
         }
@@ -654,12 +609,10 @@ mod tests {
         // Round 1: full handshake, then traffic both ways — the server's
         // reads are plaintext the client encrypted (kernel RX), and the
         // client's reads are plaintext the server wrote (kernel TX).
-        let (kind, mut server, mut client) = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            one(listener.clone(), addr, &config, &connector),
-        )
-        .await
-        .expect("the first handover runs");
+        let (kind, mut server, mut client) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), one(listener.clone(), addr, &config, &connector))
+                .await
+                .expect("the first handover runs");
         assert_eq!(kind, rustls::HandshakeKind::Full);
         client.write_all(b"ping").await.unwrap();
         server.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
@@ -672,12 +625,10 @@ mod tests {
 
         // Round 2 on the same client store resumes: the flushed tickets
         // arrived, or this abbreviates nothing.
-        let (kind, _, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            one(listener.clone(), addr, &config, &connector),
-        )
-        .await
-        .expect("the second handover runs");
+        let (kind, _, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), one(listener.clone(), addr, &config, &connector))
+                .await
+                .expect("the second handover runs");
         assert_eq!(kind, rustls::HandshakeKind::Resumed);
         let _ = std::fs::remove_dir_all(&dir);
     }
