@@ -3,6 +3,24 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.1.8] — 2026-10-17
+
+### Added
+
+- Encrypted static serving: `[static] cert` with `key` serves HTTPS
+  instead of plain HTTP, HTTP/2 where the client asks for it (ALPN) and
+  HTTP/1.1 otherwise — behind the `:443` router or direct. The two go
+  together (config error otherwise); session tickets give returning
+  clients resumption.
+- Kernel TLS on Linux: a connection whose hello offers TLS 1.3 with
+  AES-GCM hands record encryption to the kernel after the handshake, so
+  bodies go by `sendfile` again. Decided per connection before anything
+  is consumed; anything else serves through the userspace TLS path
+  unchanged, as does everything off Linux. Like nginx, connections are
+  not rekeyed.
+- `bench/static-tls.sh`: the plain-H1 vs TLS-H1 vs TLS-H2 matrix
+  (small + big file), runnable on Linux and macOS.
+
 ## [0.1.7] — 2026-10-17
 
 ### Fixed
