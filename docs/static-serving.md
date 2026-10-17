@@ -247,12 +247,25 @@ process mode. Defaults are in the table; every key is optional except `root`.
 | `cache_size` | `0` | Per worker: prebuilt responses of small files in memory, e.g. `"16MB"` (`0` = off, the default: files are read from the OS page cache on every request); bodies of 24 KB and up are kept in memfds and sent with `sendfile` (one descriptor each, at most 1/8 of the open-files limit) |
 | `cache_max_file` | `"64KB"` | With a cache: larger files are not cached (sent with `sendfile`); at most 16M, since a miss reads the whole file into memory first |
 | `cache_valid_ms` | `1000` | With a cache: a cached file is re-checked on disk at most this often |
+| `cert` | none | Certificate chain to serve HTTPS (HTTP/2 where the client asks for it, else HTTP/1.1) instead of plain HTTP: behind the `:443` router, or direct. Goes with `key` |
+| `key` | none | The private key for `cert` |
 
 On macOS there is no `openat2`: files are opened on a thread with
 `openat(O_RESOLVE_BENEATH)` (macOS 15+) or `openat(O_NOFOLLOW_ANY)` (macOS
 11-14), and a path through a symlink is resolved with realpath, then its
 real path opened the same way (same confinement); see
 [`platforms.md`](platforms.md).
+
+## Kernel TLS (Linux)
+
+With `cert` set on Linux, a connection whose hello offers TLS 1.3 with
+AES-GCM hands record encryption to the kernel after the handshake, and
+bodies go by `sendfile` again — the two costs TLS added disappear from the
+hot path. Decided per connection before anything is consumed: anything
+else (older or ChaCha-only clients, an unparseable hello, a kernel without
+it) serves through the userspace TLS path unchanged, as does everything
+off Linux. The worker's startup line says which suites go kernel. Like
+nginx, connections are not rekeyed.
 
 ## See also
 

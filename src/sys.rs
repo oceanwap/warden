@@ -1001,6 +1001,121 @@ pub fn set_tcp_cork(sock: BorrowedFd<'_>, on: bool) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// Kernel TLS record numbers (linux/tls.h): the TLS version and cipher in
+/// a crypto info struct. Plain numbers, so callers can name what the kernel
+/// was probed for on any platform; only Linux acts on them.
+pub const KTLS_VERSION_TLS13: u16 = 0x0304;
+pub const KTLS_CIPHER_AES_GCM_128: u16 = 51;
+pub const KTLS_CIPHER_AES_GCM_256: u16 = 52;
+
+/// Hand a connected TCP socket's record layer to the kernel (kTLS, Linux):
+/// from here the kernel encrypts what is written and decrypts what is
+/// read, so `sendfile` works on an encrypted connection. `key` is 16
+/// bytes for AES-128-GCM and 32 for AES-256-GCM, `iv` the 12-byte nonce
+/// the handshake derived (its first 4 bytes salt the sequence number, the
+/// last 8 seed it), `tx_seq`/`rx_seq` where each direction's wire is at.
+/// Anything else (wrong lengths, another cipher, no kernel support) is an
+/// error and the socket is untouched enough to close: callers fall back.
+#[cfg(target_os = "linux")]
+pub fn ktls_takeover(
+    sock: BorrowedFd<'_>,
+    cipher: u16,
+    tx_key: &[u8],
+    tx_iv: &[u8],
+    tx_seq: u64,
+    rx_key: &[u8],
+    rx_iv: &[u8],
+    rx_seq: u64,
+) -> io::Result<()> {
+    ktls_set_ulp(sock)?;
+    ktls_set_crypto(sock, true, cipher, tx_key, tx_iv, tx_seq)?;
+    ktls_set_crypto(sock, false, cipher, rx_key, rx_iv, rx_seq)
+}
+
+/// The `"tls"` upper-layer protocol on a TCP socket: the first step of the
+/// handover (and of probing whether the kernel takes any of it).
+#[cfg(target_os = "linux")]
+pub fn ktls_set_ulp(sock: BorrowedFd<'_>) -> io::Result<()> {
+    let name = b"tls\0";
+    // SAFETY: `name` is a live 4 bytes, the length passed its size; the
+    // socket is borrowed, so it stays open for the call.
+    check(unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_TCP,
+            libc::TCP_ULP,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    })
+    .map(|_| ())
+}
+
+/// One direction's crypto info (`tx` = transmit) for an AES-GCM suite: the
+/// exact 40- or 56-byte layout of linux/tls.h (`tls_crypto_info` version
+/// and cipher, then IV, key, salt, big-endian sequence), written
+/// field by field so no struct padding is trusted.
+#[cfg(target_os = "linux")]
+pub fn ktls_set_crypto(
+    sock: BorrowedFd<'_>,
+    tx: bool,
+    cipher: u16,
+    key: &[u8],
+    iv: &[u8],
+    seq: u64,
+) -> io::Result<()> {
+    let key_len = match cipher {
+        KTLS_CIPHER_AES_GCM_128 => 16,
+        KTLS_CIPHER_AES_GCM_256 => 32,
+        _ => return Err(io::ErrorKind::InvalidInput.into()),
+    };
+    if key.len() != key_len || iv.len() != 12 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut info = [0u8; 56];
+    info[0..2].copy_from_slice(&KTLS_VERSION_TLS13.to_ne_bytes());
+    info[2..4].copy_from_slice(&cipher.to_ne_bytes());
+    info[4..12].copy_from_slice(&iv[4..12]);
+    info[12..12 + key_len].copy_from_slice(key);
+    info[12 + key_len..16 + key_len].copy_from_slice(&iv[..4]);
+    info[16 + key_len..24 + key_len].copy_from_slice(&seq.to_be_bytes());
+    let len = 24 + key_len;
+    let opt = if tx { libc::TLS_TX } else { libc::TLS_RX };
+    // SAFETY: `info[..len]` is live and exactly the length passed; the
+    // socket is borrowed, so it stays open for the call.
+    check(unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_TLS,
+            opt,
+            info.as_ptr() as *const libc::c_void,
+            len as libc::socklen_t,
+        )
+    })
+    .map(|_| ())
+}
+
+/// The upper-layer protocol a socket runs (`ktls_set_ulp` put `"tls"`
+/// there): for tests, which hand a socket over and read back the proof.
+#[cfg(target_os = "linux")]
+pub fn ktls_ulp_name(sock: BorrowedFd<'_>) -> io::Result<String> {
+    let mut name = [0u8; 16];
+    let mut len = name.len() as libc::socklen_t;
+    // SAFETY: `name` and `len` are live and sized as passed; the socket is
+    // borrowed, so it stays open for the call.
+    check(unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_TCP,
+            libc::TCP_ULP,
+            name.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    })?;
+    let len = (len as usize).min(name.len());
+    Ok(String::from_utf8_lossy(&name[..len]).trim_end_matches('\0').into())
+}
+
 /// A worker's IPC socket (fd 3), set up so that the worker does not wait
 /// for Warden, whatever Warden does (stopped, a frozen VM, a bug): room for
 /// `IPC_BUFFER` bytes (send buffer on the worker's end, receive buffer on
@@ -2842,6 +2957,65 @@ mod tests {
         use std::os::fd::AsFd;
         let (tx, _rx) = socket_pair();
         assert_eq!(set_tcp_cork(tx.as_fd(), true).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Linux: the handover validates shapes before any system call — a
+    /// listener is a fine descriptor for that, since validation comes first
+    /// (unknown cipher, short key, short nonce).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ktls_crypto_validates_shapes_first() {
+        use std::os::fd::AsFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fd = l.as_fd();
+        assert_eq!(
+            ktls_set_crypto(fd, true, 54, &[0u8; 32], &[0u8; 12], 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_128, &[0u8; 8], &[0u8; 12], 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            ktls_set_crypto(fd, true, KTLS_CIPHER_AES_GCM_256, &[0u8; 32], &[0u8; 4], 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// Linux: ULP set and readback on a connected pair, and crypto on an
+    /// unconnected socket fails instead of silently passing (that failure
+    /// is the userspace-fallback trigger, so it must stay loud).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ktls_ulp_roundtrip_and_unconnected_refusal() {
+        use std::os::fd::AsFd;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tx = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (_rx, _) = l.accept().unwrap();
+        ktls_set_ulp(tx.as_fd()).unwrap();
+        assert_eq!(ktls_ulp_name(tx.as_fd()).unwrap(), "tls");
+        // Once is once: the kernel refuses to set it again, and a file is
+        // not a socket.
+        assert_eq!(
+            ktls_set_ulp(tx.as_fd()).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(ktls_ulp_name(std::fs::File::open("/dev/null").unwrap().as_fd()).is_err());
+        // No connection, no crypto: a listener refuses loudly.
+        let e = ktls_set_crypto(
+            l.as_fd(),
+            true,
+            KTLS_CIPHER_AES_GCM_128,
+            &[0u8; 16],
+            &[0u8; 12],
+            0,
+        )
+        .unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::InvalidInput, "shapes are fine: the kernel refused");
     }
 
     /// A worker's end of its IPC socket: a write never blocks (EAGAIN when

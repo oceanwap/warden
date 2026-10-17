@@ -222,3 +222,7 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 #                                            # the open-files limit)
 # cache_max_file = "64KB"                    # with a cache: larger files are not cached (sent with sendfile)
 # cache_valid_ms = 1000                      # with a cache: a cached file is re-checked on disk at most this often
+# cert = "/etc/ssl/site/fullchain.pem"       # example; serve HTTPS (HTTP/2 where the client asks, else HTTP/1.1)
+#                                            # instead of plain HTTP, e.g. behind the :443 router (docs/routing.md);
+#                                            # unset = plain HTTP
+# key = "/etc/ssl/site/privkey.pem"          # example; the private key for cert (the two go together)

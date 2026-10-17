@@ -7,6 +7,7 @@ use super::conn::Conn;
 use super::connection::{First, Resume, connection, first_request};
 use super::head::HeadBuf;
 use super::open::{OPEN_BENEATH, OPEN_CACHED, OPEN_LEGACY};
+use super::tls;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -162,6 +163,24 @@ impl Health {
 
 pub(super) async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let tcp = Tcp::bind(&site, port)?;
+    // Encrypted sites (`static.cert`/`key`): one TLS state per worker,
+    // shared by its connections. Loading it here (not per connection)
+    // also fails the worker at start, with the file named.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls = match (&site.cfg.cert, &site.cfg.key) {
+        (Some(cert), Some(key)) => {
+            let config = tls::load(cert, key)?;
+            let flight_cap =
+                std::fs::metadata(cert).map(|m| m.len() as usize).unwrap_or(0) + 65536;
+            Some(Tls {
+                acceptor: tokio_rustls::TlsAcceptor::from(config.clone()),
+                config,
+                ktls: super::ktls::probe(),
+                flight_cap,
+            })
+        }
+        _ => None,
+    };
     let worker: u64 = env_number("WARDEN_WORKER_ID").unwrap_or(0);
     let health = Health::bind(worker);
     announce(&site, &tcp, port, worker, health.as_ref());
@@ -175,7 +194,7 @@ pub(super) async fn serve(site: Arc<Site>, port: u16) -> Result<(), String> {
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(stop_sig))
         .map_err(|e| format!("installing the {stop_name} handler: {e}"))?;
 
-    accept_loop(&site, &tcp, health.as_ref(), &mut stop).await;
+    accept_loop(&site, &tcp, tls.as_ref(), health.as_ref(), &mut stop).await;
     drain(&site, tcp, health, worker).await;
     if let Some(c) = &site.compressor {
         c.stop().await;
@@ -206,6 +225,20 @@ fn announce(site: &Site, tcp: &Tcp, port: u16, worker: u64, health: Option<&Heal
         site.cfg.host,
         tcp.listener.name()
     );
+    if site.cfg.cert.is_some() {
+        println!("https: HTTP/2 where the client asks for it (ALPN h2), else HTTP/1.1 over TLS");
+        let ktls = super::ktls::probe();
+        let suites = [("AES-128-GCM", ktls.gcm128), ("AES-256-GCM", ktls.gcm256)]
+            .into_iter()
+            .filter(|(_, yes)| *yes)
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        if suites.is_empty() {
+            println!("ktls off (this kernel takes none of it): userspace encryption");
+        } else {
+            println!("ktls: kernel record encryption for {} (userspace fallback otherwise)", suites.join(", "));
+        }
+    }
     if let Some(c) = &site.compressor {
         println!(
             "compressing files in the background: up to {} processes at a time at low priority, copies in {} (up to {} MB)",
@@ -248,7 +281,13 @@ fn spawn_timers(site: &Site, worker: u64) {
 }
 
 /// Take connections until the stop signal.
-async fn accept_loop(site: &Arc<Site>, tcp: &Tcp, health: Option<&Health>, stop: &mut tokio::signal::unix::Signal) {
+async fn accept_loop(
+    site: &Arc<Site>,
+    tcp: &Tcp,
+    tls: Option<&Tls>,
+    health: Option<&Health>,
+    stop: &mut tokio::signal::unix::Signal,
+) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut tcp_errors = AcceptErrors::new("connections", tcp.listener.name());
     let mut health_errors = AcceptErrors::new("health checks", "its health socket");
@@ -260,7 +299,10 @@ async fn accept_loop(site: &Arc<Site>, tcp: &Tcp, health: Option<&Health>, stop:
             accepted = tcp.listener.accept(), if tcp_errors.resume_at.is_none() => match accepted {
                 Ok(fd) => {
                     tcp_errors.accepted();
-                    new_connection(site, tcp, &slots, fd);
+                    match tls {
+                        Some(tls) => new_tls_connection(site, tcp, tls, &slots, fd),
+                        None => new_connection(site, tcp, &slots, fd),
+                    }
                 }
                 Err(e) => tcp_errors.failed(&e),
             },
@@ -278,20 +320,43 @@ async fn accept_loop(site: &Arc<Site>, tcp: &Tcp, health: Option<&Health>, stop:
 /// A connection just accepted: answered on the spot when it can be
 /// (`first_request`), else served by a task of its own.
 fn new_connection(site: &Arc<Site>, tcp: &Tcp, slots: &Arc<Semaphore>, fd: OwnedFd) {
+    new_plain_connection(site, tcp.nodelay_inherited, tcp.inline_first, slots, fd);
+}
+
+/// An encrypted site's per-worker TLS state: the handshake for the
+/// userspace path, the config for the kTLS path, what the kernel was probed
+/// for, and room for the largest handshake flight.
+#[derive(Clone)]
+struct Tls {
+    acceptor: tokio_rustls::TlsAcceptor,
+    config: Arc<rustls::ServerConfig>,
+    ktls: super::ktls::Kernel,
+    flight_cap: usize,
+}
+
+/// A connection just accepted for the plain path, without the listener's
+/// flags: kTLS hands converted sockets back through here.
+fn new_plain_connection(
+    site: &Arc<Site>,
+    nodelay_inherited: bool,
+    inline_first: bool,
+    slots: &Arc<Semaphore>,
+    fd: OwnedFd,
+) {
     // At the limit a connection is dropped before anything is sent (an
     // answer promising keep-alive, then a close, is worse). Only this loop
     // takes permits, so one free now is still free below.
     if slots.available_permits() == 0 {
         return;
     }
-    if !tcp.nodelay_inherited {
+    if !nodelay_inherited {
         let _ = crate::sys::set_tcp_nodelay(fd.as_fd(), true);
     }
     let _ = crate::sys::set_nosigpipe(fd.as_fd());
     // Without openat2 every open is a call on a thread (`open_checked`): the
     // quick path would wait for it, give up, and the task would do it a
     // second time.
-    let inline = tcp.inline_first && site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY;
+    let inline = inline_first && site.open_mode.load(Ordering::Relaxed) != OPEN_LEGACY;
     let (fd, resume) = match first_request(site, fd, inline) {
         First::Done => return,
         First::Go { fd, resume } => (fd, resume),
@@ -312,6 +377,83 @@ fn new_connection(site: &Arc<Site>, tcp: &Tcp, slots: &Arc<Semaphore>, fd: Owned
         // either way).
         let (r, w) = stream.split();
         connection(r, Conn::Tcp(w), site, &guard, resume).await;
+    });
+}
+
+/// A connection to an encrypted site: the TLS handshake runs first (no
+/// accept-loop quick path: nothing can be answered before it), then ALPN
+/// decides. HTTP/2 goes to the H2 driver; anything else serves HTTP/1.1
+/// over the TLS stream through the normal connection and handler, with a
+/// `Conn::Tls` writer that copies bodies instead of sendfile'ing them.
+/// On Linux a peeked TLS 1.3/AES-GCM hello first tries the kTLS handover,
+/// after which the socket serves as plaintext through the normal paths.
+fn new_tls_connection(
+    site: &Arc<Site>,
+    tcp: &Tcp,
+    tls: &Tls,
+    slots: &Arc<Semaphore>,
+    fd: OwnedFd,
+) {
+    // At the limit a connection is dropped before anything is sent, as above.
+    // Only this loop takes permits, so one free now is still free below.
+    if slots.available_permits() == 0 {
+        return;
+    }
+    if !tcp.nodelay_inherited {
+        let _ = crate::sys::set_tcp_nodelay(fd.as_fd(), true);
+    }
+    let _ = crate::sys::set_nosigpipe(fd.as_fd());
+    let std_stream = std::net::TcpStream::from(fd);
+    if std_stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) else { return };
+    let Ok(permit) = slots.clone().try_acquire_owned() else { return };
+    let (site, tls, slots) = (site.clone(), tls.clone(), slots.clone());
+    let inline_first = tcp.inline_first;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let raw = stream.as_raw_fd();
+        let mut stream = stream;
+        // The handshake may take as long as a first request head. On Linux
+        // a peeked TLS 1.3/AES-GCM hello first tries the kernel handover;
+        // anything else (or anywhere else) comes back for the buffered
+        // path below, its bytes untouched.
+        let attempt = tokio::time::timeout(
+            site.head_timeout,
+            super::ktls::attempt(stream, &tls.config, tls.ktls, tls.flight_cap),
+        )
+        .await;
+        match attempt {
+            Ok(super::ktls::Out::Kernel { std, http2 }) => {
+                if http2 {
+                    let Ok(tcp) = tokio::net::TcpStream::from_std(std) else { return };
+                    super::http2::serve_io(tcp, site).await;
+                } else {
+                    // The permit goes back first: serving takes its own.
+                    // (Nodelay is already set above; the socket speaks
+                    // plaintext now, so the normal path serves it.)
+                    drop(_permit);
+                    new_plain_connection(&site, true, inline_first, &slots, OwnedFd::from(std));
+                }
+                return;
+            }
+            Ok(super::ktls::Out::Userspace(s)) => stream = s,
+            _ => return, // timeout, or past the gate: close
+        }
+        let tls_stream = match tokio::time::timeout(site.head_timeout, tls::accept(&tls.acceptor, stream)).await {
+            Ok(Ok(t)) => t,
+            _ => return,
+        };
+        match tls::negotiated(&tls_stream) {
+            tls::Negotiated::Http1 => {
+                let guard = site.idle.register(raw);
+                let (r, w) = tokio::io::split(tls_stream);
+                let resume = Resume::new(HeadBuf::take(&site));
+                connection(r, Conn::Tls(w), site, &guard, resume).await;
+            }
+            tls::Negotiated::Http2 => super::http2::serve(tls_stream, site).await,
+        }
     });
 }
 

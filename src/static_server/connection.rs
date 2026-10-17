@@ -278,8 +278,9 @@ fn answer_at_once(site: &Site, req: &Request<'_>, fd: BorrowedFd<'_>, keep: bool
     }
 }
 
-/// The access log line of a request (`access_log = true`).
-fn log_access(req: &Request<'_>, result: &std::io::Result<(u16, u64)>, t0: Instant, cached: &str) {
+/// The access log line of a request (`access_log = true`). Shared with the
+/// HTTP/2 adaptor, whose streams log the same line for the same request.
+pub(super) fn log_access(req: &Request<'_>, result: &std::io::Result<(u16, u64)>, t0: Instant, cached: &str) {
     let (status, bytes) = result.as_ref().map(|x| *x).unwrap_or((0, 0));
     println!("{} {} {status} {bytes}B {:.1}ms{cached}", req.method, req.path, t0.elapsed().as_secs_f64() * 1000.0);
 }
@@ -559,6 +560,87 @@ mod tests {
         assert!(h.starts_with("HTTP/1.1 200 ") && b == body, "{h}");
         assert!(site.inline.load(Ordering::Relaxed) >= 10, "answered by the accept loop");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HTTPS/1.1 through the normal stack: a TLS handshake, then the same
+    /// connection and handler over a `Conn::Tls` writer. The bytes decrypt
+    /// to the plain path's answer, byte for byte (no quick path: the
+    /// handshake runs first, so this always goes as a task).
+    #[test]
+    fn https1_serves_through_the_normal_handler() {
+        use super::super::conn::Conn;
+        use super::super::head::HeadBuf;
+        use super::super::tls;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let dir = tls::test_dir("h1");
+            let body = b"hello over tls";
+            std::fs::write(dir.join("hello.txt"), body).unwrap();
+            let site = Arc::new(test_site_at(&dir, false));
+            let (cert, key) = tls::test_cert_files(&dir);
+            let cert_pem = std::fs::read(&cert).unwrap();
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
+            // The idle guard needs a descriptor; nothing sweeps in this test.
+            let null = std::fs::File::open("/dev/null").unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&null);
+            // A real loopback socket: `Conn::Tls` holds a socket stream.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let worker = site.clone();
+            let acceptor = acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("a connection");
+                let tls = tls::accept(&acceptor, socket).await.expect("the handshake runs");
+                let guard = worker.idle.register(fd);
+                let (r, w) = tokio::io::split(tls);
+                let resume = Resume::new(HeadBuf::take(&worker));
+                connection(r, Conn::Tls(w), worker, &guard, resume).await;
+            });
+            let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = tls::test_client(b"http/1.1", &cert_pem)
+                .connect("localhost".try_into().unwrap(), socket)
+                .await
+                .expect("the client handshakes");
+            client
+                .write_all(b"GET /hello.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            // Read the response by its Content-Length, not to EOF: rustls
+            // reports a close without close_notify as an error, not clean EOF.
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let at = loop {
+                let n = client.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the head was complete");
+                got.extend_from_slice(&buf[..n]);
+                if let Some(i) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&got[..at]).into_owned();
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+            let len: usize = head
+                .lines()
+                .find(|l| l.starts_with("Content-Length:"))
+                .unwrap()
+                .split_once(':')
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(len, body.len(), "{head}");
+            while got.len() < at + len {
+                let n = client.read(&mut buf).await.unwrap();
+                assert!(n > 0, "closed before the body was complete");
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(&got[at..], body);
+            server.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// A file bigger than the accept loop sends in one go goes on as a task

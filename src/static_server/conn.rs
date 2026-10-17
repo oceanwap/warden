@@ -2,9 +2,11 @@
 //! can make, and what is left over when a socket cannot take a response whole.
 
 use super::cache::MemFile;
+use super::open::read_body;
+use super::tls::TlsIo;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bytes to send: a buffer built for this response, or a range of a cached
 /// one (no copy).
@@ -82,6 +84,17 @@ pub(super) enum Rest {
 pub(super) enum Conn<'a> {
     Tcp(tokio::net::tcp::WriteHalf<'a>),
     Unix(tokio::net::unix::WriteHalf<'a>),
+    /// HTTPS: the write half of a finished TLS handshake (`tls.rs`). Reads
+    /// and writes go through per-connection encryption, so bodies are copied
+    /// from the file instead of sendfile'd (ciphertext cannot be shared: the
+    /// keys differ on every connection). The accept loop's raw quick path
+    /// never applies here: a handshake has to run first.
+    Tls(tokio::io::WriteHalf<TlsIo<tokio::net::TcpStream>>),
+    /// In-memory sink: the HTTP/2 adaptor answering through the normal H1
+    /// handler, whose H1 bytes are then translated to H2 frames. Every
+    /// decision (auth, paths, conditionals, ranges, compression, the cache)
+    /// is shared with the plain path this way, instead of mirrored.
+    Mem(Vec<u8>),
     /// The accept loop answering a new connection's first request itself
     /// (`first_request`): never waits.
     Raw(RawSink<'a>),
@@ -181,6 +194,11 @@ impl<'a> Conn<'a> {
         match self {
             Conn::Tcp(w) => w.write_all(b.as_slice()).await,
             Conn::Unix(w) => w.write_all(b.as_slice()).await,
+            Conn::Tls(w) => w.write_all(b.as_slice()).await,
+            Conn::Mem(v) => {
+                v.extend_from_slice(b.as_slice());
+                Ok(())
+            }
             Conn::Raw(r) => r.bytes(b),
         }
     }
@@ -189,14 +207,16 @@ impl<'a> Conn<'a> {
         match self {
             Conn::Tcp(w) => w.flush().await,
             Conn::Unix(w) => w.flush().await,
-            Conn::Raw(_) => Ok(()),
+            Conn::Tls(w) => w.flush().await,
+            Conn::Mem(_) | Conn::Raw(_) => Ok(()),
         }
     }
 
     /// The response `head` (possibly empty), then `count` bytes of `src` from
     /// `offset`: on TCP by page reference (sendfile; the head goes in the
     /// same system call on macOS, and in the same packet on Linux); on the
-    /// Unix health socket a plain copy.
+    /// Unix health socket and on TLS a plain copy (TLS encrypts
+    /// per connection, so the kernel cannot move the pages as they are).
     pub(super) async fn send_file(
         &mut self,
         head: &[u8],
@@ -206,18 +226,42 @@ impl<'a> Conn<'a> {
     ) -> std::io::Result<u64> {
         match self {
             Conn::Tcp(w) => sendfile_all(w.as_ref(), head, src.file(), offset, count).await,
-            Conn::Unix(w) => {
-                w.write_all(head).await?;
-                let mut f = tokio::fs::File::from_std(src.into_file()?);
-                if offset > 0 {
-                    use tokio::io::AsyncSeekExt;
-                    f.seek(std::io::SeekFrom::Start(offset)).await?;
-                }
-                tokio::io::copy(&mut f.take(count), w).await
+            Conn::Unix(w) => copy_file(w, head, src, offset, count).await,
+            Conn::Tls(w) => copy_file(w, head, src, offset, count).await,
+            Conn::Mem(v) => {
+                // No socket to fill: the whole range goes into memory (under
+                // TLS there is no sendfile anyway: every byte is encrypted in
+                // userspace before it goes out).
+                v.extend_from_slice(head);
+                let from = v.len();
+                v.resize(from + count as usize, 0);
+                let (_, buf) = read_body(src.into_file()?, std::mem::take(v), from, offset).await?;
+                *v = buf;
+                Ok(count)
             }
             Conn::Raw(r) => r.file(head, src, offset, count).map(|()| count),
         }
     }
+}
+
+/// The head, then `count` bytes of `src` from `offset`, copied through
+/// userspace: for transports that transform the bytes (TLS encrypts per
+/// connection), where sendfile's page reference cannot apply.
+async fn copy_file(
+    w: &mut (impl AsyncWrite + Unpin),
+    head: &[u8],
+    src: Source,
+    offset: u64,
+    count: u64,
+) -> std::io::Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    w.write_all(head).await?;
+    let mut f = tokio::fs::File::from_std(src.into_file()?);
+    if offset > 0 {
+        use tokio::io::AsyncSeekExt;
+        f.seek(std::io::SeekFrom::Start(offset)).await?;
+    }
+    tokio::io::copy(&mut f.take(count), w).await
 }
 
 /// The most one sendfile(2) call is asked to move. The worker is one thread:
@@ -245,6 +289,55 @@ struct Corked<'a>(BorrowedFd<'a>);
 impl Drop for Corked<'_> {
     fn drop(&mut self) {
         let _ = crate::sys::set_tcp_cork(self.0, false);
+    }
+}
+
+/// `Conn::Tls` copies head + file range through encryption: the client
+/// decrypts exactly those bytes (no sendfile under TLS: every byte is
+/// encrypted in userspace before it goes out). Runs on every platform,
+/// unlike the Linux-only connection tests.
+#[cfg(test)]
+mod tests {
+    use super::super::tls;
+    use super::*;
+
+    #[test]
+    fn tls_copies_head_and_file_range() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let dir = tls::test_dir("conn");
+            let body: Vec<u8> = (0..50_000).map(|i| (i % 251) as u8).collect();
+            std::fs::write(dir.join("f.bin"), &body).unwrap();
+            let (cert, key) = tls::test_cert_files(&dir);
+            let cert_pem = std::fs::read(&cert).unwrap();
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(tls::load(&cert, &key).expect("the test chain loads"));
+            // A real loopback socket: `Conn::Tls` holds a socket stream.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task_dir = dir.clone();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("a connection");
+                let tls = tls::accept(&acceptor.clone(), socket).await.expect("the handshake runs");
+                let (_, w) = tokio::io::split(tls);
+                let mut conn = Conn::Tls(w);
+                let file = std::fs::File::open(task_dir.join("f.bin")).unwrap();
+                let n = conn.send_file(b"HEAD:", Source::File(file), 100, 1000).await.unwrap();
+                assert_eq!(n, 1000);
+            });
+            let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut client = tls::test_client(b"http/1.1", &cert_pem)
+                .connect("localhost".try_into().unwrap(), socket)
+                .await
+                .expect("the client handshakes");
+            let mut got = vec![0u8; 5 + 1000];
+            client.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got[..5], b"HEAD:");
+            assert_eq!(&got[5..], &body[100..1100]);
+            server.await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }
 

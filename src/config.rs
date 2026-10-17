@@ -297,6 +297,16 @@ pub struct Static {
     /// an edited or deleted file is served fresh within this time.
     #[serde(default = "default_cache_valid_ms")]
     pub cache_valid_ms: u64,
+    /// TLS certificate chain and private key: serve HTTPS instead of plain
+    /// HTTP (HTTP/2 where the client asks for it, else HTTP/1.1), so the
+    /// site can sit behind the :443 router, which passes connections on
+    /// still encrypted. Unset: plain HTTP. A relative path is read from the
+    /// working directory, else the config file's folder.
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
+    /// The private key for `cert`.
+    #[serde(default)]
+    pub key: Option<PathBuf>,
 }
 
 /// `static.precompressed_skip` unless it is set: images, fonts, audio, video,
@@ -1141,6 +1151,11 @@ impl Config {
             if let Some(dir) = st.compress_dir.as_mut().filter(|d| d.is_relative()) {
                 *dir = base.join(&*dir);
             }
+            for slot in [&mut st.cert, &mut st.key] {
+                if let Some(p) = slot.as_mut().filter(|p| p.is_relative()) {
+                    *p = base.join(&*p);
+                }
+            }
         }
         Ok(cfg)
     }
@@ -1235,6 +1250,9 @@ impl Config {
                 if !a.contains(':') {
                     return Err("static.basic_auth must be \"user:password\"".into());
                 }
+            }
+            if st.cert.is_some() != st.key.is_some() {
+                return Err("static.cert and static.key go together (the certificate chain and its key)".into());
             }
             for (name, value, max, unit) in [
                 ("static.cache_size", st.cache_size, 4 << 30, "4G"),
@@ -2123,6 +2141,36 @@ mod tests {
         // The worker gets the section as JSON (WARDEN_STATIC); sizes survive the round trip.
         let json = serde_json::to_string(&st).unwrap();
         assert_eq!(serde_json::from_str::<Static>(&json).unwrap(), st);
+    }
+
+    #[test]
+    fn static_tls_needs_both_cert_and_key() {
+        let base = "[app]\nname = \"site\"\nport = 8080\n[static]\nroot = \"/srv/site\"\n";
+        // Plain HTTP unless asked for.
+        let st = Config::parse(base).unwrap().static_files.unwrap();
+        assert_eq!((st.cert, st.key), (None, None));
+        // One without the other is refused, naming the pair.
+        for bad in ["cert = \"/srv/cert.pem\"\n", "key = \"/srv/key.pem\"\n"] {
+            let e = Config::parse(&format!("{base}{bad}")).unwrap_err();
+            assert!(e.contains("static.cert and static.key go together"), "{bad}: {e}");
+        }
+        let st = Config::parse(&format!("{base}cert = \"/srv/cert.pem\"\nkey = \"/srv/key.pem\"\n"))
+            .unwrap()
+            .static_files
+            .unwrap();
+        assert_eq!(
+            (st.cert, st.key),
+            (Some(std::path::PathBuf::from("/srv/cert.pem")), Some(std::path::PathBuf::from("/srv/key.pem")))
+        );
+        // Relative paths are read from the config file's folder, like root.
+        let dir = std::env::temp_dir().join(format!("warden-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("site.toml");
+        std::fs::write(&cfg, format!("{base}cert = \"tls/cert.pem\"\nkey = \"tls/key.pem\"\n")).unwrap();
+        let st = Config::load(&cfg).unwrap().static_files.unwrap();
+        assert_eq!(st.cert.unwrap(), dir.join("tls/cert.pem"));
+        assert_eq!(st.key.unwrap(), dir.join("tls/key.pem"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

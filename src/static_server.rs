@@ -55,6 +55,9 @@ mod response;
 pub(crate) mod serve;
 mod store;
 mod text;
+pub(crate) mod tls;
+mod http2;
+mod ktls;
 
 use crate::config::Static;
 use cache::Cache;
