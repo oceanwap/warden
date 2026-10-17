@@ -3,7 +3,7 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.1.7] — 2026-10-17
 
 ### Fixed
 
