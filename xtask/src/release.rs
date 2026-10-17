@@ -672,7 +672,6 @@ enum PushError {
 fn classify_push(stderr: &str) -> PushError {
     let s = stderr.to_ascii_lowercase();
     const DENIED: &[&str] = &[
-        "403",
         "permission",
         "denied",
         "not allowed",
@@ -685,7 +684,9 @@ fn classify_push(stderr: &str) -> PushError {
         "gh013",
         "hook declined",
     ];
-    if DENIED.iter().any(|p| s.contains(p)) {
+    // "403" only as a whole word: commit hashes and temp paths in git's output contain it too.
+    let http_403 = s.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == "403");
+    if http_403 || DENIED.iter().any(|p| s.contains(p)) {
         PushError::Denied
     } else if ["non-fast-forward", "fetch first", "stale info"].iter().any(|p| s.contains(p)) {
         PushError::Moved
@@ -2266,6 +2267,10 @@ version = \"0.2.0\"
         );
         assert_eq!(classify_push(" ! [rejected]        main -> main (fetch first)"), PushError::Moved);
         assert_eq!(classify_push(" ! [rejected]        main -> main (non-fast-forward)"), PushError::Moved);
+        assert_eq!(
+            classify_push("To /tmp/xtask-lease-4031/origin\n ! [rejected]        main -> main (stale info)"),
+            PushError::Moved
+        );
         assert_eq!(classify_push("fatal: unable to access: Could not resolve host: github.com"), PushError::Other);
     }
 
