@@ -13,6 +13,14 @@ targets = [
 # Unmaintained crates warn; vulnerabilities and yanked crates fail.
 unmaintained = "workspace"
 yanked = "deny"
+ignore = [
+    # tokio's AsyncFd::new/with_interest accept any AsRawFd. Every AsyncFd in
+    # Warden wraps a descriptor it owns (File, TcpListener, UnixStream), so the
+    # unsound case (closing or reusing the descriptor behind its back) cannot
+    # arise. Moving to the unsafe `register` constructors touches the accept,
+    # keeper and process paths: do it on purpose, then drop this entry.
+    "RUSTSEC-2026-0386",
+]
 
 [sources]
 # crates.io only: no git or alternative registries.
