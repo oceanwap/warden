@@ -391,6 +391,7 @@ pub async fn startup(args: &Args, want: Want) -> i32 {
     }
 }
 
+#[allow(clippy::unused_async)] // kept async like `startup`, which does await
 pub async fn unstartup(args: &Args, want: Want) -> i32 {
     match mode(want) {
         Mode::Systemd(scope) => systemd_unstartup(args, scope),
