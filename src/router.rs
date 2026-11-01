@@ -410,7 +410,7 @@ async fn connection(
             Ok(Ok(up)) => {
                 up.set_nodelay(true)?;
                 // The ClientHello is still in `c`: the pipe passes it on first.
-                pipe::both(&c, &up).await;
+                pipe::both(c, up).await;
                 return Ok(());
             }
             Ok(Err(e)) => last = e,

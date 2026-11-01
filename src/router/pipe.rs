@@ -8,20 +8,24 @@
 //! (nginx stream: 3.1), 36 µs per 64 KB response (nginx: 53).
 
 use std::io;
-use tokio::io::Interest;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 const BUF: usize = 16 * 1024;
 
 /// Both directions until both have ended.
-pub(super) async fn both(visitor: &TcpStream, app: &TcpStream) {
-    tokio::join!(one_way(visitor, app), one_way(app, visitor));
+pub(super) async fn both(visitor: TcpStream, app: TcpStream) {
+    // Split halves read and write through tokio's `AsyncRead`/`AsyncWrite`,
+    // which skip the read(2) that would only say EAGAIN after a short read.
+    let ((vr, vw), (ar, aw)) = (visitor.into_split(), app.into_split());
+    tokio::join!(one_way(vr, aw), one_way(ar, vw));
 }
 
 /// One direction until the end of stream (or an error), which is then passed
 /// on (shutdown of the write side) so the other end finishes too.
-async fn one_way(from: &TcpStream, to: &TcpStream) {
-    let mut b = vec![0u8; BUF];
+async fn one_way(mut from: OwnedReadHalf, mut to: OwnedWriteHalf) {
+    let mut b: Vec<u8> = Vec::with_capacity(BUF);
     #[cfg(target_os = "linux")]
     let mut pipe: Option<splice::Pipe> = None;
     #[cfg(target_os = "linux")]
@@ -33,7 +37,7 @@ async fn one_way(from: &TcpStream, to: &TcpStream) {
                 pipe = splice::Pipe::new().ok();
             }
             match &pipe {
-                Some(p) => match p.move_once(from, to, 1 << 20).await {
+                Some(p) => match p.move_once(from.as_ref(), to.as_ref(), 1 << 20).await {
                     Ok(n) if n > 0 => {
                         bulk = n >= BUF;
                         continue;
@@ -43,11 +47,16 @@ async fn one_way(from: &TcpStream, to: &TcpStream) {
                 None => bulk = false,
             }
         }
-        let n = match from.async_io(Interest::READABLE, || from.try_read(&mut b)).await {
+        // `read_buf` on the stream (not `try_read`): after a read shorter than
+        // the buffer tokio knows the socket is drained and waits for the next
+        // readiness, instead of one more read(2) that only says EAGAIN. The
+        // buffer is not zeroed either.
+        b.clear();
+        let n = match from.read_buf(&mut b).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        if write_all(to, &b[..n]).await.is_err() {
+        if to.write_all(&b[..n]).await.is_err() {
             break;
         }
         #[cfg(target_os = "linux")]
@@ -55,15 +64,7 @@ async fn one_way(from: &TcpStream, to: &TcpStream) {
             bulk = true;
         }
     }
-    let _ = shutdown_write(to);
-}
-
-async fn write_all(to: &TcpStream, mut b: &[u8]) -> io::Result<()> {
-    while !b.is_empty() {
-        let w = to.async_io(Interest::WRITABLE, || to.try_write(b)).await?;
-        b = &b[w..];
-    }
-    Ok(())
+    let _ = shutdown_write(to.as_ref());
 }
 
 fn shutdown_write(s: &TcpStream) -> io::Result<()> {
