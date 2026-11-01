@@ -255,3 +255,48 @@ linux-tools package; the script then uses any `/usr/lib/linux-tools*/perf`
   differences under 10 % as real (the CPU-per-request rows move less).
 
 Methodology notes and history (what changed and why): `docs/benchmarks.md`.
+
+## Balance
+
+`[balance]` against nginx 1.30.6 and 1.31.8 (docs/balance.md). Linux 6.18 VM,
+4 vCPU Xeon 2.8 GHz, loopback. Backends: 2 Bun 1.4.4 workers (TLS + HTTP/2)
+pinned to cores 0-1 together with nginx's 2 workers; `h2load` 1.59 pinned to
+cores 2-3, 32 connections × 10 streams (HTTP/2) or 64 connections (HTTP/1.1).
+Median of 3 runs; `BUN_OPTIONS` unset. Raw output, the nginx configs and the
+scripts: `/mnt/project-files/warden/lb-2026-11-01/bench/` in the project files.
+
+| | Warden `[balance]` | nginx stream (1.30.6 / 1.31.8) | nginx http proxy (1.30.6 / 1.31.8) |
+|---|---|---|---|
+| HTTP/2 small, req/s | 258k–328k | 158–168k / 158–177k | 29–36k / 29–36k |
+| HTTP/2 64 KB, req/s | 22k–26k | 16–20k / 17–20k | 7.9–8.7k / 7.4–8.9k |
+| HTTP/1.1 small, req/s | 89k–122k | 50k / 57k | 24–29k / 25–27k |
+
+Two runs of the same program: the first from the standalone prototype, the
+second with the workers started by Warden itself (the range is the two).
+Server CPU per request, standalone run: 5.3 µs (steering), 11.6 / 10.8 µs
+(stream), 52 / 54 µs (http proxy), HTTP/2 small.
+
+Against nginx as an HTTP load balancer (`proxy_pass` to an upstream of the two
+ports) the kernel steering is 2.8× to 9× faster. Against nginx `stream`
+(TCP pass-through, which does not terminate TLS) it is 1.6–1.9× on small
+HTTP/2 and HTTP/1.1 replies and 1.3× on 64 KB replies: not 2× everywhere, since
+the steering costs the app nothing but the nginx pass-through is already cheap.
+The steering cannot beat the app itself: it matches Bun serving the port
+directly.
+
+Also measured (wrk, `Connection: close`, a new TLS connection per request):
+steering ~2.75k conn/s, Warden's router ~2.2k, nginx stream ~2.1k (both
+versions). New connections to an address the program does not match: 35.2k/s
+with it attached, 34.1k/s without (noise). Two workers on two cores: 347k req/s
+floating, 284k pinned one per core, 170k with one worker; round-robin instead
+of the hash made no measurable difference.
+
+Not measured: IPv6, and Warden's own CPU column in the second run (its
+workers are not in the process-name filter).
+
+The copying hostname router with a list of ports, against nginx stream on the
+same backends: 208k vs 184–192k req/s (HTTP/2 small), 20.8k vs 18.6k (64 KB),
+57k vs 54–61k (HTTP/1.1); router CPU 9.2 µs vs 10.0–10.2 µs per request.
+Level to a little ahead; a router that passes bytes pays for two TCP
+connections, and only handing the connection over (Bun `server.adopt`) or
+steering by address removes that.

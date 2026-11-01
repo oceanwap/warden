@@ -34,6 +34,20 @@ picks up an app that moved) or a port number. `*.example.com` matches one
 label (`www.example.com`, not `a.b.example.com`); `"*"` takes every other
 hostname, and connections that name none.
 
+## One hostname over several processes
+
+A target can be a list of ports, or an app whose workers each listen on a port
+of their own (`port_strategy = "offset"`): the router then takes turns over
+them, and a port that refuses a connection is skipped for it.
+
+```toml
+[route]
+hosts = { "api.example.com" = [9001, 9002, 9003], "www.example.com" = "web" }
+```
+
+The router still passes bytes. Where the hostname has an address of its own,
+[`[balance]`](balance.md) does the same with nothing in the path.
+
 ## One address per app: nothing in between
 
 The fastest way: give each app an IP address of its own, and the kernel

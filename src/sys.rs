@@ -758,6 +758,47 @@ pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "pidfd_open is Linux-only"))
 }
 
+/// bpf(2) with a `bpf_attr` the caller filled in; the descriptor it returns
+/// (maps, programs and links; other commands return 0). The attr's pointers
+/// must stay valid for the call.
+#[cfg(target_os = "linux")]
+pub fn bpf(cmd: libc::c_long, attr: &mut [u8; 128]) -> io::Result<OwnedFd> {
+    // SAFETY: the kernel reads and writes within the 128 bytes of `attr`; the
+    // pointers inside it are the caller's, which it keeps alive for the call.
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.as_mut_ptr(), attr.len()) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a command that makes an object returned a new descriptor that
+    // nothing else owns; for the others the value is 0 and is closed at once
+    // by the caller dropping it, so those callers use `bpf_cmd`.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
+/// A bpf(2) command that returns no descriptor (map updates and deletes).
+#[cfg(target_os = "linux")]
+pub fn bpf_cmd(cmd: libc::c_long, attr: &mut [u8; 128]) -> io::Result<()> {
+    // SAFETY: as in `bpf`.
+    let rc = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.as_mut_ptr(), attr.len()) };
+    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// A duplicate of descriptor `fd` of process `pid` (`pidfd_getfd`, Linux
+/// 5.6+; needs ptrace rights over the process).
+#[cfg(target_os = "linux")]
+pub fn pidfd_getfd(pid: u32, fd: RawFd) -> io::Result<OwnedFd> {
+    let pidfd = pidfd_open(pid)?;
+    // SAFETY: plain syscall on integers.
+    let rc = unsafe {
+        libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd() as libc::c_long, fd as libc::c_long, 0 as libc::c_long)
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: pidfd_getfd returned a new descriptor that nothing else owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(rc as RawFd) })
+}
+
 /// pread that never waits for the disk: preadv2(RWF_NOWAIT) returns
 /// EAGAIN (`ErrorKind::WouldBlock`) when the data is not in the page cache,
 /// so a server can read cached files inline and hand the rest to a thread.
