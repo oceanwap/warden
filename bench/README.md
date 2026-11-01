@@ -284,10 +284,15 @@ the steering costs the app nothing but the nginx pass-through is already cheap.
 The steering cannot beat the app itself: it matches Bun serving the port
 directly.
 
-Not measured: connection churn (h2load cannot run `Connection: close`
-against Bun; the earlier `next-perf` notes have `newconn.ts`), IPv6, the
-cost of the `sk_lookup` program on unrelated TCP lookups, and Warden's own CPU
-column in the second run (its workers are not in the process-name filter).
+Also measured (wrk, `Connection: close`, a new TLS connection per request):
+steering ~2.75k conn/s, Warden's router ~2.2k, nginx stream ~2.1k (both
+versions). New connections to an address the program does not match: 35.2k/s
+with it attached, 34.1k/s without (noise). Two workers on two cores: 347k req/s
+floating, 284k pinned one per core, 170k with one worker; round-robin instead
+of the hash made no measurable difference.
+
+Not measured: IPv6, and Warden's own CPU column in the second run (its
+workers are not in the process-name filter).
 
 The copying hostname router with a list of ports, against nginx stream on the
 same backends: 208k vs 184–192k req/s (HTTP/2 small), 20.8k vs 18.6k (64 KB),
