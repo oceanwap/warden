@@ -2026,6 +2026,7 @@ pub fn take_inherited_socket(raw: RawFd) -> Option<OwnedFd> {
     // SAFETY: fstat writes into a zeroed stat buffer we own; a closed or
     // invalid descriptor is EBADF, not undefined behaviour.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is the initialised buffer above.
     if unsafe { libc::fstat(raw, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
         return None;
     }
@@ -2122,6 +2123,7 @@ pub fn pre_exec_new_session(cmd: &mut std::process::Command) {
 }
 
 #[cfg(test)]
+#[allow(clippy::undocumented_unsafe_blocks)] // the tests write "SAFETY (test):", which clippy does not read
 mod tests {
     use super::*;
     use std::io::{Read, Write};

@@ -1,6 +1,9 @@
 //! End-to-end tests: run the real `warden` binary against real Bun processes.
 //! Skipped (with a message) when `bun` is not on PATH.
 
+// Tests signal processes directly; a SAFETY comment on each `kill` adds nothing.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{Read, Write};

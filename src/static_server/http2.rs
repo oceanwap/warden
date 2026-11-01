@@ -214,6 +214,7 @@ async fn send(respond: &mut h2::server::SendResponse<Bytes>, response: http::Res
 
 /// A status with no body (a bad request, or translation failing where the
 /// plain path's bytes cannot become frames).
+#[allow(clippy::unused_async)] // an async signature like its siblings; callers await it
 async fn send_empty(respond: &mut h2::server::SendResponse<Bytes>, status: u16) {
     let response = http::Response::builder().status(status).body(()).unwrap_or_else(|_| http::Response::new(()));
     let _ = respond.send_response(response, true);
