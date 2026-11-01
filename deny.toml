@@ -1,0 +1,26 @@
+# cargo-deny: `cargo deny check advisories sources bans` (.github/workflows/audit.yml).
+# Licenses are checked by cargo-about at release time (about.toml).
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+[advisories]
+# Unmaintained crates warn; vulnerabilities and yanked crates fail.
+unmaintained = "workspace"
+yanked = "deny"
+
+[sources]
+# crates.io only: no git or alternative registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[bans]
+# Duplicate versions (tokio and iced pull some) are not worth failing over.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true # path dependencies between workspace members

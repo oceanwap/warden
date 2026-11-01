@@ -7,6 +7,9 @@ repository = "https://github.com/oceanwap/warden"
 publish = false
 description = "Project tasks for Warden: `cargo xtask bench` runs the benchmark suite, `cargo xtask release` releases."
 
+[lints]
+workspace = true
+
 [dependencies]
 # Reading the GitHub API's answers in `release` (already in the lockfile:
 # warden and the protocol use it). curl does the HTTP: no TLS stack here.

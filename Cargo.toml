@@ -17,6 +17,20 @@ rust-version = "1.85"
 # `--workspace` (or `-p warden-gui`) takes in the rest.
 members = ["protocol", "gui", "xtask"]
 
+# The code standards CI enforces (`cargo clippy -- -D warnings`); see
+# CONTRIBUTING.md. Every member opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+mem_forget = "warn"
+# Every `unsafe` block says why it is sound.
+undocumented_unsafe_blocks = "warn"
+unused_async = "warn"
+
+[lints]
+workspace = true
+
 [dependencies]
 libc = "0.2.189"
 memchr = "2.8"

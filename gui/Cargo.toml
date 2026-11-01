@@ -20,6 +20,9 @@ path = "src/main.rs"
 default = []
 wgpu = ["iced/wgpu"]
 
+[lints]
+workspace = true
+
 [dependencies]
 warden-protocol = { path = "../protocol" }
 # canvas: the history charts. tiny-skia draws the paths itself: the default
