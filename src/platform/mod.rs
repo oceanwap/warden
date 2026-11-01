@@ -262,6 +262,7 @@ pub fn listeners_each(pids: &[u32]) -> Vec<Option<Vec<Listener>>> {
 }
 
 /// `pid` and the processes below it (the limits of [`listeners_each`]).
+#[cfg(target_os = "linux")]
 pub fn process_tree(pid: u32) -> Vec<u32> {
     listeners::tree(current(), pid)
 }
