@@ -261,6 +261,11 @@ pub fn listeners_each(pids: &[u32]) -> Vec<Option<Vec<Listener>>> {
     listeners::of_trees(current(), pids)
 }
 
+/// `pid` and the processes below it (the limits of [`listeners_each`]).
+pub fn process_tree(pid: u32) -> Vec<u32> {
+    listeners::tree(current(), pid)
+}
+
 /// The sockets (inodes) the process and the processes below it hold open.
 /// `None` unless every one of them was read: the tree was bigger than a walk
 /// looks at (as [`listeners`] limits it), a process in it could not be read,

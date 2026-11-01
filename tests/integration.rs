@@ -2280,6 +2280,82 @@ fn an_app_listens_on_its_own_address() {
     }
 }
 
+/// `[balance]`: connections to the app's address and public port are spread
+/// by the kernel over workers that each listen on a port of their own, with
+/// no failed connection while the workers are replaced one by one. Needs
+/// root and Linux 5.9+; skips (and says why) without them.
+#[test]
+#[cfg(target_os = "linux")]
+fn balance_spreads_a_public_port_over_workers_on_their_own_ports() {
+    if !have_bun() {
+        return;
+    }
+    let (base, public) = (free_port(), free_port());
+    let cfg = format!(
+        "[app]\nname = \"bal\"\ncommand = \"bun\"\nargs = [\"{}\"]\nport = {base}\naddress = \"127.0.0.2\"\n\
+         [workers]\ncount = 3\nport_strategy = \"offset\"\n[balance]\nport = {public}\n\
+         [health]\npath = \"/health\"\n[reload]\nhealth_passes = 1\nhealth_interval_ms = 100\n[shutdown]\ndrain_ms = 200\n",
+        fixture("app.ts")
+    );
+    let w = Warden::start("bal", base, &cfg);
+    w.wait_for("3 ready", T, ready(3));
+    let log = w.log();
+    if log.contains("[balance] is off") {
+        eprintln!("skipped: no eBPF sk_lookup here\n{log}");
+        return;
+    }
+    let get_public = || -> Option<String> {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 2], public));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        write!(s, "GET /whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).ok()?;
+        buf.starts_with("HTTP/1.1 2").then(|| buf.rsplit("\r\n\r\n").next().unwrap_or("").to_string())
+    };
+    let pids =
+        |w: &Warden| -> HashSet<String> { pid_set(&w.status().unwrap()).into_iter().map(|p| p.to_string()).collect() };
+    let seen = |n: usize| -> HashSet<String> {
+        (0..n).map(|_| get_public().expect("a request failed").split(':').next().unwrap().to_string()).collect()
+    };
+    let first = seen(90);
+    assert_eq!(first, pids(&w), "every worker serves the public port: {first:?}\n{}", w.log());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (ok, fail) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let client = {
+        let (stop, ok, fail) = (stop.clone(), ok.clone(), fail.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 2], public));
+                let got = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok().and_then(|mut s| {
+                    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+                    write!(s, "GET /whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+                    let mut b = String::new();
+                    s.read_to_string(&mut b).ok()?;
+                    b.starts_with("HTTP/1.1 2").then_some(())
+                });
+                if got.is_some() {
+                    ok.fetch_add(1, Ordering::Relaxed)
+                } else {
+                    fail.fetch_add(1, Ordering::Relaxed)
+                };
+            }
+        })
+    };
+    let before = pids(&w);
+    let (code, out) = w.cli(&["restart"]);
+    stop.store(true, Ordering::Relaxed);
+    client.join().unwrap();
+    assert_eq!(code, 0, "{out}\n{}", w.log());
+    let after = pids(&w);
+    assert!(before.is_disjoint(&after), "every worker replaced");
+    eprintln!("balance rolling restart: {} ok, {} failed", ok.load(Ordering::Relaxed), fail.load(Ordering::Relaxed));
+    assert!(ok.load(Ordering::Relaxed) > 50);
+    assert!(fail.load(Ordering::Relaxed) <= allowed_resets(), "connections failed during the rolling restart");
+    assert_eq!(seen(90), after, "the new workers serve the public port");
+}
+
 #[test]
 fn node_workers_share_a_port_through_the_shim() {
     if !have_bun() || !have_node() {
@@ -9192,6 +9268,35 @@ fn tagged_echo(tag: &'static str) -> u16 {
         }
     });
     port
+}
+
+/// `[route]` with a list of ports: connections take turns over the processes,
+/// and a port nothing listens on is skipped instead of refusing the visitor.
+#[test]
+fn the_router_spreads_a_hostname_over_several_ports() {
+    let (a, b) = (tagged_echo("A:"), tagged_echo("B:"));
+    let dead = free_port();
+    let port = free_port();
+    let cfg = format!(
+        "[app]\nname = \"edge\"\nport = {port}\n[workers]\ncount = 1\n\
+         [route]\nhost = \"127.0.0.1\"\nclient_ip = false\nhosts = {{ \"a.test\" = [{a}, {dead}, {b}] }}\n"
+    );
+    let w = Warden::start("route-many", port, &cfg);
+    w.wait_for("ready", T, ready(1));
+    let tag = || -> String {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(&client_hello("a.test")).unwrap();
+        let mut t = [0u8; 2];
+        c.read_exact(&mut t).expect("a process answered");
+        String::from_utf8_lossy(&t).into_owned()
+    };
+    let seen: Vec<String> = (0..30).map(|_| tag()).collect();
+    assert!(seen.iter().all(|t| t == "A:" || t == "B:"), "{seen:?}");
+    assert!(
+        seen.iter().filter(|t| *t == "A:").count() >= 10 && seen.iter().filter(|t| *t == "B:").count() >= 10,
+        "{seen:?}"
+    );
 }
 
 /// `[route]`: each connection goes, by the hostname in its ClientHello, to

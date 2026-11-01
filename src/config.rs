@@ -50,6 +50,49 @@ pub struct Config {
     /// used.
     #[serde(default)]
     pub route: Option<Route>,
+    /// The kernel spreads connections to `app.address:balance.port` over the
+    /// workers, each on its own port (`docs/balance.md`). Linux, root.
+    #[serde(default)]
+    pub balance: Option<Balance>,
+}
+
+/// `[balance]`: one hostname's connections over workers that each listen on a
+/// port of their own.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Balance {
+    /// The port visitors connect to at `app.address` (443). The workers
+    /// listen on `app.port`, `app.port + 1`, ... (`port_strategy = "offset"`).
+    pub port: u16,
+}
+
+impl Balance {
+    pub fn check(&self, cfg: &Config) -> Result<(), String> {
+        let (a, w) = (&cfg.app, &cfg.workers);
+        if a.address.is_none() {
+            return Err("[balance] needs app.address: the address the hostname's DNS record points at".into());
+        }
+        if w.port_strategy != PortStrategy::Offset {
+            return Err("[balance] needs workers.port_strategy = \"offset\": each worker listens on its own port. \
+                        (Workers that can share a port need no [balance]: leave port_strategy = \"shared\" and \
+                        the kernel already spreads connections)"
+                .into());
+        }
+        if self.port == 0 || Some(self.port) == a.port {
+            return Err("balance.port must be the public port (443), not app.port or 0".into());
+        }
+        let top = a.port.map_or(0, |p| p as usize + w.count.saturating_sub(1));
+        if (a.port.unwrap_or(0)..=top.min(u16::MAX as usize) as u16).contains(&self.port) {
+            return Err(format!("balance.port {} is one of the workers' own ports (app.port ..= {top})", self.port));
+        }
+        if w.count > crate::networking::steer_max_slots() {
+            return Err(format!("[balance] spreads over at most {} workers", crate::networking::steer_max_slots()));
+        }
+        if cfg.route.is_some() || cfg.static_files.is_some() || w.mode != Mode::Process {
+            return Err("[balance] is for process-mode apps (not [route], [static] or worker mode)".into());
+        }
+        Ok(())
+    }
 }
 
 /// `[route]`: hostname → app.
@@ -74,6 +117,9 @@ pub struct Route {
 #[serde(untagged)]
 pub enum RouteTarget {
     Port(u16),
+    /// Several ports (processes that each listen on one): connections take
+    /// turns over them and skip one that refuses.
+    Ports(Vec<u16>),
     App(String),
 }
 
@@ -98,6 +144,9 @@ impl Route {
             }
             match t {
                 RouteTarget::Port(0) => return Err(format!("route.hosts.{h:?}: port 0 is not a port")),
+                RouteTarget::Ports(v) if v.is_empty() || v.contains(&0) => {
+                    return Err(format!("route.hosts.{h:?}: a list of ports, none of them 0"));
+                }
                 RouteTarget::App(name)
                     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) =>
                 {
@@ -1210,6 +1259,9 @@ impl Config {
                 return Err("app.address does not apply to [static]: set static.host".into());
             }
         }
+        if let Some(b) = &self.balance {
+            b.check(self)?;
+        }
         if let Some(r) = &self.route {
             r.check()?;
             if self.app.port.is_none() {
@@ -1224,10 +1276,13 @@ impl Config {
             if self.watch.enabled {
                 return Err("[watch] does not apply to [route]: the router runs Warden's own code".into());
             }
-            if let Some(RouteTarget::Port(p)) =
-                r.hosts.values().find(|t| **t == RouteTarget::Port(self.app.port.unwrap_or(0)))
-            {
-                return Err(format!("route.hosts: port {p} is the router's own port"));
+            let own = self.app.port.unwrap_or(0);
+            if r.hosts.values().any(|t| match t {
+                RouteTarget::Port(p) => *p == own,
+                RouteTarget::Ports(v) => v.contains(&own),
+                RouteTarget::App(_) => false,
+            }) {
+                return Err(format!("route.hosts: port {own} is the router's own port"));
             }
         }
         if let Some(x) = &self.expose {
@@ -1869,6 +1924,18 @@ mod tests {
         assert_eq!(c.watchdog.timeout, 60);
         assert_eq!(c.restart.failed_cooldown, 300);
         assert_eq!(c.health_path(), None);
+    }
+
+    #[test]
+    fn balance_is_checked() {
+        let ok = "[app]\nname = \"a\"\nport = 9000\naddress = \"2001:db8::10\"\n[workers]\ncount = 3\nport_strategy = \"offset\"\n[balance]\nport = 443\n";
+        assert_eq!(Config::parse(ok).unwrap().balance, Some(Balance { port: 443 }));
+        let err = |t: &str| Config::parse(t).unwrap_err();
+        assert!(err(&ok.replace("address = \"2001:db8::10\"\n", "")).contains("needs app.address"));
+        assert!(err(&ok.replace("offset", "shared")).contains("port_strategy = \"offset\""));
+        assert!(err(&ok.replace("port = 443", "port = 9001")).contains("workers' own ports"));
+        assert!(err(&ok.replace("port = 443", "port = 9000")).contains("not app.port"));
+        assert!(err(&ok.replace("count = 3", "count = 300")).contains("at most"));
     }
 
     #[test]

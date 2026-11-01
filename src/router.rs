@@ -18,7 +18,7 @@ mod pipe;
 #[cfg(target_os = "linux")]
 pub(crate) mod rules;
 
-use crate::config::{Config, Route, RouteTarget};
+use crate::config::{Config, PortStrategy, Route, RouteTarget};
 use crate::static_server::serve::{Health, env_number, report};
 use hello::Hello;
 use std::collections::BTreeMap;
@@ -57,6 +57,11 @@ pub struct Table {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Dest {
     pub port: u16,
+    /// Further ports of the same app (`port_strategy = "offset"`: its workers
+    /// each listen on their own): connections take turns over `port` and
+    /// these, and a port that refuses is skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more: Vec<u16>,
     /// The app's own address (`[app] address`): bytes passed go there, and
     /// never from the visitor's address (routing rules for its port would
     /// also catch the answers to the visitors who reach the app directly).
@@ -74,14 +79,26 @@ impl Dest {
     fn port(port: u16) -> Dest {
         Dest { port, ..Dest::default() }
     }
+
+    /// Every port the app's workers listen on.
+    fn ports(&self) -> impl Iterator<Item = u16> + '_ {
+        std::iter::once(self.port).chain(self.more.iter().copied())
+    }
 }
 
 impl std::fmt::Display for Dest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.address {
-            Some(ip) => write!(f, "{}", SocketAddr::new(ip, self.port)),
-            None => write!(f, "{}", self.port),
+        let mut first = true;
+        for port in self.ports() {
+            if !std::mem::take(&mut first) {
+                f.write_str(",")?;
+            }
+            match self.address {
+                Some(ip) => write!(f, "{}", SocketAddr::new(ip, port))?,
+                None => write!(f, "{port}")?,
+            }
         }
+        Ok(())
     }
 }
 
@@ -93,7 +110,17 @@ pub fn table(r: &Route) -> Table {
 
 fn table_with(r: &Route, apps: &[Config]) -> Table {
     let mut t = Table { client_ip: r.client_ip(), host: r.host.clone(), ..Table::default() };
-    let app = |c: &Config, port: u16| Dest { port, address: c.app.address, handoff: Some(handoff_socket(c)) };
+    let app = |c: &Config, port: u16| Dest {
+        port,
+        // Workers on ports of their own: the router spreads over all of them.
+        more: if c.workers.port_strategy == PortStrategy::Offset {
+            (1..c.workers.count).filter_map(|i| port.checked_add(i as u16)).collect()
+        } else {
+            Vec::new()
+        },
+        address: c.app.address,
+        handoff: Some(handoff_socket(c)),
+    };
     for (host, target) in &r.hosts {
         let dest = match target {
             // A port: the app on it, if one here has it (and no address of its own).
@@ -101,6 +128,7 @@ fn table_with(r: &Route, apps: &[Config]) -> Table {
                 .iter()
                 .find(|c| c.app.port == Some(*p) && c.route.is_none() && c.app.address.is_none())
                 .map_or_else(|| Dest::port(*p), |c| app(c, *p)),
+            RouteTarget::Ports(v) => Dest { port: v[0], more: v[1..].to_vec(), ..Dest::default() },
             RouteTarget::App(name) => match apps.iter().find(|c| &c.app.name == name && c.route.is_none()) {
                 Some(c) if c.app.port.is_some() => app(c, c.app.port.unwrap_or(0)),
                 _ => {
@@ -137,6 +165,7 @@ pub fn routed(cfg: &Config) -> bool {
         r.hosts.values().any(|t| match t {
             RouteTarget::App(n) => *n == cfg.app.name,
             RouteTarget::Port(p) => Some(*p) == cfg.app.port,
+            RouteTarget::Ports(_) => false,
         })
     })
 }
@@ -163,7 +192,7 @@ impl Table {
     /// to on loopback (not the apps with their own address).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn rule_ports(&self) -> Vec<u16> {
-        let mut p: Vec<u16> = self.routes.values().filter(|d| d.address.is_none()).map(|d| d.port).collect();
+        let mut p: Vec<u16> = self.routes.values().filter(|d| d.address.is_none()).flat_map(|d| d.ports()).collect();
         p.sort_unstable();
         p.dedup();
         p
@@ -345,34 +374,50 @@ async fn connection(
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
     let Some(dest) = table.lookup(host.as_deref()) else { return Ok(()) };
-    let port = dest.port;
     if handovers.give(dest, &c).await {
         // The app's worker has it; our copy closes, the connection stays.
         return Ok(());
     }
 
     let peer_ip = peer.ip().to_canonical();
-    let (target, from) = if let Some(ip) = dest.address {
-        // An app on its own address: the router's own address as the source.
-        (SocketAddr::new(ip, port), None)
-    } else if transparent && !peer_ip.is_loopback() {
-        // The app's port on the address the visitor reached: from the
-        // visitor's address, a loopback target would be a martian.
-        (SocketAddr::new(c.local_addr()?.ip().to_canonical(), port), Some(peer_ip))
+    let local_ip = if dest.address.is_none() && transparent && !peer_ip.is_loopback() {
+        Some(c.local_addr()?.ip().to_canonical())
     } else {
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), None)
+        None
     };
-    let sock = if target.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
-    if let Some(ip) = from {
-        bind_transparent(&sock, ip)?;
+    // Workers on ports of their own take turns; one that refuses is skipped.
+    static TURN: AtomicUsize = AtomicUsize::new(0);
+    let ports: Vec<u16> = dest.ports().collect();
+    let first = if ports.len() > 1 { TURN.fetch_add(1, Ordering::Relaxed) } else { 0 };
+    let mut last = io::Error::from(io::ErrorKind::NotFound);
+    for k in 0..ports.len() {
+        let port = ports[(first + k) % ports.len()];
+        let (target, from) = if let Some(ip) = dest.address {
+            // An app on its own address: the router's own address as the source.
+            (SocketAddr::new(ip, port), None)
+        } else if let Some(ip) = local_ip {
+            // The app's port on the address the visitor reached: from the
+            // visitor's address, a loopback target would be a martian.
+            (SocketAddr::new(ip, port), Some(peer_ip))
+        } else {
+            (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), None)
+        };
+        let sock = if target.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+        if let Some(ip) = from {
+            bind_transparent(&sock, ip)?;
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(target)).await {
+            Ok(Ok(up)) => {
+                up.set_nodelay(true)?;
+                // The ClientHello is still in `c`: the pipe passes it on first.
+                pipe::both(&c, &up).await;
+                return Ok(());
+            }
+            Ok(Err(e)) => last = e,
+            Err(_) => last = io::Error::from(io::ErrorKind::TimedOut),
+        }
     }
-    let up = tokio::time::timeout(CONNECT_TIMEOUT, sock.connect(target))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-    up.set_nodelay(true)?;
-    // The ClientHello is still in `c`: the pipe passes it on first.
-    pipe::both(&c, &up).await;
-    Ok(())
+    Err(last)
 }
 
 /// The hostname a connection's ClientHello asks for, read with MSG_PEEK so
@@ -563,6 +608,16 @@ mod tests {
         assert_eq!(t.routes["b.test"].handoff, Some(handoff_socket(&apps[1])), "each app its own supervisor");
         assert_eq!(t.routes["c.test"].to_string(), "8443");
         assert_eq!(t.rule_ports(), vec![8443], "rules on 443 would catch the answers to its direct visitors");
+    }
+
+    #[test]
+    fn an_app_with_a_port_per_worker_is_routed_over_all_its_ports() {
+        let app = |text: &str| Config::parse(text).unwrap();
+        let apps = [app("[app]\nname = \"api\"\nport = 9000\n[workers]\ncount = 3\nport_strategy = \"offset\"\n")];
+        let r: Route = toml::from_str("hosts = { \"a.test\" = \"api\" }").unwrap();
+        let t = table_with(&r, &apps);
+        assert_eq!(t.routes["a.test"].ports().collect::<Vec<_>>(), vec![9000, 9001, 9002]);
+        assert_eq!(t.rule_ports(), vec![9000, 9001, 9002]);
     }
 
     #[test]

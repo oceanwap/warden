@@ -8,6 +8,16 @@ use crate::config::PortStrategy;
 
 #[cfg(target_os = "linux")]
 pub(crate) mod address;
+#[cfg(target_os = "linux")]
+pub(crate) mod steer;
+
+/// The most workers `[balance]` spreads connections over.
+pub fn steer_max_slots() -> usize {
+    #[cfg(target_os = "linux")]
+    return steer::MAX_SLOTS;
+    #[cfg(not(target_os = "linux"))]
+    256
+}
 
 /// The port worker `id` (1-based) should listen on.
 pub fn worker_port(base: u16, strategy: PortStrategy, id: usize) -> u16 {

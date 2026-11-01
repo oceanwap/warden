@@ -3,6 +3,17 @@
 All notable changes to Warden are documented here.
 Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- `[balance]` (Linux, root): connections to an app's `address:port` are
+  spread by the kernel over workers that each listen on their own port
+  (`port_strategy = "offset"`), with an eBPF `sk_lookup` program. No proxy,
+  no `SO_REUSEPORT` needed, no byte copied. A worker joins when ready and
+  leaves when it starts to stop. Without privileges it logs why and the
+  workers keep their ports. See `docs/balance.md`.
+
 ## [0.1.8] — 2026-10-17
 
 ### Added

@@ -111,6 +111,16 @@ pub struct Supervisor {
     handoff_listen: bool,
     /// The dispatcher, once a worker said it takes handed-over connections.
     handoff: Option<crate::handoff::Handoff>,
+    /// `[balance]`: the kernel program that sends connections to the workers'
+    /// ports, once the first worker listens (Linux, root); `None` if it could
+    /// not be attached (said once).
+    #[cfg(target_os = "linux")]
+    steer: Option<networking::steer::Steer>,
+    #[cfg(target_os = "linux")]
+    steer_failed: bool,
+    /// Which instance holds each slot of the program.
+    #[cfg(target_os = "linux")]
+    steer_owner: HashMap<usize, u64>,
     /// A worker's Bun is too old for the handoff (its version): logged once,
     /// then shown as the status hint (`warden doctor`, the GUI).
     handoff_old_bun: Option<String>,
@@ -733,6 +743,12 @@ impl Supervisor {
                 cfg!(target_os = "macos"),
             ),
             handoff: None,
+            #[cfg(target_os = "linux")]
+            steer: None,
+            #[cfg(target_os = "linux")]
+            steer_failed: false,
+            #[cfg(target_os = "linux")]
+            steer_owner: HashMap::new(),
             handoff_old_bun: None,
             policy: Policy::from(&cfg.restart),
             count: cfg.workers.count,
@@ -1973,6 +1989,10 @@ impl Supervisor {
             }
             Role::Retiring | Role::Standby => {}
         }
+        #[cfg(target_os = "linux")]
+        if matches!(role, Role::Current | Role::Replacement) {
+            self.steer_add(inst_id);
+        }
         self.attach_oom(inst_id);
         self.rollout_on_ready(inst_id);
         self.check_all_ready();
@@ -2460,6 +2480,69 @@ impl Supervisor {
         }
     }
 
+    /// `[balance]`: the worker listens, so connections to the app's public
+    /// port may go to it.
+    #[cfg(target_os = "linux")]
+    fn steer_add(&mut self, inst_id: u64) {
+        let (Some(b), Some(addr), Some(base)) = (self.cfg.balance.clone(), self.cfg.app.address, self.cfg.app.port)
+        else {
+            return;
+        };
+        if self.steer_failed {
+            return;
+        }
+        let Some(inst) = self.insts.get(&inst_id) else { return };
+        let (slot, pid) = (inst.slot.max(1), inst.handle.pid);
+        if self.steer.is_none() {
+            match networking::steer::Steer::attach(addr, b.port, self.cfg.workers.count) {
+                Ok(s) => {
+                    info!("balancing the app's public port over its workers", address = addr, port = b.port);
+                    self.steer = Some(s);
+                }
+                Err(e) => {
+                    self.steer_failed = true;
+                    warn!(
+                        "[balance] is off: the workers keep their own ports and nothing spreads connections over them",
+                        error = e,
+                        hint = "needs Linux 5.9+ and root (CAP_BPF and CAP_NET_ADMIN); see docs/balance.md",
+                    );
+                    return;
+                }
+            }
+        }
+        let port = networking::worker_port(base, self.cfg.workers.port_strategy, slot);
+        let listener = networking::steer::find_listener(&crate::platform::process_tree(pid), port);
+        let result = match (&self.steer, listener) {
+            (Some(s), Ok(fd)) => s.set(slot - 1, std::os::fd::AsRawFd::as_raw_fd(&fd)),
+            (_, Err(e)) => Err(e),
+            _ => return,
+        };
+        // The descriptor is closed here; the map keeps the socket.
+        match result {
+            Ok(()) => {
+                self.steer_owner.insert(slot - 1, inst_id);
+            }
+            Err(e) => warn!(
+                "the worker is not in the balance: connections to the public port skip it",
+                worker = slot,
+                port = port,
+                error = e,
+            ),
+        }
+    }
+
+    /// `[balance]`: a worker that stops gets no new connection.
+    #[cfg(target_os = "linux")]
+    fn steer_remove(&mut self, inst_id: u64) {
+        let slots: Vec<usize> = self.steer_owner.iter().filter(|(_, o)| **o == inst_id).map(|(s, _)| *s).collect();
+        for s in slots {
+            if let Some(st) = &self.steer {
+                st.clear(s);
+            }
+            self.steer_owner.remove(&s);
+        }
+    }
+
     fn stop_instance(&mut self, inst_id: u64) {
         let grace = self.cfg.grace_period();
         let stop_signal = self.cfg.stop_signal();
@@ -2470,6 +2553,9 @@ impl Supervisor {
             return;
         }
         i.stopping = true;
+        #[cfg(target_os = "linux")]
+        self.steer_remove(inst_id);
+        let Some(i) = self.insts.get_mut(&inst_id) else { return };
         // Out of the rotation before it drains: no new connection for it.
         if let (true, Some(h)) = (i.handoff, self.handoff.as_ref()) {
             h.remove(inst_id);
@@ -2492,6 +2578,8 @@ impl Supervisor {
     }
 
     fn kill_instance(&mut self, inst_id: u64) {
+        #[cfg(target_os = "linux")]
+        self.steer_remove(inst_id);
         let Some(who) = self.insts.get(&inst_id).map(|i| self.event_who(i)) else { return };
         if let Some(h) = self.handoff.as_ref() {
             h.remove(inst_id);
