@@ -20,6 +20,10 @@ ignore = [
     # arise. Moving to the unsafe `register` constructors touches the accept,
     # keeper and process paths: do it on purpose, then drop this entry.
     "RUSTSEC-2026-0386",
+    # rustls-pemfile is unmaintained (its parser moved into rustls-pki-types),
+    # with no vulnerability. Replace it when the TLS loading code is next
+    # touched, then drop this entry.
+    "RUSTSEC-2025-0134",
 ]
 
 [sources]
