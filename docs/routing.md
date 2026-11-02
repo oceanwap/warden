@@ -150,7 +150,8 @@ no `X-Forwarded-For` are needed. The mechanism, the same as nginx's
 
 - The router's connection is bound to the visitor's address (IP_TRANSPARENT,
   so Warden runs as root or with CAP_NET_ADMIN), and goes to the app's port on
-  the address the visitor reached.
+  the address the visitor reached; for an app with `[balance]`, to its
+  `address` and its workers' ports.
 - The app answers to the visitor's address. Two routing rules, which Warden
   adds when a router worker starts and removes when the router stops, deliver
   those packets back to the router instead of the internet:
@@ -162,8 +163,20 @@ no `X-Forwarded-For` are needed. The mechanism, the same as nginx's
 
 Because of the rules, while the router runs an app's port answers only
 through the router: a visitor connecting to `:8443` directly gets no answer.
-The app has to listen on all addresses (`0.0.0.0` or `::`), not only
-`127.0.0.1`. `client_ip = false` turns all of this off: apps then see
+The app has to listen on an address other than loopback: on all addresses
+(`0.0.0.0` or `::`), or on the address the visitor reached (or, with
+`[balance]`, on its own `address`), not only on `127.0.0.1`.
+
+Apps with an `address` get the visitor's IP from the router only with
+`[balance]` (see [balance.md](balance.md)), whose workers' ports visitors
+never connect to. An app that has an `address` and a public port of its own
+(`port = 443`, no `[balance]`) keeps the router's address as the peer when the
+router passes bytes: the rule on port 443 would also catch the answers to its
+direct visitors, which no rule can tell apart. It sees the visitor's IP when
+its connections are handed over (above). Also unchanged: an `address` on
+loopback (127.x, ::1), because a packet from the visitor's address to a
+loopback address is dropped as a martian source, and an `address` of the other
+IP family than the visitor. `client_ip = false` turns all of this off: apps then see
 `127.0.0.1`, and the router needs no privileges (that is the only mode on
 macOS). The rules use priority and table 22356, so run one router app per
 host.

@@ -9348,3 +9348,75 @@ fn the_router_sends_each_hostname_to_its_app() {
     let mut b = [0u8; 16];
     assert_eq!(c.read(&mut b).unwrap_or(0), 0);
 }
+
+/// `client_ip` with an app on its own address (the `[balance]` shape): the
+/// router connects from the visitor's address to the app, which listens on its
+/// own address only, so the app's peer is the visitor. In network namespaces
+/// of their own (the rules and addresses stay out of the host's); needs root,
+/// `ip` and python3, else skips.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_router_connects_to_an_apps_own_address_from_the_visitors() {
+    let ip = |args: &[&str]| Command::new("ip").args(args).output().map(|o| o.status.success()).unwrap_or(false);
+    let python = Command::new("python3").arg("-c").arg("").status().map(|s| s.success()).unwrap_or(false);
+    let _ = (ip(&["netns", "del", "cipfix"]), ip(&["netns", "del", "cipfixc"]));
+    struct Netns;
+    impl Drop for Netns {
+        fn drop(&mut self) {
+            for n in ["cipfix", "cipfixc"] {
+                let _ = Command::new("ip").args(["netns", "del", n]).status();
+            }
+        }
+    }
+    let _ns = Netns;
+    let setup: &[&[&str]] = &[
+        &["netns", "add", "cipfix"],
+        &["netns", "add", "cipfixc"],
+        &["link", "add", "cf0", "netns", "cipfix", "type", "veth", "peer", "name", "cf1", "netns", "cipfixc"],
+        &["-n", "cipfix", "addr", "add", "10.78.0.1/24", "dev", "cf0"],
+        &["-n", "cipfix", "link", "set", "cf0", "up"],
+        &["-n", "cipfix", "link", "set", "lo", "up"],
+        &["-n", "cipfix", "addr", "add", "10.78.0.5/32", "dev", "lo"],
+        &["-n", "cipfixc", "addr", "add", "10.78.0.2/24", "dev", "cf1"],
+        &["-n", "cipfixc", "link", "set", "cf1", "up"],
+        // What the supervisor's rules do (router::rules), for the workers' port.
+        &["-n", "cipfix", "rule", "add", "pref", "22356", "ipproto", "tcp", "sport", "9317", "lookup", "22356"],
+        &["-n", "cipfix", "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "22356"],
+    ];
+    if !python || !setup.iter().all(|a| ip(a)) {
+        eprintln!("skipping: needs root, `ip` with network namespaces and python3");
+        return;
+    }
+    let nsexec = |ns: &str| {
+        let mut c = Command::new("ip");
+        c.args(["netns", "exec", ns]);
+        c
+    };
+    // The app: on 10.78.0.5 only; answers with the peer address it sees.
+    let mut app = nsexec("cipfix")
+        .args(["python3", "-c"])
+        .arg(
+            "import socket\ns=socket.socket();s.setsockopt(1,2,1);s.bind(('10.78.0.5',9317));s.listen(8)\n\
+             while True:\n c,r=s.accept();c.sendall(('peer='+r[0]+'\\n').encode());c.close()",
+        )
+        .spawn()
+        .unwrap();
+    let route = json!({"routes": {"a.test": {"port": 9317, "address": "10.78.0.5", "balanced": true}},
+                       "client_ip": true, "host": "0.0.0.0"});
+    let mut router = nsexec("cipfix")
+        .env("PORT", "8447")
+        .env("WARDEN_ROUTE", route.to_string())
+        .args([BIN, "route"])
+        .spawn()
+        .unwrap();
+    let hello: String = client_hello("a.test").iter().map(|b| format!("{b:02x}")).collect();
+    let ask = || -> String {
+        let code = "import socket,sys,time\nt=time.time()+10\nwhile True:\n try:\n  s=socket.create_connection(('10.78.0.1',8447),timeout=5);break\n \
+                    except OSError:\n  assert time.time()<t;time.sleep(0.05)\ns.sendall(bytes.fromhex(sys.argv[1]))\nprint(s.recv(100).decode().strip())";
+        let o = nsexec("cipfixc").args(["python3", "-c", code, &hello]).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let seen = ask();
+    let _ = (app.kill(), router.kill(), app.wait(), router.wait());
+    assert_eq!(seen, "peer=10.78.0.2", "the app sees the visitor's address, not the router's");
+}

@@ -14,6 +14,14 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   leaves when it starts to stop. Without privileges it logs why and the
   workers keep their ports. See `docs/balance.md`.
 
+### Fixed
+
+- `[route]` with `client_ip`: an app with `[balance]` (so with `app.address`)
+  now sees the visitor's IP when the router passes bytes to it, not the
+  router's address; the routing rules cover its workers' ports. Own-address
+  apps that visitors also reach directly, and loopback addresses, keep
+  the router's address. See `docs/routing.md`.
+
 ## [0.1.8] — 2026-10-17
 
 ### Added
