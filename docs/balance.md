@@ -52,6 +52,17 @@ loads the program with raw `bpf(2)`: no libbpf and no compiler.
 - At most 256 workers per app. Each `[balance]` app attaches its own program,
   which matches only its own address and port.
 
+## Behind the hostname router
+
+With [the router](routing.md) in front (`hosts = { "api.example.com" = "api" }`,
+for visitors on a shared IPv4 address), the router connects to the workers'
+ports on `app.address` from the visitor's own address (`client_ip`, on by
+default on Linux with root), so the workers see the visitor's IP. The routing
+rules cover `app.port`, `app.port + 1`, ...: those ports answer only through
+the router. The workers may listen on `app.address` alone. Not with a loopback
+`app.address` or a visitor of the other IP family: those connections come from
+the router's address.
+
 ## What it does not do
 
 - No health-based routing beyond what Warden already does (a worker that fails

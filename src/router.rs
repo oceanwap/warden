@@ -62,12 +62,16 @@ pub struct Dest {
     /// these, and a port that refuses is skipped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub more: Vec<u16>,
-    /// The app's own address (`[app] address`): bytes passed go there, and
-    /// never from the visitor's address (routing rules for its port would
-    /// also catch the answers to the visitors who reach the app directly).
-    /// Several apps can share a port this way.
+    /// The app's own address (`[app] address`): bytes passed go there. From
+    /// the visitor's address only when `balanced` (else routing rules for its
+    /// port would also catch the answers to the visitors who reach the app
+    /// directly). Several apps can share a port this way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<IpAddr>,
+    /// The app has `[balance]`: visitors reach it on `balance.port`, never on
+    /// the ports the router connects to, so those can carry `client_ip`'s rules.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub balanced: bool,
     /// The `route.sock` of the app: its connections are handed to the app's
     /// workers when its supervisor takes them (`crate::handoff`), and passed
     /// byte by byte otherwise.
@@ -78,6 +82,13 @@ pub struct Dest {
 impl Dest {
     fn port(port: u16) -> Dest {
         Dest { port, ..Dest::default() }
+    }
+
+    /// Whether connections to the app can come from the visitor's address:
+    /// an app on its own address needs `balanced` and a non-loopback address
+    /// (a visitor's address toward 127.x/::1 is a martian source).
+    fn can_use_visitor_source(&self) -> bool {
+        self.address.is_none_or(|a| self.balanced && !a.is_loopback())
     }
 
     /// Every port the app's workers listen on.
@@ -119,6 +130,7 @@ fn table_with(r: &Route, apps: &[Config]) -> Table {
             Vec::new()
         },
         address: c.app.address,
+        balanced: c.balance.is_some(),
         handoff: Some(handoff_socket(c)),
     };
     for (host, target) in &r.hosts {
@@ -189,10 +201,12 @@ impl Table {
     }
 
     /// The ports `client_ip`'s routing rules are for: those connections go
-    /// to on loopback (not the apps with their own address).
+    /// to, except an own-address app's ports that visitors reach directly (or
+    /// that are on loopback).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn rule_ports(&self) -> Vec<u16> {
-        let mut p: Vec<u16> = self.routes.values().filter(|d| d.address.is_none()).flat_map(|d| d.ports()).collect();
+        let mut p: Vec<u16> =
+            self.routes.values().filter(|d| d.can_use_visitor_source()).flat_map(|d| d.ports()).collect();
         p.sort_unstable();
         p.dedup();
         p
@@ -380,10 +394,12 @@ async fn connection(
     }
 
     let peer_ip = peer.ip().to_canonical();
-    let local_ip = if dest.address.is_none() && transparent && !peer_ip.is_loopback() {
-        Some(c.local_addr()?.ip().to_canonical())
-    } else {
-        None
+    let from_visitor = transparent && !peer_ip.is_loopback() && dest.can_use_visitor_source();
+    let local_ip = match dest.address {
+        // A source of the other family cannot connect there.
+        Some(a) => (from_visitor && a.is_ipv4() == peer_ip.is_ipv4()).then_some(a),
+        None if from_visitor => Some(c.local_addr()?.ip().to_canonical()),
+        None => None,
     };
     // Workers on ports of their own take turns; one that refuses is skipped.
     static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -392,13 +408,14 @@ async fn connection(
     let mut last = io::Error::from(io::ErrorKind::NotFound);
     for k in 0..ports.len() {
         let port = ports[(first + k) % ports.len()];
-        let (target, from) = if let Some(ip) = dest.address {
+        let (target, from) = if let Some(ip) = local_ip {
+            // The app's port on its own address, or on the address the
+            // visitor reached: from the visitor's address (a loopback target
+            // would be a martian).
+            (SocketAddr::new(ip, port), Some(peer_ip))
+        } else if let Some(ip) = dest.address {
             // An app on its own address: the router's own address as the source.
             (SocketAddr::new(ip, port), None)
-        } else if let Some(ip) = local_ip {
-            // The app's port on the address the visitor reached: from the
-            // visitor's address, a loopback target would be a martian.
-            (SocketAddr::new(ip, port), Some(peer_ip))
         } else {
             (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port), None)
         };
@@ -608,6 +625,23 @@ mod tests {
         assert_eq!(t.routes["b.test"].handoff, Some(handoff_socket(&apps[1])), "each app its own supervisor");
         assert_eq!(t.routes["c.test"].to_string(), "8443");
         assert_eq!(t.rule_ports(), vec![8443], "rules on 443 would catch the answers to its direct visitors");
+    }
+
+    #[test]
+    fn balanced_apps_on_their_own_address_get_rules_for_their_workers_ports() {
+        let app = |text: &str| Config::parse(text).unwrap();
+        let bal = "[workers]\ncount = 2\nport_strategy = \"offset\"\n[balance]\nport = 443\n";
+        let apps = [
+            app(&format!("[app]\nname = \"a\"\nport = 9000\naddress = \"2001:db8::10\"\n{bal}")),
+            app(&format!("[app]\nname = \"b\"\nport = 9100\naddress = \"127.0.0.2\"\n{bal}")),
+        ];
+        let r: Route = toml::from_str("hosts = { \"a.test\" = \"a\", \"b.test\" = \"b\" }").unwrap();
+        let t = table_with(&r, &apps);
+        assert!(
+            t.routes["a.test"].can_use_visitor_source() && !t.routes["b.test"].can_use_visitor_source(),
+            "loopback is a martian"
+        );
+        assert_eq!(t.rule_ports(), vec![9000, 9001]);
     }
 
     #[test]
