@@ -171,6 +171,18 @@ carries the same reason with a `hint=`.
 | `openat2 is unavailable … checking paths with realpath instead` | Kernel before 5.6, or a seccomp profile blocks `openat2` (some container runtimes) | Nothing breaks, it is slower; allow `openat2` in the seccomp profile. `WARDEN_STATIC_OPEN=legacy` forces this mode for testing |
 | Stale content after a deploy | Workers resolve a `current` symlink when they start | `warden restart <site>` (rolling, no downtime) |
 
+## Automatic HTTPS (`[tls]`)
+
+`warden tls` lists the certificates and how long each has left. Details: [`tls.md`](tls.md).
+
+| You see | Why | Fix |
+|---|---|---|
+| `no certificate yet: workers start with a self-signed placeholder` | The first start of an app with `[tls]` | Nothing: the real certificate follows within a minute if port 80 reaches this server and the names resolve to it; the workers are then replaced by a rolling reload |
+| `port for the certificate challenge is not available` | Warden cannot listen on port 80 (`http_port`), so no certificate can be ordered; the app keeps serving | Another server (nginx) holds the port, or Warden may not bind it: run as root or `sysctl net.ipv4.ip_unprivileged_port_start=80`. Retried every minute |
+| `certificate order failed; trying again later` | The CA could not validate a name or refused the order; `reason` has its words | The name does not resolve to this server, port 80 is blocked, or the CA's rate limit. `staging = true` tries without the limits. Retried after 1, 5 and 15 minutes, then hourly, up to 12 hours |
+| `certificate renewal failed and the certificate expires soon` | The same, with less than 14 days left | Fix the cause above; the running certificate keeps serving until it expires |
+| `reload for the new certificate could not start; trying again` | Another rollout is running or the workers are stopping | Nothing: tried again on the next tick |
+
 ## The CLI
 
 | You see | Why | Fix |

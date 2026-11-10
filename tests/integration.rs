@@ -9420,3 +9420,182 @@ fn the_router_connects_to_an_apps_own_address_from_the_visitors() {
     let _ = (app.kill(), router.kill(), app.wait(), router.wait());
     assert_eq!(seen, "peer=10.78.0.2", "the app sees the visitor's address, not the router's");
 }
+
+// ---------------------------------------------------------------- [tls]
+
+/// The certificate a TLS server on `port` presents for `host`: openssl's
+/// one-line issuer and the subject alternative names.
+fn served_cert(port: u16, host: &str) -> Option<String> {
+    let mut s = Command::new("openssl")
+        .args(["s_client", "-connect", &format!("127.0.0.1:{port}"), "-servername", host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pem = String::new();
+    s.stdout.take()?.read_to_string(&mut pem).ok()?;
+    let _ = s.wait();
+    let mut x = Command::new("openssl")
+        .args(["x509", "-noout", "-issuer", "-ext", "subjectAltName"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    x.stdin.take()?.write_all(pem.as_bytes()).ok()?;
+    let out = x.wait_with_output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Raw HTTP/1.1 request to `port`; the whole answer.
+fn raw_http(port: u16, req: &str) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+fn tls_config(name: &str, port: u16, directory: &str, http_port: u16) -> String {
+    format!(
+        "{}\n[tls]\nhosts = [\"app.test\"]\nemail = \"me@example.com\"\ndirectory = \"{directory}\"\nhttp_port = {http_port}\n",
+        gated(name, port, 2, "")
+    )
+}
+
+/// `[tls]` with a CA that cannot be reached: the app still listens (with the
+/// app's plain `Bun.serve`, given a placeholder certificate by the shim), health
+/// checks pass, port 80 redirects to https, and the order fails with a hint,
+/// not a crash.
+#[test]
+fn a_tls_section_serves_a_placeholder_and_redirects() {
+    if !have_bun() || !have_openssl() {
+        return;
+    }
+    let (port, http) = (free_port(), free_port());
+    let home = tmp().join(format!("warden-tls-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let cfg = tls_config("tlsph", port, &format!("https://127.0.0.1:{}/dir", free_port()), http);
+    let w = Warden::start_env("tlsph", port, &cfg, &[("WARDEN_HOME", home.to_str().unwrap())]);
+    w.wait_for("ready", T, ready(2));
+    let cert = served_cert(port, "app.test").expect("TLS on the app's port");
+    assert!(cert.contains("DNS:app.test"), "{cert}");
+    let log = w.wait_log("certificate order failed", T);
+    assert!(log.contains("no certificate yet"), "{log}");
+    every_warning_has_a_hint(&log);
+    let r = raw_http(http, "GET /a?b=1 HTTP/1.1\r\nHost: app.test\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 308") && r.contains("Location: https://app.test/a?b=1\r\n"), "{r}");
+    assert!(
+        raw_http(http, "GET /.well-known/acme-challenge/nope HTTP/1.1\r\nHost: app.test\r\n\r\n")
+            .starts_with("HTTP/1.1 404")
+    );
+    let out = warden().arg("tls").env("WARDEN_HOME", &home).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("placeholder"), "{out:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A test ACME server (Pebble and its DNS stand-in), when the tools are
+/// there: `pebble` and `pebble-challtestsrv` on PATH and PEBBLE_CERTS naming
+/// Pebble's `test/certs` directory. Killed when dropped.
+struct Pebble {
+    procs: Vec<Child>,
+    dir: PathBuf,
+    port: u16,
+    http: u16,
+}
+
+impl Pebble {
+    fn start() -> Option<Pebble> {
+        let certs = PathBuf::from(std::env::var_os("PEBBLE_CERTS")?);
+        let found = |b: &str| Command::new(b).arg("-help").output().is_ok();
+        if !(found("pebble") && found("pebble-challtestsrv")) {
+            return None;
+        }
+        let (port, mgmt, http, tls, dns, chall) =
+            (free_port(), free_port(), free_port(), free_port(), free_port(), free_port());
+        let dir = tmp().join(format!("warden-pebble-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = json!({"pebble": {
+            "listenAddress": format!("127.0.0.1:{port}"), "managementListenAddress": format!("127.0.0.1:{mgmt}"),
+            "certificate": certs.join("localhost/cert.pem"), "privateKey": certs.join("localhost/key.pem"),
+            "httpPort": http, "tlsPort": tls, "ocspResponderURL": "", "externalAccountBindingRequired": false,
+            "domainBlocklist": [], "retryAfter": {"authz": 1, "order": 1}, "keyAlgorithm": "ecdsa",
+            "profiles": {"default": {"description": "default", "validityPeriod": 7776000}}}});
+        std::fs::write(dir.join("pebble.json"), conf.to_string()).unwrap();
+        let quiet = || (Stdio::null(), Stdio::null());
+        let (o, e) = quiet();
+        let challtest = Command::new("pebble-challtestsrv")
+            .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-defaultIPv6", ""])
+            .args(["-dnsserver", &format!("127.0.0.1:{dns}"), "-management", &format!("127.0.0.1:{chall}")])
+            .stdout(o)
+            .stderr(e)
+            .spawn()
+            .ok()?;
+        let (o, e) = quiet();
+        let pebble = Command::new("pebble")
+            .args(["-config"])
+            .arg(dir.join("pebble.json"))
+            .args(["-dnsserver", &format!("127.0.0.1:{dns}")])
+            .env("PEBBLE_VA_NOSLEEP", "1")
+            .stdout(o)
+            .stderr(e)
+            .spawn()
+            .ok()?;
+        let me = Pebble { procs: vec![challtest, pebble], dir, port, http };
+        let t0 = Instant::now();
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "Pebble did not start");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(me)
+    }
+}
+
+impl Drop for Pebble {
+    fn drop(&mut self) {
+        for p in &mut self.procs {
+            let _ = p.kill();
+            let _ = p.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The whole path against a real ACME server: placeholder first, then the
+/// CA validates the name over port 80 (the supervisor's own responder), the
+/// certificate is stored, the workers are replaced by a gated rolling reload
+/// and present it. `warden tls` reports it.
+#[test]
+fn a_tls_section_gets_a_certificate_and_rolls_the_workers() {
+    if !have_bun() || !have_openssl() {
+        return;
+    }
+    let Some(pebble) = Pebble::start() else {
+        eprintln!("skipping: pebble, pebble-challtestsrv and PEBBLE_CERTS are needed");
+        return;
+    };
+    let port = free_port();
+    let home = tmp().join(format!("warden-tls-home2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let root = Path::new(&std::env::var("PEBBLE_CERTS").unwrap()).join("pebble.minica.pem");
+    let cfg = tls_config("tlsca", port, &format!("https://127.0.0.1:{}/dir", pebble.port), pebble.http);
+    let w = Warden::start_env(
+        "tlsca",
+        port,
+        &cfg,
+        &[("WARDEN_HOME", home.to_str().unwrap()), ("WARDEN_ACME_ROOT", root.to_str().unwrap())],
+    );
+    let before = pid_set(&w.wait_for("ready", T, ready(2)));
+    w.wait_log("new certificate: rolling reload", Duration::from_secs(60));
+    let s = w.wait_for("workers replaced", T, |s| s["last_rollout"]["ok"] == true && ready(2)(s));
+    assert!(pid_set(&s).is_disjoint(&before), "every worker must be new");
+    let cert = served_cert(port, "app.test").unwrap();
+    assert!(cert.contains("Pebble") && cert.contains("DNS:app.test"), "{cert}");
+    let out = warden().arg("tls").env("WARDEN_HOME", &home).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.contains("app.test") && out.contains("issued") && out.contains("89 days left"), "{out}");
+    every_warning_has_a_hint(&w.log());
+    let _ = std::fs::remove_dir_all(&home);
+}

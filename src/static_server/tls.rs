@@ -84,7 +84,7 @@ pub(super) fn test_cert_files(dir: &std::path::Path) -> (std::path::PathBuf, std
     let mut f = std::fs::File::create(&cert).unwrap();
     f.write_all(certified.cert.pem().as_bytes()).unwrap();
     let mut f = std::fs::File::create(&key).unwrap();
-    f.write_all(certified.key_pair.serialize_pem().as_bytes()).unwrap();
+    f.write_all(certified.signing_key.serialize_pem().as_bytes()).unwrap();
     (cert, key)
 }
 

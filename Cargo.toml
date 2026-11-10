@@ -53,12 +53,16 @@ rustls-pemfile = "2"
 h2 = "0.4"
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde"] }
 warden-protocol = { path = "protocol" }
+# `[tls]`: the ACME client (pure Rust on the same ring-based rustls), the
+# placeholder certificate, and the certificate's validity dates.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+x509-parser = { version = "0.18", default-features = false }
+time = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 libc = "0.2.189"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-# Makes self-signed certificates for the TLS tests (pure Rust, tests only).
-rcgen = "0.13"
 
 [profile.release]
 lto = true
