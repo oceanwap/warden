@@ -40,6 +40,7 @@ mod supervisor;
 mod sys;
 mod systemd;
 mod table;
+mod unavailable;
 mod upgrade;
 mod watch;
 mod worker;

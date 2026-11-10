@@ -213,6 +213,18 @@ Applies to every log file above; built in, no logrotate needed.
 | `listen` | none | e.g. `"127.0.0.1:9464"`: Prometheus text at `/metrics` |
 | `requests` | `true` | Count the responses the workers send, by status (2xx, 3xx, 4xx, 404, 5xx), for `warden list` (`req/s`, `4xx/5xx`), `status`, the GUI and the metrics (`warden_responses_total`): Warden's static server counts its own, and the shim, under Node, subscribes to `node:diagnostics_channel` (`http.server.response.finish`): nothing of the app or of `http` is wrapped, and a hello-world server measured the same with and without (25.89 against 25.80 µs of CPU per request). Not available under Bun. `false` turns both off. The ports' queues and connections come from the kernel either way |
 
+## `[unavailable]`
+
+A 503 page on the app's port while no worker serves; off by default. Keys, why it cannot slow the app, and its limits: [`unavailable.md`](unavailable.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Turn the page on |
+| `after` | `2` | Seconds without a serving worker before it appears |
+| `host` | `127.0.0.1` | The address the app listens on (`app.address` wins) |
+| `page` | built-in | HTML file, up to 64 KB, relative to the config file |
+| `retry_after` | `5` | `Retry-After` seconds |
+
 ## `[control]`
 
 | Key | Default | Meaning |

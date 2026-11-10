@@ -1092,6 +1092,58 @@ fn failed_worker_is_retried_after_cooldown() {
     assert!(w.log().contains("retrying failed worker after cooldown"));
 }
 
+/// The status line and body of a GET over a fresh connection.
+fn raw_get(port: u16) -> Option<(String, String)> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(s, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok()?;
+    let (head, body) = buf.split_once("\r\n\r\n")?;
+    Some((head.lines().next()?.to_string(), body.to_string()))
+}
+
+#[test]
+fn the_503_page_is_on_the_port_only_while_no_worker_serves() {
+    if !have_bun() {
+        return;
+    }
+    let port = free_port();
+    let w = Warden::start(
+        "unavailable",
+        port,
+        &format!(
+            "[app]\nname = \"unavailable\"\nargs = [\"{}\"]\nport = {port}\nenv = {{ FIXTURE_NO_LISTEN = \"1\" }}\n[unavailable]\nenabled = true\nafter = 1\n",
+            fixture("app.ts")
+        ),
+    );
+    let deadline = Instant::now() + T;
+    let down = loop {
+        match raw_get(port) {
+            Some(r) => break r,
+            None => assert!(Instant::now() < deadline, "no 503 page appeared:\n{}", w.log()),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(down.0, "HTTP/1.1 503 Service Unavailable");
+    assert!(down.1.contains("Temporarily unavailable"), "{}", down.1);
+    assert!(w.log().contains("answering with the 503 page"));
+
+    // A deploy that listens: the page is gone, the app answers.
+    let good = std::fs::read_to_string(&w.cfg).unwrap();
+    std::fs::write(&w.cfg, good.replace("env = { FIXTURE_NO_LISTEN = \"1\" }\n", "")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let deadline = Instant::now() + T;
+    while get(port, "/").is_none() {
+        assert!(Instant::now() < deadline, "the app never answered:\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(raw_get(port).map(|r| r.0).as_deref(), Some("HTTP/1.1 200 OK"));
+    every_warning_has_a_hint(&w.log());
+}
+
 // ------------------------------------------------- review regression tests
 
 /// LISTEN sockets on `port`, system-wide.

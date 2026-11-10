@@ -19,6 +19,7 @@ mod requests;
 mod rig;
 mod rollout;
 mod standby;
+mod unavailable;
 mod upkeep;
 
 use crate::config::{Config, Mode, OnHealthFailure, PortStrategy};
@@ -169,6 +170,8 @@ pub struct Supervisor {
     /// reads `/proc`, or asks libproc, for each: see `listening.rs`).
     listeners: ListenerCache,
     ticks: u64,
+    /// `[unavailable]`: the 503 page while no worker serves.
+    unavail: unavailable::State,
     /// Fleet-wide health failure: a dependency is probably down; replacements held.
     outage: bool,
     last_tick: Instant,
@@ -780,6 +783,7 @@ impl Supervisor {
             supervisor_cpu_prev: None,
             listeners: ListenerCache::default(),
             ticks: 0,
+            unavail: unavailable::State::default(),
             outage: false,
             last_tick: Instant::now(),
             watchdog_enabled: systemd::watchdog_requested(),

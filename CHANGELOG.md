@@ -14,6 +14,12 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   leaves when it starts to stop. Without privileges it logs why and the
   workers keep their ports. See `docs/balance.md`.
 
+- `[unavailable]`: a 503 page (your HTML or a built-in one, with
+  `Retry-After`) answered on the app's port while no worker has served for
+  `after` seconds. It joins the `SO_REUSEPORT` group only then and is gone
+  within a second of a worker serving, so nothing an app answers meets it.
+  Off by default. See `docs/unavailable.md`.
+
 ### Fixed
 
 - `[route]` with `client_ip`: an app with `[balance]` (so with `app.address`)
