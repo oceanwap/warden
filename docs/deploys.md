@@ -108,6 +108,41 @@ others run, not the new one. `warden status` shows the pinned release. If
 that directory is deleted, the next restart falls back to `current` and logs a
 warning.
 
+## Warming up new workers
+
+A new worker starts with a cold JIT, and today it joins the port as soon as it
+listens, so its first visitors pay for the compiling. `[reload.warmup]`
+changes the order for rollouts:
+
+```toml
+[reload.warmup]
+path = "/"          # a GET that is safe to repeat; default: the [health] path
+requests = 200
+concurrency = 4
+```
+
+The shim starts the replacement with its listen on the app's port held back
+(as for a [hot standby](reliability.md)); Warden sends the requests over the
+worker's private socket, then tells it to listen. The old worker serves the
+whole time, so visitors never wait for the warm-up. The gates then run as
+before. Standbys get the same requests before they count as available.
+
+- If the warm-up takes longer than `timeout` (10 s), or some requests fail, the
+  worker joins anyway and Warden logs it. A warm-up never fails a rollout.
+- The app must listen the way the shim can hold back (`Bun.serve`, `node:http`
+  or `net` on `app.port`). One that listens another way reports `listening`
+  at once and joins cold, as before.
+- The path should be a plain GET with no side effects.
+- Measured (4 workers, 300 new connections/s, 4 shared cores): an app that
+  builds a table on its first request had 8-13 requests over 25 ms during a
+  reload and none with warm-up. An app with nothing but JIT warm-up to gain
+  showed no p99 change, and the reload took about 0.3 s longer per worker. The
+  warm-up uses CPU on the host while the old workers serve, so lower
+  `concurrency` on a host with no spare cores.
+- It needs process mode, `[app] port`, and `reload.surge`-compatible overlap
+  (not `port_strategy = "offset"`, whose workers stop before their
+  replacement starts).
+
 ## See also
 
 - [`configuration.md`](configuration.md#reload): the `[reload]` and `[shutdown]` keys.

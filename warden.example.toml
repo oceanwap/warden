@@ -93,6 +93,12 @@ max_draining = 4                             # old workers that may still be dra
                                              # until it exits: a rollout runs at most max(surge, max_draining)
                                              # extra processes. 1 = each old worker exits before the next starts
 
+# [reload.warmup]                            # off by default: requests sent to a new worker (and to standbys) on its
+# path = "/"                                 # private socket before it joins the port, so its JIT is warm for the first
+# requests = 200                             # visitor. A GET that is safe to repeat; default path: the [health] path
+# concurrency = 4
+# timeout = 10                               # s; then the worker joins anyway
+
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
 port_lost = 10                               # s a worker that listened on a TCP port may go without one before it is
