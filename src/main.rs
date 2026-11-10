@@ -5,6 +5,7 @@
 // two `Command::pre_exec` helpers); everything else is checked by the compiler.
 #![deny(unsafe_code)]
 
+mod autotls;
 mod cli;
 mod config;
 mod control;
@@ -134,6 +135,7 @@ fn main() {
         Command::Kill => rt.block_on(fleet::kill(&args)),
         Command::Top => rt.block_on(fleet::top(&args)),
         Command::Doctor => rt.block_on(doctor::run(&args)),
+        Command::Tls => autotls::print_status(),
         Command::Pm2Migrate(ref o) => rt.block_on(migrate::run(&args, o)),
         Command::WattpmMigrate(ref o) => rt.block_on(migrate_wattpm::run(&args, o)),
         Command::GuiInstall(ref o) => gui_install::run(o),

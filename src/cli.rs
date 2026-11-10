@@ -117,6 +117,7 @@ SUPERVISOR:
     config <app>     Effective config as JSON (values hidden unless --show-secrets)
     log-level [target] [debug|info|warn|error]   Show or change it at runtime
     check            Validate the config file and exit (-c wardend.toml: the alert rules)
+    tls              The certificates [tls] keeps: hostnames, expiry, placeholder or issued (docs/tls.md)
     doctor           Check this host for the problems Warden knows about, with a fix
                      for each  [--json]
     version          Print the version
@@ -182,6 +183,8 @@ pub enum Command {
     Kill,
     Top,
     Doctor,
+    /// `warden tls [status]`.
+    Tls,
     Pm2Migrate(Box<crate::migrate::MigrateOpts>),
     /// `warden migrate-wattpm [dir|file]`: a Platformatic Watt project into Warden configs.
     WattpmMigrate(Box<crate::migrate_wattpm::Opts>),
@@ -703,6 +706,13 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         "doctor" => {
             too_many(0)?;
             Command::Doctor
+        }
+        "tls" => {
+            too_many(1)?;
+            match one(&rest).as_deref() {
+                None | Some("status") => Command::Tls,
+                Some(other) => return Err(format!("tls {other:?}: expected `status` or nothing")),
+            }
         }
         "top" | "monit" => {
             target = many(&rest);

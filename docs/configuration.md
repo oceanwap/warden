@@ -263,6 +263,13 @@ plain DNS, each doing its own TLS. How it works and what it costs:
 
 `[workers] count` defaults to one per CPU core here.
 
+## `[tls]`
+
+Automatic HTTPS for a Bun app: Warden orders and renews a Let's Encrypt
+certificate and the shim gives it to `Bun.serve`. Keys (`hosts`, `email`,
+`staging`, `directory`, `redirect`, `http_port`), port 80, files and
+renewal: [`tls.md`](tls.md).
+
 ## `[static]`
 
 A static site instead of an app (what `warden serve <dir> <port>` writes).

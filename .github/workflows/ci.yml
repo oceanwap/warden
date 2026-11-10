@@ -104,6 +104,15 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends nginx strace
+      # The [tls] integration test orders a certificate from Pebble, Let's
+      # Encrypt's test ACME server (Go is on the runner); it skips without it.
+      - name: install Pebble (test ACME server)
+        run: |
+          go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
+          go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1
+          dir=$(go mod download -json github.com/letsencrypt/pebble/v2@v2.10.1 | jq -r .Dir)
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          echo "PEBBLE_CERTS=$dir/test/certs" >> "$GITHUB_ENV"
       - run: cargo fmt --all --check
       - run: shellcheck install.sh install-gui.sh scripts/*.sh .github/code-changed.sh .github/release-notes.sh contrib/nfpm-preremove.sh contrib/nfpm-gui-preremove.sh
       # The macOS release script, with stubs for the Mac-only tools; and the

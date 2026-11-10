@@ -232,3 +232,13 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 #                                            # instead of plain HTTP, e.g. behind the :443 router (docs/routing.md);
 #                                            # unset = plain HTTP
 # key = "/etc/ssl/site/privkey.pem"          # example; the private key for cert (the two go together)
+
+# Automatic HTTPS for a Bun app: Warden gets and renews a Let's Encrypt certificate and the shim
+# gives it to Bun.serve (the app passes no `tls`). Needs app.port, port 80 reachable. docs/tls.md
+# [tls]
+# hosts = ["api.example.com"]                # example; no wildcards
+# email = "you@example.com"                  # example; the CA's contact address
+# staging = false                            # Let's Encrypt's staging CA, to try first
+# directory = "https://acme.example/dir"     # example; another ACME CA instead
+# redirect = true                            # port 80: 308 to https (everything but challenges)
+# http_port = 80                             # the CA always asks 80: change only behind a port forward

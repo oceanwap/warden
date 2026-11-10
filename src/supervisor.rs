@@ -99,6 +99,8 @@ enum Event {
     Ports(Vec<(u64, portwatch::Seen)>),
     /// The keeper's channel ended: it died (`crate::keeper`).
     KeeperGone,
+    /// `[tls]`: a new certificate is in place; the workers must be replaced.
+    TlsRenewed,
 }
 
 struct HealthState {
@@ -200,6 +202,8 @@ pub struct Supervisor {
     watch_pending: Option<watch::Change>,
     /// The wait for `watch_pending` was logged.
     watch_held: bool,
+    /// `[tls]`: a new certificate waits for a rolling reload.
+    tls_pending: bool,
     /// A restart that could not start (the release did not resolve) is tried
     /// again a few times: `(failures so far, not before)`.
     watch_retry: Option<(u8, Instant)>,
@@ -410,6 +414,11 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             standby = sup.cfg.workers.standby,
             note = "each costs about one worker's memory",
         );
+    }
+    if let Some(t) = sup.cfg.tls.clone() {
+        crate::autotls::ensure_placeholder(&t)?;
+        let tx = sup.tx.clone();
+        crate::guard::spawn_request("certificates", crate::autotls::run(t, move || drop(tx.send(Event::TlsRenewed))));
     }
     warn_if_no_migrate_req(&sup.cfg);
     if !sup.handoff_on {
@@ -796,6 +805,7 @@ impl Supervisor {
             launch_cwd: std::env::current_dir().ok(),
             watch_pending: None,
             watch_held: false,
+            tls_pending: false,
             watch_retry: None,
             watch_throttle: watch::Throttle::default(),
             exe: own_exe(),
@@ -1503,6 +1513,10 @@ impl Supervisor {
             // The shim reads the shared ticket key off fd 3 first thing.
             add("WARDEN_TLS_TICKET", "1".into());
         }
+        if let Some(t) = &self.cfg.tls {
+            // The shim gives Bun.serve this certificate when the app brings none.
+            add("WARDEN_TLS_DIR", crate::autotls::live(t).display().to_string());
+        }
         if let Some(ip) = a.address {
             // The shim makes the app's listen on its port use this address.
             add("WARDEN_ADDRESS", ip.to_string());
@@ -1731,6 +1745,11 @@ impl Supervisor {
                 // `[watch]` changed by a reload, workers stopped or started again.
                 self.sync_watch();
                 self.try_watch_restart();
+                self.try_tls_reload();
+            }
+            Event::TlsRenewed => {
+                self.tls_pending = true;
+                self.try_tls_reload();
             }
             Event::Watch { token, change } => self.on_watch(token, change),
             Event::Gate(g) => self.on_gate(g),
@@ -3153,6 +3172,31 @@ impl Supervisor {
                     );
                 }
             }
+        }
+    }
+
+    /// A new `[tls]` certificate: the same gated rolling reload as `warden
+    /// reload`, so the old workers drain and no connection is cut. Waits for a
+    /// rollout in progress and is tried again on the next tick.
+    fn try_tls_reload(&mut self) {
+        if !self.tls_pending {
+            return;
+        }
+        if self.shutting_down || self.stopped || self.sweep.is_some() || self.insts.is_empty() {
+            // The workers that start next read the new files.
+            self.tls_pending = false;
+            return;
+        }
+        if self.roll.is_some() {
+            return;
+        }
+        let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+        match self.begin_rollout(Kind::Reload, ids, "tls".into(), false) {
+            Ok(_) => {
+                self.tls_pending = false;
+                info!("new certificate: rolling reload of the workers");
+            }
+            Err(e) => warn!("reload for the new certificate could not start; trying again", reason = e),
         }
     }
 

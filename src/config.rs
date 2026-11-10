@@ -54,6 +54,93 @@ pub struct Config {
     /// workers, each on its own port (`docs/balance.md`). Linux, root.
     #[serde(default)]
     pub balance: Option<Balance>,
+    /// Warden gets and renews a Let's Encrypt certificate for these hostnames
+    /// and the shim hands it to `Bun.serve` (`docs/tls.md`).
+    #[serde(default)]
+    pub tls: Option<Tls>,
+}
+
+/// `[tls]`: automatic HTTPS for a Bun app (`docs/tls.md`).
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Tls {
+    /// Hostnames of the one certificate (no wildcards: those need DNS-01).
+    pub hosts: Vec<String>,
+    /// Contact address for the CA.
+    pub email: String,
+    /// Let's Encrypt's staging CA (certificates no browser trusts).
+    #[serde(default)]
+    pub staging: bool,
+    /// Another ACME directory URL (default: Let's Encrypt).
+    #[serde(default)]
+    pub directory: Option<String>,
+    /// Port 80 answers everything but challenges with a redirect to https.
+    #[serde(default = "yes")]
+    pub redirect: bool,
+    /// Port of the challenge listener. The CA always asks port 80; change
+    /// this only behind a port forward or in tests.
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+}
+
+fn default_http_port() -> u16 {
+    80
+}
+
+impl Tls {
+    pub fn check(&self, cfg: &Config) -> Result<(), String> {
+        if self.hosts.is_empty() {
+            return Err("tls.hosts must name at least one hostname, e.g. [\"api.example.com\"]".into());
+        }
+        for h in &self.hosts {
+            valid_hostname(h).map_err(|e| format!("tls.hosts: {e}"))?;
+            if h.starts_with("*.") {
+                return Err(format!("tls.hosts: {h} is a wildcard, which needs the DNS challenge; list the names"));
+            }
+            if h.chars().any(|c| c.is_ascii_uppercase()) {
+                return Err(format!("tls.hosts: write {h:?} in lowercase"));
+            }
+            if h.parse::<std::net::IpAddr>().is_ok() {
+                return Err(format!("tls.hosts: {h} is an IP address; Let's Encrypt needs hostnames here"));
+            }
+        }
+        if !self.email.contains('@') || self.email.contains(char::is_whitespace) {
+            return Err(format!("tls.email = {:?}: an e-mail address for the CA", self.email));
+        }
+        if self.staging && self.directory.is_some() {
+            return Err("tls.staging and tls.directory both name a CA: set one".into());
+        }
+        if let Some(d) = &self.directory {
+            if !(d.starts_with("https://") || d.starts_with("http://")) {
+                return Err(format!("tls.directory = {d:?}: an http(s) URL"));
+            }
+        }
+        if self.http_port == 0 {
+            return Err("tls.http_port: port 0 is not a port".into());
+        }
+        if cfg.route.is_some() || cfg.static_files.is_some() || cfg.workers.mode != Mode::Process {
+            return Err("[tls] is for Bun apps in process mode (not [route], [static] or worker mode)".into());
+        }
+        if cfg.expose.as_ref().is_some_and(|x| x.cert.is_some() || x.acme.is_some()) {
+            return Err("[tls] and [expose] cert/acme both get a certificate: set one".into());
+        }
+        if cfg.app.port.is_none() {
+            return Err("[tls] needs app.port (the port the app serves HTTPS on, usually 443)".into());
+        }
+        if cfg.app.shim == Some(false) {
+            return Err("[tls] hands the certificate over through the shim: remove app.shim = false".into());
+        }
+        Ok(())
+    }
+
+    /// The directory URL to order from.
+    pub fn directory_url(&self) -> String {
+        match (&self.directory, self.staging) {
+            (Some(d), _) => d.clone(),
+            (None, true) => "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
+            (None, false) => "https://acme-v02.api.letsencrypt.org/directory".into(),
+        }
+    }
 }
 
 /// `[balance]`: one hostname's connections over workers that each listen on a
@@ -1310,6 +1397,9 @@ impl Config {
                 return Err(format!("route.hosts: port {own} is the router's own port"));
             }
         }
+        if let Some(t) = &self.tls {
+            t.check(self)?;
+        }
         if let Some(x) = &self.expose {
             x.check()?;
             if self.app.port.is_none() {
@@ -1997,6 +2087,27 @@ mod tests {
             err("[app]\nname = \"e\"\nport = 443\naddress = \"2001:db8::1\"\n[route]\nhosts = { \"a.test\" = 1 }\n")
                 .contains("route.host")
         );
+    }
+
+    #[test]
+    fn a_tls_section_is_checked() {
+        let base = "[app]\nname = \"api\"\nport = 443\n";
+        let parse = |extra: &str| Config::parse(&format!("{base}{extra}"));
+        let tls = "[tls]\nhosts = [\"api.example.com\", \"www.example.com\"]\nemail = \"me@example.com\"\n";
+        let t = parse(tls).unwrap().tls.unwrap();
+        assert_eq!((t.http_port, t.redirect, t.staging), (80, true, false));
+        assert!(t.directory_url().starts_with("https://acme-v02."));
+        assert!(parse(&format!("{tls}staging = true\n")).unwrap().tls.unwrap().directory_url().contains("staging"));
+        let err = |extra: &str| parse(extra).unwrap_err();
+        assert!(err("[tls]\nhosts = []\nemail = \"a@b.c\"\n").contains("at least one hostname"));
+        assert!(err("[tls]\nhosts = [\"*.example.com\"]\nemail = \"a@b.c\"\n").contains("wildcard"));
+        assert!(err("[tls]\nhosts = [\"API.example.com\"]\nemail = \"a@b.c\"\n").contains("lowercase"));
+        assert!(err("[tls]\nhosts = [\"10.0.0.1\"]\nemail = \"a@b.c\"\n").contains("IP address"));
+        assert!(err("[tls]\nhosts = [\"a.test\"]\nemail = \"nobody\"\n").contains("e-mail"));
+        assert!(err(&format!("{tls}staging = true\ndirectory = \"https://ca.test/dir\"\n")).contains("set one"));
+        assert!(err(&format!("{tls}[static]\nroot = \"/srv\"\n")).contains("Bun apps"));
+        assert!(Config::parse(&format!("[app]\nname = \"x\"\n{tls}")).unwrap_err().contains("app.port"));
+        assert!(err(&format!("{tls}[workers]\nmode = \"worker\"\n")).contains("process mode"));
     }
 
     #[test]

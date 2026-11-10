@@ -12,6 +12,13 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   socket before it joins the port, and standbys before they count as
   available, so the JIT has compiled the hot paths when the first visitor
   arrives. See `docs/deploys.md`.
+
+- `[tls]`: automatic HTTPS for Bun apps. Warden orders and renews a Let's
+  Encrypt certificate (HTTP-01, answered on port 80 by the supervisor), the
+  shim gives it to `Bun.serve`, and a renewal is a gated rolling reload.
+  Workers start with a placeholder certificate until the real one arrives.
+  `warden tls` lists the certificates. Nothing is added to the request path;
+  without `[tls]` nothing changes. See `docs/tls.md`.
 - `[balance]` (Linux, root): connections to an app's `address:port` are
   spread by the kernel over workers that each listen on their own port
   (`port_strategy = "offset"`), with an eBPF `sk_lookup` program. No proxy,
