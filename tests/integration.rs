@@ -224,10 +224,12 @@ impl Warden {
         (t0.elapsed(), out)
     }
 
+    /// Anonymous memory (heap, stacks): what a flood can grow. VmRSS also counts the
+    /// binary's own file-backed pages, which grow with every feature and say nothing about leaks.
     fn rss_kb(&self) -> u64 {
         let st = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())).unwrap_or_default();
         st.lines()
-            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .find_map(|l| l.strip_prefix("RssAnon:"))
             .and_then(|v| v.split_whitespace().next()?.parse().ok())
             .unwrap_or(0)
     }
