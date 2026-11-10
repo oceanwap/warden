@@ -641,6 +641,30 @@ pub struct Reload {
     /// beyond the worker count. 1: each old worker exits before the next
     /// replacement starts.
     pub max_draining: usize,
+    /// Requests sent to a new worker's private socket before it joins the
+    /// port, so its JIT has compiled the hot paths when the first visitor
+    /// arrives. Off by default.
+    pub warmup: Option<Warmup>,
+}
+
+/// `[reload.warmup]`: what a new worker is sent before it takes traffic.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Warmup {
+    /// A GET that is safe to repeat. Default: the health path.
+    pub path: Option<String>,
+    /// Requests in all.
+    pub requests: u32,
+    /// Requests in flight at once.
+    pub concurrency: u32,
+    /// Seconds after which the warm-up stops and the worker joins anyway.
+    pub timeout: u64,
+}
+
+impl Default for Warmup {
+    fn default() -> Self {
+        Self { path: None, requests: 200, concurrency: 4, timeout: 10 }
+    }
 }
 
 /// `reload.max_draining` without a value: a 4-worker rolling restart with
@@ -1140,6 +1164,7 @@ impl Default for Reload {
             timeout: 120,
             surge: Surge::Count(1),
             max_draining: DEFAULT_MAX_DRAINING,
+            warmup: None,
         }
     }
 }
@@ -1510,6 +1535,22 @@ impl Config {
                 )
             });
         }
+        if let Some(w) = &rl.warmup {
+            if w.path.is_none() && self.ready_path().is_none() {
+                return Err("reload.warmup needs a path: set reload.warmup.path or a [health] path".into());
+            }
+            if w.path.as_deref().is_some_and(|p| !p.starts_with('/')) {
+                return Err("reload.warmup.path must start with /".into());
+            }
+            if !(1..=100_000).contains(&w.requests) || !(1..=256).contains(&w.concurrency) || w.timeout == 0 {
+                return Err("reload.warmup: requests must be 1-100000, concurrency 1-256 and timeout > 0".into());
+            }
+            if self.workers.mode != Mode::Process || self.app.port.is_none() || self.builtin_server() {
+                return Err(
+                    "reload.warmup needs process mode, an [app] port and an app (not [static] or [route])".into()
+                );
+            }
+        }
         for (name, cmd) in [("reload.verify_command", &rl.verify_command), ("reload.preflight", &rl.preflight)] {
             if cmd.as_deref().is_some_and(|c| c.trim().is_empty()) {
                 return Err(format!("{name} must not be empty (omit it instead)"));
@@ -1777,7 +1818,13 @@ impl Config {
     /// WARDEN_WORKER_SOCKET). A second server per worker costs memory
     /// (measured: ~6 MB per Bun worker), so none without a reason.
     pub fn private_sockets(&self) -> bool {
-        self.health_sockets() && (self.any_worker_path() || self.reload.verify_command.is_some())
+        self.health_sockets()
+            && (self.any_worker_path() || self.reload.verify_command.is_some() || self.reload.warmup.is_some())
+    }
+
+    /// The path a warm-up requests.
+    pub fn warmup_path(&self) -> Option<String> {
+        self.reload.warmup.as_ref()?.path.clone().or_else(|| self.ready_path())
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -2390,6 +2437,21 @@ mod tests {
             Config::parse(&format!("{MIN}[reload]\nverify_command = \"curl --unix-socket $WARDEN_WORKER_SOCKET x\"\n"))
                 .unwrap();
         assert!(c.private_sockets(), "verify_command gets WARDEN_WORKER_SOCKET");
+    }
+
+    #[test]
+    fn warmup_needs_a_path_and_gets_a_private_socket() {
+        const WP: &str = "[app]\nname = \"api\"\nargs = [\"run\", \"server.ts\"]\nport = 3000\n";
+        let c = Config::parse(&format!("{WP}[health]\npath = \"/health\"\n[reload.warmup]\n")).unwrap();
+        assert_eq!(c.warmup_path().as_deref(), Some("/health"), "the health path by default");
+        assert_eq!(c.reload.warmup.as_ref().map(|w| (w.requests, w.concurrency, w.timeout)), Some((200, 4, 10)));
+        let c = Config::parse(&format!("{WP}[reload.warmup]\npath = \"/\"\n")).unwrap();
+        assert!(c.private_sockets(), "the warm-up is sent over the private socket");
+        assert!(Config::parse(&format!("{WP}[reload.warmup]\n")).is_err(), "no path to warm");
+        assert!(Config::parse(&format!("{WP}[reload.warmup]\npath = \"x\"\n")).is_err());
+        assert!(Config::parse(&format!("{WP}[reload.warmup]\npath = \"/\"\nrequests = 0\n")).is_err());
+        assert!(Config::parse(&format!("{WP}[reload.warmup]\npath = \"/\"\nbogus = 1\n")).is_err());
+        assert!(Config::parse(WP).unwrap().reload.warmup.is_none(), "off by default");
     }
 
     #[test]

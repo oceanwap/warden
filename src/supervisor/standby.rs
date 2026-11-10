@@ -273,6 +273,29 @@ impl Supervisor {
             self.launch_standby_verify(inst_id);
             return;
         }
+        if !st.warmed {
+            st.warmed = true;
+            let socket = i.sockets.values().next().cloned();
+            if let (Some(w), Some(path), Some(socket)) =
+                (self.cfg.reload.warmup.clone(), self.cfg.warmup_path(), socket)
+            {
+                st.checking = true;
+                let (tx, each) = (self.tx.clone(), Duration::from_secs(self.cfg.health.timeout));
+                tokio::task::spawn_local(async move {
+                    let (sent, failed) = crate::health::warm_unix(
+                        &socket,
+                        &path,
+                        w.requests,
+                        w.concurrency,
+                        each,
+                        Duration::from_secs(w.timeout),
+                    )
+                    .await;
+                    let _ = tx.send(Event::StandbyWarmed { inst: inst_id, sent, failed });
+                });
+                return;
+            }
+        }
         st.available = true;
         let (pid, ms, n) = (i.handle.pid, i.started.elapsed().as_millis(), i.standby_number.unwrap_or(0));
         info!("standby ready", worker = sb(i), pid = pid, startup_ms = ms);
@@ -368,6 +391,17 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    pub(super) fn on_standby_warmed(&mut self, inst_id: u64, sent: u32, failed: u32) {
+        let Some(i) = self.insts.get_mut(&inst_id) else { return };
+        let label = sb(i);
+        let Some(st) = i.standby.as_mut() else { return };
+        st.checking = false;
+        if failed > 0 {
+            warn!("some warm-up requests failed", worker = label, failed = failed, sent = sent);
+        }
+        self.standby_gates(inst_id);
     }
 
     pub(super) fn on_standby_verified(&mut self, inst_id: u64, result: Result<(), String>) {

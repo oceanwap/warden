@@ -105,6 +105,13 @@ pub(super) enum GateEvent {
     PauseDone {
         seq: u64,
     },
+    /// A held replacement's warm-up requests are done.
+    Warmed {
+        seq: u64,
+        inst: u64,
+        sent: u32,
+        failed: u32,
+    },
     /// The addresses a vacated slot's old worker listened on are free (or
     /// `PORT_WAIT` is over): start its replacement.
     PortsFree {
@@ -194,6 +201,7 @@ enum At {
         new: u64,
         old: Option<u64>,
         deadline: Instant,
+        warm: Warm,
     },
     Verifying(Verify),
     /// Passed every gate; waits for the rest of its batch before taking over.
@@ -211,6 +219,17 @@ enum At {
     /// The new process took over (its old one, if any, drains in the
     /// background: `Roll::draining`).
     Done,
+}
+
+/// A replacement started with its listen held back (`[reload.warmup]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Warm {
+    /// Not held: it listens as soon as it can.
+    Off,
+    /// Held; initializing.
+    Waiting,
+    /// Held; the warm-up requests are running.
+    Running,
 }
 
 impl At {
@@ -709,7 +728,7 @@ impl Supervisor {
                     At::Vacating { old, addrs }
                 }
                 (Some(old), _) => match self.start_replacement(slot_id, kind) {
-                    Ok(new) => At::Starting { new, old: Some(old), deadline },
+                    Ok(new) => At::Starting { new, old: Some(old), deadline, warm: self.warm_of(new) },
                     Err(e) => {
                         self.fail_at(Some(slot_id), format!("could not start a new worker: {e}"));
                         return;
@@ -722,7 +741,7 @@ impl Supervisor {
                     At::Vacating { old, addrs }
                 }
                 (None, None) => match self.spawn_current(slot_id) {
-                    Some(new) => At::Starting { new, old: None, deadline },
+                    Some(new) => At::Starting { new, old: None, deadline, warm: Warm::Off },
                     None => {
                         self.fail_at(Some(slot_id), "could not start a new worker".into());
                         return;
@@ -750,7 +769,7 @@ impl Supervisor {
         let Some(lane) = lanes.iter_mut().find(|l| matches!(l.at, At::Starting { new, .. } if new == inst)) else {
             return;
         };
-        let At::Starting { new, old, deadline } = lane.at else { return };
+        let At::Starting { new, old, deadline, .. } = lane.at else { return };
         let soak = Duration::from_secs(if canary { canary_soak } else { min_ready });
         let cmd = if verify { Cmd::Pending } else { Cmd::Skip };
         if canary {
@@ -788,6 +807,101 @@ impl Supervisor {
         self.gate_steps(Some(new));
     }
 
+    fn warm_of(&self, inst: u64) -> Warm {
+        if self.insts.get(&inst).is_some_and(|i| i.held) { Warm::Waiting } else { Warm::Off }
+    }
+
+    /// Whether a rollout's replacement is held back to be warmed up: the
+    /// shim can defer the listen of an app on a shared port, in process mode.
+    pub(super) fn warmup_holds(&self) -> bool {
+        self.cfg.reload.warmup.is_some()
+            && self.cfg.workers.mode == Mode::Process
+            && self.cfg.shim_enabled()
+            && self.cfg.app.port.is_some()
+            && !self.handoff_on
+            && !self.cfg.builtin_server()
+    }
+
+    /// A held replacement initialized (the shim's `standby_ready`): warm it
+    /// up on its private socket, then tell it to listen. Without a socket
+    /// there is nothing to send requests to: it listens at once.
+    pub(super) fn rollout_on_held_ready(&mut self, inst: u64, slot: usize, socket: Option<String>) {
+        if let Some(i) = self.insts.get_mut(&inst) {
+            if let Some(s) = socket {
+                i.sockets.insert(slot, PathBuf::from(s));
+            }
+        }
+        let socket = self.insts.get(&inst).and_then(|i| i.sockets.values().next().cloned());
+        let Some(Roll { seq, step: Step::Batch(lanes), .. }) = &mut self.roll else { return };
+        let seq = *seq;
+        let Some(lane) =
+            lanes.iter_mut().find(|l| matches!(l.at, At::Starting { new, warm: Warm::Waiting, .. } if new == inst))
+        else {
+            return;
+        };
+        let At::Starting { warm, .. } = &mut lane.at else { return };
+        let (Some(w), Some(path), Some(socket)) = (self.cfg.reload.warmup.clone(), self.cfg.warmup_path(), socket)
+        else {
+            *warm = Warm::Running;
+            warn!("no private socket to warm the new worker up on; it listens now", worker = self.label(slot));
+            self.warmed(seq, inst, 0, 0);
+            return;
+        };
+        *warm = Warm::Running;
+        let (tx, every) = (self.tx.clone(), Duration::from_secs(self.cfg.health.timeout));
+        tokio::task::spawn_local(async move {
+            let done = crate::health::warm_unix(
+                &socket,
+                &path,
+                w.requests,
+                w.concurrency,
+                every,
+                Duration::from_secs(w.timeout),
+            )
+            .await;
+            let _ = tx.send(Event::Gate(GateEvent::Warmed { seq, inst, sent: done.0, failed: done.1 }));
+        });
+    }
+
+    /// The warm-up ended (sent all, or timed out): tell the replacement to
+    /// listen. The gates after that start with a fresh deadline.
+    fn warmed(&mut self, seq: u64, inst: u64, sent: u32, failed: u32) {
+        let timeout = Duration::from_secs(self.cfg.reload.timeout);
+        let count = self.count;
+        let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll else { return };
+        let Some(lane) =
+            lanes.iter_mut().find(|l| matches!(l.at, At::Starting { new, warm: Warm::Running, .. } if new == inst))
+        else {
+            return;
+        };
+        let slot = lane.slot;
+        let At::Starting { warm, deadline, .. } = &mut lane.at else { return };
+        *warm = Warm::Off;
+        *deadline = crate::restart::later(Instant::now(), timeout);
+        let label = self.label(slot);
+        let Some(i) = self.insts.get_mut(&inst) else { return };
+        let started = i.started.elapsed();
+        if failed > 0 {
+            warn!(
+                "some warm-up requests failed",
+                worker = label,
+                failed = failed,
+                sent = sent,
+                hint = "check reload.warmup.path: it should answer 2xx or 3xx"
+            );
+        } else if sent > 0 {
+            info!("new worker warmed up", worker = label, requests = sent, started_s = started.as_secs_f32());
+        }
+        let msg = format!("{{\"cmd\":\"promote\",\"worker\":{slot},\"count\":{count}}}\n");
+        if let Err(e) = i.handle.send(msg.as_bytes()) {
+            self.fail_at(Some(slot), format!("could not tell the new worker to listen: {e}"));
+            return;
+        }
+        i.promoted_at = Some(Instant::now());
+        self.send_later(standby::PROMOTE_TIMEOUT.min(self.cfg.ready_timeout()), Event::ReadyTimeout { inst });
+        let _ = seq;
+    }
+
     /// The shim reported a private health socket of `inst`.
     pub(super) fn rollout_socket_reported(&mut self, inst: u64) {
         self.gate_steps(Some(inst));
@@ -817,6 +931,9 @@ impl Supervisor {
                 }
             }
             GateEvent::Check { seq, inst, result } if Some(seq) == seq_now => self.gate_check(inst, result),
+            GateEvent::Warmed { seq, inst, sent, failed } if Some(seq) == seq_now => {
+                self.warmed(seq, inst, sent, failed)
+            }
             GateEvent::Command { seq, inst, result } if Some(seq) == seq_now => {
                 let Some((slot, v)) = self.verifying(inst) else { return };
                 match result {
@@ -1317,7 +1434,7 @@ impl Supervisor {
     /// listened on are free): start the new one.
     fn spawn_vacated(&mut self, slot: usize) {
         let deadline = crate::restart::later(Instant::now(), Duration::from_secs(self.cfg.reload.timeout));
-        let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline });
+        let at = self.spawn_current(slot).map(|new| At::Starting { new, old: None, deadline, warm: Warm::Off });
         match at {
             Some(at) => {
                 if let Some(Roll { step: Step::Batch(lanes), .. }) = &mut self.roll {
@@ -1656,6 +1773,9 @@ impl Supervisor {
     fn lane_phase(&self, l: &Lane) -> String {
         let label = self.label(l.slot);
         match &l.at {
+            At::Starting { new, warm: Warm::Running, .. } => {
+                format!("worker {label}: warming up new process (pid {})", self.pid_of(*new))
+            }
             At::Starting { new, .. } => format!("worker {label}: starting new process (pid {})", self.pid_of(*new)),
             At::Vacating { old, addrs } if !self.insts.contains_key(old) => {
                 format!("worker {label}: waiting for {} to be free before starting its replacement", addrs_text(addrs))
@@ -1724,7 +1844,7 @@ fn batch_key(lanes: &[Lane]) -> (u8, u64, u64) {
         .min_by_key(|v| (v.stage(), u64::from(v.passes)));
     if lanes.len() == 1 {
         return match &lanes[0].at {
-            At::Starting { new, .. } => (3, *new, 0),
+            At::Starting { new, warm, .. } => (3, *new, *warm as u64),
             At::Vacating { old, .. } => (4, *old, 0),
             At::Verifying(v) => {
                 let detail = match v.stage() {
@@ -2228,6 +2348,73 @@ wait $!
         .await;
         assert_eq!(waited.borrow().as_slice(), &[] as &[&str], "a gate waited");
         promoted.get()
+    }
+
+    /// With `[reload.warmup]` the replacement is started with its listen
+    /// held back: it gets every warm-up request on its private socket
+    /// before it is told to listen, and the old worker serves until then.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replacement_is_warmed_up_before_it_is_told_to_listen() {
+        local(async {
+            let dir = std::env::temp_dir().join(format!("warden-warm-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("w.sock");
+            let told = dir.join("told");
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let before_promote = Rc::new(Cell::new(0u32));
+            let late = Rc::new(Cell::new(0u32));
+            let (b, l, told2) = (before_promote.clone(), late.clone(), told.clone());
+            tokio::task::spawn_local(async move {
+                loop {
+                    let Ok((mut s, _)) = listener.accept().await else { return };
+                    let (b, l, told) = (b.clone(), l.clone(), told2.clone());
+                    tokio::task::spawn_local(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 512];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /warm HTTP/1.1"));
+                        if told.exists() {
+                            l.set(l.get() + 1)
+                        } else {
+                            b.set(b.get() + 1)
+                        }
+                        let _ =
+                            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+                    });
+                }
+            });
+            let script = r#"
+if [ "$WARDEN_STANDBY" = 1 ]; then
+  echo '{"ev":"standby_ready","port":1,"socket":"'$SOCK'"}' >&3
+  read -r line <&3 || exit 0
+  echo "$line" > "$TOLD"
+fi
+echo '{"ev":"listening","port":1}' >&3
+exec sleep 60
+"#;
+            let sections = format!(
+                "shim = true\nenv = {{ SOCK = \"{}\", TOLD = \"{}\" }}\n[reload]\nhealth_passes = 0\n\
+                 [reload.warmup]\npath = \"/warm\"\nrequests = 20\nconcurrency = 4\n",
+                sock.display(),
+                told.display()
+            );
+            let mut r = Rig::new("warm", &sections, script);
+            r.sup.start_all();
+            r.until("the worker running", |s| s.slots.values().all(|x| x.state == State::Running)).await;
+            let old = currents(&r.sup)[0];
+            // The first worker is not a replacement: nothing was held or warmed.
+            assert_eq!(before_promote.get(), 0);
+            r.sup.begin_rollout(Kind::Restart, vec![1], String::new(), false).unwrap();
+            r.until("the rollout's end", |s| s.roll.is_none()).await;
+            assert_eq!(r.sup.last_rollout.as_ref().map(|o| o.ok), Some(true));
+            assert_ne!(currents(&r.sup)[0], old);
+            assert_eq!(before_promote.get(), 20, "every warm-up request came before the listen command");
+            assert_eq!(late.get(), 0);
+            r.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        })
+        .await;
     }
 
     fn gaps(seen: &[Instant]) -> Vec<Duration> {

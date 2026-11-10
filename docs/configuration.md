@@ -125,6 +125,17 @@ Gates for every replacement: `reload`, `safe-reload`, `restart N` and recycling.
 | `surge` | `1` | New workers started at once, each next to the one it replaces: `1`, `N` or `"all"`. The old ones drain once the whole batch passed the gates; a failure stops the batch's new workers. Briefly runs up to N extra workers (memory). Not with `port_strategy = "offset"` |
 | `max_draining` | `4` | Old workers that may still be draining (closing WebSockets/SSE, finishing requests) while the next ones are replaced; past that, the next replacement waits for one to exit. Each holds its memory until it exits: a rollout runs at most max(`surge`, `max_draining`) extra processes. `1` = each old worker exits before the next starts |
 
+`[reload.warmup]` (off by default) sends requests to a new worker before it joins the port:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | the `[health]` path | A GET that is safe to repeat; it should answer 2xx or 3xx |
+| `requests` | `200` | Requests in all (1-100000) |
+| `concurrency` | `4` | Requests in flight at once (1-256) |
+| `timeout` | `10` | Seconds after which the warm-up stops and the worker joins anyway |
+
+Needs process mode, an `[app] port` and an app under the shim (Bun or Node). See [`deploys.md`](deploys.md#warming-up-new-workers).
+
 How the gates work: [`deploys.md`](deploys.md).
 
 ## `[watchdog]`

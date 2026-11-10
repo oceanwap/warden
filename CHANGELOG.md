@@ -7,6 +7,11 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- `[reload.warmup]` (off by default): a new worker started by a reload,
+  safe-reload, restart or recycle gets `requests` GETs on its private
+  socket before it joins the port, and standbys before they count as
+  available, so the JIT has compiled the hot paths when the first visitor
+  arrives. See `docs/deploys.md`.
 - `[balance]` (Linux, root): connections to an app's `address:port` are
   spread by the kernel over workers that each listen on their own port
   (`port_strategy = "offset"`), with an eBPF `sk_lookup` program. No proxy,
