@@ -12,7 +12,6 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   socket before it joins the port, and standbys before they count as
   available, so the JIT has compiled the hot paths when the first visitor
   arrives. See `docs/deploys.md`.
-
 - `[tls]`: automatic HTTPS for Bun apps. Warden orders and renews a Let's
   Encrypt certificate (HTTP-01, answered on port 80 by the supervisor), the
   shim gives it to `Bun.serve`, and a renewal is a gated rolling reload.
