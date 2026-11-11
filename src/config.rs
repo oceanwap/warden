@@ -58,6 +58,10 @@ pub struct Config {
     /// and the shim hands it to `Bun.serve` (`docs/tls.md`).
     #[serde(default)]
     pub tls: Option<Tls>,
+    /// A 503 page answered on the app's port while no worker serves
+    /// (`docs/unavailable.md`).
+    #[serde(default)]
+    pub unavailable: Unavailable,
 }
 
 /// `[tls]`: automatic HTTPS for a Bun app (`docs/tls.md`).
@@ -140,6 +144,34 @@ impl Tls {
             (None, true) => "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
             (None, false) => "https://acme-v02.api.letsencrypt.org/directory".into(),
         }
+    }
+}
+
+/// `[unavailable]`: while the app has no serving worker for `after` seconds,
+/// Warden answers its port itself with a 503 page. It is on the port only
+/// then: the moment a worker serves, it is gone, so a request an app answers
+/// never meets it.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Unavailable {
+    pub enabled: bool,
+    /// Seconds without a serving worker before the page appears (short
+    /// blips, a crash restart, a reload, stay as they are).
+    pub after: u64,
+    /// The address the app listens on, which the page must share to be heard
+    /// there: `app.address` when set, else this (default 127.0.0.1, the
+    /// usual app behind nginx).
+    pub host: Option<std::net::IpAddr>,
+    /// An HTML file (up to 64 KB), read when the page appears; relative to
+    /// the config file. Unset: a short built-in page.
+    pub page: Option<PathBuf>,
+    /// Seconds in the `Retry-After` header.
+    pub retry_after: u64,
+}
+
+impl Default for Unavailable {
+    fn default() -> Self {
+        Unavailable { enabled: false, after: 2, host: None, page: None, retry_after: 5 }
     }
 }
 
@@ -1298,6 +1330,11 @@ impl Config {
                 .map_err(|e| format!("{}: app.env_file {}: {e}", path.display(), file.display()))?;
             cfg.app.env_file = Some(file);
         }
+        if let Some(page) = &cfg.unavailable.page {
+            if page.is_relative() {
+                cfg.unavailable.page = Some(path.parent().unwrap_or(Path::new(".")).join(page));
+            }
+        }
         // A relative static root, and a relative compress_dir: from the working
         // directory, else the config file.
         if let Some(st) = &mut cfg.static_files {
@@ -1369,6 +1406,19 @@ impl Config {
             }
             if self.static_files.is_some() {
                 return Err("app.address does not apply to [static]: set static.host".into());
+            }
+        }
+        if self.unavailable.enabled {
+            if self.app.port.is_none() {
+                return Err("unavailable.enabled needs app.port: the port the page is answered on".into());
+            }
+            if self.builtin_server() || self.balance.is_some() || self.workers.port_strategy != PortStrategy::Shared {
+                return Err("unavailable.enabled needs an app whose workers share app.port (not [static], [route], \
+                            [balance] or port_strategy = \"offset\")"
+                    .into());
+            }
+            if self.unavailable.after > 3600 || self.unavailable.retry_after > 86_400 {
+                return Err("unavailable.after is at most 3600 seconds and unavailable.retry_after 86400".into());
             }
         }
         if let Some(b) = &self.balance {
@@ -2073,6 +2123,17 @@ mod tests {
         assert!(err(&ok.replace("port = 443", "port = 9001")).contains("workers' own ports"));
         assert!(err(&ok.replace("port = 443", "port = 9000")).contains("not app.port"));
         assert!(err(&ok.replace("count = 3", "count = 300")).contains("at most"));
+    }
+
+    #[test]
+    fn the_503_page_needs_a_shared_port() {
+        let on = "[unavailable]\nenabled = true\n";
+        let bad = |t: String| Config::parse(&t).unwrap_err();
+        assert!(bad(format!("[app]\nname = \"a\"\n{on}")).contains("needs app.port"));
+        let ok = format!("[app]\nname = \"a\"\nport = 9000\n{on}");
+        assert!(Config::parse(&ok).is_ok());
+        assert!(bad(format!("{ok}[workers]\nport_strategy = \"offset\"\n")).contains("share app.port"));
+        assert!(bad(ok.replace("enabled = true", "enabled = true\nafter = 99999")).contains("at most 3600"));
     }
 
     #[test]

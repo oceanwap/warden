@@ -20,6 +20,7 @@ impl Supervisor {
     pub(super) fn on_tick(&mut self) {
         crate::guard::fault("tick");
         self.ticks += 1;
+        self.check_unavailable();
         // OOM kills are charged only to deaths right after them: stamp new
         // ones now (also while stopped: a kill seen late must not look fresh),
         // in every cgroup a process of Warden's runs in.

@@ -176,6 +176,12 @@ max_age_days = 0                             # also delete rotated files older t
 # listen = "127.0.0.1:9464"                  # Prometheus text at /metrics
 requests = true                              # count responses by status (static server; Node via diagnostics_channel)
 
+# [unavailable]                              # a 503 page on the port while no worker serves (docs/unavailable.md)
+# enabled = true
+# after = 2                                  # seconds without a serving worker before it appears
+# host = "0.0.0.0"                           # the address the app listens on (default 127.0.0.1)
+# page = "503.html"                          # your HTML; unset: a short built-in page
+
 [control]
 socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory=warden/%i in the unit
 
