@@ -5,6 +5,8 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-11-11
+
 ### Added
 
 - `[reload.warmup]` (off by default): a new worker started by a reload,
