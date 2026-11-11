@@ -178,6 +178,7 @@ carries the same reason with a `hint=`.
 | You see | Why | Fix |
 |---|---|---|
 | `no certificate yet: workers start with a self-signed placeholder` | The first start of an app with `[tls]` | Nothing: the real certificate follows within a minute if port 80 reaches this server and the names resolve to it; the workers are then replaced by a rolling reload |
+| `certificate order failed ... tls.dns_hook` | The DNS challenge command failed or took over 120 s | Run it by hand with `WARDEN_ACME_RECORD`, `WARDEN_ACME_VALUE` set and `present` as its last argument; see `docs/tls.md` |
 | `port for the certificate challenge is not available` | Warden cannot listen on port 80 (`http_port`), so no certificate can be ordered; the app keeps serving | Another server (nginx) holds the port, or Warden may not bind it: run as root or `sysctl net.ipv4.ip_unprivileged_port_start=80`. Retried every minute |
 | `certificate order failed; trying again later` | The CA could not validate a name or refused the order; `reason` has its words | The name does not resolve to this server, port 80 is blocked, or the CA's rate limit. `staging = true` tries without the limits. Retried after 1, 5 and 15 minutes, then hourly, up to 12 hours |
 | `certificate renewal failed and the certificate expires soon` | The same, with less than 14 days left | Fix the cause above; the running certificate keeps serving until it expires |

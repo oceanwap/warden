@@ -9550,6 +9550,80 @@ fn a_tls_section_serves_a_placeholder_and_redirects() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A wildcard name through the DNS challenge: `tls.dns_hook` sets the TXT
+/// record (here in Pebble's test DNS) and removes it again.
+#[test]
+fn a_tls_wildcard_is_proved_with_the_dns_hook() {
+    if !have_bun() || !have_openssl() || Command::new("curl").arg("--version").output().is_err() {
+        return;
+    }
+    let Some(pebble) = Pebble::start() else {
+        eprintln!("skipping: pebble, pebble-challtestsrv and PEBBLE_CERTS are needed");
+        return;
+    };
+    let port = free_port();
+    let home = tmp().join(format!("warden-tls-home4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let root = Path::new(&std::env::var("PEBBLE_CERTS").unwrap()).join("pebble.minica.pem");
+    let hook = pebble.dir.join("dns-hook.sh");
+    let api = format!("http://127.0.0.1:{}", pebble.chall);
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n present) curl -sf -d \"{{\\\"host\\\":\\\"$WARDEN_ACME_RECORD.\\\",\\\"value\\\":\\\"$WARDEN_ACME_VALUE\\\"}}\" {api}/set-txt ;;\n \
+             cleanup) curl -sf -d \"{{\\\"host\\\":\\\"$WARDEN_ACME_RECORD.\\\"}}\" {api}/clear-txt ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cfg = tls_config("tlsdns", port, &format!("https://127.0.0.1:{}/dir", pebble.port), pebble.http)
+        .replace("hosts = [\"app.test\"]", "hosts = [\"*.app.test\", \"app.test\"]")
+        + &format!("dns_hook = [\"{}\"]\ndns_wait = 0\n", hook.display());
+    let w = Warden::start_env(
+        "tlsdns",
+        port,
+        &cfg,
+        &[("WARDEN_HOME", home.to_str().unwrap()), ("WARDEN_ACME_ROOT", root.to_str().unwrap())],
+    );
+    w.wait_for("ready", T, ready(2));
+    w.wait_log("new certificate: rolling reload", Duration::from_secs(60));
+    w.wait_for("settled", T, |s| s["reloading"] == false && ready(2)(s));
+    let cert = served_cert(port, "x.app.test").unwrap();
+    assert!(cert.contains("Pebble") && cert.contains("DNS:*.app.test") && cert.contains("DNS:app.test"), "{cert}");
+    every_warning_has_a_hint(&w.log());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A `[static]` site with `[tls]` serves the placeholder certificate too.
+#[test]
+fn a_static_site_takes_a_tls_section() {
+    if !have_openssl() {
+        return;
+    }
+    let (port, http) = (free_port(), free_port());
+    let home = tmp().join(format!("warden-tls-home3-{}", std::process::id()));
+    let dir = tmp().join(format!("warden-it-site-tls-{}", std::process::id()));
+    for d in [&home, &dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), "<h1>home</h1>").unwrap();
+    let cfg = format!(
+        "[app]\nname = \"statls\"\nport = {port}\n[workers]\ncount = 1\n[static]\nroot = \"{}\"\n\
+         [tls]\nhosts = [\"app.test\"]\nemail = \"me@example.com\"\ndirectory = \"https://127.0.0.1:{}/dir\"\nhttp_port = {http}\n",
+        dir.join("site").display(),
+        free_port()
+    );
+    let w = Warden::start_env("statls", port, &cfg, &[("WARDEN_HOME", home.to_str().unwrap())]);
+    w.wait_for("ready", T, ready(1));
+    let cert = served_cert(port, "app.test").expect("TLS on the site's port");
+    assert!(cert.contains("DNS:app.test"), "{cert}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A test ACME server (Pebble and its DNS stand-in), when the tools are
 /// there: `pebble` and `pebble-challtestsrv` on PATH and PEBBLE_CERTS naming
 /// Pebble's `test/certs` directory. Killed when dropped.
@@ -9558,6 +9632,8 @@ struct Pebble {
     dir: PathBuf,
     port: u16,
     http: u16,
+    /// pebble-challtestsrv's management port (TXT records for DNS-01).
+    chall: u16,
 }
 
 impl Pebble {
@@ -9597,7 +9673,7 @@ impl Pebble {
             .stderr(e)
             .spawn()
             .ok()?;
-        let me = Pebble { procs: vec![challtest, pebble], dir, port, http };
+        let me = Pebble { procs: vec![challtest, pebble], dir, port, http, chall };
         let t0 = Instant::now();
         while TcpStream::connect(("127.0.0.1", port)).is_err() {
             assert!(t0.elapsed() < Duration::from_secs(20), "Pebble did not start");
@@ -9650,6 +9726,25 @@ fn a_tls_section_gets_a_certificate_and_rolls_the_workers() {
     let out = warden().arg("tls").env("WARDEN_HOME", &home).output().unwrap();
     let out = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.contains("app.test") && out.contains("issued") && out.contains("89 days left"), "{out}");
+    // `warden tls renew` orders again at once and rolls the workers.
+    let first = pid_set(&s);
+    let (code, out) = w.cli(&["tls", "renew"]);
+    assert_eq!(code, 0, "{out}");
+    let s = w.wait_for("renewed", Duration::from_secs(60), |s| {
+        s["reloading"] == false && s["last_rollout"]["ok"] == true && ready(2)(s) && pid_set(s).is_disjoint(&first)
+    });
+    // A new name in `[tls]` applies on `warden reload`: one more certificate, with it.
+    let second = pid_set(&s);
+    let text = std::fs::read_to_string(&w.cfg).unwrap();
+    std::fs::write(&w.cfg, text.replace("hosts = [\"app.test\"]", "hosts = [\"app.test\", \"www.app.test\"]")).unwrap();
+    let (code, out) = w.cli(&["reload"]);
+    assert_eq!(code, 0, "{out}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    while !served_cert(port, "app.test").is_some_and(|c| c.contains("DNS:www.app.test")) {
+        assert!(std::time::Instant::now() < deadline, "no certificate with the new name\n{}", w.log());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    w.wait_for("settled", T, |s| s["reloading"] == false && ready(2)(s) && pid_set(s).is_disjoint(&second));
     every_warning_has_a_hint(&w.log());
     let _ = std::fs::remove_dir_all(&home);
 }

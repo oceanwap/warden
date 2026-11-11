@@ -807,6 +807,7 @@ async fn ops(ctx: &Ctx, sels: &[Sel], action: &Action, args: &Args) -> i32 {
             Action::Reload { safe } => Request::Reload { safe: *safe },
             Action::Reset => Request::Reset { worker: w },
             Action::Flush => Request::Flush,
+            Action::TlsRenew => Request::TlsRenew,
             Action::Signal(sig) => Request::Signal { signal: sig.clone(), worker: w },
             Action::LogLevel(level) => Request::LogLevel { level: *level },
             _ => return 2,

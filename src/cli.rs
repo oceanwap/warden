@@ -117,7 +117,7 @@ SUPERVISOR:
     config <app>     Effective config as JSON (values hidden unless --show-secrets)
     log-level [target] [debug|info|warn|error]   Show or change it at runtime
     check            Validate the config file and exit (-c wardend.toml: the alert rules)
-    tls              The certificates [tls] keeps: hostnames, expiry, placeholder or issued (docs/tls.md)
+    tls [renew [app]]  The certificates [tls] keeps: hostnames, expiry, placeholder or issued; `renew` orders now (docs/tls.md)
     doctor           Check this host for the problems Warden knows about, with a fix
                      for each  [--json]
     version          Print the version
@@ -228,6 +228,8 @@ pub enum Action {
     },
     Reset,
     Flush,
+    /// `warden tls renew`: order the `[tls]` certificate now.
+    TlsRenew,
     Scale(ScaleArg),
     Logs {
         /// Last N lines; `None`: 15 from memory, everything from history.
@@ -707,13 +709,17 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             too_many(0)?;
             Command::Doctor
         }
-        "tls" => {
-            too_many(1)?;
-            match one(&rest).as_deref() {
-                None | Some("status") => Command::Tls,
-                Some(other) => return Err(format!("tls {other:?}: expected `status` or nothing")),
+        "tls" => match one(&rest).as_deref() {
+            None | Some("status") => {
+                too_many(1)?;
+                Command::Tls
             }
-        }
+            Some("renew") => {
+                target = many(&rest[1..]);
+                Command::Act(Action::TlsRenew)
+            }
+            Some(other) => return Err(format!("tls {other:?}: expected `status` or `renew [app]`")),
+        },
         "top" | "monit" => {
             target = many(&rest);
             Command::Top
