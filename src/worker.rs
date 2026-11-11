@@ -116,6 +116,8 @@ pub struct StandbyGates {
     /// A check or verify_command is running.
     pub checking: bool,
     pub verified: bool,
+    /// `[reload.warmup]` ran (or there is none).
+    pub warmed: bool,
     /// Passed every gate: may be promoted.
     pub available: bool,
     /// Its instance number (`[app] instance_var`) until promoted: past the
@@ -328,6 +330,9 @@ pub struct Instance {
     /// Warden's own until it is ready, then its cgroup's (a worker may run
     /// in one of its own); `None`: no readable counter.
     pub oom_counter: Option<PathBuf>,
+    /// A rollout's replacement started with its listen held back
+    /// (`[reload.warmup]`), until it is warmed up and told to listen.
+    pub held: bool,
 }
 
 impl Instance {
@@ -342,6 +347,7 @@ impl Instance {
             promoted_at: None,
             release: None,
             oom_counter: None,
+            held: false,
             slot,
             handle,
             started: Instant::now(),

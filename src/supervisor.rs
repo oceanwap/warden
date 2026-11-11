@@ -87,6 +87,11 @@ enum Event {
         inst: u64,
         result: Result<(), String>,
     },
+    StandbyWarmed {
+        inst: u64,
+        sent: u32,
+        failed: u32,
+    },
     StandbyVerified {
         inst: u64,
         result: Result<(), String>,
@@ -95,6 +100,8 @@ enum Event {
     Ports(Vec<(u64, portwatch::Seen)>),
     /// The keeper's channel ended: it died (`crate::keeper`).
     KeeperGone,
+    /// `[tls]`: a new certificate is in place; the workers must be replaced.
+    TlsRenewed,
 }
 
 struct HealthState {
@@ -198,6 +205,8 @@ pub struct Supervisor {
     watch_pending: Option<watch::Change>,
     /// The wait for `watch_pending` was logged.
     watch_held: bool,
+    /// `[tls]`: a new certificate waits for a rolling reload.
+    tls_pending: bool,
     /// A restart that could not start (the release did not resolve) is tried
     /// again a few times: `(failures so far, not before)`.
     watch_retry: Option<(u8, Instant)>,
@@ -408,6 +417,11 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
             standby = sup.cfg.workers.standby,
             note = "each costs about one worker's memory",
         );
+    }
+    if let Some(t) = sup.cfg.tls.clone() {
+        crate::autotls::ensure_placeholder(&t)?;
+        let tx = sup.tx.clone();
+        crate::guard::spawn_request("certificates", crate::autotls::run(t, move || drop(tx.send(Event::TlsRenewed))));
     }
     warn_if_no_migrate_req(&sup.cfg);
     if !sup.handoff_on {
@@ -795,6 +809,7 @@ impl Supervisor {
             launch_cwd: std::env::current_dir().ok(),
             watch_pending: None,
             watch_held: false,
+            tls_pending: false,
             watch_retry: None,
             watch_throttle: watch::Throttle::default(),
             exe: own_exe(),
@@ -1316,7 +1331,9 @@ impl Supervisor {
         self.check_release();
         // A standby: its number in the pool, and its instance number.
         let standby = (role == Role::Standby).then(|| (self.free_standby_number(), self.free_standby_instance()));
-        let spec = self.spec(slot_id, inst_id, standby);
+        // A rollout's replacement is held back to be warmed up first.
+        let held = role == Role::Replacement && self.warmup_holds();
+        let spec = self.spec(slot_id, inst_id, standby, held);
         let handle = process::spawn(spec, inst_id, self.proc_tx.clone())?;
         let pid = handle.pid;
         let mut inst = Instance::new(slot_id, handle, role);
@@ -1324,6 +1341,7 @@ impl Supervisor {
         inst.oom_counter = self.oom.own();
         let number = standby.map(|(n, _)| n);
         inst.standby_number = number;
+        inst.held = held;
         if let (Some(st), Some((_, instance))) = (inst.standby.as_mut(), standby) {
             st.instance = instance;
         }
@@ -1353,10 +1371,15 @@ impl Supervisor {
 
     /// `standby`: the number and instance number of the standby this starts
     /// (`slot_id` is then 0).
-    fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>) -> process::Spec {
+    /// `held`: the shim defers its listen until told to (`standby` env), and
+    /// it keeps the slot's worker id.
+    fn spec(&self, slot_id: usize, inst_id: u64, standby: Option<(usize, usize)>, held: bool) -> process::Spec {
         let a = &self.cfg.app;
         let mut env: Vec<(String, String)> =
             self.worker_env(slot_id, inst_id, standby).into_iter().map(|(k, v, _)| (k, v)).collect();
+        if held {
+            env.push(("WARDEN_STANDBY".into(), "1".into()));
+        }
         // Warden's own code reports on fd 3 (`process::Spec::ipc_nonblocking`).
         let ipc_nonblocking;
         let mut recoverable = false;
@@ -1493,6 +1516,10 @@ impl Supervisor {
         if self.ticket_preamble(slot_id).is_some() {
             // The shim reads the shared ticket key off fd 3 first thing.
             add("WARDEN_TLS_TICKET", "1".into());
+        }
+        if let Some(t) = &self.cfg.tls {
+            // The shim gives Bun.serve this certificate when the app brings none.
+            add("WARDEN_TLS_DIR", crate::autotls::live(t).display().to_string());
         }
         if let Some(ip) = a.address {
             // The shim makes the app's listen on its port use this address.
@@ -1653,7 +1680,8 @@ impl Supervisor {
                     let late = match (&i.standby, i.promoted_at) {
                         (Some(st), _) => st.ready_at.is_none(),
                         (None, Some(p)) => i.ready_at.is_none() && p.elapsed() >= promote_timeout,
-                        (None, None) => i.ready_at.is_none(),
+                        // A held replacement is bounded by its rollout's deadline.
+                        (None, None) => i.ready_at.is_none() && !i.held,
                     };
                     if late && !i.stopping {
                         if i.standby.is_some() {
@@ -1721,6 +1749,11 @@ impl Supervisor {
                 // `[watch]` changed by a reload, workers stopped or started again.
                 self.sync_watch();
                 self.try_watch_restart();
+                self.try_tls_reload();
+            }
+            Event::TlsRenewed => {
+                self.tls_pending = true;
+                self.try_tls_reload();
             }
             Event::Watch { token, change } => self.on_watch(token, change),
             Event::Gate(g) => self.on_gate(g),
@@ -1731,6 +1764,7 @@ impl Supervisor {
             Event::StandbyGateDue { inst } => self.standby_gates(inst),
             Event::StandbyChecked { inst, result } => self.on_standby_checked(inst, result),
             Event::StandbyVerified { inst, result } => self.on_standby_verified(inst, result),
+            Event::StandbyWarmed { inst, sent, failed } => self.on_standby_warmed(inst, sent, failed),
             Event::KeeperGone => self.keeper_gone(),
         }
     }
@@ -1848,6 +1882,7 @@ impl Supervisor {
                     self.rollout_socket_reported(inst_id);
                 }
             }
+            "standby_ready" if inst.held => self.rollout_on_held_ready(inst_id, worker, msg.socket.clone()),
             "standby_ready" => self.on_standby_ready(inst_id, msg.socket.clone()),
             "handoff_unsupported" if self.handoff_old_bun.is_none() => {
                 let bun = msg.message.clone().unwrap_or_else(|| "?".into());
@@ -1951,7 +1986,8 @@ impl Supervisor {
         }
         let ms = inst.started.elapsed().as_millis();
         // Promoted standby: from the promotion to listening.
-        let promote_ms = inst.promoted_at.map(|p| format!("{:.1}", p.elapsed().as_secs_f64() * 1000.0));
+        let promote_ms =
+            inst.promoted_at.filter(|_| !inst.held).map(|p| format!("{:.1}", p.elapsed().as_secs_f64() * 1000.0));
         let (slot_id, role, pid) = (inst.slot, inst.role, inst.handle.pid);
         // The standby it was (`--worker sN` shows its whole story).
         let was = inst.standby_number.map(standby_label).unwrap_or_default();
@@ -3143,6 +3179,31 @@ impl Supervisor {
         }
     }
 
+    /// A new `[tls]` certificate: the same gated rolling reload as `warden
+    /// reload`, so the old workers drain and no connection is cut. Waits for a
+    /// rollout in progress and is tried again on the next tick.
+    fn try_tls_reload(&mut self) {
+        if !self.tls_pending {
+            return;
+        }
+        if self.shutting_down || self.stopped || self.sweep.is_some() || self.insts.is_empty() {
+            // The workers that start next read the new files.
+            self.tls_pending = false;
+            return;
+        }
+        if self.roll.is_some() {
+            return;
+        }
+        let ids: Vec<usize> = self.slots.values().filter(|s| !s.removing).map(|s| s.id).collect();
+        match self.begin_rollout(Kind::Reload, ids, "tls".into(), false) {
+            Ok(_) => {
+                self.tls_pending = false;
+                info!("new certificate: rolling reload of the workers");
+            }
+            Err(e) => warn!("reload for the new certificate could not start; trying again", reason = e),
+        }
+    }
+
     fn request_reload(&mut self, safe: bool) -> Response {
         if self.shutting_down {
             return Response::err("shutting down");
@@ -3970,7 +4031,7 @@ mod tests {
         // The app's own come first, Warden's after: what `spec` applies in order.
         let first_warden = env.iter().position(|e| e.2 == "warden").unwrap();
         assert!(env[first_warden..].iter().all(|e| e.2 == "warden"));
-        let spec = s.spec(2, 7, None);
+        let spec = s.spec(2, 7, None, false);
         assert!(spec.env.iter().rev().find(|(k, _)| k == "PORT").is_some_and(|(_, v)| v == "3001"));
 
         // A standby: worker id 0 and an instance number past the workers'.

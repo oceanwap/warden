@@ -93,6 +93,12 @@ max_draining = 4                             # old workers that may still be dra
                                              # until it exits: a rollout runs at most max(surge, max_draining)
                                              # extra processes. 1 = each old worker exits before the next starts
 
+# [reload.warmup]                            # off by default: requests sent to a new worker (and to standbys) on its
+# path = "/"                                 # private socket before it joins the port, so its JIT is warm for the first
+# requests = 200                             # visitor. A GET that is safe to repeat; default path: the [health] path
+# concurrency = 4
+# timeout = 10                               # s; then the worker joins anyway
+
 [watchdog]
 timeout = 60                                 # s without an event-loop heartbeat = hung (0 = off)
 port_lost = 10                               # s a worker that listened on a TCP port may go without one before it is
@@ -190,6 +196,16 @@ socket = "/run/warden/travelerwe-api/control.sock"   # example; RuntimeDirectory
 # site = "/etc/nginx/conf.d/warden-api.conf" # default: warden-<name>.conf in nginx's conf.d
 # websocket_paths = ["/ws"]                  # example; 1 h read timeout
 # sse_paths = ["/events"]                    # example; no buffering, 1 h read timeout
+
+# Automatic HTTPS for a Bun app: Warden gets and renews a Let's Encrypt certificate and the shim
+# gives it to Bun.serve (the app passes no `tls`). Needs app.port, port 80 reachable. docs/tls.md
+# [tls]
+# hosts = ["api.example.com"]                # example; no wildcards
+# email = "you@example.com"                  # example; the CA's contact address
+# staging = false                            # Let's Encrypt's staging CA, to try first
+# directory = "https://acme.example/dir"     # example; another ACME CA instead
+# redirect = true                            # port 80: 308 to https (everything but challenges)
+# http_port = 80                             # the CA always asks 80: change only behind a port forward
 
 # A static site instead of an app (what `warden serve <dir> <port>` writes).
 # Workers are Warden's own file server: no command needed, process mode.

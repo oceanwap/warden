@@ -404,8 +404,19 @@ function openPrivateBun(options) {
 
 // The app's options plus what the shim adds to every server: WebSocket
 // open/close tracking (long-lived connections, below).
+// [tls]: the certificate Warden keeps for this app (WARDEN_TLS_DIR holds
+// fullchain.pem and privkey.pem). An app that passes its own `tls` keeps it.
+// Read once per server, when it is created: nothing per request.
 function withShimOptions(options) {
   const o = Object.create(options);
+  if (env.WARDEN_TLS_DIR && options.tls == null && !options.unix && (options.port == null || Number(options.port) === appPort)) {
+    const dir = env.WARDEN_TLS_DIR;
+    try {
+      o.tls = { cert: fs.readFileSync(dir + "/fullchain.pem"), key: fs.readFileSync(dir + "/privkey.pem") };
+    } catch (e) {
+      throw new Error(`warden: [tls] certificate in ${dir} cannot be read: ${e && e.message}`);
+    }
+  }
   if (longLived && options.websocket && typeof options.websocket === "object") o.websocket = trackBunWebSockets(options.websocket);
   return o;
 }

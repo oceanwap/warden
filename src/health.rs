@@ -41,7 +41,7 @@ pub async fn check(t: &Target, timeout: Duration) -> Result<u16, String> {
     let host = format!("{}:{}", t.host, t.port);
     with_timeout(timeout, async {
         let s = TcpStream::connect((t.host.as_str(), t.port)).await.map_err(|e| e.to_string())?;
-        request(s, &host, &t.path).await
+        request(s, &host, &t.path, false).await
     })
     .await
 }
@@ -50,9 +50,45 @@ pub async fn check(t: &Target, timeout: Duration) -> Result<u16, String> {
 pub async fn check_unix(socket: &Path, path: &str, timeout: Duration) -> Result<u16, String> {
     with_timeout(timeout, async {
         let s = UnixStream::connect(socket).await.map_err(|e| format!("{}: {e}", socket.display()))?;
-        request(s, "localhost", path).await
+        request(s, "localhost", path, false).await
     })
     .await
+}
+
+/// `requests` GETs of `path` over the worker's private socket, `concurrency`
+/// at a time, each read to its end so the app does all its work. Stops at
+/// `total`. Returns (requests finished, of which failed).
+pub async fn warm_unix(
+    socket: &Path,
+    path: &str,
+    requests: u32,
+    concurrency: u32,
+    each: Duration,
+    total: Duration,
+) -> (u32, u32) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let (next, done, failed) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..concurrency.min(requests) {
+        let (socket, path) = (socket.to_path_buf(), path.to_string());
+        let (next, done, failed) = (next.clone(), done.clone(), failed.clone());
+        tasks.spawn_local(async move {
+            while next.fetch_add(1, Relaxed) < requests {
+                let r = with_timeout(each, async {
+                    let s = UnixStream::connect(&socket).await.map_err(|e| e.to_string())?;
+                    request(s, "localhost", &path, true).await
+                })
+                .await;
+                done.fetch_add(1, Relaxed);
+                if r.is_err() {
+                    failed.fetch_add(1, Relaxed);
+                }
+            }
+        });
+    }
+    let _ = tokio::time::timeout(total, async { while tasks.join_next().await.is_some() {} }).await;
+    (done.load(Relaxed), failed.load(Relaxed))
 }
 
 async fn with_timeout(
@@ -65,7 +101,13 @@ async fn with_timeout(
     }
 }
 
-async fn request<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, host: &str, path: &str) -> Result<u16, String> {
+/// `drain`: read the whole response, so the app finishes writing it.
+async fn request<S: AsyncRead + AsyncWrite + Unpin>(
+    mut s: S,
+    host: &str,
+    path: &str,
+    drain: bool,
+) -> Result<u16, String> {
     let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: warden-health\r\nConnection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
     let mut buf = [0u8; 256];
@@ -83,6 +125,10 @@ async fn request<S: AsyncRead + AsyncWrite + Unpin>(mut s: S, host: &str, path: 
         .and_then(|r| r.get(2..5))
         .and_then(|c| c.parse::<u16>().ok())
         .ok_or_else(|| format!("not an HTTP response: {:?}", head.lines().next().unwrap_or("")))?;
+    if drain {
+        let mut sink = [0u8; 8192];
+        while s.read(&mut sink).await.map_err(|e| e.to_string())? > 0 {}
+    }
     if (200..400).contains(&code) { Ok(code) } else { Err(format!("HTTP {code}")) }
 }
 
