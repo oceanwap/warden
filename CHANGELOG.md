@@ -5,6 +5,14 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-11-11
+
+### Fixed
+
+- The Release workflow retries `apt` when the runner's Ubuntu mirrors fail to
+  resolve, which stopped 0.1.9 from publishing. 0.1.10 is 0.1.9 plus that
+  fix; 0.1.9's changes are listed below.
+
 ## [0.1.9] — 2026-11-11
 
 ### Added

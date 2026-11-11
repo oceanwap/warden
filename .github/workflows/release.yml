@@ -450,8 +450,12 @@ jobs:
       # for the menu entry: the inspection of what is inside.
       - name: Tools for the inspection
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends rpm desktop-file-utils
+          # The runners' Ubuntu mirrors sometimes fail to resolve for a while: try again.
+          for i in 1 2 3 4 5; do
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends rpm desktop-file-utils && exit 0
+            sleep $((i * 30))
+          done
+          exit 1
       # Inspects every package (what it holds, what it must not), then in each
       # image `dpkg -i` / `rpm -i`, warden --version, warden doctor, a reinstall,
       # warden-gui in warden's place and back (apt/dnf, then dpkg/rpm), the
