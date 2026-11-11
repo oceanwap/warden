@@ -18,6 +18,10 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
   Workers start with a placeholder certificate until the real one arrives.
   `warden tls` lists the certificates. Nothing is added to the request path;
   without `[tls]` nothing changes. See `docs/tls.md`.
+- `[tls]` follow-ups: `warden tls renew [app]` orders a certificate now;
+  changes to `hosts`, `email`, `staging`, `directory` apply on `warden
+  reload`; `[static]` sites can have `[tls]`; `dns_hook` proves names with
+  the DNS challenge (wildcards, servers without port 80).
 - `[balance]` (Linux, root): connections to an app's `address:port` are
   spread by the kernel over workers that each listen on their own port
   (`port_strategy = "offset"`), with an eBPF `sk_lookup` program. No proxy,

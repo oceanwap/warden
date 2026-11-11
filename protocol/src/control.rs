@@ -31,6 +31,8 @@ pub enum Request {
         #[serde(default)]
         safe: bool,
     },
+    /// `[tls]`: order a new certificate now, though the current one is not due.
+    TlsRenew,
     Scale {
         count: usize,
     },

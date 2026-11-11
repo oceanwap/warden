@@ -524,6 +524,9 @@ impl Supervisor {
 
     fn restore(&mut self, snap: Snapshot) {
         self.cfg = snap.cfg;
+        if let (Some(t), Some((tx, _))) = (&self.cfg.tls, &self.tls_ctl) {
+            tx.send_replace(t.clone());
+        }
         self.policy = Policy::from(&self.cfg.restart);
         self.shim_path = snap.shim_path;
         self.host_path = snap.host_path;
@@ -581,10 +584,33 @@ impl Supervisor {
         if diff(&old.metrics, &new.metrics) || diff(&old.control, &new.control) {
             ignored.push("metrics/control");
         }
+        // `[tls]` can change in place (hosts, email, CA); adding or removing it needs a restart.
+        let tls = match (&old.tls, &new.tls) {
+            (Some(a), Some(b)) => {
+                if a != b {
+                    crate::autotls::ensure_placeholder(b)?;
+                    if let Some((tx, _)) = &self.tls_ctl {
+                        tx.send_replace(b.clone());
+                    }
+                    applied.push("tls");
+                    if a.http_port != b.http_port || a.redirect != b.redirect {
+                        ignored.push("tls.http_port/redirect");
+                    }
+                }
+                new.tls.clone()
+            }
+            (a, b) => {
+                if a != b {
+                    ignored.push("tls (adding or removing the section)");
+                }
+                a.clone()
+            }
+        };
         let (workers, logging, metrics, control) =
             (old.workers.clone(), old.logging.clone(), old.metrics.clone(), old.control.clone());
         let (url, enabled, interval) = (old.health.url.clone(), old.health.enabled, old.health.interval);
         self.cfg = new;
+        self.cfg.tls = tls;
         self.cfg.workers = workers;
         self.cfg.logging = logging;
         self.cfg.metrics = metrics;

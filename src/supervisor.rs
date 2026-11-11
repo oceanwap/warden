@@ -207,6 +207,8 @@ pub struct Supervisor {
     watch_held: bool,
     /// `[tls]`: a new certificate waits for a rolling reload.
     tls_pending: bool,
+    /// The certificate task's inputs: the `[tls]` section (changed by a reload) and a nudge to order now.
+    tls_ctl: Option<(tokio::sync::watch::Sender<crate::config::Tls>, std::sync::Arc<tokio::sync::Notify>)>,
     /// A restart that could not start (the release did not resolve) is tried
     /// again a few times: `(failures so far, not before)`.
     watch_retry: Option<(u8, Instant)>,
@@ -421,7 +423,13 @@ async fn run_local(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), String>
     if let Some(t) = sup.cfg.tls.clone() {
         crate::autotls::ensure_placeholder(&t)?;
         let tx = sup.tx.clone();
-        crate::guard::spawn_request("certificates", crate::autotls::run(t, move || drop(tx.send(Event::TlsRenewed))));
+        let (cfg_tx, cfg_rx) = tokio::sync::watch::channel(t);
+        let force = std::sync::Arc::new(tokio::sync::Notify::new());
+        sup.tls_ctl = Some((cfg_tx, force.clone()));
+        crate::guard::spawn_request(
+            "certificates",
+            crate::autotls::run(cfg_rx, force, move || drop(tx.send(Event::TlsRenewed))),
+        );
     }
     warn_if_no_migrate_req(&sup.cfg);
     if !sup.handoff_on {
@@ -810,6 +818,7 @@ impl Supervisor {
             watch_pending: None,
             watch_held: false,
             tls_pending: false,
+            tls_ctl: None,
             watch_retry: None,
             watch_throttle: watch::Throttle::default(),
             exe: own_exe(),
@@ -1550,6 +1559,11 @@ impl Supervisor {
                 if let Some(st) = &self.cfg.static_files {
                     let mut st = st.clone();
                     st.root = self.pinned_path(st.root);
+                    if let Some(t) = &self.cfg.tls {
+                        let live = crate::autotls::live(t);
+                        st.cert = Some(live.join("fullchain.pem"));
+                        st.key = Some(live.join("privkey.pem"));
+                    }
                     // Where the background compression keeps its copies: one folder per app.
                     st.compress_dir
                         .get_or_insert_with(|| crate::fleet::state_dir().join("compress").join(&self.cfg.app.name));
@@ -3301,6 +3315,15 @@ impl Supervisor {
                 Response { info: Some(self.info(show_secrets, worker)), ..Response::ok("") }
             }
             Request::Reload { safe } => self.request_reload(safe),
+            Request::TlsRenew => match &self.tls_ctl {
+                Some((_, force)) => {
+                    force.notify_one();
+                    Response::ok(
+                        "ordering a new certificate; the workers reload when it arrives (`warden logs` shows it)",
+                    )
+                }
+                None => Response::err("this app has no [tls] section (docs/tls.md)"),
+            },
             Request::Stop => {
                 if self.shutting_down {
                     return Response::err("shutting down");

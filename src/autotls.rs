@@ -28,7 +28,7 @@ pub fn base() -> PathBuf {
 
 /// Where this app's certificates live.
 pub fn app_dir(t: &Tls) -> PathBuf {
-    base().join(&t.hosts[0])
+    base().join(t.hosts[0].replacen("*.", "wildcard.", 1))
 }
 
 /// The directory the workers read `fullchain.pem` and `privkey.pem` from.
@@ -71,23 +71,32 @@ fn backoff(failures: u32) -> Duration {
 
 /// Runs for the life of the supervisor. `renewed` is called after a new
 /// certificate is in place.
-pub async fn run(t: Tls, renewed: impl Fn()) {
+pub async fn run(
+    mut cfg: tokio::sync::watch::Receiver<Tls>,
+    force: std::sync::Arc<tokio::sync::Notify>,
+    renewed: impl Fn(),
+) {
     // The ACME client's TLS (the process default, once; the static server does the same).
     let _ = rustls::crypto::ring::default_provider().install_default();
     let base = base();
-    let dir = app_dir(&t);
+    let mut t = cfg.borrow_and_update().clone();
     let challenges = base.join("challenges");
+    // The port and the redirect are fixed for the life of the supervisor.
     tokio::task::spawn_local(responder::serve(t.http_port, challenges.clone(), t.redirect));
     let mut failures = 0u32;
+    // `warden tls renew`: order even though the certificate is not due; kept until an order succeeds.
+    let mut forced = false;
     loop {
+        let dir = app_dir(&t);
         let meta = store::read_meta(&dir);
-        let wait = if store::due(meta.as_ref(), &t.hosts, now()) {
+        let wait = if forced || store::due(meta.as_ref(), &t.hosts, now()) {
             match order::issue(&t, &base, &challenges)
                 .await
                 .and_then(|(chain, key)| store::install(&dir, &chain, &key, true))
             {
                 Ok(()) => {
                     failures = 0;
+                    forced = false;
                     let m = store::read_meta(&dir);
                     info!(
                         "certificate issued",
@@ -128,7 +137,17 @@ pub async fn run(t: Tls, renewed: impl Fn()) {
         };
         // A little jitter so many apps do not order in the same second.
         let jitter = Duration::from_millis(u64::from(std::process::id()) % 60_000);
-        tokio::time::sleep(wait + jitter.min(wait / 10 + Duration::from_secs(1))).await;
+        tokio::select! {
+            () = tokio::time::sleep(wait + jitter.min(wait / 10 + Duration::from_secs(1))) => {}
+            () = force.notified() => forced = true,
+            changed = cfg.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                t = cfg.borrow_and_update().clone();
+                failures = 0;
+            }
+        }
     }
 }
 

@@ -50,8 +50,44 @@ async fn account(t: &Tls, base: &Path) -> Result<Account, String> {
     Ok(account)
 }
 
+/// Runs `tls.dns_hook` with `present` or `cleanup` for one TXT record.
+async fn hook(argv: &[String], what: &str, domain: &str, value: &str) -> Result<(), String> {
+    let run = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .arg(what)
+        .env("WARDEN_ACME_DOMAIN", domain)
+        .env("WARDEN_ACME_RECORD", format!("_acme-challenge.{domain}"))
+        .env("WARDEN_ACME_VALUE", value)
+        .kill_on_drop(true)
+        .status();
+    match tokio::time::timeout(Duration::from_secs(120), run).await {
+        Err(_) => Err(format!("tls.dns_hook {what} took more than 120 s")),
+        Ok(Err(e)) => Err(format!("tls.dns_hook {}: {e}", argv[0])),
+        Ok(Ok(s)) if !s.success() => Err(format!("tls.dns_hook {what} failed: {s}")),
+        Ok(Ok(_)) => Ok(()),
+    }
+}
+
 /// Orders a certificate for `t.hosts`: the chain and its private key (PEM).
 pub async fn issue(t: &Tls, base: &Path, challenges: &Path) -> Result<(String, String), String> {
+    let mut records = vec![];
+    let result = order(t, base, challenges, &mut records).await;
+    for (domain, value) in records {
+        if let Some(argv) = &t.dns_hook {
+            if let Err(e) = hook(argv, "cleanup", &domain, &value).await {
+                crate::warn!("DNS challenge record not removed", reason = e);
+            }
+        }
+    }
+    result
+}
+
+async fn order(
+    t: &Tls,
+    base: &Path,
+    challenges: &Path,
+    records: &mut Vec<(String, String)>,
+) -> Result<(String, String), String> {
     let account = account(t, base).await?;
     let ids: Vec<Identifier> = t.hosts.iter().map(|h| Identifier::Dns(h.clone())).collect();
     let mut order = account.new_order(&NewOrder::new(&ids)).await.map_err(|e| format!("new order: {e}"))?;
@@ -64,6 +100,18 @@ pub async fn issue(t: &Tls, base: &Path, challenges: &Path) -> Result<(String, S
             AuthorizationStatus::Pending => {}
             AuthorizationStatus::Valid => continue,
             s => return Err(format!("authorization is {s:?}")),
+        }
+        if let Some(argv) = &t.dns_hook {
+            let mut ch = a.challenge(ChallengeType::Dns01).ok_or("the CA offers no DNS-01 challenge")?;
+            let Identifier::Dns(domain) = ch.identifier().identifier.clone() else {
+                return Err("not a DNS name".into());
+            };
+            let value = ch.key_authorization().dns_value();
+            records.push((domain.clone(), value.clone()));
+            hook(argv, "present", &domain, &value).await?;
+            tokio::time::sleep(Duration::from_secs(t.dns_wait)).await;
+            ch.set_ready().await.map_err(|e| format!("challenge: {e}"))?;
+            continue;
         }
         let mut ch = a.challenge(ChallengeType::Http01).ok_or("the CA offers no HTTP-01 challenge")?;
         // The CA names the file: nothing but a token's own characters may reach the path.

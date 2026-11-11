@@ -85,6 +85,18 @@ pub struct Tls {
     /// this only behind a port forward or in tests.
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    /// Proves the names with the DNS challenge instead of port 80 (and allows
+    /// wildcards): this command runs as `<command> present` and `<command>
+    /// cleanup` with WARDEN_ACME_RECORD and WARDEN_ACME_VALUE set.
+    #[serde(default)]
+    pub dns_hook: Option<Vec<String>>,
+    /// Seconds to wait after `present` for the TXT record to spread.
+    #[serde(default = "default_dns_wait")]
+    pub dns_wait: u64,
+}
+
+fn default_dns_wait() -> u64 {
+    30
 }
 
 fn default_http_port() -> u16 {
@@ -98,8 +110,8 @@ impl Tls {
         }
         for h in &self.hosts {
             valid_hostname(h).map_err(|e| format!("tls.hosts: {e}"))?;
-            if h.starts_with("*.") {
-                return Err(format!("tls.hosts: {h} is a wildcard, which needs the DNS challenge; list the names"));
+            if h.starts_with("*.") && self.dns_hook.is_none() {
+                return Err(format!("tls.hosts: {h} is a wildcard, which needs the DNS challenge (tls.dns_hook)"));
             }
             if h.chars().any(|c| c.is_ascii_uppercase()) {
                 return Err(format!("tls.hosts: write {h:?} in lowercase"));
@@ -119,11 +131,17 @@ impl Tls {
                 return Err(format!("tls.directory = {d:?}: an http(s) URL"));
             }
         }
+        if self.dns_hook.as_ref().is_some_and(|c| c.first().is_none_or(String::is_empty)) {
+            return Err("tls.dns_hook: a command, e.g. [\"/usr/local/bin/acme-dns\"]".into());
+        }
         if self.http_port == 0 {
             return Err("tls.http_port: port 0 is not a port".into());
         }
-        if cfg.route.is_some() || cfg.static_files.is_some() || cfg.workers.mode != Mode::Process {
-            return Err("[tls] is for Bun apps in process mode (not [route], [static] or worker mode)".into());
+        if cfg.route.is_some() || cfg.workers.mode != Mode::Process {
+            return Err("[tls] is for Bun apps and [static] sites in process mode (not [route] or worker mode)".into());
+        }
+        if cfg.static_files.as_ref().is_some_and(|s| s.cert.is_some()) {
+            return Err("[tls] and static.cert both name the certificate: set one".into());
         }
         if cfg.expose.as_ref().is_some_and(|x| x.cert.is_some() || x.acme.is_some()) {
             return Err("[tls] and [expose] cert/acme both get a certificate: set one".into());
@@ -131,7 +149,7 @@ impl Tls {
         if cfg.app.port.is_none() {
             return Err("[tls] needs app.port (the port the app serves HTTPS on, usually 443)".into());
         }
-        if cfg.app.shim == Some(false) {
+        if cfg.app.shim == Some(false) && cfg.static_files.is_none() {
             return Err("[tls] hands the certificate over through the shim: remove app.shim = false".into());
         }
         Ok(())
@@ -2162,11 +2180,19 @@ mod tests {
         let err = |extra: &str| parse(extra).unwrap_err();
         assert!(err("[tls]\nhosts = []\nemail = \"a@b.c\"\n").contains("at least one hostname"));
         assert!(err("[tls]\nhosts = [\"*.example.com\"]\nemail = \"a@b.c\"\n").contains("wildcard"));
+        let wild = "[tls]\nhosts = [\"*.example.com\"]\nemail = \"a@b.c\"\ndns_hook = [\"/bin/true\"]\n";
+        assert_eq!(parse(wild).unwrap().tls.unwrap().dns_wait, 30);
+        assert!(err(&wild.replace("[\"/bin/true\"]", "[]")).contains("dns_hook"));
         assert!(err("[tls]\nhosts = [\"API.example.com\"]\nemail = \"a@b.c\"\n").contains("lowercase"));
         assert!(err("[tls]\nhosts = [\"10.0.0.1\"]\nemail = \"a@b.c\"\n").contains("IP address"));
         assert!(err("[tls]\nhosts = [\"a.test\"]\nemail = \"nobody\"\n").contains("e-mail"));
         assert!(err(&format!("{tls}staging = true\ndirectory = \"https://ca.test/dir\"\n")).contains("set one"));
-        assert!(err(&format!("{tls}[static]\nroot = \"/srv\"\n")).contains("Bun apps"));
+        assert!(
+            parse(&format!("{tls}[static]\nroot = \"/srv\"\n")).unwrap().tls.is_some(),
+            "a static site takes [tls]"
+        );
+        assert!(err(&format!("{tls}[static]\nroot = \"/srv\"\ncert = \"/a\"\nkey = \"/b\"\n")).contains("set one"));
+        assert!(err(&format!("{tls}[route]\nhosts = {{ \"a.test\" = 1 }}\n")).contains("Bun apps"));
         assert!(Config::parse(&format!("[app]\nname = \"x\"\n{tls}")).unwrap_err().contains("app.port"));
         assert!(err(&format!("{tls}[workers]\nmode = \"worker\"\n")).contains("process mode"));
     }
