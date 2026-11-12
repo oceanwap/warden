@@ -45,9 +45,14 @@ impl Release {
 }
 
 /// Ask the host's warden whether a newer release exists.
-pub async fn check(host: &Host) -> Result<Check, String> {
+pub async fn check(host: &Host, exe: Option<&std::path::Path>) -> Result<Check, String> {
     let args = ["upgrade".to_string(), "--check".into(), "--json".into()];
-    let out = commands::run_warden(host, &args, None, &[], Duration::from_secs(60)).await?;
+    let limit = Duration::from_secs(60);
+    let out = match (host, exe) {
+        // The `warden` wardend runs from, when it is not the one beside this window.
+        (Host::Local, Some(exe)) => commands::run(exe, &args, None, &[], limit).await?,
+        _ => commands::run_warden(host, &args, None, &[], limit).await?,
+    };
     if !out.ok {
         return Err(out.text());
     }

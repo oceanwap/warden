@@ -933,8 +933,9 @@ impl Gui {
                     return Task::none();
                 }
                 self.release = Release::Updating { to: c.latest.clone(), secs: 0 };
-                let (host, dir, tag) = (self.target.host.clone(), self.wardend_dir(), self.tag());
-                Task::perform(async move { commands::upgrade(&host, dir.as_deref()).await }, move |r| {
+                let (host, dir, tag, exe) =
+                    (self.target.host.clone(), self.wardend_dir(), self.tag(), self.daemon_exe());
+                Task::perform(async move { commands::upgrade(&host, dir.as_deref(), exe.as_deref()).await }, move |r| {
                     tag.wrap(Message::Upgraded(r))
                 })
             }
@@ -1467,8 +1468,16 @@ impl Gui {
             return Task::none();
         }
         self.release = Release::Checking;
-        let (host, tag) = (self.target.host.clone(), self.tag());
-        Task::perform(async move { release::check(&host).await }, move |r| tag.wrap(Message::ReleaseChecked(r)))
+        let (host, tag, exe) = (self.target.host.clone(), self.tag(), self.daemon_exe());
+        Task::perform(async move { release::check(&host, exe.as_deref()).await }, move |r| {
+            tag.wrap(Message::ReleaseChecked(r))
+        })
+    }
+
+    /// The `warden` wardend on this machine runs from, if it is not the one beside this window.
+    fn daemon_exe(&self) -> Option<PathBuf> {
+        let pid = self.model.daemon.as_ref()?.pid;
+        if self.target.host.is_local() { commands::daemon_exe(pid) } else { None }
     }
 
     fn persist(&mut self) -> Task<Message> {
