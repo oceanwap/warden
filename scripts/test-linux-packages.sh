@@ -305,6 +305,8 @@ if [ "$FAMILY" = deb ]; then
   owner() { dpkg -S "$1" 2>/dev/null | sed 's/: .*//'; }
   refusal='libc6|Depends|unmet'
 else
+  # Fedora 45's rpm refuses unsigned packages by default; ours are not signed (docs/packages.md).
+  mkdir -p /etc/rpm && echo '%_pkgverify_level none' >/etc/rpm/macros.warden-test
   low_install() { rpm -i "$1"; }
   low_remove() { rpm -e "$1"; }
   pm_install() { dnf install -y -q "$1"; }
