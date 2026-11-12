@@ -344,8 +344,29 @@ pub async fn restart_everything(host: &Host, dir: Option<&Path>) -> Restart {
 }
 
 /// `warden upgrade --yes`: the newest release installed on `host`, everything restarted onto it.
-pub async fn upgrade(host: &Host, dir: Option<&Path>) -> Result<Output, String> {
-    run_aimed(host, &["upgrade".into(), "--yes".into()], dir).await.map_err(|n| n.text)
+pub async fn upgrade(host: &Host, dir: Option<&Path>, exe: Option<&Path>) -> Result<Output, String> {
+    let args = ["upgrade".to_string(), "--yes".into()];
+    // On this machine, the `warden` wardend runs from (see `daemon_exe`): it is the one to replace.
+    if let (Host::Local, Some(exe)) = (host, exe) {
+        let env: Vec<_> =
+            dir.map(|d| ("WARDEN_RUNTIME_DIR".to_string(), d.display().to_string())).into_iter().collect();
+        return run(exe, &args, None, &env, RESTART_LIMIT).await;
+    }
+    run_aimed(host, &args, dir).await.map_err(|n| n.text)
+}
+
+/// The program wardend (process `pid`, on this machine) runs from, when it is not the `warden`
+/// beside this window: `~/.local/bin/warden` next to a Warden.app of another version. The update
+/// check and the Update button ask that one, or they would say "up to date" about the copy inside
+/// the app while the daemon runs an older one.
+pub fn daemon_exe(pid: u32) -> Option<PathBuf> {
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok().or_else(|| {
+        let out = std::process::Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()?;
+        let s = String::from_utf8(out.stdout).ok()?;
+        Some(PathBuf::from(s.trim())).filter(|p| p.is_absolute())
+    })?;
+    let ours = find_local_warden().ok()?;
+    (is_executable(&exe) && std::fs::canonicalize(&exe).ok() != std::fs::canonicalize(&ours).ok()).then_some(exe)
 }
 
 /// `warden resurrect`: start what the last `warden save` (the first step of a restart) remembered.
@@ -795,6 +816,12 @@ async fn write_in_place(path: &str, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn daemon_exe_is_none_for_the_warden_beside_the_window_or_a_dead_pid() {
+        // No `warden` beside the test binary and none found: also None, never a guess.
+        assert_eq!(daemon_exe(u32::MAX), None);
+    }
+
     use super::*;
 
     fn form(what: &str, name: &str, i: &str, port: &str) -> AddApp {

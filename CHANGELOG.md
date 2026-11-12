@@ -5,6 +5,13 @@ Format inspired by [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+
+- GUI: the update check and the Update button ask the `warden` that wardend runs
+  from, not the copy inside Warden.app. With an app newer than the CLI and
+  the daemon (after updating only the app), the window said "up to date" and
+  offered nothing; now it offers the update.
+
 ## [0.1.9] — 2026-11-12
 
 ### Added
