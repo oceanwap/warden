@@ -366,7 +366,21 @@ pub fn daemon_exe(pid: u32) -> Option<PathBuf> {
         Some(PathBuf::from(s.trim())).filter(|p| p.is_absolute())
     })?;
     let ours = find_local_warden().ok()?;
-    (is_executable(&exe) && std::fs::canonicalize(&exe).ok() != std::fs::canonicalize(&ours).ok()).then_some(exe)
+    (trusted_warden(&exe) && std::fs::canonicalize(&exe).ok() != std::fs::canonicalize(&ours).ok()).then_some(exe)
+}
+
+/// A file this window may run as `warden upgrade --yes`: named `warden`, owned by this user or
+/// root, and writable by nobody else. The pid comes from what the socket's peer says about
+/// itself, so it is not enough that it names an executable.
+// shortcut: the pid is the peer's own word, not SO_PEERCRED; same-user peers gain nothing from it.
+fn trusted_warden(exe: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(exe) else { return false };
+    let me = rustix::process::geteuid().as_raw();
+    is_executable(exe)
+        && exe.file_name().is_some_and(|n| n == "warden")
+        && (m.uid() == me || m.uid() == 0)
+        && m.mode() & 0o022 == 0
 }
 
 /// `warden resurrect`: start what the last `warden save` (the first step of a restart) remembered.
