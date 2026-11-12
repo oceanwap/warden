@@ -3620,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "warden"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "brotli",
  "bytes",
@@ -3645,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "warden-gui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "chrono",
  "iced",
@@ -3659,7 +3659,7 @@ dependencies = [
 
 [[package]]
 name = "warden-protocol"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
